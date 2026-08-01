@@ -13,7 +13,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
-import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
+import {
+  createRunPersistence,
+  generateRunId,
+  loadRunState,
+  listActiveRuns,
+  saveCheckpoint,
+  type PersistedRunState,
+  type RunCheckpoint,
+} from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -1081,5 +1089,144 @@ test(
 
     // listAllRuns ignores the session binding.
     assert.equal(new WorkflowManager({ cwd, sessionId: "s1" }).listAllRuns().length, 2);
+  }),
+);
+
+// ─── P0-4: saveCheckpoint must not pollute the resume journal ────────────────
+
+test(
+  "saveCheckpoint appends to checkpoints[] and leaves the resume journal untouched (no fake hash entry)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "p0-4-journal";
+    const seededJournal = [
+      { index: 0, runId, hash: "real-call-hash-1", result: { reply: "first" } },
+      { index: 1, runId, hash: "real-call-hash-2", result: { reply: "second" } },
+    ];
+    rp.save({
+      runId,
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      journal: seededJournal,
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    const checkpoint: RunCheckpoint = {
+      runId,
+      taskId: "approve-plan",
+      status: "completed",
+      worktreePath: "/tmp/worktree",
+      branch: "plan-approval",
+      output: "approved",
+      timestamp: "2024-01-01T00:05:00.000Z",
+    };
+    await saveCheckpoint(runId, checkpoint, cwd);
+
+    const raw = rp.load(runId);
+    assert.deepEqual(
+      raw?.journal,
+      seededJournal,
+      "the resume journal must be unchanged — a checkpoint must never add an entry the resume path could replay as a cache hit",
+    );
+    assert.equal(raw?.journal?.length, 2, "no fake hash entry may be appended");
+    assert.deepEqual(raw?.checkpoints, [checkpoint], "the checkpoint lands in checkpoints[]");
+
+    // Round-trip through the exported reader.
+    const state = await loadRunState(runId, cwd);
+    assert.equal(state?.status, "active", "a paused run maps to checkpoint-state 'active'");
+    assert.deepEqual(state?.checkpoints, [checkpoint], "checkpoint round-trips via loadRunState");
+    assert.equal(state?.checkpoints[0].taskId, "approve-plan");
+    assert.equal(state?.checkpoints[0].branch, "plan-approval");
+
+    // listActiveRuns (paused run) reads from checkpoints[] too.
+    const active = await listActiveRuns(cwd);
+    assert.equal(active.length, 1);
+    assert.deepEqual(active[0].checkpoints, [checkpoint]);
+  }),
+);
+
+test(
+  "saveCheckpoint dedupes by taskId and keeps checkpoints in first-seen order",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "p0-4-dedupe";
+    rp.save({
+      runId,
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "running",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    const mk = (taskId: string, timestamp: string): RunCheckpoint => ({
+      runId,
+      taskId,
+      status: "active",
+      timestamp,
+    });
+    await saveCheckpoint(runId, mk("t1", "2024-01-01T00:01:00.000Z"), cwd);
+    await saveCheckpoint(runId, mk("t2", "2024-01-01T00:02:00.000Z"), cwd);
+    // Re-saving t1 must update in place, not append a duplicate at the end.
+    await saveCheckpoint(runId, mk("t1", "2024-01-01T00:03:00.000Z"), cwd);
+
+    const state = await loadRunState(runId, cwd);
+    assert.equal(state?.checkpoints.length, 2, "re-saving an existing taskId must not duplicate it");
+    assert.deepEqual(
+      state?.checkpoints.map((c) => c.taskId),
+      ["t1", "t2"],
+      "checkpoints keep their first-seen order after an in-place update",
+    );
+    assert.equal(
+      state?.checkpoints[0].timestamp,
+      "2024-01-01T00:03:00.000Z",
+      "the updated checkpoint replaces the old one in place",
+    );
+  }),
+);
+
+test(
+  "loadRunState falls back to checkpoint-shaped journal entries for legacy polluted runs",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "p0-4-legacy";
+    rp.save({
+      runId,
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+      // A run persisted by the pre-P0-4 saveCheckpoint: checkpoint records
+      // were written into the journal alongside real call-hash entries.
+      journal: [
+        { index: 0, runId, hash: "real-call-hash", result: { reply: "ok" } },
+        {
+          index: 1,
+          runId,
+          hash: "approve-plan",
+          result: { runId, taskId: "approve-plan", status: "completed", timestamp: "2024-01-01T00:05:00.000Z" },
+        },
+      ],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+
+    const state = await loadRunState(runId, cwd);
+    assert.equal(
+      state?.checkpoints.length,
+      1,
+      "only checkpoint-shaped journal entries are treated as checkpoints, real agent-call entries are not",
+    );
+    assert.equal(state?.checkpoints[0].taskId, "approve-plan");
   }),
 );

@@ -90,6 +90,15 @@ export interface PersistedRunState {
     storeDelta?: Record<string, unknown>;
   }>;
   /**
+   * Human-approval checkpoints for this run (see saveCheckpoint). Kept in
+   * their own array, deliberately NOT in `journal`: the resume path replays
+   * journal entries as call hashes, so a checkpoint written there could fake
+   * a cache hit for a changed checkpoint (P0-4). Absent on legacy runs whose
+   * checkpoints were written into the journal before this split; loadRunState
+   * falls back to checkpoint-shaped journal entries for those.
+   */
+  checkpoints?: RunCheckpoint[];
+  /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
    * and carried through resumes; see UsageLimitScheduler.
@@ -481,4 +490,108 @@ export function generateRunId(): string {
   const timestamp = Date.now().toString(36);
   const random = Math.random().toString(36).slice(2, 8);
   return `${timestamp}-${random}`;
+}
+
+// ─── Task 8: Checkpointing & Crash Recovery ─────────────────────────────────
+
+export interface RunCheckpoint {
+  runId: string;
+  taskId: string;
+  status: string;
+  worktreePath?: string;
+  branch?: string;
+  output?: string;
+  timestamp: string;
+}
+
+export interface RunCheckpointState {
+  runId: string;
+  status: "active" | "completed" | "failed" | "recovered";
+  checkpoints: RunCheckpoint[];
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export async function createRunState(runId: string, _cwd?: string): Promise<RunCheckpointState> {
+  const now = new Date().toISOString();
+  return { runId, status: "active", checkpoints: [], startedAt: now, updatedAt: now };
+}
+
+/**
+ * True for values shaped like a persisted RunCheckpoint (taskId + timestamp
+ * are required fields). Used to extract legacy checkpoints out of a resume
+ * journal written by the pre-P0-4 saveCheckpoint, without mistaking real
+ * agent-call journal entries (whose `result` is an arbitrary agent result)
+ * for checkpoints.
+ */
+function isRunCheckpoint(value: unknown): value is RunCheckpoint {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as RunCheckpoint;
+  return typeof candidate.taskId === "string" && typeof candidate.timestamp === "string";
+}
+
+function checkpointsFromJournal(state: PersistedRunState): RunCheckpoint[] {
+  return (state.journal || []).map((j) => j.result).filter(isRunCheckpoint);
+}
+
+export async function saveCheckpoint(runId: string, checkpoint: RunCheckpoint, cwd?: string): Promise<void> {
+  const persistence = createRunPersistence(cwd || process.cwd());
+  const existing = persistence.load(runId);
+  if (!existing) throw new Error(`Run ${runId} not found`);
+  // Checkpoints live in checkpoints[], never in journal[]: the resume path
+  // replays journal entries as call hashes, so a checkpoint written there
+  // could fake a cache hit for a changed checkpoint (P0-4). Dedupe by taskId
+  // and update in place so first-seen order is preserved.
+  existing.checkpoints = existing.checkpoints ?? [];
+  const at = existing.checkpoints.findIndex((c) => c.taskId === checkpoint.taskId);
+  if (at >= 0) existing.checkpoints[at] = checkpoint;
+  else existing.checkpoints.push(checkpoint);
+  persistence.save(existing);
+}
+
+export async function loadRunState(runId: string, cwd?: string): Promise<RunCheckpointState | null> {
+  const persistence = createRunPersistence(cwd || process.cwd());
+  const state = persistence.load(runId);
+  if (!state) return null;
+  return {
+    runId: state.runId,
+    status: state.status === "completed" ? "completed" : state.status === "failed" ? "failed" : "active",
+    checkpoints: state.checkpoints ?? checkpointsFromJournal(state),
+    startedAt: state.startedAt,
+    updatedAt: state.updatedAt,
+    completedAt: state.completedAt,
+  };
+}
+
+export async function listActiveRuns(cwd?: string): Promise<RunCheckpointState[]> {
+  const persistence = createRunPersistence(cwd || process.cwd());
+  const runs = persistence.list();
+  return runs
+    .filter(r => r.status === "running" || r.status === "paused")
+    .map(r => ({
+      runId: r.runId,
+      status: "active" as const,
+      checkpoints: r.checkpoints ?? checkpointsFromJournal(r),
+      startedAt: r.startedAt,
+      updatedAt: r.updatedAt,
+    }));
+}
+
+export async function resumeRun(runId: string, cwd?: string): Promise<RunCheckpointState> {
+  const persistence = createRunPersistence(cwd || process.cwd());
+  const state = persistence.load(runId);
+  if (!state) throw new Error(`Run ${runId} not found`);
+  state.status = "running";
+  persistence.save(state);
+  return loadRunState(runId, cwd) as Promise<RunCheckpointState>;
+}
+
+export async function cleanupRun(runId: string, cwd?: string): Promise<void> {
+  const persistence = createRunPersistence(cwd || process.cwd());
+  const state = persistence.load(runId);
+  if (!state) return;
+  state.status = "completed";
+  state.completedAt = new Date().toISOString();
+  persistence.save(state);
 }
