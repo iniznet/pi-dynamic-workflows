@@ -5,6 +5,7 @@
 import assert from "node:assert";
 import { Socket } from "node:net";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { MCPProxyClient } from "../../src/agent/mcp-proxy-client.js";
 import { MCPBridge } from "../../src/gateway/mcp-bridge.js";
 import type { ToolCallResult, ToolExecutor } from "../../src/gateway/types.js";
 import { TOOL_TIMEOUT } from "../../src/gateway/types.js";
@@ -385,5 +386,47 @@ describe("MCPBridge", () => {
     assert.strictEqual(bridge.pendingTimeoutCount, 0, "no timer should remain after a timeout");
 
     socket.destroy();
+  });
+
+  it("round-trips a tool call through a real MCPProxyClient socket (E2E proxied path)", async () => {
+    bridge = new MCPBridge({
+      tools,
+      toolDefs: [
+        { name: "echo", description: "Echo tool", inputSchema: {}, source: "host" },
+        { name: "error-tool", description: "Error tool", inputSchema: {}, source: "host" },
+      ],
+    });
+    await bridge.start();
+
+    // Client side of the proxied path: a real MCPProxyClient connects to the
+    // bridge socket exactly like a subagent session would.
+    const client = new MCPProxyClient(bridge.getSocketPath());
+    await client.connect();
+    try {
+      const proxiedDefs = client.getProxiedToolDefs();
+      assert.deepStrictEqual(
+        proxiedDefs.map((d) => d.name),
+        ["echo", "error-tool"],
+        "tool.list must reach the client through the socket",
+      );
+
+      // Invoke a tool through the bridge and assert the response round-trips.
+      const result = await client.executeToolCall("echo", { hello: "world" });
+      assert.deepStrictEqual(result, {
+        content: JSON.stringify({ hello: "world" }),
+        isError: false,
+      });
+
+      // The proxied ToolDefinition path (what a subagent session actually
+      // executes) forwards through the same client.
+      const echoDef = client.getToolDefinitions().find((d) => d.name === "echo");
+      assert.ok(echoDef, "echo tool definition must be exposed to the subagent");
+      const defResult = (await (
+        echoDef as { execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }
+      ).execute("call-1", { nested: [1, 2] })) as { content: Array<{ type: string; text: string }> };
+      assert.strictEqual(defResult.content[0].text, JSON.stringify({ nested: [1, 2] }));
+    } finally {
+      await client.disconnect();
+    }
   });
 });

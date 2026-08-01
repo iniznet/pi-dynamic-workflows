@@ -9,10 +9,13 @@ import {
 } from "../src/extension-reload.js";
 import {
   createEffortState,
+  createGatewayProxiedTools,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
+  HostToolGateway,
+  hostToolsFromDefinitions,
   installResultDelivery,
   installTaskPanel,
   installWorkflowKeywordArming,
@@ -21,6 +24,7 @@ import {
   registerBuiltinWorkflows,
   registerEffortCommand,
   registerWorkflowCommands,
+  registerWorkflowGatewayCommand,
   registerWorkflowModelsCommand,
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
@@ -53,13 +57,31 @@ export default function extension(pi: ExtensionAPI) {
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
   };
+  // P2-1 WIRE: lazily-started host tool gateway. Constructing it opens nothing;
+  // the bridge only comes up when a user runs /workflows-gateway start. The
+  // host-tools toolset below is the explicit opt-in: a run that names
+  // toolset "host-tools" receives proxied host tools, everything else keeps the
+  // README-documented default of no host tools in subagents.
+  const hostToolGateway = new HostToolGateway();
+  const gatewayManagerOptions = {
+    ...managerOptions,
+    toolsets: {
+      ...managerOptions.toolsets,
+      "host-tools": () => createGatewayProxiedTools(hostToolGateway),
+    },
+  };
+  // The gateway is created per extension generation; a /reload hands the old
+  // bridge no continuation, so stop it on shutdown to release the socket.
+  const stopHostToolGateway = () => {
+    if (hostToolGateway.isRunning()) void hostToolGateway.stop().catch(() => {});
+  };
   const runtimeClaim = claimWorkflowRuntime(cwd);
   const previousRuntime = runtimeClaim.compatible;
   const pausedForVersionChange = runtimeClaim.versionMismatch
     ? pauseStrandedWorkflowRuntime(runtimeClaim.versionMismatch)
     : 0;
-  const manager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...managerOptions });
-  if (previousRuntime) manager.reconfigureAfterReload(managerOptions);
+  const manager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...gatewayManagerOptions });
+  if (previousRuntime) manager.reconfigureAfterReload(gatewayManagerOptions);
   // /effort is independent of the manager implementation and can safely
   // survive an extension-version fallback to a fresh manager.
   const effort = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort ?? createEffortState();
@@ -78,6 +100,13 @@ export default function extension(pi: ExtensionAPI) {
   const workflowControlTool = createWorkflowControlTool({ manager });
   pi.registerTool(workflowTool);
   pi.registerTool(workflowControlTool);
+  // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
+  // definitions are built at start time so the extension load stays side-effect
+  // free and the default (no host tools in subagents) is untouched until a user
+  // explicitly enables the bridge.
+  registerWorkflowGatewayCommand(pi, hostToolGateway, {
+    buildHostTools: () => hostToolsFromDefinitions([...createCodingTools(cwd), ...createWebTools()]),
+  });
   // Auto-resume runs that paused on a provider usage limit once the quota is
   // likely refilled. Standalone: only consumes the manager's public surface, so
   // it stays decoupled from manager/persistence internals. Its constructor also
@@ -86,6 +115,7 @@ export default function extension(pi: ExtensionAPI) {
   const usageLimitScheduler = new UsageLimitScheduler(manager);
   pi.on("session_shutdown", (event?: { reason?: string }) => {
     usageLimitScheduler.dispose();
+    stopHostToolGateway();
     if (event?.reason === "reload") {
       handoffWorkflowRuntime(runtime);
     } else {

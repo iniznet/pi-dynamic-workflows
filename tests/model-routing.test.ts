@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { type ModelRoutingConfig, parseModelRoutingFromMeta, resolveModelForPhase } from "../src/model-routing.js";
+import {
+  classifyTask,
+  type ModelRoutingConfig,
+  parseModelRoutingFromMeta,
+  resolveModelForPhase,
+  TaskClassification,
+} from "../src/model-routing.js";
 
 test("resolveModelForPhase returns default when no phases match", () => {
   assert.equal(resolveModelForPhase("Discovery", { defaultModel: "default-model", routes: [] }), "default-model");
@@ -98,4 +104,32 @@ test("parseModelRoutingFromMeta returns empty routes / no default when nothing d
 
 test("parseModelRoutingFromMeta returns empty routes when phases have no models", () => {
   assert.deepEqual(parseModelRoutingFromMeta([{ title: "Scan" }, { title: "Report" }]).routes, []);
+});
+
+// ─── classifyTask (folded from engine/tier-router.ts, P2-1) ────────────────
+
+test("classifyTask defaults to EDIT for a neutral prompt", () => {
+  assert.equal(classifyTask("3", "finish the migration"), TaskClassification.EDIT);
+});
+
+test("classifyTask scans early reconnaissance phases by scan keywords", () => {
+  assert.equal(classifyTask("0", "find the failing test"), TaskClassification.SCAN);
+  assert.equal(classifyTask("phase-1", "grep for TODO markers"), TaskClassification.SCAN);
+});
+
+test("classifyTask maps synthesize and analyze keywords by prompt (any phase)", () => {
+  assert.equal(classifyTask("3", "synthesize the findings"), TaskClassification.SYNTHESIZE);
+  assert.equal(classifyTask("2", "review this PR"), TaskClassification.ANALYZE);
+});
+
+test("classifyTask keyword matching is case-insensitive substring matching", () => {
+  assert.equal(classifyTask("3", "IMPLEMENT the loader"), TaskClassification.EDIT);
+  assert.equal(classifyTask("0", "Summarize phase 1"), TaskClassification.SYNTHESIZE);
+});
+
+test("classifyTask prioritizes synthesize/analyze over scan for non-early phases", () => {
+  // The early-phase branch returns SCAN before falling through to prompt-wide
+  // rules; outside phases 0/1 the prompt-wide synthesize rule wins instead.
+  assert.equal(classifyTask("0", "scan for final summary"), TaskClassification.SCAN);
+  assert.equal(classifyTask("2", "scan for final summary"), TaskClassification.SYNTHESIZE);
 });

@@ -166,10 +166,23 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/workflows-trigger set <word>\|reset` | Set or reset the trigger word |
 | `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
 | `/workflows-models` | Map model tiers and thinking levels |
+| `/workflows-gateway start\|stop\|status` | Lazily start/stop the host tool IPC gateway (MCPBridge) — see below |
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
 
 In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit.
+
+### Host tool gateway (opt-in proxying)
+
+Subagents never load host extensions by default (see “Upgrading past 3.2”); that default is preserved. If you explicitly want a run's subagents to call host-side tools, start the gateway on demand and opt the run into its toolset:
+
+```bash
+/workflows-gateway start   # lazily starts MCPBridge over a local IPC socket
+/workflows-gateway status
+/workflows-gateway stop
+```
+
+Nothing starts on extension load; `status` reports `STOPPED` until you run `start`. Once running, a run opts in explicitly by naming the `host-tools` toolset at run level — `executeRun({ toolset: "host-tools" })`, the `workflow` tool with a saved/built-in workflow that carries a toolset tag, or direct `runWorkflow({ tools })`. Those subagents receive proxied definitions that forward each tool call back to the host. A run that opts in while the gateway is stopped fails loudly at call time instead of silently dropping the tools.
 
 Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
 

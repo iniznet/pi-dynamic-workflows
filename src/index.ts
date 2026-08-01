@@ -1,5 +1,8 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
+export { createProxiedTools, MCPProxyClient } from "./agent/mcp-proxy-client.js";
+export type { RunResult, WorktreeRunner, WorktreeRunnerConfig, WorktreeTask } from "./agent/worktree-runner.js";
+export { createWorktreeRunner, executeTask, implementProtocol } from "./agent/worktree-runner.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
 export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
@@ -43,10 +46,40 @@ export {
   WorkflowErrorCode,
   wrapError,
 } from "./errors.js";
+export type { HostToolsBundle, WorkflowGatewayCommandOptions } from "./gateway/host-tool-gateway.js";
+export {
+  createGatewayProxiedTools,
+  GATEWAY_NOT_RUNNING_MESSAGE,
+  HostToolGateway,
+  hostToolsFromDefinitions,
+  registerWorkflowGatewayCommand,
+} from "./gateway/host-tool-gateway.js";
+// ─── Universal Host Tool IPC Gateway (Task 1) ──────────────────────────────
+export { MCPBridge } from "./gateway/mcp-bridge.js";
+export type {
+  MCPBridgeOptions,
+  MCPProxyClientOptions,
+  ProxiedToolDef,
+  ToolCallResult,
+  ToolExecutor,
+} from "./gateway/types.js";
+export {
+  CONNECTION_CLOSED,
+  INTERNAL_ERROR,
+  INVALID_PARAMS,
+  INVALID_REQUEST,
+  METHOD_NOT_FOUND,
+  PARSE_ERROR,
+  TOOL_EXECUTION_ERROR,
+  TOOL_NOT_FOUND,
+  TOOL_TIMEOUT,
+} from "./gateway/types.js";
+export type { PlannotatorBridge, PlannotatorConfig, ReviewPlan } from "./integrations/plannotator.js";
+export { createPlannotatorBridge, getPlanStatus, submitPlan, waitForApproval } from "./integrations/plannotator.js";
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
 export { createWorkflowLogger } from "./logger.js";
 export type { ModelRoute, ModelRoutingConfig } from "./model-routing.js";
-export { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+export { classifyTask, parseModelRoutingFromMeta, resolveModelForPhase, TaskClassification } from "./model-routing.js";
 export type { ModelThinkingLevel, ResolvedModelSpec } from "./model-spec.js";
 export {
   canonicalModelSpec,
@@ -66,8 +99,64 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
-export { createRunPersistence, generateRunId } from "./run-persistence.js";
+export type { BlueprintStep, ExecutionBlueprint } from "./phases/prewalk.js";
+export { generateBlueprint, loadBlueprint, saveBlueprint, validateBlueprint } from "./phases/prewalk.js";
+export type { PhaseState } from "./phases/state-machine.js";
+export {
+  APPROVAL_REQUIRED,
+  PHASE_TRANSITION_INVALID,
+  PhaseGuard,
+  SUBAGENT_SPAWN_BLOCKED,
+  WorkflowStateManager,
+} from "./phases/state-machine.js";
+export type {
+  ClaimSource,
+  CreateDecisionMapOptions,
+  DecisionMap,
+  DecisionTicket,
+  FogAssessment,
+  FrontierMappedTicket,
+  FrontierMapper,
+  FrontierMapping,
+  ResearchDispatch,
+  StatableQuestion,
+  TicketClaim,
+  TicketStatus,
+  TicketType,
+  WayfinderRuntime,
+} from "./phases/wayfinder.js";
+export {
+  assessPrompt,
+  beginSession,
+  blockTicket,
+  buildResearchPrompt,
+  createDecisionMap,
+  dispatchTicketResearch,
+  getNextAction,
+  getSessionTicket,
+  loadDecisionMap,
+  renderMarkdownMap,
+  resolveTicket,
+  saveDecisionMap,
+  unblockTicket,
+} from "./phases/wayfinder.js";
+export type {
+  PersistedRunState,
+  RunCheckpoint,
+  RunCheckpointState,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
+export {
+  cleanupRun,
+  createRunPersistence,
+  createRunState,
+  generateRunId,
+  listActiveRuns,
+  loadRunState,
+  resumeRun,
+  saveCheckpoint,
+} from "./run-persistence.js";
 export {
   parseCommandArgs,
   registerAllSavedWorkflows,
@@ -85,14 +174,6 @@ export type {
 } from "./usage-limit-scheduler.js";
 export { computeAutoResumeDelayMs, parseResetHintMs, UsageLimitScheduler } from "./usage-limit-scheduler.js";
 export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
-export type { PhaseState } from "./phases/state-machine.js";
-export {
-  APPROVAL_REQUIRED,
-  PHASE_TRANSITION_INVALID,
-  PhaseGuard,
-  SUBAGENT_SPAWN_BLOCKED,
-  WorkflowStateManager,
-} from "./phases/state-machine.js";
 export type {
   AgentOptions,
   CheckpointGate,
@@ -171,6 +252,14 @@ export {
   saveWorkflowSettings,
   saveWorkflowSettingsForCwd,
 } from "./workflow-settings.js";
+export type { FileLock, WorkflowStatus } from "./workflow-status.js";
+export {
+  acquireFileLock,
+  checkFileConflict,
+  getWorkflowStatus,
+  listRunningWorkflows,
+  releaseFileLock,
+} from "./workflow-status.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
 export {
