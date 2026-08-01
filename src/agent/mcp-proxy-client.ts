@@ -15,24 +15,19 @@
 
 import { randomUUID } from "node:crypto";
 import { Socket } from "node:net";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  type ConnectionState,
   type JsonRpcRequest,
   type JsonRpcResponse,
   type MCPProxyClientOptions,
+  METHOD_TOOL_CALL,
+  METHOD_TOOL_LIST,
   type PendingRequest,
   type ProxiedToolDef,
   type ToolCallResult,
-  type ConnectionState,
-  METHOD_TOOL_CALL,
-  METHOD_TOOL_LIST,
-  METHOD_TOOL_DESCRIBE,
-  METHOD_PING,
-  TOOL_TIMEOUT,
-  CONNECTION_CLOSED,
-  TOOL_EXECUTION_ERROR,
 } from "../gateway/types.js";
 
 /** Default per-request timeout in milliseconds. */
@@ -154,7 +149,7 @@ export class MCPProxyClient {
     }
 
     // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests) {
+    for (const [_id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("Connection closed"));
     }
@@ -163,7 +158,7 @@ export class MCPProxyClient {
     // Close socket
     if (this.socket) {
       return new Promise<void>((resolve) => {
-        this.socket!.end(() => {
+        this.socket?.end(() => {
           this.socket = null;
           this.state = "disconnected";
           resolve();
@@ -206,7 +201,13 @@ export class MCPProxyClient {
       label: def.name,
       description: `[Proxied] ${def.description}`,
       parameters: Type.Object({}),
-      async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext) {
+      async execute(
+        _toolCallId: string,
+        params: Record<string, unknown>,
+        _signal: AbortSignal | undefined,
+        _onUpdate: unknown,
+        _ctx: ExtensionContext,
+      ) {
         const result = await client.executeToolCall(def.name, params);
         return {
           content: [{ type: "text" as const, text: result.content }],
@@ -254,7 +255,7 @@ export class MCPProxyClient {
         const messageBuffer = Buffer.from(json, "utf-8");
         const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
         lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
-        this.socket!.write(Buffer.concat([lengthPrefix, messageBuffer]));
+        this.socket?.write(Buffer.concat([lengthPrefix, messageBuffer]));
       } catch (error) {
         clearTimeout(timeout);
         this.pendingRequests.delete(id);
@@ -334,7 +335,7 @@ export class MCPProxyClient {
     this.socket = null;
 
     // Reject all pending requests
-    for (const [id, pending] of this.pendingRequests) {
+    for (const [_id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("Connection lost"));
     }
@@ -344,7 +345,7 @@ export class MCPProxyClient {
     if (this.reconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       console.warn(
-        `[MCPProxyClient] Connection lost. Reconnecting (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`
+        `[MCPProxyClient] Connection lost. Reconnecting (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`,
       );
 
       this.reconnectTimer = setTimeout(async () => {
@@ -391,23 +392,26 @@ export class MCPProxyClient {
  * @param toolDefs - Tool definitions from the bridge
  * @returns Array of ToolDefinition objects
  */
-export function createProxiedTools(
-  client: MCPProxyClient,
-  toolDefs: ProxiedToolDef[]
-): ToolDefinition[] {
+export function createProxiedTools(client: MCPProxyClient, toolDefs: ProxiedToolDef[]): ToolDefinition[] {
   return toolDefs.map((def) =>
     defineTool({
       name: def.name,
       label: def.name,
       description: `[Proxied] ${def.description}`,
       parameters: Type.Object({}),
-      async execute(toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: unknown, ctx: ExtensionContext) {
+      async execute(
+        _toolCallId: string,
+        params: Record<string, unknown>,
+        _signal: AbortSignal | undefined,
+        _onUpdate: unknown,
+        _ctx: ExtensionContext,
+      ) {
         const result = await client.executeToolCall(def.name, params);
         return {
           content: [{ type: "text" as const, text: result.content }],
           details: result.details,
         };
       },
-    })
+    }),
   );
 }

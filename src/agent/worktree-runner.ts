@@ -2,8 +2,7 @@
  * Worktree Subagent Execution & /implement Protocol (Phase 3).
  * Fans out parallel subagent tasks in isolated Git worktrees.
  */
-import { createWorktree, removeWorktree } from "../worktree.js";
-import { WorkflowError, WorkflowErrorCode } from "../errors.js";
+import { removeWorktree } from "../worktree.js";
 
 export interface WorktreeTask {
   id: string;
@@ -44,7 +43,7 @@ const DEFAULT_CONFIG: WorktreeRunnerConfig = {
   cleanupOnComplete: true,
 };
 
-export async function executeTask(task: WorktreeTask, config: WorktreeRunnerConfig): Promise<RunResult> {
+export async function executeTask(task: WorktreeTask, _config: WorktreeRunnerConfig): Promise<RunResult> {
   const start = Date.now();
   task.status = "running";
   task.startedAt = new Date().toISOString();
@@ -67,7 +66,7 @@ export async function executeTask(task: WorktreeTask, config: WorktreeRunnerConf
   }
 }
 
-export async function implementProtocol(task: WorktreeTask): Promise<{
+export async function implementProtocol(_task: WorktreeTask): Promise<{
   testsWritten: boolean;
   implWritten: boolean;
   typecheckPassed: boolean;
