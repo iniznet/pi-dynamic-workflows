@@ -222,6 +222,22 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * unchanged. Users without a toolchain are never blocked.
    */
   preRunTypecheck?: boolean;
+  /**
+   * OPT-IN resume-journal compaction request (default OFF). When true, the
+   * journal owner (WorkflowManager's persist path — runWorkflow itself emits
+   * journal entries but never holds the accumulated journal) folds the run's
+   * resolved journal segments — calls whose operation traces are all "ok" —
+   * into a compact interned summary at persist time, persisting it ONLY when
+   * reconstruction QA reproduces the original journal byte-identically; a
+   * summary that fails QA is discarded and the original journal is kept. The
+   * positional deltaKey (`${runId}:${callIndex}`) scheme is untouched — no
+   * migration, no relabeling. Default OFF: emitted journal entries are
+   * byte-identical to the pre-compaction shape. Direct callers that
+   * accumulate onAgentJournal entries themselves can apply the same pipeline
+   * via compactJournal/reconstructJournal/verifyJournalCompaction from
+   * journal-compaction.ts.
+   */
+  compactJournal?: boolean;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**

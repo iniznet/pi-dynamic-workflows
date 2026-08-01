@@ -7,11 +7,13 @@ import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-ag
 import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
 import {
   buildResumeJournal,
   createRunPersistence,
   generateRunId,
   keepsResumeJournal,
+  loadPersistedJournal,
   type PersistedRunState,
   type RunLease,
   type RunLeaseState,
@@ -46,6 +48,15 @@ export interface ManagedRunBase {
    * Undefined means eligible (default-on); false opts out.
    */
   autoResume?: boolean;
+  /**
+   * OPT-IN resume-journal compaction (default OFF), frozen at run start like
+   * tokenBudget and carried through resume() so a resumed run keeps
+   * compacting if it started with the flag. When true, writeRunToDisk folds
+   * the journal's resolved segments into a compact summary and persists it
+   * only when reconstruction QA reproduces the original byte-identically
+   * (failed-QA summaries are discarded; the original journal is kept).
+   */
+  compactJournal?: boolean;
   /**
    * The run's resolved hard token budget (per-run value, else the manager
    * default), fixed at run start and carried through resume() — a resumed run
@@ -193,6 +204,17 @@ export interface ExecOptions {
    * it too. See usage-limit-scheduler.ts.
    */
   autoResume?: boolean;
+  /**
+   * OPT-IN resume-journal compaction (default OFF): when true, the run's
+   * journal is folded into a compact summary at persist time — resolved
+   * segments (calls whose operation traces are all "ok") are interned into
+   * shared tables — and the summary is persisted ONLY when reconstruction QA
+   * reproduces the original journal byte-identically (a failed-QA summary is
+   * discarded and the original journal is kept). The positional deltaKey
+   * scheme is untouched. Default off: the persisted journal is byte-identical
+   * to today's shape. See journal-compaction.ts.
+   */
+  compactJournal?: boolean;
   /**
    * Seed for the execution's cumulative token counters — passed through to
    * runWorkflow's WorkflowRunOptions.initialTokenUsage. Only resume() sets
@@ -499,6 +521,7 @@ export class WorkflowManager extends EventEmitter {
       background: true,
       lease,
       autoResume: exec.autoResume,
+      compactJournal: exec.compactJournal === true,
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
       tokenBudget: exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget,
@@ -531,6 +554,9 @@ export class WorkflowManager extends EventEmitter {
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
+        // Persisted only when opted in so a default run's file is byte-identical
+        // to the pre-compaction shape (undefined keys are dropped by JSON).
+        compactJournal: managed.compactJournal === true ? true : undefined,
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
@@ -569,6 +595,7 @@ export class WorkflowManager extends EventEmitter {
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     const executing = this.startExecuting(managed, lease);
     executing.autoResume = exec.autoResume;
+    executing.compactJournal = exec.compactJournal === true;
     executing.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
     executing.toolset = exec.toolset;
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
@@ -708,6 +735,9 @@ export class WorkflowManager extends EventEmitter {
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
+        // The run's frozen compaction opt-in — surfaced on runWorkflow's options
+        // surface (the journal owner, writeRunToDisk, honors it at persist time).
+        compactJournal: managed.compactJournal === true,
         // Seed the fresh SharedRuntime's spend counter from the persisted total
         // (resume()) so the hard tokenBudget cap holds cumulatively across a
         // pause/resume cycle instead of resetting to zero each time (see A2 —
@@ -1149,6 +1179,33 @@ export class WorkflowManager extends EventEmitter {
       // agent details. Persist exactly one full copy of each agent result instead
       // of writing it to both agents[].result and journal[].result.
       const keepJournal = keepsResumeJournal(managed.status);
+      // P2-5 opt-in compaction (ExecOptions.compactJournal): fold the journal's
+      // resolved segments into a compact summary and persist it ONLY when the
+      // reconstruction-QA gate reproduces the original journal byte-identically
+      // (verifyJournalCompaction) — a failed-QA summary is discarded and the
+      // original journal is kept; a compacted form is never persisted without
+      // passing the gate. A summary that does not actually shrink the journal
+      // (nothing foldable / everything verbatim) is also skipped — persisting a
+      // larger "compaction" buys nothing. The positional deltaKey scheme
+      // (`${runId}:${callIndex}`) is untouched in both forms.
+      let journal: PersistedRunState["journal"];
+      let journalCompacted: PersistedRunState["journalCompacted"];
+      if (keepJournal && managed.compactJournal === true) {
+        const summary = compactJournal(managed.journal);
+        const qa = verifyJournalCompaction(summary, managed.journal);
+        if (qa.ok && JSON.stringify(summary).length <= JSON.stringify(managed.journal).length) {
+          journalCompacted = summary;
+        } else {
+          if (!qa.ok) {
+            console.warn(
+              `[workflow-manager] journal compaction QA rejected for run ${managed.runId} (${qa.reason}) — keeping the original journal`,
+            );
+          }
+          journal = managed.journal;
+        }
+      } else {
+        journal = keepJournal ? managed.journal : undefined;
+      }
       this.persistence.save({
         runId: managed.runId,
         workflowName: managed.snapshot.name,
@@ -1157,12 +1214,18 @@ export class WorkflowManager extends EventEmitter {
         script: managed.script,
         args: managed.args,
         sessionId: this.sessionId,
-        journal: keepJournal ? managed.journal : undefined,
+        journal,
+        journalCompacted,
         status: managed.status,
         // Persisted every write (not just at pause) so a stale read during the
         // "paused" event race (see UsageLimitScheduler) is still correct — this
         // is fixed at run-start and doesn't change over the run's lifetime.
         autoResume: managed.autoResume,
+        // The run's frozen compaction opt-in (see ExecOptions.compactJournal),
+        // persisted so a resumed run keeps compacting if it started with the
+        // flag; omitted (JSON-dropped) on default runs so their persisted files
+        // stay byte-identical to the pre-compaction shape.
+        compactJournal: managed.compactJournal === true ? true : undefined,
         // Start-time execution context, re-read by resume() (see ManagedRun).
         tokenBudget: managed.tokenBudget,
         toolset: managed.toolset,
@@ -1300,12 +1363,15 @@ export class WorkflowManager extends EventEmitter {
       // writes them below, so a later resume of this run sees the edited script.
       script,
       args,
-      journal: persisted.journal ?? [],
+      journal: loadPersistedJournal(persisted),
       background: true,
       lease,
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
+      // Carry the compaction opt-in forward across resumes the same way: a run
+      // that started compacting keeps compacting (persisted as a boolean).
+      compactJournal: persisted.compactJournal === true,
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
@@ -1355,7 +1421,7 @@ export class WorkflowManager extends EventEmitter {
     // nested workflow() journaling was namespaced), so it still resume-hits
     // for a top-level call and safely cache-misses (re-runs live, does not
     // misapply) for what was actually a nested-run entry.
-    const resumeJournal = buildResumeJournal(runId, persisted.journal);
+    const resumeJournal = buildResumeJournal(runId, loadPersistedJournal(persisted));
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent

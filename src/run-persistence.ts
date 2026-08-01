@@ -15,6 +15,7 @@ import {
   unlinkIfExistsSafe,
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import { type CompactJournalSummary, reconstructJournal } from "./journal-compaction.js";
 import type { JournalEntry } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
@@ -104,6 +105,18 @@ export interface PersistedRunState {
     operations?: OperationTrace[];
   }>;
   /**
+   * The run's resume journal in COMPACTED form (see CompactJournalSummary in
+   * journal-compaction.ts): written INSTEAD of `journal` when the run opted
+   * into compaction (ExecOptions.compactJournal) AND the reconstruction-QA
+   * gate (verifyJournalCompaction) reproduced the original journal
+   * byte-identically. Never both: a compacted write omits `journal`; the
+   * default (opt-out) write omits this field and persists `journal` exactly
+   * as before this field existed. Load-side normalization is
+   * loadPersistedJournal() — reconstructs this form, else falls back to the
+   * plain array (legacy and default runs unchanged).
+   */
+  journalCompacted?: CompactJournalSummary;
+  /**
    * Human-approval checkpoints for this run (see saveCheckpoint). Kept in
    * their own array, deliberately NOT in `journal`: the resume path replays
    * journal entries as call hashes, so a checkpoint written there could fake
@@ -118,6 +131,13 @@ export interface PersistedRunState {
    * and carried through resumes; see UsageLimitScheduler.
    */
   autoResume?: boolean;
+  /**
+   * The run's opt-in resume-journal compaction flag (see
+   * ExecOptions.compactJournal), frozen at run start and persisted so a
+   * resumed run keeps compacting if it started with the flag. Absent/undefined
+   * on legacy and default runs (never compacted).
+   */
+  compactJournal?: boolean;
   /**
    * The run's resolved hard token budget, fixed at start (per-run value, else
    * the manager default at the time). Resume re-applies THIS value — never the
@@ -245,6 +265,23 @@ export function buildResumeJournal(runId: string, journal: JournalEntry[] | unde
  */
 export function keepsResumeJournal(status: RunStatus): boolean {
   return status !== "completed" && status !== "aborted";
+}
+
+/**
+ * Normalize a persisted run's journal for resume: a compacted form (written
+ * by the P2-5 opt-in compaction path) is reconstructed back to the original
+ * entries; a plain `journal` array (default and legacy runs) is returned
+ * unchanged. The reconstructed entries are what resume() seeds its in-memory
+ * journal with and feeds to buildResumeJournal — the positional deltaKey
+ * (`${runId}:${index}`) surface is untouched by compaction, so replay
+ * behaves exactly as it would against the original journal.
+ */
+export function loadPersistedJournal(state: {
+  journal?: JournalEntry[];
+  journalCompacted?: CompactJournalSummary;
+}): JournalEntry[] {
+  if (state.journalCompacted) return reconstructJournal(state.journalCompacted);
+  return state.journal ?? [];
 }
 
 interface LockFile {
