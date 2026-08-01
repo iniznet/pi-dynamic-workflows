@@ -1320,3 +1320,66 @@ return main`;
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
 });
+
+// ── Drain-wedge backstop: a hung, signal-ignoring un-awaited agent() with
+// agentTimeoutMs: null must not block run completion forever — the drain-side
+// deadline (drainTimeoutMs, default DRAIN_ABORT_TIMEOUT_MS) aborts the
+// stragglers via runFatalController and the run completes deterministically. ──
+
+test("a hung, signal-ignoring un-awaited agent() cannot wedge the run past the drain deadline", async () => {
+  const logLines: string[] = [];
+  const script = `export const meta = { name: 'drain_wedge_demo', description: 'never-settling un-awaited agent' }
+// Deliberately un-awaited AND signal-ignoring, with agentTimeoutMs: null (the
+// default): without the drain-side deadline this call would wedge the run's
+// completion forever.
+agent('never settles', { label: 'hung' })
+return 'done'`;
+  const run = runWorkflow<string>(script, {
+    agent: {
+      run() {
+        // Never resolves — and ignores its AbortSignal entirely (no listener,
+        // no abort check): the exact pathological case the drain deadline is for.
+        return new Promise<never>(() => {});
+      },
+    },
+    drainTimeoutMs: 50,
+    persistLogs: false,
+    onLog: (line) => logLines.push(line),
+  });
+  const result = await Promise.race([
+    run,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("run did not complete within the drain deadline")), 2000),
+    ),
+  ]);
+  assert.equal(result.result, "done");
+  assert.ok(
+    logLines.some((line) => line.includes("drain deadline")),
+    "the drain deadline warning must be logged when hung agents are aborted",
+  );
+});
+
+test("the drain deadline aborts cooperative in-flight agents via runFatalController", async () => {
+  let sawAbort = false;
+  const script = `export const meta = { name: 'drain_abort_demo', description: 'cooperative hung agent' }
+agent('cooperative hang', { label: 'hung' })
+return 'done'`;
+  const result = await runWorkflow<string>(script, {
+    agent: {
+      run(_prompt: string, options: { signal?: AbortSignal }) {
+        // Settles only when the drain deadline's abort reaches it — proves the
+        // runFatalController -> per-attempt AbortController link actually fires.
+        return new Promise((resolve) => {
+          options.signal?.addEventListener("abort", () => {
+            sawAbort = true;
+            resolve("aborted");
+          });
+        });
+      },
+    },
+    drainTimeoutMs: 50,
+    persistLogs: false,
+  });
+  assert.equal(result.result, "done");
+  assert.equal(sawAbort, true, "the in-flight agent must observe its abort signal once the drain deadline fires");
+});

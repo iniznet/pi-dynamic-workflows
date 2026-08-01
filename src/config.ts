@@ -8,6 +8,17 @@ export const MAX_AGENTS_PER_RUN = 1000;
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
 
+/**
+ * Drain-side backstop deadline in milliseconds. After a workflow script has
+ * finished, the top-level run waits up to this long for outstanding (possibly
+ * un-awaited) agent() calls to settle before aborting them via the run's fatal
+ * controller and completing the run anyway. Guards the drain against the wedge
+ * where a signal-ignoring agent with agentTimeoutMs: null would otherwise block
+ * run completion forever. Deterministic termination — this is a hard deadline,
+ * not a heuristic poll.
+ */
+export const DRAIN_ABORT_TIMEOUT_MS = 60_000;
+
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;
 

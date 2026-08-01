@@ -14,7 +14,13 @@ import {
   loadAgentRegistry,
   resolveAgentType,
 } from "./agent-registry.js";
-import { DEFAULT_AGENT_TIMEOUT_MS, MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
+import {
+  DEFAULT_AGENT_TIMEOUT_MS,
+  DRAIN_ABORT_TIMEOUT_MS,
+  MAX_AGENT_RETRIES,
+  MAX_AGENTS_PER_RUN,
+  MAX_CONCURRENCY,
+} from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
@@ -175,6 +181,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * Drain-side backstop deadline in milliseconds: how long the top-level run
+   * waits for outstanding (possibly un-awaited) agent() calls to settle after
+   * the script has finished, before aborting them via runFatalController and
+   * completing the run anyway. Defaults to DRAIN_ABORT_TIMEOUT_MS. This is
+   * what guarantees the run terminates even when agentTimeoutMs is null and an
+   * in-flight agent ignores its abort signal.
+   */
+  drainTimeoutMs?: number;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -411,6 +426,14 @@ export async function runWorkflow<T = unknown>(
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  // Positive finite numbers only; anything else (undefined, NaN, <= 0) falls
+  // back to the documented constant so the drain always has a deadline.
+  const drainTimeoutMs =
+    typeof options.drainTimeoutMs === "number" &&
+    Number.isFinite(options.drainTimeoutMs) &&
+    options.drainTimeoutMs > 0
+      ? options.drainTimeoutMs
+      : DRAIN_ABORT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
@@ -1320,20 +1343,34 @@ export async function runWorkflow<T = unknown>(
       // (not a single Promise.allSettled) because draining can itself let a
       // still-running call schedule further work that adds to the set.
       //
-      // Caveat: this can block indefinitely. A run-fatal abort (see the catch
-      // above) aborts the AbortSignal passed to each in-flight agent, but that
-      // is cooperative — an agent runner that ignores its signal (or one still
+      // Bounded, not indefinite. A run-fatal abort (see the catch above)
+      // aborts the AbortSignal passed to each in-flight agent, but that is
+      // cooperative — an agent runner that ignores its signal (or one still
       // waiting out a real subagent process that won't die) never settles on
       // its own. Combined with agentTimeoutMs: null (no hard timeout, the
-      // default), a single hung, signal-ignoring, un-awaited agent() call can
-      // wedge this drain — and therefore the whole run's completion — forever.
-      // Configure a finite agentTimeoutMs (run- or per-agent-level) for any
-      // workflow where this is a real risk; there is no drain-side timeout.
+      // default), a single hung, signal-ignoring, un-awaited agent() call
+      // would wedge this drain — and therefore the whole run's completion —
+      // forever. So the drain runs under a hard deadline: once drainTimeoutMs
+      // (default DRAIN_ABORT_TIMEOUT_MS) has elapsed with agents still in
+      // flight, runFatalController is aborted — the same cooperative abort a
+      // run-fatal error uses, which every in-flight agent()'s per-attempt
+      // AbortController is linked to — and the run completes without the
+      // stragglers. Termination is guaranteed by the deadline itself; the
+      // abort just winds cooperative agents down before the drain gives up.
       if (shared.inFlight.size > 0) {
         log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
       }
+      const drainDeadline = Date.now() + drainTimeoutMs;
       while (shared.inFlight.size > 0) {
-        await Promise.allSettled(Array.from(shared.inFlight));
+        if (Date.now() >= drainDeadline) {
+          shared.runFatalController.abort();
+          log(
+            `drain deadline (${drainTimeoutMs}ms) reached with ${shared.inFlight.size} outstanding agent() call(s) ` +
+              `still running; aborting them and completing the run — check for un-awaited agent() calls or a hung subagent`,
+          );
+          break;
+        }
+        await waitForInFlightSettlement(shared.inFlight, drainDeadline);
       }
       store.dispose();
     }
@@ -1572,6 +1609,23 @@ function normalizeConcurrency(value: unknown): number {
 function normalizeAgentRetries(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
+}
+
+/**
+ * Wait for every in-flight agent() call to settle, but never past `deadline`.
+ * The drain loop races Promise.allSettled against the remaining time instead of
+ * awaiting it bare, so a single never-settling promise can't wedge the wait —
+ * when the deadline fires we return and the loop decides whether to abort the
+ * stragglers (see the drain in runWorkflow's finally). Deterministic: the
+ * deadline, not a poll interval, bounds the wait.
+ */
+async function waitForInFlightSettlement(inFlight: Set<Promise<unknown>>, deadline: number): Promise<void> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) return;
+  await Promise.race([
+    Promise.allSettled(Array.from(inFlight)),
+    new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
+  ]);
 }
 
 /**
