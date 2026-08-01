@@ -12,3 +12,6 @@ scripts/verify-npm-install.sh
 __pycache__/
 .context/
 .auto/
+
+# Local-only task working notes (research/design/handoff docs; never shared)
+tasks/
