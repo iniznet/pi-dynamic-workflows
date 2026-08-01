@@ -4,7 +4,7 @@ import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
-import type { AgentUsage } from "./agent.js";
+import type { AgentUsage, OperationTrace } from "./agent.js";
 import { type AgentRunOptions, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
@@ -89,6 +89,14 @@ export interface JournalEntry {
    * which agent finished first. Absent on older journal entries.
    */
   storeDelta?: Record<string, unknown>;
+  /**
+   * Typed operation traces (Fabric-style): one entry per tool call this agent
+   * made, in execution order, pinned to the workflow-script line of the owning
+   * agent() call. Absent when the runner reported no tool calls (e.g. a test
+   * double, or a session that only produced prose) and on ALL journal entries
+   * persisted before this field existed — legacy journals replay unchanged.
+   */
+  operations?: OperationTrace[];
 }
 
 /**
@@ -158,6 +166,12 @@ export type WorkflowRuntimeEvent =
 /** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
 export interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
+  /**
+   * Optional teardown the workflow layer calls when the top-level run frame
+   * finishes (used to dispose a chained handoff session). Absent on injected
+   * test doubles.
+   */
+  close?(): void;
 }
 
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
@@ -280,6 +294,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    /**
+     * The failing tool call (Fabric-style line-numbered failure repair): the
+     * last operation whose outcome was not "ok" (else the final operation)
+     * when this agent's run() made tool calls before failing. Present only on
+     * error events whose session reported traces.
+     */
+    failingOperation?: OperationTrace;
   }) => void;
   onAgentHistory?: (event: { id: string; label: string; phase?: string; history: AgentHistoryEntry[] }) => void;
   onTokenUsage?: (usage: {
@@ -377,6 +398,16 @@ interface RuntimeState {
    * callIndex < firstMiss; once a call misses, it AND everything after run live.
    */
   firstMiss: number;
+  /**
+   * Phase of the last TOP-LEVEL agent() call (undefined before the first). Used
+   * by the session-handoff chaining rule: a top-level call whose phase differs
+   * from its predecessor continues the handoff session, so phase N+1's agent
+   * inherits phase N's trajectory instead of re-reading context. Fan-out calls
+   * (inside parallel()/pipeline()) never chain — they stay isolated.
+   */
+  lastTopLevelPhase?: string;
+  /** True once the first top-level agent() call has run (handoff chain root). */
+  sawTopLevelAgent: boolean;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -421,7 +452,7 @@ export async function runWorkflow<T = unknown>(
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
-  const { meta, body } = parseWorkflowScript(script);
+  const { meta, body, bodyLineToScriptLine } = parseWorkflowScript(script);
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
@@ -429,9 +460,7 @@ export async function runWorkflow<T = unknown>(
   // Positive finite numbers only; anything else (undefined, NaN, <= 0) falls
   // back to the documented constant so the drain always has a deadline.
   const drainTimeoutMs =
-    typeof options.drainTimeoutMs === "number" &&
-    Number.isFinite(options.drainTimeoutMs) &&
-    options.drainTimeoutMs > 0
+    typeof options.drainTimeoutMs === "number" && Number.isFinite(options.drainTimeoutMs) && options.drainTimeoutMs > 0
       ? options.drainTimeoutMs
       : DRAIN_ABORT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
@@ -459,6 +488,7 @@ export async function runWorkflow<T = unknown>(
     phaseBudgets: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
+    sawTopLevelAgent: false,
   };
 
   const agentRunner = options.agent ?? new WorkflowAgent(options);
@@ -620,6 +650,28 @@ export async function runWorkflow<T = unknown>(
 
     const requestedLabel = agentOptions.label?.trim();
 
+    // Typed operation traces: attribute this call to its workflow-script line.
+    // The stack is read at CALL time (the vm frame is the agent() call site)
+    // and mapped back through the prelude + body line maps (see
+    // captureScriptLine). Best-effort: an unattributable call site yields
+    // undefined and traces carry line 0 rather than failing the run.
+    const scriptLine = captureScriptLine(
+      new Error().stack ?? "",
+      `${meta.name || "workflow"}.js`,
+      bodyLineToScriptLine,
+    );
+    // Session-handoff chaining (Prewalk): a top-level agent() call whose phase
+    // differs from the previous top-level call continues the handoff session, so
+    // phase N+1's agent inherits phase N's trajectory instead of re-reading
+    // context. The FIRST top-level call creates the chain root. Fan-out calls
+    // (inside parallel()/pipeline()) never chain — isolation is preserved.
+    const chainHandoff =
+      options.sessionHandoff === true &&
+      batch === undefined &&
+      (!state.sawTopLevelAgent || state.lastTopLevelPhase !== assignedPhase);
+    state.lastTopLevelPhase = assignedPhase;
+    state.sawTopLevelAgent = true;
+
     // Resolve a named agentType to its bound definition (tools/model/prompt).
     const agentDef = resolveAgentType(agentOptions.agentType, agentRegistry);
     if (agentOptions.agentType && !agentDef) {
@@ -737,6 +789,9 @@ export async function runWorkflow<T = unknown>(
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
+          // This attempt's tool-call traces; the successful attempt's traces are
+          // journaled, a failed attempt's traces surface the failing operation.
+          let operations: OperationTrace[] = [];
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
@@ -780,6 +835,23 @@ export async function runWorkflow<T = unknown>(
               modelRegistry: options.modelRegistry,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
+              // Typed operation traces: the script line of THIS call (the
+              // differentiator across journal entries) plus the callback that
+              // delivers the per-tool-call {line, op, outcome} traces.
+              scriptLine,
+              onOperations: (traces) => {
+                operations = traces;
+              },
+              // Prewalk session handoff: chain the handoff session at phase
+              // boundaries (see chainHandoff) so phase N+1 inherits the phase N
+              // trajectory instead of re-reading context.
+              handoff: chainHandoff,
+              onSwap: (info) => {
+                log(
+                  `first-edit swap: execution mode on session ${info.sessionId} ` +
+                    `(${info.fromModel ?? "?"} → ${info.toModel ?? "?"})`,
+                );
+              },
               // Per-agent store tools track this agent's writes by the
               // run-unique deltaKey so the delta can be journaled and replayed
               // correctly on resume, even when a nested workflow() run shares
@@ -824,6 +896,9 @@ export async function runWorkflow<T = unknown>(
               hash: callHash,
               result,
               storeDelta: store.commitDelta(deltaKey),
+              // Typed operation traces for this call (absent when the runner
+              // reported none).
+              operations: operations.length ? operations : undefined,
             });
             options.onAgentEnd?.({
               id: deltaKey,
@@ -866,6 +941,12 @@ export async function runWorkflow<T = unknown>(
               continue;
             }
 
+            // The failing operation (Fabric-style line-numbered failure repair):
+            // the last tool call whose outcome was not ok, else the final call.
+            const failingOperation =
+              operations.length > 0
+                ? ([...operations].reverse().find((t) => t.outcome !== "ok") ?? operations[operations.length - 1])
+                : undefined;
             options.onAgentEnd?.({
               id: deltaKey,
               label,
@@ -878,6 +959,7 @@ export async function runWorkflow<T = unknown>(
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
+              failingOperation,
             });
 
             if (workflowError.recoverable) {
@@ -1373,11 +1455,30 @@ export async function runWorkflow<T = unknown>(
         await waitForInFlightSettlement(shared.inFlight, drainDeadline);
       }
       store.dispose();
+      // Dispose any chained handoff session so it never outlives its run frame
+      // (a no-op for injected test doubles without close()).
+      try {
+        agentRunner.close?.();
+      } catch {
+        // teardown is best-effort; never mask the run's own result/error
+      }
     }
   }
 }
 
-export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
+export function parseWorkflowScript(script: string): {
+  meta: WorkflowMeta;
+  body: string;
+  /**
+   * Maps each body line (1-indexed) to the line of the ORIGINAL script it came
+   * from — the meta export (and any leading comments) is stripped into `body`,
+   * so body line numbers differ from script line numbers. The vm stack reports
+   * WRAPPED line numbers (prelude + async wrapper + body), so tracing an
+   * agent() call back to its script line needs this map AND the prelude offset
+   * (see captureScriptLine).
+   */
+  bodyLineToScriptLine: number[];
+} {
   if (DETERMINISM_BLOCKLIST.test(script)) {
     throw new WorkflowError(
       "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
@@ -1436,7 +1537,80 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
   return {
     meta,
     body: script.slice(0, first.start) + script.slice(first.end),
+    bodyLineToScriptLine: buildBodyLineToScriptLine(script, first.start, first.end),
   };
+}
+
+/**
+ * Map each body line (1-indexed) to the original script line it came from.
+ * See parseWorkflowScript's return doc. Walks the body once, tracking the
+ * corresponding script cursor and jumping over the stripped meta segment.
+ */
+function buildBodyLineToScriptLine(script: string, metaStart: number, metaEnd: number): number[] {
+  const map = [0];
+  const bodyLen = script.length - (metaEnd - metaStart);
+  let bodyLine = 1;
+  // Script index of body char 0: the prefix (script[0..metaStart)) is empty
+  // when metaStart === 0, so body char 0 is directly script[metaEnd].
+  let scriptPos = metaStart === 0 ? metaEnd : 0;
+  map[1] = lineOfIndex(script, scriptPos);
+  for (let i = 0; i < bodyLen; i++) {
+    if (script[scriptPos] === "\n") {
+      bodyLine++;
+      scriptPos++;
+      map[bodyLine] = lineOfIndex(script, scriptPos);
+    } else {
+      scriptPos++;
+    }
+    // Body chars at/after metaStart map to script chars shifted by the
+    // stripped segment — advance the cursor past it exactly once.
+    if (scriptPos === metaStart) scriptPos = metaEnd;
+  }
+  return map;
+}
+
+/** 1-based line number of a character index in `text`. */
+function lineOfIndex(text: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index; i++) {
+    if (text[i] === "\n") line++;
+  }
+  return line;
+}
+
+/**
+ * Recover the original workflow-script line of the agent() call currently
+ * executing, from a fresh Error's stack. The script runs wrapped inside a
+ * DETERMINISM_PRELUDE + async arrow, so vm frames report wrapped line numbers;
+ * map back through the prelude offset and the body→script line map. Returns
+ * undefined when the call site can't be attributed (never throws).
+ */
+function captureScriptLine(stack: string, scriptFilename: string, bodyLineToScriptLine: number[]): number | undefined {
+  let wrappedLine: number | undefined;
+  for (const frame of stack.split("\n")) {
+    // vm frames are anonymous: `at trace_ok.js:19:17` (no parens). Host
+    // frames carry the callee: `at agentImpl (F:\...\workflow.ts:661:7)`.
+    const paren = frame.match(/\(([^()]+):(\d+):\d+\)$/);
+    const bare = frame.match(/^ {4}at ([^ (]+):(\d+):\d+$/);
+    const file = paren?.[1] ?? bare?.[1];
+    if (file === undefined) continue;
+    const line = Number(paren?.[2] ?? bare?.[2]);
+    if (file === scriptFilename) {
+      wrappedLine = line;
+      break;
+    }
+    // Fallback: any bare-js frame (vm frames carry no directory) — host frames
+    // have path separators and node internals have no .js extension.
+    if (file.endsWith(".js") && !file.includes("/") && !file.includes("\\")) {
+      wrappedLine = line;
+      break;
+    }
+  }
+  if (wrappedLine === undefined) return undefined;
+  // wrapped = prelude + "\n(async () => {\n" + body + "\n})()"
+  const bodyLine = wrappedLine - (DETERMINISM_PRELUDE.split("\n").length + 1);
+  if (bodyLine < 1) return undefined;
+  return bodyLineToScriptLine[bodyLine];
 }
 
 function evaluateLiteral(node: AnyNode, path: string): unknown {

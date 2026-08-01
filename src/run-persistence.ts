@@ -3,7 +3,7 @@
  */
 
 import { join } from "node:path";
-import type { AgentUsage } from "./agent.js";
+import type { AgentUsage, OperationTrace } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import {
@@ -42,6 +42,12 @@ export interface PersistedAgentState {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /**
+   * The failing tool call (Fabric-style line-numbered failure repair), when
+   * this agent failed after making tool calls. Absent on successes and on
+   * runs that never observed a tool call.
+   */
+  failingOperation?: OperationTrace;
 }
 
 export interface PersistedRunState {
@@ -88,6 +94,13 @@ export interface PersistedRunState {
     hash: string;
     result: unknown;
     storeDelta?: Record<string, unknown>;
+    /**
+     * Typed operation traces for this call (one entry per tool call, pinned to
+     * the owning agent() call's script line). Absent on legacy journals — the
+     * resume path treats a missing field exactly like a missing storeDelta:
+     * it replays the result and skips the optional payload.
+     */
+    operations?: OperationTrace[];
   }>;
   /**
    * Human-approval checkpoints for this run (see saveCheckpoint). Kept in
@@ -568,8 +581,8 @@ export async function listActiveRuns(cwd?: string): Promise<RunCheckpointState[]
   const persistence = createRunPersistence(cwd || process.cwd());
   const runs = persistence.list();
   return runs
-    .filter(r => r.status === "running" || r.status === "paused")
-    .map(r => ({
+    .filter((r) => r.status === "running" || r.status === "paused")
+    .map((r) => ({
       runId: r.runId,
       status: "active" as const,
       checkpoints: r.checkpoints ?? checkpointsFromJournal(r),

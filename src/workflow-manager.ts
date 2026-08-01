@@ -735,6 +735,7 @@ export class WorkflowManager extends EventEmitter {
             agent.error = event.error;
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
+            agent.failingOperation = event.failingOperation;
             agent.tokens = event.tokens;
             if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
@@ -836,7 +837,17 @@ export class WorkflowManager extends EventEmitter {
         // Guarded: EventEmitter throws on an unlistened "error" emit, which
         // would abort this catch block mid-way — skipping the final persist,
         // the lease release, and the real error rethrow below.
-        this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
+        // Surface the failing operation (Fabric-style line-numbered failure
+        // repair) from the failed agent that carries one, when present.
+        const failedAgent = [...managed.agentsById.values()]
+          .filter((a) => a.error !== undefined)
+          .reverse()
+          .find((a) => a.failingOperation !== undefined);
+        this.emitLive(managed, "error", {
+          runId: managed.runId,
+          error: workflowError,
+          ...(failedAgent?.failingOperation ? { failingOperation: failedAgent.failingOperation } : {}),
+        });
       }
 
       // Persist final state (see the success-path comment above for the

@@ -3,6 +3,7 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSession,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
@@ -239,6 +240,37 @@ export interface WorkflowAgentOptions {
    * Default: false (current behavior).
    */
   persistAgentSessions?: boolean;
+  /**
+   * Enable Prewalk-style session handoff for this agent instance: run() calls
+   * that set `handoff: true` share ONE session, and the model is swapped
+   * mid-session (AgentSession.setModel) when the resolved model changes. The
+   * first-edit swap gate watches the session's tool surface: on the first
+   * file-edit tool call (see {@link handoffToolFilter}) it swaps to
+   * {@link handoffExecutionModel}, prunes the planning context, and reports
+   * the transition via the run's `onSwap`. Off by default (unchanged
+   * behavior: every run() gets a fresh session).
+   */
+  sessionHandoff?: boolean;
+  /**
+   * Model spec to swap the handoff session to when the first-edit swap gate
+   * fires (resolved via the same registry the run uses). When omitted the gate
+   * still flips to execution mode (planning context pruned) but leaves the
+   * model unchanged. Requires `sessionHandoff: true`.
+   */
+  handoffExecutionModel?: string;
+  /**
+   * Swap-gate trigger predicate: called with each tool call name observed in
+   * the handoff session; the first call returning true opens the gate.
+   * Defaults to {@link isFileEditTool} (edit/write). Injectable for tests.
+   */
+  handoffToolFilter?: (toolName: string) => boolean;
+  /**
+   * Called with the handoff session's id on EVERY handoff run() (creation and
+   * reuse) so observers can correlate a chained session across runs — the id
+   * is unchanged across a model swap, proving continuation. Requires
+   * `sessionHandoff: true`.
+   */
+  onHandoffSession?: (sessionId: string) => void;
 }
 
 // pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
@@ -492,6 +524,64 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * omitted.
    */
   modelRegistry?: ModelRegistry;
+  /**
+   * The original workflow-script line of the agent() call this run serves,
+   * captured by the workflow layer at call time. Stamped onto every operation
+   * trace this run records so a failing tool call is attributable to its
+   * owning script line (the differentiator across journal entries).
+   */
+  scriptLine?: number;
+  /**
+   * Called once per run (success AND error paths, before run() settles) with
+   * this run's tool-call traces, in execution order. Each trace is
+   * `{line, op, outcome}` — see {@link OperationTrace}. Absent when the run's
+   * session reported no tool calls (or the runner is a test double that never
+   * invokes the callback).
+   */
+  onOperations?: (operations: OperationTrace[]) => void;
+  /**
+   * Continue the WorkflowAgent's handoff session for this run instead of
+   * creating a fresh one: the session (and its trajectory) is kept across
+   * handoff runs, and the model is swapped mid-session (setModel) when the
+   * resolved model differs. Only meaningful when the agent was constructed
+   * with `sessionHandoff: true`; otherwise ignored (fresh session, unchanged
+   * behavior).
+   */
+  handoff?: boolean;
+  /**
+   * Called once, when this run's first-edit swap gate fires — i.e. the first
+   * file-edit tool call observed in the handoff session. Carries the model
+   * change (undefined when no execution model is configured) and the session
+   * id, which is UNCHANGED across the swap (the same session continues).
+   */
+  onSwap?: (info: HandoffSwapInfo) => void;
+}
+
+/**
+ * One typed operation trace (Fabric-style): a single tool call observed in a
+ * subagent session, pinned to the workflow-script line of the agent() call
+ * that owns it. The line is the differentiator across journal entries; within
+ * one entry, the op/outcome sequence tells the call's story.
+ */
+export interface OperationTrace {
+  /** Original workflow-script line of the owning agent() call (0 when unknown). */
+  line: number;
+  /** Tool name, e.g. "edit", "read", "structured_output". */
+  op: string;
+  /** "ok" | "error: <reason>" | "aborted" — the tool call's terminal outcome. */
+  outcome: string;
+}
+
+/** Payload delivered when the first-edit swap gate opens (see onSwap). */
+export interface HandoffSwapInfo {
+  /** Canonical spec of the model the session was on before the swap. */
+  fromModel?: string;
+  /** Canonical spec of the model the session swapped to, when one was configured. */
+  toModel?: string;
+  /** Why the gate opened — always "first-edit" today. */
+  reason: "first-edit";
+  /** Session id — unchanged across the swap (the same session continues). */
+  sessionId: string;
 }
 
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema
@@ -519,6 +609,49 @@ export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
 export function subagentExcludedTools(extra?: string[], sessionExclude?: string[]): string[] {
   return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
 }
+
+/**
+ * Tool names whose execution mutates project files. The first-edit swap gate
+ * watches for these: planning runs on the handoff session's cheap model until
+ * the first such call, then the gate opens and execution mode (model swap +
+ * planning-context pruning) begins.
+ */
+export const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write"]);
+
+/** Default swap-gate trigger predicate: any file-mutating coding tool call. */
+export function isFileEditTool(toolName: string): boolean {
+  return FILE_EDIT_TOOL_NAMES.has(toolName);
+}
+
+/**
+ * Planning-mode system guidance, prepended to every handoff run()'s prompt
+ * while the first-edit swap gate is still closed. Once the gate opens
+ * (first file-edit tool call) this block is pruned from subsequent prompts —
+ * execution mode no longer re-reads the planning brief; the plan itself lives
+ * in the continued session trajectory.
+ */
+const PLANNING_GUIDANCE =
+  "You are in the PLANNING phase: explore and produce a plan. Do not modify project files yet — your analysis must be read-only.";
+
+/**
+ * Compress a failed tool call's result payload into a short, log-safe reason
+ * string for an operation trace's `outcome` field. Never includes raw file
+ * contents or secrets — only a truncated text snippet from the tool result.
+ */
+export function summarizeToolError(result: unknown): string {
+  if (!result || typeof result !== "object") return String(result ?? "unknown tool error").slice(0, 200);
+  const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
+  if (!Array.isArray(content)) return "tool error";
+  const text = content
+    .filter((part): part is { type: string; text: string } => typeof part?.text === "string")
+    .map((part) => part.text)
+    .join(" ")
+    .trim();
+  return (text || "tool error").slice(0, 200);
+}
+
+/** Internal operation trace with the tool-call pairing key; stripped before reporting. */
+type PendingOperationTrace = OperationTrace & { toolCallId: string };
 
 export class WorkflowAgent {
   private readonly cwd: string;
@@ -553,6 +686,32 @@ export class WorkflowAgent {
    * run. See onModelFallback below for the (still-loud) degrade path.
    */
   private warnedDefaultTierUnavailable = false;
+  /** Handoff machinery is enabled for this instance (see WorkflowAgentOptions). */
+  private readonly sessionHandoff: boolean;
+  /** Model spec the first-edit swap gate swaps to; undefined = mode-flip only. */
+  private readonly handoffExecutionModel?: string;
+  /** Injectable swap-gate trigger predicate (defaults to isFileEditTool). */
+  private readonly handoffToolFilter: (toolName: string) => boolean;
+  /**
+   * The shared handoff session, created on the first handoff run() and kept
+   * alive until close(). One session per WorkflowAgent instance (~= one run
+   * frame) — see run() for the reuse path.
+   */
+  private handoffSession?: AgentSession;
+  /** True once the handoff session has been disposed (close() or a fatal create error). */
+  private handoffSessionClosed = false;
+  /** Canonical spec of the model the handoff session is currently on. */
+  private handoffSessionModel?: string;
+  /** True once the first-edit swap gate has opened for the handoff session. */
+  private handoffSwapped = false;
+  /** True while a settled swap still owes the session its planning-context prune. */
+  private handoffPrunePending = false;
+  /** Planning guidance is pruned once the swap gate opens (mode flip). */
+  private handoffExecutionMode = false;
+  /** Unsubscribe handle for the handoff session's gate/ops listener. */
+  private handoffUnsubscribe?: () => void;
+  /** Observer hook: session id of every handoff run (see WorkflowAgentOptions). */
+  private readonly onHandoffSession?: (sessionId: string) => void;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -563,6 +722,29 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.sharedRegistry = options.modelRegistry;
+    this.sessionHandoff = options.sessionHandoff ?? false;
+    this.handoffExecutionModel = options.handoffExecutionModel;
+    this.handoffToolFilter = options.handoffToolFilter ?? isFileEditTool;
+    this.onHandoffSession = options.onHandoffSession;
+  }
+
+  /**
+   * Dispose the shared handoff session (if any) and detach its listeners. Safe
+   * to call more than once. The workflow layer calls this when the run frame
+   * tears down so a chained session never outlives its run.
+   */
+  close(): void {
+    this.handoffUnsubscribe?.();
+    this.handoffUnsubscribe = undefined;
+    if (this.handoffSession && !this.handoffSessionClosed) {
+      try {
+        this.handoffSession.dispose();
+      } catch {
+        // best-effort teardown; never mask a run result
+      }
+    }
+    this.handoffSession = undefined;
+    this.handoffSessionClosed = true;
   }
 
   /**
@@ -809,44 +991,125 @@ export class WorkflowAgent {
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
     const sessionManager = this.createSessionManager();
-    const { session } = await createAgentSession({
-      cwd: runCwd,
-      agentDir,
-      sessionManager,
-      // Use real SettingsManager to inherit user's default provider/model settings.
-      // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
-      // would fall back to the first available model (e.g. openai-codex) which may
-      // not have valid auth, causing silent empty responses.
-      settingsManager: SettingsManager.create(this.cwd, agentDir),
-      customTools,
-      // Shared per-run loader with no host extensions (#109) — see
-      // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
-      // wins and skips the shared build entirely; the ...this.sessionOptions
-      // spread below re-applies the same injected value harmlessly.
-      resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
-      // Share the resolved registry's ModelRuntime (catalog + auth, including
-      // extension-registered providers) with the subagent session. pi >= 0.80.8
-      // takes modelRuntime here; the old modelRegistry option is gone.
-      ...(modelRuntime ? { modelRuntime } : {}),
-      ...this.sessionOptions,
-      // Per-call model/thinking wins over any sessionOptions defaults.
-      ...(resolvedModel ? { model: resolvedModel } : {}),
-      ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
-      // Deny recursive-orchestration tools in the subagent (#107). Placed after
-      // the sessionOptions spread so it always applies; folds in any denylist
-      // the caller set on sessionOptions rather than dropping it.
-      excludeTools: subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools),
-    });
+    // Tool-call traces for THIS run, collected from the session's tool events
+    // in execution order. Pinned to the owning agent() call's script line.
+    const operations: PendingOperationTrace[] = [];
+    // Resolves once the first-edit swap gate's model change settles (if the
+    // gate fired this run); awaited in the finally so the swap is deterministic
+    // by the time run() settles.
+    let gateSwapPromise: Promise<void> | undefined;
+
+    /**
+     * Prewalk handoff: a handoff run() continues the instance's shared session
+     * instead of creating a fresh one — phase N+1's trajectory carries over and
+     * the model is swapped mid-session when it changes. The session is retained
+     * (not disposed in the finally) until close().
+     */
+    const activeHandoffSession =
+      this.sessionHandoff && options.handoff === true && this.handoffSession !== undefined && !this.handoffSessionClosed
+        ? this.handoffSession
+        : undefined;
+    const reuseHandoff = activeHandoffSession !== undefined;
+
+    let session: AgentSession;
+    if (reuseHandoff) {
+      session = activeHandoffSession;
+      // Swap the model mid-session when this run's resolved model differs from
+      // the model the session is currently on (the SDK supports continuation
+      // across a model change via setModel).
+      if (resolvedModel && canonicalModelSpec(resolvedModel) !== this.handoffSessionModel) {
+        await session.setModel(resolvedModel);
+        this.handoffSessionModel = canonicalModelSpec(resolvedModel);
+      }
+      this.onHandoffSession?.(session.sessionId);
+    } else {
+      const created = await createAgentSession({
+        cwd: runCwd,
+        agentDir,
+        sessionManager,
+        // Use real SettingsManager to inherit user's default provider/model settings.
+        // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
+        // would fall back to the first available model (e.g. openai-codex) which may
+        // not have valid auth, causing silent empty responses.
+        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        customTools,
+        // Shared per-run loader with no host extensions (#109) — see
+        // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
+        // wins and skips the shared build entirely; the ...this.sessionOptions
+        // spread below re-applies the same injected value harmlessly.
+        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
+        // Share the resolved registry's ModelRuntime (catalog + auth, including
+        // extension-registered providers) with the subagent session. pi >= 0.80.8
+        // takes modelRuntime here; the old modelRegistry option is gone.
+        ...(modelRuntime ? { modelRuntime } : {}),
+        ...this.sessionOptions,
+        // Per-call model/thinking wins over any sessionOptions defaults.
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+        ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+        // Deny recursive-orchestration tools in the subagent (#107). Placed after
+        // the sessionOptions spread so it always applies; folds in any denylist
+        // the caller set on sessionOptions rather than dropping it.
+        excludeTools: subagentExcludedTools(this.excludeTools, this.sessionOptions.excludeTools),
+      });
+      session = created.session;
+      if (this.sessionHandoff && options.handoff === true) {
+        // This run is the root of (or a continuation of) the handoff chain;
+        // retain the session + manager so later handoff runs continue it.
+        this.handoffSession = session;
+        this.handoffSessionClosed = false;
+        // Track the model the session actually started on (the resolved spec
+        // when one was set, else the session's own default) so later swaps can
+        // compare and report an honest fromModel.
+        this.handoffSessionModel =
+          (resolvedModel !== undefined ? canonicalModelSpec(resolvedModel) : undefined) ??
+          (session.model ? canonicalModelSpec(session.model) : undefined) ??
+          this.handoffSessionModel;
+        this.onHandoffSession?.(session.sessionId);
+      }
+    }
 
     // Name the persisted session so it's identifiable in session pickers.
-    // Skip when an injected session.sessionManager override won (tests/embedders).
-    if (this.persistAgentSessions && !this.sessionOptions.sessionManager && options.sessionName) {
+    // Skip when an injected session.sessionManager override won (tests/embedders)
+    // or the session is a reused handoff continuation.
+    if (this.persistAgentSessions && !this.sessionOptions.sessionManager && options.sessionName && !reuseHandoff) {
       try {
         sessionManager.appendSessionInfo(options.sessionName);
       } catch {
         // Naming is best-effort; never fail the run over it.
       }
     }
+
+    // Observe the session's tool surface: collect typed operation traces and,
+    // for handoff sessions, arm the first-edit swap gate. Both share one
+    // subscription so concurrent tool batches stay in one event stream.
+    const removeToolListener = session.subscribe((event) => {
+      if (event.type === "tool_execution_start") {
+        operations.push({
+          toolCallId: event.toolCallId,
+          line: options.scriptLine ?? 0,
+          op: event.toolName,
+          outcome: "running",
+        });
+        if (this.sessionHandoff && !this.handoffSwapped && this.handoffToolFilter(event.toolName)) {
+          // First file-edit tool call: open the gate. Execution mode begins
+          // (planning guidance pruned) and the model swap runs detached, awaited
+          // in the finally so run() settles only after it resolves.
+          this.handoffSwapped = true;
+          this.handoffExecutionMode = true;
+          this.handoffPrunePending = true;
+          gateSwapPromise = this.performSwap(session, options).catch((error) => {
+            console.warn(
+              `[workflow] first-edit swap failed: ${error instanceof Error ? error.message : String(error)}; continuing in execution mode on the current model`,
+            );
+          });
+        }
+      } else if (event.type === "tool_execution_end") {
+        const trace = operations.find((t) => t.toolCallId === event.toolCallId);
+        if (trace) {
+          trace.outcome = event.isError ? `error: ${summarizeToolError(event.result)}` : "ok";
+        }
+      }
+    });
 
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
@@ -906,6 +1169,43 @@ export class WorkflowAgent {
       } catch {
         // History is diagnostic only; never let it mask the real result/error.
       }
+      // A run that never settled a tool call leaves "running" traces — an
+      // abort/timeout mid-call. Normalize them before reporting so consumers
+      // never see a non-terminal outcome.
+      for (const trace of operations) {
+        if (trace.outcome === "running") trace.outcome = "aborted";
+      }
+      // Settle the first-edit swap (model change) before this run reports, so
+      // a caller observing onSwap/onOperations sees a consistent end state.
+      if (gateSwapPromise) {
+        try {
+          await gateSwapPromise;
+        } catch {
+          // performSwap already logs; never let the swap mask the real result.
+        }
+        gateSwapPromise = undefined;
+      }
+      // Planning context prune: once the swap gate has opened, fold the raw
+      // planning transcript into a compact summary so execution-mode turns send
+      // less context (best-effort — the SDK refuses tiny sessions, and a prune
+      // failure degrades to keeping the trajectory, which is still correct).
+      if (this.handoffPrunePending && !this.handoffSessionClosed) {
+        this.handoffPrunePending = false;
+        try {
+          await session.compact(
+            "The planning phase is complete. Keep only the agreed plan and any decisions; discard raw exploration context.",
+          );
+        } catch {
+          // best-effort pruning; execution continues on the unpruned trajectory
+        }
+      }
+      if (options.onOperations) {
+        try {
+          options.onOperations(operations.map(({ toolCallId: _id, ...trace }) => trace));
+        } catch {
+          // Traces are diagnostic; never let them mask the real result/error.
+        }
+      }
       // Read real usage before disposing — dispose tears down the session state.
       if (options.onUsage) {
         try {
@@ -915,13 +1215,22 @@ export class WorkflowAgent {
           // Usage is best-effort; never let stats failure mask the real result/error.
         }
       }
-      session.dispose();
+      // Handoff sessions survive run() so the next handoff call can continue
+      // the trajectory; every other session is disposed as before.
+      if (!(reuseHandoff || (this.sessionHandoff && options.handoff === true))) {
+        session.dispose();
+      }
+      removeToolListener();
     }
   }
 
   private buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string {
     const parts = [
       this.instructions,
+      // Planning guidance is injected ONLY for handoff sessions while the
+      // first-edit swap gate is still closed; it is pruned once the gate
+      // opens (execution mode). Ordinary (non-handoff) agents are untouched.
+      this.sessionHandoff && !this.handoffExecutionMode ? PLANNING_GUIDANCE : undefined,
       options.instructions,
       options.label ? `Task label: ${options.label}` : undefined,
       prompt,
@@ -940,6 +1249,42 @@ export class WorkflowAgent {
     }
 
     return parts.join("\n\n");
+  }
+
+  /**
+   * The first-edit swap gate's model half: swap the handoff session to the
+   * configured execution model (best-effort — an unresolvable/unauthenticated
+   * spec degrades to keeping the current model with a warning, never a throw),
+   * then report the transition via onSwap. Called detached from the tool event
+   * listener; run()'s finally awaits the returned promise so the swap is
+   * settled before run() reports.
+   */
+  private async performSwap(session: AgentSession, options: AgentRunOptions<any>): Promise<void> {
+    const fromModel = this.handoffSessionModel;
+    let toModel = fromModel;
+    if (this.handoffExecutionModel) {
+      try {
+        const registry = await this.getRegistry(options.modelRegistry);
+        const resolved = resolveModelSpecWithThinking(this.handoffExecutionModel, registry);
+        if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
+        if (resolved.model && canonicalModelSpec(resolved.model) !== this.handoffSessionModel) {
+          await session.setModel(resolved.model);
+          this.handoffSessionModel = canonicalModelSpec(resolved.model);
+          toModel = this.handoffSessionModel;
+        }
+      } catch (error) {
+        console.warn(
+          `[workflow] could not swap the handoff session to execution model "${this.handoffExecutionModel}" ` +
+            `(${error instanceof Error ? error.message : String(error)}); continuing in execution mode on the current model`,
+        );
+      }
+    }
+    options.onSwap?.({
+      fromModel,
+      toModel,
+      reason: "first-edit",
+      sessionId: session.sessionId,
+    });
   }
 
   private lastAssistantText(messages: unknown[]): string {

@@ -1,5 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { AgentUsage } from "./agent.js";
+import type { AgentUsage, OperationTrace } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
@@ -27,6 +27,11 @@ export interface WorkflowAgentSnapshot {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /**
+   * The failing tool call (Fabric-style line-numbered failure repair), when
+   * this agent failed after making tool calls. Absent on successes.
+   */
+  failingOperation?: OperationTrace;
 }
 
 export interface WorkflowSnapshot {
