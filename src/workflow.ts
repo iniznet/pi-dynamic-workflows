@@ -20,12 +20,14 @@ import {
   MAX_AGENT_RETRIES,
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
+  MAX_NESTED_WORKFLOW_DEPTH,
 } from "./config.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
@@ -110,6 +112,15 @@ export interface SharedRuntime {
   agentCount: number;
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
+  /**
+   * Number of live nested workflow() frames (incremented around the nested
+   * runWorkflow call in workflowFn, decremented in its finally). Enforced in
+   * two places: workflowFn's policy check (`maxNestedWorkflowDepth`, default
+   * 1 — the documented one-level-deep rule) and the vm wrapper's hard runaway
+   * ceiling (MAX_NESTED_WORKFLOW_DEPTH), which every script execution passes
+   * through. The ceiling is a runaway guard, NOT a security boundary — the vm
+   * is deliberately not a sandbox.
+   */
   depth: number;
   /**
    * Monotonic count of every workflow() call anywhere in this run tree,
@@ -194,6 +205,23 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
+  /**
+   * Maximum workflow() nesting depth, clamped to 1..MAX_NESTED_WORKFLOW_DEPTH.
+   * Default 1 — the documented one-level-deep policy. Raising it lets a
+   * workflow nest a few saved runs deep for staged pipelines; the vm wrapper's
+   * hard ceiling (MAX_NESTED_WORKFLOW_DEPTH) still blocks runaway recursion
+   * with a clear SCRIPT_VALIDATION_ERROR (a runaway guard, not a sandbox).
+   */
+  maxNestedWorkflowDepth?: number;
+  /**
+   * OPT-IN advisory pre-run typecheck: run `tsc --noEmit` over the workflow
+   * script before executing it, so type mistakes surface pre-flight instead of
+   * mid-run. Default OFF — a script's runtime behavior never depends on it.
+   * SOFT-FAIL by design: no TypeScript toolchain, a spawn error, a timeout,
+   * or tsc reporting problems only logs a warning and the run proceeds
+   * unchanged. Users without a toolchain are never blocked.
+   */
+  preRunTypecheck?: boolean;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**
@@ -540,6 +568,12 @@ export async function runWorkflow<T = unknown>(
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  // Positive integer in 1..MAX_NESTED_WORKFLOW_DEPTH; anything else (undefined,
+  // NaN, 0, negatives, fractions) falls back to the documented one-level policy.
+  const maxNestedWorkflowDepth =
+    typeof options.maxNestedWorkflowDepth === "number" && Number.isFinite(options.maxNestedWorkflowDepth)
+      ? Math.max(1, Math.min(MAX_NESTED_WORKFLOW_DEPTH, Math.floor(options.maxNestedWorkflowDepth)))
+      : 1;
   // Positive finite numbers only; anything else (undefined, NaN, <= 0) falls
   // back to the documented constant so the drain always has a deadline.
   const drainTimeoutMs =
@@ -1210,13 +1244,22 @@ export async function runWorkflow<T = unknown>(
   };
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
-  // run's limiter/counters/budget so the global caps hold. One level deep only.
+  // run's limiter/counters/budget so the global caps hold. One level deep by
+  // default; maxNestedWorkflowDepth (clamped to MAX_NESTED_WORKFLOW_DEPTH) is
+  // the author-facing policy ceiling. The vm wrapper enforces the hard runaway
+  // ceiling for anything that still gets past this check.
   const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
     throwIfAborted();
-    if (shared.depth >= 1) {
-      throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
-        recoverable: false,
-      });
+    if (shared.depth >= maxNestedWorkflowDepth) {
+      throw new WorkflowError(
+        maxNestedWorkflowDepth === 1
+          ? "workflow() can nest only one level deep"
+          : `workflow() nesting depth exceeded (max ${maxNestedWorkflowDepth})`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        {
+          recoverable: false,
+        },
+      );
     }
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
@@ -1540,6 +1583,34 @@ export async function runWorkflow<T = unknown>(
   const { globals: projectGlobals, diagnostics: bindingDiagnostics } =
     WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(runtimeImplementations);
   for (const diagnostic of bindingDiagnostics) logger.warn(diagnostic.message);
+  // ── Pre-run guards at the vm wrapper — the single choke point every script ──
+  // ── execution (top-level and each nested workflow() frame) passes through. ──
+  //
+  // Runaway recursion ceiling: shared.depth counts live nested workflow()
+  // frames (workflowFn increments it around the nested runWorkflow call). The
+  // policy check above already caps nesting at maxNestedWorkflowDepth (default
+  // 1); this is the hard ceiling that no future nesting path can slip past.
+  // Deliberately NOT a sandbox claim — the vm is not a security boundary — it
+  // only stops runaway recursion from piling frames up unbounded.
+  if (shared.depth >= MAX_NESTED_WORKFLOW_DEPTH) {
+    throw new WorkflowError(
+      `workflow() recursion depth exceeded (max ${MAX_NESTED_WORKFLOW_DEPTH}) — runaway nested workflow() calls are blocked`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  // Optional advisory pre-run typecheck (opt-in, soft-fail): acorn parse already
+  // catches syntax errors; this catches type errors before execution. Every
+  // failure mode (no tsc toolchain, spawn error, timeout, tsc findings) logs a
+  // warning and the run proceeds — see typecheckWorkflowScript.
+  if (options.preRunTypecheck) {
+    const outcome = await typecheckWorkflowScript({ meta, body }, { cwd: baseCwd });
+    if (!outcome.ok) {
+      log(
+        `[warn] pre-run typecheck failed — continuing anyway (advisory; set preRunTypecheck: false to disable): ${outcome.detail}`,
+      );
+    }
+  }
   const context = vm.createContext({
     ...projectGlobals,
     // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm

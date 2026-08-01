@@ -22,6 +22,18 @@ export const DRAIN_ABORT_TIMEOUT_MS = 60_000;
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;
 
+/**
+ * Hard ceiling on live nested workflow() frames, enforced at the vm wrapper —
+ * the single choke point every script execution passes through. This is a
+ * RUNAWAY guard, not a security boundary: the vm is deliberately not a
+ * sandbox, so this only stops runaway recursion from piling frames up
+ * unbounded, it makes no isolation promise. The `maxNestedWorkflowDepth`
+ * runWorkflow option (default 1, the documented one-level-deep policy) is
+ * clamped to at most this value; once a frame's nesting reaches the ceiling
+ * the run fails with a clear SCRIPT_VALIDATION_ERROR instead of recursing on.
+ */
+export const MAX_NESTED_WORKFLOW_DEPTH = 8;
+
 /** Maximum automatic retry attempts after a recoverable agent failure. */
 export const MAX_AGENT_RETRIES = 3;
 
