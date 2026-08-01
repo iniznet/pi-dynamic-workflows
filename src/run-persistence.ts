@@ -15,6 +15,7 @@ import {
   unlinkIfExistsSafe,
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import type { JournalEntry } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -189,6 +190,61 @@ export interface RunPersistence {
 export interface RunLease {
   runId: string;
   token: string;
+}
+
+/**
+ * A run's lease state — the "lease ⟺ executing" invariant, machine-checked.
+ * A run is either EXECUTING (status "running" + holding its exclusive
+ * cross-process lease) or IDLE (any other status, lease released). The two
+ * halves are one discriminated union, so the compiler refuses to express an
+ * executing run without its lease or an idle run holding one — see
+ * WorkflowManager's `ManagedRun` (workflow-manager.ts), which composes this
+ * type. The only lease transitions are the acquire/release primitives below
+ * and the manager's startExecuting()/settleExecuting() helpers.
+ */
+export type RunLeaseState = { status: "running"; lease: RunLease } | { status: Exclude<RunStatus, "running"> };
+
+/**
+ * Namespaced journal key for an agent() call: `${frameRunId}:${index}`. A
+ * nested workflow() restarts its own callSeq at 0, so `index` alone collides
+ * between a parent's and a child's same-numbered calls — the key is what
+ * distinguishes them (same format as SharedStore's deltaKey and the resume
+ * replay map built by buildResumeJournal).
+ */
+export function journalEntryKey(frameRunId: string, index: number): string {
+  return `${frameRunId}:${index}`;
+}
+
+/**
+ * Append one journaled agent() result, keeping the LATEST entry per
+ * (runId, index) pair. Matching on index ALONE would let a nested
+ * workflow()'s callIndex-0 entry evict the parent's own callIndex-0 entry
+ * (and vice versa) — they're only distinguished by runId (JournalEntry.runId).
+ * Returns a new array; the input is not mutated.
+ */
+export function upsertJournalEntry(journal: JournalEntry[], entry: JournalEntry): JournalEntry[] {
+  return [...journal.filter((e) => !(e.index === entry.index && e.runId === entry.runId)), entry];
+}
+
+/**
+ * Build the resume-replay map from a persisted journal. A legacy entry
+ * persisted before runId-namespacing existed has no `runId`; it is assumed to
+ * belong to this run's own top-level runId (the only frame that existed then),
+ * so it still resume-hits for a top-level call and safely cache-misses for a
+ * nested-run entry (re-runs live, never misapplies).
+ */
+export function buildResumeJournal(runId: string, journal: JournalEntry[] | undefined): Map<string, JournalEntry> {
+  return new Map((journal ?? []).map((entry) => [journalEntryKey(entry.runId ?? runId, entry.index), entry] as const));
+}
+
+/**
+ * Whether a run's status keeps its resume journal on disk. Resumable states
+ * (running/paused/failed/pending) keep it so resume() can replay the
+ * completed prefix; settled "completed"/"aborted" runs drop it — their full
+ * agent detail lives in `agents[]` instead (see writeRunToDisk).
+ */
+export function keepsResumeJournal(status: RunStatus): boolean {
+  return status !== "completed" && status !== "aborted";
 }
 
 interface LockFile {

@@ -8,18 +8,21 @@ import type { WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
+  buildResumeJournal,
   createRunPersistence,
   generateRunId,
+  keepsResumeJournal,
   type PersistedRunState,
   type RunLease,
+  type RunLeaseState,
   type RunPersistence,
   type RunStatus,
+  upsertJournalEntry,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
-export interface ManagedRun {
+export interface ManagedRunBase {
   runId: string;
-  status: RunStatus;
   snapshot: WorkflowSnapshot;
   result?: WorkflowRunResult;
   error?: WorkflowError;
@@ -30,8 +33,6 @@ export interface ManagedRun {
   args?: unknown;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
-  /** Cross-process execution lease for this run, when it is actively executing. */
-  lease?: RunLease;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -109,6 +110,44 @@ export interface ManagedRun {
    */
   agentRetries?: number;
 }
+
+/** Statuses a run can rest in while it is NOT executing (lease released). */
+type IdleRunStatus = Exclude<RunStatus, "running">;
+
+/** A run that is executing: status "running" and its exclusive RunLease — see RunLeaseState. */
+type ExecutingRun = ManagedRunBase & Extract<RunLeaseState, { status: "running" }>;
+
+/** A run that is idle: any resting status, lease released — see RunLeaseState. */
+type IdleRun = ManagedRunBase & Exclude<RunLeaseState, { status: "running" }>;
+
+/**
+ * A managed run — the "lease ⟺ executing" invariant, enforced by the TYPE
+ * SYSTEM (see RunLeaseState in run-persistence.ts) instead of a comment:
+ *
+ *  - ExecutingRun: status "running" AND an exclusive cross-process lease.
+ *    Its executeRun() promise is in flight (or about to start); it owns the
+ *    run's lease until it settles.
+ *  - IdleRun: any other status, no lease property at all. Nothing will
+ *    asynchronously touch its lease bookkeeping again.
+ *
+ * An "executing run without a lease" or an "idle run holding a lease" cannot
+ * be expressed — the compiler rejects both. The two members share one runtime
+ * object (startExecuting()/settleExecuting() mutate it in place so
+ * isCurrent()/getRun() keep seeing the live entry); those two helpers, plus
+ * releaseHeldLease() for discard paths, are the ONLY code that writes
+ * `status`/`lease`.
+ */
+export type ManagedRun = ExecutingRun | IdleRun;
+
+/**
+ * Writable runtime layout of a ManagedRun: both union members share one
+ * in-memory shape, and transitions mutate it in place so object identity
+ * survives (isCurrent()/getRun()/tests depend on it). This view is the cast
+ * bridge used ONLY by startExecuting()/settleExecuting()/releaseHeldLease()
+ * — the sole writers of `status`/`lease` — so every other read sees the
+ * immutable union, which is what refuses to express an illegal state.
+ */
+type ManagedRunRuntime = ManagedRunBase & { status: RunStatus; lease?: RunLease };
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
@@ -276,7 +315,7 @@ export class WorkflowManager extends EventEmitter {
    *    considers an entry AFTER executeRun() has fully settled it to
    *    "completed" | "failed" | "aborted" (see IN_MEMORY_TERMINAL_STATUSES)
    *    and persisted + released its lease — i.e. strictly after the same
-   *    isCurrent()-gated persistRun()/releaseRunLease() calls in
+   *    isCurrent()-gated persistRun() + settleExecuting() lease-release in
    *    executeRun()'s success/catch tails.
    *  - Once terminal, an entry becomes eviction-ELIGIBLE (recordTerminalRun())
    *    but is not necessarily evicted immediately: up to
@@ -500,7 +539,9 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: managed.agentRetries,
       });
     } catch (err) {
-      this.releaseRunLease(managed);
+      // Nothing was persisted; the entry is discarded. Release the lease and
+      // drop the run from memory — no settle transition needed.
+      this.releaseHeldLease(managed);
       this.runs.delete(runId);
       throw err;
     }
@@ -526,24 +567,30 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.createManaged(script, args);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
-    managed.lease = lease;
-    managed.autoResume = exec.autoResume;
-    managed.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
-    managed.toolset = exec.toolset;
+    const executing = this.startExecuting(managed, lease);
+    executing.autoResume = exec.autoResume;
+    executing.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
+    executing.toolset = exec.toolset;
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
-    managed.maxAgents = exec.maxAgents;
-    managed.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
-    managed.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
-    managed.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
-    this.runs.set(managed.runId, managed);
+    executing.maxAgents = exec.maxAgents;
+    executing.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
+    executing.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
+    executing.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
+    this.runs.set(executing.runId, executing);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
-    this.persistRun(managed);
-    return this.executeRun(managed, script, args, exec);
+    this.persistRun(executing);
+    return this.executeRun(executing, script, args, exec);
   }
 
-  /** Build a fresh managed run with an empty snapshot. */
-  private createManaged(script: string, args?: unknown): ManagedRun {
+  /**
+   * Build a fresh managed run with an empty snapshot, in the released-and-idle
+   * "pending" state: created but not yet executing. The caller acquires the
+   * lease and flips it into the executing state via startExecuting() — until
+   * then the run is never in the map and never persisted, so the transient
+   * "pending" status is unobservable.
+   */
+  private createManaged(script: string, args?: unknown): IdleRun {
     const parsed = parseWorkflowScript(script);
     const slug = parsed.meta.name
       ? parsed.meta.name
@@ -555,7 +602,7 @@ export class WorkflowManager extends EventEmitter {
     const runId = slug ? `${slug}-${generateRunId()}` : generateRunId();
     return {
       runId,
-      status: "running",
+      status: "pending",
       snapshot: {
         name: parsed.meta.name,
         description: parsed.meta.description,
@@ -579,7 +626,7 @@ export class WorkflowManager extends EventEmitter {
   }
 
   private async executeRun(
-    managed: ManagedRun,
+    managed: ExecutingRun,
     script: string,
     args?: unknown,
     exec: ExecOptions = {},
@@ -677,16 +724,15 @@ export class WorkflowManager extends EventEmitter {
         },
         onAgentJournal: (entry) => {
           // Append (crash-safe-ish): keep the latest entry per (runId, index)
-          // pair, then persist. Matching on index ALONE would let a nested
-          // workflow()'s callIndex-0 entry evict the parent's own
-          // callIndex-0 entry (and vice versa) — they're only distinguished
-          // by runId (see JournalEntry.runId). This is the high-frequency
-          // progress persist (fires once per completed agent, can burst
-          // under concurrency) — throttled (trailing edge). Every
+          // pair, then persist — see upsertJournalEntry in run-persistence.ts
+          // (matching on index ALONE would let a nested workflow()'s
+          // callIndex-0 entry evict the parent's own callIndex-0 entry, and
+          // vice versa — they're only distinguished by runId). This is the
+          // high-frequency progress persist (fires once per completed agent,
+          // can burst under concurrency) — throttled (trailing edge). Every
           // lifecycle-critical persist below (status transitions, run end,
           // pause/resume/stop) still calls persistRun() directly and flushes this.
-          managed.journal = managed.journal.filter((e) => !(e.index === entry.index && e.runId === entry.runId));
-          managed.journal.push(entry);
+          managed.journal = upsertJournalEntry(managed.journal, entry);
           this.schedulePersist(managed);
         },
         onLog: (message) => {
@@ -776,22 +822,27 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
-      managed.status = "completed";
       managed.result = result;
+      // Settle the run to idle (completed): flip status + release the lease
+      // (isCurrent-gated — see settleExecuting). The flip happens before the
+      // "complete" emit below so listeners observe the settled run; the
+      // isCurrent()-gated recordTerminalRun() then makes it eviction-eligible
+      // (see the `runs` field doc comment). persistRun() below lands the final
+      // state on disk — it no-ops if `managed` was superseded while awaiting
+      // (resume()/deleteRun() took over this runId), and settleExecuting()'s
+      // lease release is guarded the same way: a stale execution settling after
+      // resume() has already acquired a NEW lease for this runId must not
+      // touch that newer lease's bookkeeping.
+      this.settleExecuting(managed, "completed");
       // Gated the same way as disk/lease below (see emitLive()): a stale
       // execution's "complete" would otherwise still deliver a result for a
       // run that's been superseded or deleted (e.g. background result
       // delivery into the conversation) even though it's no longer current.
       this.emitLive(managed, "complete", { runId: managed.runId, result });
 
-      // Persist final state. persistRun()/writeRunToDisk() already no-op if
-      // `managed` has been superseded (resume()/deleteRun() took over this
-      // runId) — see isCurrent(). Guard the lease release the same way: a
-      // stale execution settling after resume() has already acquired a NEW
-      // lease for this runId must not touch that newer lease's bookkeeping.
+      // Persist final state.
       this.persistRun(managed);
       if (this.isCurrent(managed)) {
-        this.releaseRunLease(managed);
         // Now (and only now — after the run's data is safely on disk and its
         // lease released) does this run become eviction-eligible; see the
         // `runs` field doc comment.
@@ -810,18 +861,26 @@ export class WorkflowManager extends EventEmitter {
             );
 
       const usageLimitPaused = !managed.controller.signal.aborted && isProviderUsageLimit(workflowError);
+      // Settle the run to idle in the status this failure warrants. The abort
+      // branch is the abort/drain interplay's hinge: pause()/stop() may have
+      // already settled THIS SAME object to idle (status flipped + lease
+      // released) while this execution was awaiting — re-check its CURRENT
+      // state and only settle it here if it is still genuinely executing, so
+      // an already-settled run is never double-settled (its lease was already
+      // released, and releasing again would be a type error at best, a
+      // wrong-lease release at worst).
       if (managed.controller.signal.aborted) {
-        // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
+        // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop().
         if (managed.status === "running") {
-          managed.status = "aborted";
+          this.settleExecuting(managed, "aborted");
         }
       } else if (usageLimitPaused) {
         // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
         // the persisted journal (completed agent results) is replayed by resume()
         // once the budget refills — instead of the user starting from scratch.
-        managed.status = "paused";
+        this.settleExecuting(managed, "paused");
       } else {
-        managed.status = "failed";
+        this.settleExecuting(managed, "failed");
       }
       managed.error = workflowError;
       // Both branches gated via emitLive() (see its doc comment) — a stale
@@ -854,7 +913,6 @@ export class WorkflowManager extends EventEmitter {
       // isCurrent() rationale — same guard, same reason).
       this.persistRun(managed);
       if (this.isCurrent(managed)) {
-        this.releaseRunLease(managed);
         // "paused" (manual pause() or a usage-limit checkpoint) is
         // deliberately NOT eviction-eligible — only a genuinely settled
         // terminal status is (see IN_MEMORY_TERMINAL_STATUSES / the `runs`
@@ -908,8 +966,9 @@ export class WorkflowManager extends EventEmitter {
    * settled to a terminal status (completed/failed/aborted — see
    * IN_MEMORY_TERMINAL_STATUSES), and evict the oldest eligible entries
    * beyond maxTerminalRunsInMemory. Callers must only invoke this after the
-   * same isCurrent()-gated persistRun()/releaseRunLease() sequence executeRun()
-   * already uses (see the `runs` field doc comment for the full contract) —
+   * same isCurrent()-gated persistRun() + settleExecuting() lease-release
+   * sequence executeRun() already uses (see the `runs` field doc comment for
+   * the full contract) —
    * this method itself re-validates the CURRENT entry's status before
    * deleting anything, so it never evicts a run that isn't (or is no longer)
    * genuinely terminal, including one resumed back to "running" after being
@@ -964,10 +1023,47 @@ export class WorkflowManager extends EventEmitter {
     managed.snapshot.tokenUsage = usage;
   }
 
-  private releaseRunLease(managed: ManagedRun): void {
-    if (!managed.lease) return;
-    this.persistence.releaseRunLease(managed.lease);
-    managed.lease = undefined;
+  /**
+   * Idle → executing transition: attach the exclusive lease and flip status
+   * together, so "executing" and "leased" can never drift apart (see the
+   * ManagedRun union). The run is already in `runs`; this happens
+   * synchronously before any await, so the transition is unobservable.
+   */
+  private startExecuting(run: IdleRun, lease: RunLease): ExecutingRun {
+    const runtime = run as unknown as ManagedRunRuntime;
+    runtime.status = "running";
+    runtime.lease = lease;
+    return run as unknown as ExecutingRun;
+  }
+
+  /**
+   * Executing → idle transition: flip the status and release the lease as ONE
+   * state change. The release is isCurrent()-gated exactly as the old inline
+   * release was: a stale execution settling after resume()/deleteRun() took
+   * over this runId must not release the newer execution's lease (or call
+   * releaseRunLease(undefined) — deleteRun() clears the lease first).
+   * persistRun() is deliberately NOT bundled here: callers keep their existing
+   * emit→persist order and single final persist (see the burst-coalescing
+   * test), so the settled status lands on disk at the same moment as before.
+   */
+  private settleExecuting(run: ExecutingRun, status: IdleRunStatus): IdleRun {
+    const runtime = run as unknown as ManagedRunRuntime;
+    runtime.status = status;
+    if (this.isCurrent(run)) {
+      this.persistence.releaseRunLease(run.lease);
+      runtime.lease = undefined;
+    }
+    return run as unknown as IdleRun;
+  }
+
+  /**
+   * Release a run's lease WITHOUT settling it — for discard paths where the
+   * run leaves `runs` entirely (deleteRun(), or startInBackground()'s
+   * initial-persist failure), so no legal idle state is needed afterward.
+   */
+  private releaseHeldLease(run: ExecutingRun): void {
+    this.persistence.releaseRunLease(run.lease);
+    (run as unknown as ManagedRunRuntime).lease = undefined;
   }
 
   /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
@@ -1052,7 +1148,7 @@ export class WorkflowManager extends EventEmitter {
       // Resumable states need their journal; completed/aborted states need rich
       // agent details. Persist exactly one full copy of each agent result instead
       // of writing it to both agents[].result and journal[].result.
-      const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
+      const keepJournal = keepsResumeJournal(managed.status);
       this.persistence.save({
         runId: managed.runId,
         workflowName: managed.snapshot.name,
@@ -1061,7 +1157,7 @@ export class WorkflowManager extends EventEmitter {
         script: managed.script,
         args: managed.args,
         sessionId: this.sessionId,
-        journal: keepsResumeJournal ? managed.journal : undefined,
+        journal: keepJournal ? managed.journal : undefined,
         status: managed.status,
         // Persisted every write (not just at pause) so a stale read during the
         // "paused" event race (see UsageLimitScheduler) is still correct — this
@@ -1091,7 +1187,7 @@ export class WorkflowManager extends EventEmitter {
             ...summary,
             // Live runs keep the rich value in memory. Cold resumable runs use
             // the journal and retain resultPreview until replay reconstructs it.
-            ...(keepsResumeJournal || result === undefined ? {} : { result }),
+            ...(keepJournal || result === undefined ? {} : { result }),
             startedAt: ts?.startedAt,
             endedAt: ts?.endedAt,
           };
@@ -1129,10 +1225,9 @@ export class WorkflowManager extends EventEmitter {
     if (managed?.status !== "running") return false;
 
     managed.controller.abort();
-    managed.status = "paused";
+    this.settleExecuting(managed, "paused");
     this.emit("paused", { runId });
     this.persistRun(managed);
-    this.releaseRunLease(managed);
     return true;
   }
 
@@ -1253,13 +1348,14 @@ export class WorkflowManager extends EventEmitter {
     this.persistRun(managed);
 
     // Namespace by (runId, index) exactly like the live onAgentJournal dedup
-    // above and like SharedStore's deltaKey — see JournalEntry.runId. A
-    // legacy entry persisted before namespacing existed has no `runId`; it is
-    // assumed to belong to this run's own top-level runId (the only frame
-    // that existed before nested workflow() journaling was namespaced), so it
-    // still resume-hits for a top-level call and safely cache-misses (re-runs
-    // live, does not misapply) for what was actually a nested-run entry.
-    const resumeJournal = new Map((persisted.journal ?? []).map((e) => [`${e.runId ?? runId}:${e.index}`, e] as const));
+    // and like SharedStore's deltaKey — see JournalEntry.runId and
+    // buildResumeJournal in run-persistence.ts. A legacy entry persisted
+    // before namespacing existed has no `runId`; it is assumed to belong to
+    // this run's own top-level runId (the only frame that existed before
+    // nested workflow() journaling was namespaced), so it still resume-hits
+    // for a top-level call and safely cache-misses (re-runs live, does not
+    // misapply) for what was actually a nested-run entry.
+    const resumeJournal = buildResumeJournal(runId, persisted.journal);
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent
@@ -1318,10 +1414,16 @@ export class WorkflowManager extends EventEmitter {
       // small leak in exactly the class this manager otherwise bounds.
       const hadNoPendingSettle = managed.status === "paused";
       managed.controller.abort();
-      managed.status = "aborted";
+      if (managed.status === "running") {
+        this.settleExecuting(managed, "aborted");
+      } else {
+        // Already idle (paused): just flip the resting status — the lease is
+        // already released, and an idle→idle status write is legal on the
+        // IdleRun member.
+        managed.status = "aborted";
+      }
       this.emit("stopped", { runId });
       this.persistRun(managed);
-      this.releaseRunLease(managed);
       if (hadNoPendingSettle) this.recordTerminalRun(runId);
       return true;
     }
@@ -1386,7 +1488,7 @@ export class WorkflowManager extends EventEmitter {
    * aborted execution's eventual settle (executeRun's success/catch path,
    * asynchronously, possibly much later) must be a harmless no-op rather than
    * a resurrection — that's what isCurrent() guarantees: `this.runs.delete()`
-   * below means executeRun's later persistRun()/releaseRunLease() calls on
+   * below means executeRun's later persistRun()/settleExecuting() calls on
    * this same `managed` object find `this.runs.get(runId) !== managed` (in
    * fact `undefined`, since the entry is gone) and skip writing/releasing.
    */
@@ -1394,7 +1496,11 @@ export class WorkflowManager extends EventEmitter {
     const managed = this.runs.get(runId);
     if (managed) {
       if (!managed.controller.signal.aborted) managed.controller.abort();
-      this.releaseRunLease(managed);
+      // A live execution holds the run's lease; release it before the entry is
+      // discarded. No settle transition is needed — the object leaves `runs`
+      // entirely, so isCurrent() makes its eventual settle a no-op (and the
+      // lease is already gone for idle runs).
+      if (managed.status === "running") this.releaseHeldLease(managed);
     }
     this.runs.delete(runId);
     // Cancel any pending throttled write so a deferred persist can't fire after
