@@ -156,7 +156,8 @@ Every exact fact below is projected from the installed extension's capability co
 - `kind`: "confirm" | "input" | "select" (optional; default: "confirm")
 - `choices`: string[] (optional)
 - `timeoutMs`: number (optional)
-- Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
+- Constraint: foreground confirm, headless behavior, and the visual approve/deny gate (checkpointGate) are implemented
+- Constraint: input/select resolve through the visual gate's approve/deny verdict when a gate is configured, else they take the declared default headless
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
 
@@ -175,6 +176,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `phase(title, options?) => void`
 - Option shape: `phase-options`
 - `budget`: number (optional; positive soft pre-call token gate)
+- `stage`: 0 | 1 | 2 | 3 (optional; drives the persisted phase state machine when configured; forward-only (backward declarations fail at the next flush point))
 - Constraint: phase budgets are soft pre-call gates
 
 <a id="args"></a>

@@ -14,6 +14,6 @@ Preserve candidate or work identity outside helper results that may omit failed 
 | Helper | Authoring contract |
 | --- | --- |
 | `gate(thunk, validator, { attempts })` | Calls `thunk(feedback, attempt)` with initial `undefined` feedback and a zero-based attempt. `validator(value)` returns `{ ok, feedback? }`, synchronously or asynchronously; a bare boolean is not accepted. Three attempts by default. Returns `{ ok, value, attempts }`, including the last value on exhaustion. See [validated gate](../examples/validated-gate.js). |
-| `checkpoint(prompt, options?)` | Journals a human/default decision. Only foreground confirm and documented headless behavior work; input, select, and timeout are declared-only. |
+| `checkpoint(prompt, options?)` | Journals a human/default decision. Foreground confirm, headless behavior, and the visual approve/deny gate (`runWorkflow({ checkpointGate })`) are implemented; with a gate configured, the payload is published to the gate and the human verdict resolves the reply (approve → `true`/declared default, deny/timeout → `false`). |
 
 Always `await gate()`. A thunk containing `await` must itself be declared `async`; await `agent()` before adding its resolved value to a ledger. Runtime agent retries repeat recoverable execution failures; helper attempts are new semantic calls. Bound both layers and ledger exhaustion.

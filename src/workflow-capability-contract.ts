@@ -197,7 +197,12 @@ const CHECKPOINT_OPTIONS: OptionShape = {
 };
 const PHASE_OPTIONS: OptionShape = {
   id: "phase-options",
-  options: [option("budget", "number", true, null, ["positive soft pre-call token gate"])],
+  options: [
+    option("budget", "number", true, null, ["positive soft pre-call token gate"]),
+    option("stage", "0 | 1 | 2 | 3", true, null, [
+      "drives the persisted phase state machine when configured; forward-only (backward declarations fail at the next flush point)",
+    ]),
+  ],
 };
 const VERIFY_OPTIONS: OptionShape = {
   id: "verify-options",
@@ -422,7 +427,8 @@ const capabilities: readonly CapabilityDescriptor[] = [
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "checkpoint-options",
     constraints: [
-      "foreground confirm and headless behavior are implemented; input/select/timeout are declared-only",
+      "foreground confirm, headless behavior, and the visual approve/deny gate (checkpointGate) are implemented",
+      "input/select resolve through the visual gate's approve/deny verdict when a gate is configured, else they take the declared default headless",
       "consumes one agent slot and no tokens",
       "journaled answers replay only within an unchanged resume prefix",
     ],

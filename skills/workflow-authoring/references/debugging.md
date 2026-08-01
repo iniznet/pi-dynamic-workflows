@@ -15,7 +15,7 @@ Start from the symptom, then reproduce through the real workflow runtime with de
 | Resume reruns a call that already "succeeded" once before | Its only prior attempt(s) ended in a recoverable failure (e.g. `AGENT_EMPTY_OUTPUT`) and were never journaled | [lifecycle](lifecycle.md#resume) |
 | A field read off `agent()`'s result is `undefined` | No `schema` was set; the prompt asking for JSON does not change that `agent()` returns raw text | [lifecycle](lifecycle.md#serialization) |
 | Nested workflow fails | Nesting exceeded one level or shared limits were exhausted | [lifecycle](lifecycle.md#nesting-and-shared-state) |
-| Checkpoint does not show a form | Input/select/timeout behavior is declared-only | [lifecycle](lifecycle.md#checkpoints) |
+| Checkpoint does not show a form | Input/select/timeout have no inline form; they resolve through the visual approve/deny gate when one is configured, else take the declared default | [lifecycle](lifecycle.md#checkpoints) |
 | Returned result cannot cross boundary | It contains a function, promise, cycle, `BigInt`, or runtime object | [lifecycle](lifecycle.md#serialization) |
 | `Date.now()`/randomness is rejected | Resume requires deterministic call structure | [lifecycle](lifecycle.md#resume) |
 

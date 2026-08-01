@@ -24,6 +24,7 @@ import {
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
@@ -269,6 +270,21 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * default (and journals it), so a detached/background run never hangs.
    */
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
+  /**
+   * Optional visual approve/deny gate for checkpoint() — e.g. a plannotator SSE
+   * bridge (createPlannotatorBridge()). When provided, checkpoint() publishes
+   * the checkpoint payload to the gate and waits for the human verdict instead
+   * of the inline `confirm` prompt; see CheckpointGate for the verdict mapping.
+   * Default behavior (no gate, no confirm) is unchanged: headless takes the
+   * declared default.
+   */
+  checkpointGate?: CheckpointGate;
+  /**
+   * Optional persisted phase state machine wiring (PhaseGuard activation) — see
+   * PhaseStateIntegration. Strictly additive: the existing live phasing in
+   * model-routing.ts, phase budgets, and onPhase events are untouched.
+   */
+  phaseState?: PhaseStateIntegration;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
@@ -376,6 +392,73 @@ export interface CheckpointOptions {
   choices?: string[];
   /** Per-checkpoint timeout in ms for the interactive prompt. */
   timeoutMs?: number;
+}
+
+/**
+ * Minimal visual approve/deny gate for checkpoint() — satisfied structurally by
+ * createPlannotatorBridge() from integrations/plannotator.ts. When a run is
+ * configured with a gate, every checkpoint() publishes its payload (prompt,
+ * kind, choices, declared default, run/call identity) to the gate and waits for
+ * the human verdict instead of the inline `confirm` prompt.
+ *
+ * Verdict mapping: an approved "confirm" checkpoint resolves `true`; a rejected
+ * or timed-out one resolves `false`. For "input"/"select" checkpoints the gate
+ * presents the declared `default` as the payload under review, so approval
+ * resolves the default value and rejection resolves `false` — the gate is
+ * approve/deny, not a free-text channel.
+ *
+ * The payload must be JSON-serializable: gate implementations persist it (the
+ * plannotator bridge writes it to `.pi/workflows/plans/<id>.json`).
+ */
+export interface CheckpointGate {
+  /** Publish a checkpoint to the visual gate; resolves with the gate's plan id. */
+  submitPlan(blueprint: unknown): Promise<{ id: string }>;
+  /**
+   * Wait for the human verdict; resolves `true` on approval, `false` on denial
+   * or when the timeout elapses with no decision.
+   */
+  waitForApproval(planId: string, timeoutMs?: number, signal?: AbortSignal): Promise<boolean>;
+  /** Subscribe to gate status transitions (the SSE 'update' surface). Optional. */
+  onStatusChange?(callback: (plan: { id: string; status: string; feedback?: string }) => void): () => void;
+}
+
+/** Options for the phase() runtime helper. */
+export interface PhaseOptions {
+  /** Soft per-phase token sub-budget carved from the run total. */
+  budget?: number;
+  /**
+   * Deterministic stage (0–3) for the persisted phase state machine — see
+   * PhaseStateIntegration. Declaring a higher stage advances the machine;
+   * backward/no-op declarations throw PHASE_TRANSITION_INVALID when the queued
+   * transition flushes. Ignored when no state machine is configured.
+   */
+  stage?: PhaseStage;
+}
+
+/**
+ * Opt-in wiring of the persisted phase state machine (phases/state-machine.ts)
+ * into a workflow run — the PhaseGuard activation path. When provided:
+ *
+ * - `phase(title, { stage })` queues a forward transition of the persisted
+ *   state (stages must be declared strictly ascending; a backward declaration
+ *   fails the run at the next flush point with PHASE_TRANSITION_INVALID).
+ * - a checkpoint routed through a CheckpointGate records `plannotatorSubmitted`
+ *   and, on approval, `humanApproved` (approvePlan() — only valid at stage 2).
+ * - `agent()` calls inherit PhaseGuard's gate: subagent spawning requires
+ *   stage 3 with human approval (SUBAGENT_SPAWN_BLOCKED otherwise), unless
+ *   `gateAgentCalls` is false.
+ *
+ * Existing live phasing (model-routing.ts, onPhase/phase budgets) is untouched;
+ * this is strictly additive on top of it.
+ */
+export interface PhaseStateIntegration {
+  /** The persisted state machine that becomes authoritative for this run. */
+  stateManager: WorkflowStateManager;
+  /**
+   * Gate agent() calls (the live subagent spawn) behind stage 3 + human
+   * approval. Defaults to `true` when the integration is provided.
+   */
+  gateAgentCalls?: boolean;
 }
 
 interface RuntimeState {
@@ -533,6 +616,51 @@ export async function runWorkflow<T = unknown>(
   // equivalent to `!options.sharedStore` — used at both choke points below.
   const isTopLevelRun = !options.sharedRuntime;
 
+  // PhaseGuard activation: when a persisted phase state machine is configured,
+  // phase(title, { stage }) queues forward transitions on a chain that flushes
+  // at the run's await points (checkpoint-gate publish, agent() gate check,
+  // run end). Queueing (not awaiting inline) keeps phase() synchronous — the
+  // documented runtime signature is `phase(title, options?) => void` — while
+  // the chain guarantees transitions apply in declaration order and any
+  // backward-transition error surfaces at a deterministic flush point.
+  const phaseStateIntegration = options.phaseState;
+  const gateAgentCalls = phaseStateIntegration ? (phaseStateIntegration.gateAgentCalls ?? true) : false;
+  let phaseStateChain: Promise<void> = Promise.resolve();
+  const queuePhaseTransition = (stage: PhaseStage) => {
+    if (!phaseStateIntegration) return;
+    phaseStateChain = phaseStateChain.then(() => phaseStateIntegration.stateManager.transitionTo(stage));
+  };
+  const flushPhaseState = () => phaseStateChain;
+  /** Record a gate verdict in the persisted state machine (approval only at stage 2). */
+  const recordGateVerdict = async (approved: boolean) => {
+    if (!phaseStateIntegration) return;
+    const stateManager = phaseStateIntegration.stateManager;
+    await stateManager.setState({ plannotatorSubmitted: true });
+    if (approved) await stateManager.approvePlan();
+  };
+  /**
+   * Live PhaseGuard gate for agent(): the persisted machine must be at stage 3
+   * with human approval before the run may spawn subagents.
+   */
+  const assertPhaseGateOpen = async () => {
+    if (!phaseStateIntegration || !gateAgentCalls) return;
+    await flushPhaseState();
+    const stateManager = phaseStateIntegration.stateManager;
+    // Refresh the synchronous cache before the synchronous gate check.
+    await stateManager.getState();
+    if (!stateManager.canSpawnSubagents()) {
+      const state = await stateManager.getState();
+      throw new WorkflowError(
+        `agent() is gated: subagent spawning requires Phase 3 with human approval (current: Phase ${state.activePhase}, approved: ${state.humanApproved}).`,
+        WorkflowErrorCode.UNKNOWN,
+        {
+          recoverable: false,
+          details: { code: SUBAGENT_SPAWN_BLOCKED },
+        },
+      );
+    }
+  };
+
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
   const store: SharedStore = options.sharedStore ?? new SharedStore();
@@ -543,7 +671,7 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
-  const phase = (title: string, phaseOptions?: { budget?: number }) => {
+  const phase = (title: string, phaseOptions?: PhaseOptions) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
     // Carve a soft sub-budget from the run total for work done under this phase.
@@ -551,6 +679,19 @@ export async function runWorkflow<T = unknown>(
     // script re-runs phase() and the ceiling is recomputed from live spent).
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+    }
+    // Deterministic stage for the persisted phase state machine (opt-in, see
+    // PhaseStateIntegration). Queued — phase() stays synchronous — and flushed
+    // at the next checkpoint-gate/agent()/run-end boundary. Same lenient
+    // validation as `budget`: a non-integer or out-of-range stage is ignored.
+    if (
+      phaseStateIntegration &&
+      typeof phaseOptions?.stage === "number" &&
+      Number.isInteger(phaseOptions.stage) &&
+      phaseOptions.stage >= 0 &&
+      phaseOptions.stage <= 3
+    ) {
+      queuePhaseTransition(phaseOptions.stage as PhaseStage);
     }
     options.onPhase?.(title);
     options.onRuntimeEvent?.({
@@ -749,6 +890,13 @@ export async function runWorkflow<T = unknown>(
     if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
+      // PhaseGuard activation (see PhaseStateIntegration): agent() is the live
+      // subagent spawn, so it inherits the state machine's gate. Checked inside
+      // the limiter so the agentCount limit/budget gate stays atomic (no await
+      // between the count check and `shared.agentCount++` above). Replay of a
+      // journaled cache hit bypasses this entirely (the return above).
+      await assertPhaseGateOpen();
+
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
@@ -1312,7 +1460,43 @@ export async function runWorkflow<T = unknown>(
     shared.agentCount++;
 
     let reply: unknown;
-    if (options.confirm) {
+    if (options.checkpointGate) {
+      // Visual approve/deny gate (e.g. the plannotator SSE bridge): publish the
+      // checkpoint payload to the gate, then wait for the human verdict instead
+      // of the inline confirm. Resume-safe: the journaled reply replays from the
+      // cache hit above, so a re-run never re-blocks on the gate. Flush declared
+      // stages first so an approval records against the current stage (approvePlan
+      // is only valid at stage 2 of the phase state machine).
+      await flushPhaseState();
+      const plan = await options.checkpointGate.submitPlan({
+        prompt: promptText,
+        kind: checkpointOptions.kind ?? "confirm",
+        choices: checkpointOptions.choices,
+        default: checkpointOptions.default,
+        runId,
+        callIndex,
+      });
+      let approved: boolean;
+      try {
+        approved = await options.checkpointGate.waitForApproval(plan.id, checkpointOptions.timeoutMs, options.signal);
+      } catch (error) {
+        // A host abort surfaced by the gate is re-routed through the run's
+        // canonical abort path (throwIfAborted below); any other gate failure
+        // (bind error, I/O) propagates as-is.
+        if (!(error instanceof Error && error.name === "AbortError" && options.signal?.aborted)) throw error;
+        approved = false;
+      }
+      throwIfAborted();
+      await recordGateVerdict(approved);
+      // Approve/deny verdict mapping: a confirmed plan resolves true on approval
+      // and false on denial/timeout; input/select checkpoints present the declared
+      // default as the payload under review, so approval resolves that default.
+      reply = approved
+        ? checkpointOptions.kind === "confirm" || checkpointOptions.kind === undefined
+          ? true
+          : (checkpointOptions.default ?? true)
+        : false;
+    } else if (options.confirm) {
       reply = await options.confirm(promptText, checkpointOptions);
     } else if (checkpointOptions.headless === "abort") {
       throw new WorkflowError(
@@ -1414,6 +1598,19 @@ export async function runWorkflow<T = unknown>(
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {
+    // Persist any phase-state transitions queued by phase() declarations that
+    // never reached an awaited flush point (a planning-only frame with no
+    // checkpoint/agent) so the state file reflects the final declared stage.
+    // Runs per frame: a nested workflow() inherits the integration via the
+    // spread options, so each frame flushes its own queued transitions.
+    // Best-effort: the state machine is persistence bookkeeping here, so a
+    // rejected trailing transition (e.g. a backward stage declaration) is
+    // logged, never allowed to fail an otherwise-completed run. Strict
+    // enforcement happens at the checkpoint-gate/agent() flush points, which
+    // throw.
+    await flushPhaseState().catch((error: unknown) => {
+      log(`phase state machine flush failed at run end: ${error instanceof Error ? error.message : String(error)}`);
+    });
     // Only the top-level frame drains/disposes (see isTopLevelRun) — a nested
     // workflow()'s in-flight agents are still tracked in this SAME shared set
     // and get drained once, here, when the whole run finishes.
