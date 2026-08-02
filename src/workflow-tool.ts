@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
+import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import {
   createToolUpdateWorkflowDisplay,
   createWorkflowSnapshot,
@@ -14,7 +15,8 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { parseWorkflowScript, type WorkflowRunResult } from "./workflow.js";
+import { coerceArgs } from "./saved-commands.js";
+import { parseWorkflowScript, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -75,30 +77,38 @@ const workflowToolSchema = Type.Object({
   ),
   maxAgents: Type.Optional(
     Type.Number({
+      minimum: 1,
+      maximum: MAX_AGENTS_PER_RUN,
       description:
         "Maximum number of agents allowed in this run. Default: 1000; this is a safety ceiling, not a target. Set a lower limit for dynamic or exploratory fan-out, and reserve large fan-outs for explicit user intent.",
     }),
   ),
   concurrency: Type.Optional(
     Type.Number({
+      minimum: 1,
+      maximum: MAX_CONCURRENCY,
       description:
         "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters.",
     }),
   ),
   agentRetries: Type.Optional(
     Type.Number({
+      minimum: 0,
+      maximum: MAX_AGENT_RETRIES,
       description:
         "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
     }),
   ),
   agentTimeoutMs: Type.Optional(
     Type.Number({
+      minimum: 1,
       description:
         "Timeout per agent in milliseconds. Omit to use configured `defaultAgentTimeoutMs`; without one, there is no hard timeout. Set only when the user asks to bound time.",
     }),
   ),
   tokenBudget: Type.Optional(
     Type.Number({
+      minimum: 1,
       description:
         "Optional user-requested soft spend gate, not a planning target. Do not set `tokenBudget` unless the user explicitly supplies a cap or asks you to choose one; never infer or invent one from task size. If omitted, the configured `defaultTokenBudget` applies; without one, the run is unlimited. Reaching the gate blocks later `agent()` calls; concurrent in-flight work can overshoot.",
     }),
@@ -110,6 +120,12 @@ const workflowToolSchema = Type.Object({
         "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
         "Calls match by position: keep earlier good calls identical and in order. Always background.",
       ].join(" "),
+    }),
+  ),
+  dryRun: Type.Optional(
+    Type.Boolean({
+      description:
+        "Validate the script (or named workflow) without starting a run: parses and checks the script, then returns immediately with the workflow's meta (name/phases) and launches no subagents. Useful for iterating on a script before committing to a run.",
     }),
   ),
 });
@@ -125,6 +141,7 @@ export type WorkflowToolInput = {
   agentTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
+  dryRun?: boolean;
 };
 
 export interface WorkflowToolOptions {
@@ -181,10 +198,16 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       let invocationTools: ToolDefinition[] | undefined;
       let invocationToolset: string | undefined;
       let script: string;
+      let runArgs: Record<string, unknown> | undefined = params.args;
       if (params.name) {
         if (params.resumeFromRunId) {
           throw new Error(
             "workflow: `name` cannot be combined with `resumeFromRunId` — resume with an edited `script` instead.",
+          );
+        }
+        if (params.script) {
+          throw new Error(
+            "workflow: `name` cannot be combined with `script` — provide either a saved/built-in `name` or a raw `script`, not both.",
           );
         }
         const resolved = resolveWorkflowInvocation(params.name, params.args, { storage, cwd });
@@ -193,6 +216,12 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             `workflow: no saved or built-in workflow named "${params.name}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`,
           );
         }
+        // A saved workflow declares an argument schema (SavedWorkflow.parameters);
+        // coerce + validate the caller's args against it before launching, so a
+        // mistyped or missing arg fails here with a descriptive error instead of
+        // reaching the script as an undefined/raw value.
+        const saved = storage.load(params.name);
+        if (saved?.parameters) runArgs = coerceArgs(params.args, saved.parameters);
         script = normalizeWorkflowScript(resolved.script);
         invocationTools = resolved.tools;
         invocationToolset = resolved.toolset;
@@ -202,6 +231,17 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       }
       const parsed = parseWorkflowScript(script);
 
+      // dryRun: validate the script/name and return its meta without launching
+      // a run (no manager activity, no subagents, no persisted run).
+      if (params.dryRun) {
+        if (params.resumeFromRunId) {
+          throw new Error(
+            "workflow: `dryRun` cannot be combined with `resumeFromRunId` — resume launches a run by definition.",
+          );
+        }
+        return dryRunResult(parsed.meta);
+      }
+
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
       // script instead of creating a brand-new run. Unchanged agent() calls
       // replay from the prior run's journal; the first edited/new call and
@@ -209,7 +249,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // detached and its result is delivered back into the conversation).
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
-        const resumed = await manager.resume(runId, { script, args: params.args });
+        const resumed = await manager.resume(runId, { script, args: runArgs });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId));
         }
@@ -235,7 +275,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // conversation when the run finishes (see installResultDelivery). Only an
       // explicit `background: false` blocks for the result inline.
       if (params.background ?? true) {
-        const { runId } = manager.startInBackground(script, params.args, {
+        const { runId } = manager.startInBackground(script, runArgs, {
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
@@ -264,7 +304,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 
       let result: WorkflowRunResult;
       try {
-        result = await manager.runSync(script, params.args, {
+        result = await manager.runSync(script, runArgs, {
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
@@ -355,6 +395,28 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return new Text(clean || theme.fg("muted", "workflow"), 0, 0);
     },
   });
+}
+
+/**
+ * The tool result returned for a dryRun: the script (or named workflow) was
+ * parsed and validated but no run was launched — no manager activity, no
+ * subagents, nothing persisted.
+ */
+function dryRunResult(meta: WorkflowMeta): {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+} {
+  const phases = meta.phases?.map((p) => p.title) ?? [];
+  const phaseInfo = phases.length ? ` Phases: ${phases.join(", ")}.` : "";
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Workflow **${meta.name}** validated — the script parses and its meta is well-formed. No run was started.${phaseInfo}`,
+      },
+    ],
+    details: { dryRun: true, name: meta.name, description: meta.description, phases },
+  };
 }
 
 function resolveWorkflowToolDefaults(

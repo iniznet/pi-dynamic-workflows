@@ -6,7 +6,10 @@
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
-import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
+import type { SavedWorkflow, WorkflowParameterSpec, WorkflowParameters, WorkflowStorage } from "./workflow-saved.js";
+
+/** Argument tokens that ask for help instead of running the workflow. */
+const HELP_TOKENS = new Set(["--help", "-h", "help"]);
 
 function isRegistered(pi: ExtensionAPI, name: string): boolean {
   try {
@@ -22,12 +25,70 @@ function reportText(result: WorkflowRunResult): string {
   return JSON.stringify(result.result, null, 2);
 }
 
+/** Coerce one raw value to a parameter's declared type; throws on mismatch. */
+function coerceParameterValue(key: string, value: unknown, spec: WorkflowParameterSpec): unknown {
+  switch (spec.type) {
+    case "string":
+      if (typeof value !== "string") {
+        throw new Error(`args.${key} must be a string, got ${typeof value}`);
+      }
+      return value;
+    case "number": {
+      const n = typeof value === "number" ? value : Number(value);
+      if (!Number.isFinite(n)) {
+        throw new Error(`args.${key} must be a number, got ${JSON.stringify(value)}`);
+      }
+      return n;
+    }
+    case "integer": {
+      const n = typeof value === "number" ? value : Number(value);
+      if (!Number.isFinite(n) || !Number.isInteger(n)) {
+        throw new Error(`args.${key} must be an integer, got ${JSON.stringify(value)}`);
+      }
+      return n;
+    }
+    case "boolean": {
+      if (typeof value === "boolean") return value;
+      const token = String(value).trim().toLowerCase();
+      if (token === "true" || token === "1") return true;
+      if (token === "false" || token === "0") return false;
+      throw new Error(`args.${key} must be a boolean, got ${JSON.stringify(value)}`);
+    }
+    default:
+      // "array" (or any undeclared type) has no CLI representation; pass through.
+      return value;
+  }
+}
+
+/**
+ * Validate + coerce an args object against a declared parameter schema.
+ * Missing required params (with no default) throw; provided values are coerced
+ * to their declared type (a failed coercion throws a descriptive error);
+ * defaults fill missing optional params. Undeclared keys pass through.
+ */
+export function coerceArgs(args: unknown, parameters?: WorkflowParameters): Record<string, unknown> {
+  const out: Record<string, unknown> =
+    args && typeof args === "object" && !Array.isArray(args) ? { ...(args as Record<string, unknown>) } : {};
+  for (const [key, spec] of Object.entries(parameters ?? {})) {
+    if (out[key] === undefined) {
+      if (spec.required && spec.default === undefined) {
+        throw new Error(`Missing required argument: ${key}`);
+      }
+      if (spec.default !== undefined) out[key] = spec.default;
+    } else if (spec.type) {
+      out[key] = coerceParameterValue(key, out[key], spec);
+    }
+  }
+  return out;
+}
+
 /**
  * Parse a command argument string into an `args` object for the script.
  * Supports `key=value` tokens; everything else collects into `_` (and `_raw`).
- * Declared parameter defaults fill in missing keys.
+ * Declared parameter defaults fill missing keys, provided values are coerced
+ * to their declared type, and missing required params throw.
  */
-export function parseCommandArgs(raw: string, parameters?: SavedWorkflow["parameters"]): Record<string, unknown> {
+export function parseCommandArgs(raw: string, parameters?: WorkflowParameters): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const positional: string[] = [];
   for (const tok of raw.trim().split(/\s+/).filter(Boolean)) {
@@ -37,10 +98,54 @@ export function parseCommandArgs(raw: string, parameters?: SavedWorkflow["parame
   }
   out._ = positional.join(" ");
   out._raw = raw.trim();
-  for (const [key, spec] of Object.entries(parameters ?? {})) {
-    if (out[key] === undefined && spec.default !== undefined) out[key] = spec.default;
+  return coerceArgs(out, parameters);
+}
+
+/** Infer a parameter spec's type from a runtime value (for /workflows save). */
+function inferParameterType(value: unknown): string {
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number";
+  return "string";
+}
+
+/**
+ * Derive a declared parameter schema from a run's args object, so a saved
+ * workflow replays the same invocation by default. `_`/`_raw` are parse
+ * artifacts, not real arguments. Returns undefined when there is nothing to
+ * declare.
+ */
+export function parametersFromArgs(args: unknown): WorkflowParameters | undefined {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+  const record = args as Record<string, unknown>;
+  const entries = Object.entries(record).filter(([key]) => key !== "_" && key !== "_raw");
+  if (!entries.length) return undefined;
+  const parameters: WorkflowParameters = {};
+  for (const [key, value] of entries) {
+    parameters[key] = {
+      type: inferParameterType(value),
+      default: value,
+      description: `Saved from the originating run's args.${key}.`,
+    };
   }
-  return out;
+  return parameters;
+}
+
+/** Render the declared argument schema as a `--help` text block. */
+export function formatParameterHelp(name: string, description: string, parameters?: WorkflowParameters): string {
+  const lines = [`/${name} — ${description}`];
+  const specs = Object.entries(parameters ?? {});
+  if (!specs.length) {
+    lines.push("No arguments.");
+    return lines.join("\n");
+  }
+  lines.push("Arguments:");
+  for (const [key, spec] of specs) {
+    const required = spec.required ? "required" : "optional";
+    const defaultValue = spec.default !== undefined ? `, default: ${JSON.stringify(spec.default)}` : "";
+    const detail = spec.description ? ` — ${spec.description}` : "";
+    lines.push(`  ${key} (${spec.type}, ${required}${defaultValue})${detail}`);
+  }
+  return lines.join("\n");
 }
 
 /** Register one saved workflow as a `/<name>` command (idempotent).
@@ -66,6 +171,12 @@ export function registerSavedWorkflow(
     async handler(args: string, ctx: ExtensionCommandContext) {
       if (exists && !exists()) {
         ctx.ui.notify(`/${wf.name} was deleted — reload the session to remove this command.`, "warning");
+        return;
+      }
+      // `--help` (or `help`/`-h`) lists the declared argument schema instead of
+      // launching a run — args stay parseable even for parameterized workflows.
+      if (HELP_TOKENS.has(args.trim().toLowerCase())) {
+        ctx.ui.notify(formatParameterHelp(wf.name, wf.description, wf.parameters), "info");
         return;
       }
       try {

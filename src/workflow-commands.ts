@@ -14,7 +14,8 @@ import {
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
-import { registerSavedWorkflow } from "./saved-commands.js";
+import { parametersFromArgs, registerSavedWorkflow } from "./saved-commands.js";
+import { parseWorkflowScript } from "./workflow.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -261,19 +262,39 @@ export function registerWorkflowCommands(
             ctx.ui.notify(runIdArg ? `No run ${runIdArg} with a script` : "No saved run to save", "error");
             return;
           }
+          // Validate the run's script before persisting it as a reusable
+          // workflow — a malformed script should surface here (a named error,
+          // not at every future /name invocation), and this handler must not
+          // block on execution.
+          try {
+            parseWorkflowScript(run.script);
+          } catch (error) {
+            ctx.ui.notify(
+              `Cannot save ${run.runId}: ${error instanceof Error ? error.message : String(error)}`,
+              "error",
+            );
+            return;
+          }
           let saved: ReturnType<WorkflowStorage["save"]>;
           try {
             saved = storage.save({
               name,
               description: run.workflowName,
               script: run.script,
+              // Derive the saved workflow's declared arg schema from the run's
+              // args: each arg becomes a parameter with its value as the
+              // default, so /name replays the same invocation by default.
+              parameters: parametersFromArgs(run.args),
               location: "project",
             });
           } catch (error) {
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
             return;
           }
-          registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
+          // Wire the new /name command through the SHARED manager for full
+          // background-execution parity (task panel, /workflows tracking, result
+          // delivery) instead of the no-manager inline blocking fallback.
+          registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, manager, () =>
             storage.list().some((w) => w.name === saved.name),
           );
           ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");

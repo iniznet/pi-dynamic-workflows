@@ -14,6 +14,24 @@ import {
 } from "./fs-persistence.js";
 import { workflowProjectPaths, workflowUserSavedDir } from "./workflow-paths.js";
 
+/**
+ * Declared argument schema entry for a saved workflow. `type` is one of
+ * "string" | "number" | "integer" | "boolean" ("array" passes through
+ * unchanged, since a CLI cannot express it). `required` params must be
+ * provided (or defaulted); provided values are coerced to `type` and a
+ * failed coercion throws a descriptive error instead of silently passing
+ * the raw string through to the script.
+ */
+export interface WorkflowParameterSpec {
+  type: string;
+  description?: string;
+  required?: boolean;
+  default?: unknown;
+}
+
+/** Declared argument schema for a saved workflow: key -> spec. */
+export type WorkflowParameters = Record<string, WorkflowParameterSpec>;
+
 export interface SavedWorkflow {
   /** Command name (filename without extension). */
   name: string;
@@ -22,7 +40,7 @@ export interface SavedWorkflow {
   /** The workflow script. */
   script: string;
   /** Optional parameter schema for parameterized workflows. */
-  parameters?: Record<string, { type: string; description?: string; required?: boolean; default?: unknown }>;
+  parameters?: WorkflowParameters;
   /** Where this workflow is saved. */
   location: "project" | "user";
   /** Full file path. */

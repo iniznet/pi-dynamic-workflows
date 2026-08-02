@@ -2,7 +2,7 @@
  * Non-blocking Multi-tasking & File Conflict Detection (Task 9).
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRunPersistence, type PersistedRunState, type RunStatus } from "./run-persistence.js";
 
@@ -26,6 +26,17 @@ export interface FileLock {
 
 /** Default time-to-live for a file lock in ms: stale holders can be reclaimed after this. */
 export const DEFAULT_LOCK_TTL_MS = 300000;
+
+/** Options for acquireFileLock's bounded wait on a live (unexpired) holder. */
+export interface AcquireFileLockOptions {
+  /**
+   * Keep polling for the lock when a live holder owns it. 0/omitted fails fast
+   * (the historical behavior); a positive value bounds the total wait.
+   */
+  waitMs?: number;
+  /** Poll interval while waiting for a live holder to release or expire. */
+  pollIntervalMs?: number;
+}
 
 const RUNNING_OR_PAUSED: ReadonlySet<RunStatus> = new Set(["running", "paused"]);
 
@@ -76,6 +87,151 @@ async function readActiveLock(path: string, now: number): Promise<LockFileRecord
   return null;
 }
 
+/** Outcome of probing an existing lock file for reclamation. */
+type StaleProbe = { kind: "live" } | { kind: "stale"; record: LockFileRecord } | { kind: "corrupt" };
+
+/**
+ * Classify an existing lock file: live (valid unexpired holder), stale (an
+ * expired record we may reclaim), or corrupt (unparseable garbage).
+ */
+async function probeLock(path: string, now: number): Promise<StaleProbe> {
+  try {
+    const data = await readFile(path, "utf-8");
+    const lock = JSON.parse(data) as LockFileRecord;
+    if (lock.filePath && new Date(lock.expiresAt).getTime() > now) return { kind: "live" };
+    return { kind: "stale", record: lock };
+  } catch {
+    return { kind: "corrupt" };
+  }
+}
+
+/**
+ * Delete a stale lock file ONLY when its on-disk content is still the exact
+ * record we read — closes the read→unlink TOCTOU where a lock that another
+ * process reclaimed (with a fresh token) between our read and our unlink
+ * would otherwise be destroyed.
+ */
+async function unlinkIfUnchanged(lockPath: string, expected: LockFileRecord): Promise<boolean> {
+  try {
+    const current = JSON.parse(await readFile(lockPath, "utf-8")) as LockFileRecord;
+    if (current.token !== expected.token) return false;
+    await unlink(lockPath);
+    return true;
+  } catch {
+    // Vanished or unreadable between read and unlink: someone else reclaimed
+    // it (or is mid-reclaim) — back off rather than delete blindly.
+    return false;
+  }
+}
+
+/**
+ * One atomic acquire attempt: exclusive-create the lock file; on EEXIST,
+ * reclaim a stale/corrupt holder via a content-verified unlink and retry once.
+ */
+async function tryAcquireOnce(
+  lockPath: string,
+  filePath: string,
+  runId: string,
+  taskId: string,
+  now: number,
+  ttl: number,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const lock: LockFileRecord = {
+      filePath,
+      runId,
+      taskId,
+      lockedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ttl).toISOString(),
+      token: `${process.pid}-${now.toString(36)}-${Math.random().toString(36).slice(2)}`,
+    };
+    try {
+      // Exclusive create (O_EXCL): an atomic check-and-create — racing
+      // processes cannot both pass a read-then-write check on the same path.
+      await writeFile(lockPath, JSON.stringify(lock, null, 2), { flag: "wx" });
+      return true;
+    } catch (err) {
+      if ((err as { code?: string }).code !== "EEXIST") throw err;
+    }
+    const probe = await probeLock(lockPath, now);
+    if (probe.kind === "live") return false;
+    if (probe.kind === "corrupt") {
+      // Garbage file with no owner to protect: delete it and let the next
+      // attempt re-create. A failed unlink means someone else reclaimed it.
+      try {
+        await unlink(lockPath);
+      } catch {
+        return false;
+      }
+      continue;
+    }
+    // Expired holder: reclaim only if nobody has re-acquired since our read.
+    if (!(await unlinkIfUnchanged(lockPath, probe.record))) return false;
+  }
+  return false;
+}
+
+export async function acquireFileLock(
+  filePath: string,
+  runId: string,
+  taskId: string,
+  ttl: number = DEFAULT_LOCK_TTL_MS,
+  options: AcquireFileLockOptions = {},
+): Promise<boolean> {
+  const dir = lockDir();
+  await mkdir(dir, { recursive: true });
+  const lockPath = lockPathFor(filePath);
+  const deadline = options.waitMs ? Date.now() + options.waitMs : 0;
+  const pollIntervalMs = options.pollIntervalMs ?? 50;
+  while (true) {
+    if (await tryAcquireOnce(lockPath, filePath, runId, taskId, Date.now(), ttl)) return true;
+    // A live holder with no wait budget fails fast (historical behavior).
+    if (!deadline) return false;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
+/**
+ * Extend a lock's TTL so a still-working holder is not reclaimed as stale
+ * (the holder must refresh before expiry). Refuses to renew a lock owned by a
+ * different runId, and rotates the owner token so a concurrent reclaimer that
+ * read the old record backs off (content-verified unlink mismatch) instead of
+ * deleting the renewed lock.
+ */
+export async function renewFileLock(
+  filePath: string,
+  runId: string,
+  ttl: number = DEFAULT_LOCK_TTL_MS,
+): Promise<boolean> {
+  const lockPath = lockPathFor(filePath);
+  try {
+    const lock = JSON.parse(await readFile(lockPath, "utf-8")) as LockFileRecord;
+    if (!lock.filePath || lock.runId !== runId) return false;
+    const now = Date.now();
+    const renewed: LockFileRecord = {
+      ...lock,
+      lockedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ttl).toISOString(),
+      token: `${process.pid}-${now.toString(36)}-${Math.random().toString(36).slice(2)}`,
+    };
+    // Write via a temp file + atomic rename so a concurrent reader never sees
+    // a truncated lock, and the rotated token makes our own read→unlink
+    // reclamation (or another process's) safely miss.
+    const tmp = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      await writeFile(tmp, JSON.stringify(renewed, null, 2), { flag: "wx" });
+      await rename(tmp, lockPath);
+    } catch (err) {
+      await unlink(tmp).catch(() => {});
+      throw err;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function getWorkflowStatus(runId?: string): Promise<WorkflowStatus | null> {
   if (!runId) return null;
   const state = createRunPersistence(process.cwd()).load(runId);
@@ -88,44 +244,6 @@ export async function listRunningWorkflows(): Promise<WorkflowStatus[]> {
     .list()
     .filter((run) => RUNNING_OR_PAUSED.has(run.status))
     .map((run) => toWorkflowStatus(run, run.runId));
-}
-
-export async function acquireFileLock(
-  filePath: string,
-  runId: string,
-  taskId: string,
-  ttl: number = DEFAULT_LOCK_TTL_MS,
-): Promise<boolean> {
-  const dir = lockDir();
-  await mkdir(dir, { recursive: true });
-  const lockPath = lockPathFor(filePath);
-  const now = Date.now();
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const lock: LockFileRecord = {
-      filePath,
-      runId,
-      taskId,
-      lockedAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + ttl).toISOString(),
-      token: `${process.pid}-${now.toString(36)}-${Math.random().toString(36).slice(2)}`,
-    };
-    try {
-      // Exclusive create (O_EXCL): atomic claim — racing processes cannot
-      // both pass a read-then-write check on the same path.
-      await writeFile(lockPath, JSON.stringify(lock, null, 2), { flag: "wx" });
-      return true;
-    } catch (err) {
-      if ((err as { code?: string }).code !== "EEXIST") throw err;
-      if (await readActiveLock(lockPath, now)) return false;
-      // Stale/corrupt holder: reclaim its file and retry the exclusive create.
-      try {
-        await unlink(lockPath);
-      } catch {
-        return false;
-      }
-    }
-  }
-  return false;
 }
 
 export async function releaseFileLock(filePath: string, runId: string): Promise<boolean> {

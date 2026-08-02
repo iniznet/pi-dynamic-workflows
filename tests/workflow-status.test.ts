@@ -15,6 +15,7 @@ import {
   getWorkflowStatus,
   listRunningWorkflows,
   releaseFileLock,
+  renewFileLock,
 } from "../src/workflow-status.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -142,6 +143,89 @@ describe("file locking", () => {
         acquireFileLock("src/a.ts", "run-2", "task-2"),
       ]);
       assert.equal(results.filter(Boolean).length, 1);
+    }),
+  );
+
+  it(
+    "renewFileLock extends the TTL so a working holder is not reclaimed as stale",
+    withStatusEnv(async () => {
+      assert.equal(await acquireFileLock("src/a.ts", "run-1", "task-1", 80), true);
+      // Renew shortly before the original TTL would expire.
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(await renewFileLock("src/a.ts", "run-1", 5000), true);
+      // Wait past the ORIGINAL TTL: the renewed lock must still be live.
+      await new Promise((r) => setTimeout(r, 80));
+      const conflict = await checkFileConflict("src/a.ts");
+      assert.equal(conflict.locked, true, "renewed lock should outlive the original TTL");
+      assert.equal(conflict.runId, "run-1");
+      // A second acquire still refuses while the renewed lock is live.
+      assert.equal(await acquireFileLock("src/a.ts", "run-2", "task-2", 5000), false);
+    }),
+  );
+
+  it(
+    "renewFileLock refuses to renew a lock owned by a different runId",
+    withStatusEnv(async () => {
+      assert.equal(await acquireFileLock("src/a.ts", "run-1", "task-1", 5000), true);
+      assert.equal(await renewFileLock("src/a.ts", "run-2", 5000), false);
+      // The owner's lock is untouched.
+      const conflict = await checkFileConflict("src/a.ts");
+      assert.equal(conflict.locked, true);
+      assert.equal(conflict.runId, "run-1");
+    }),
+  );
+
+  it(
+    "renewFileLock fails cleanly when no lock exists",
+    withStatusEnv(async () => {
+      assert.equal(await renewFileLock("src/none.ts", "run-1", 5000), false);
+    }),
+  );
+
+  it(
+    "a bounded wait acquires the lock once a live holder releases it",
+    withStatusEnv(async () => {
+      assert.equal(await acquireFileLock("src/a.ts", "run-1", "task-1", 5000), true);
+      setTimeout(() => void releaseFileLock("src/a.ts", "run-1"), 120);
+      // With no wait budget the acquire fails fast against the live holder…
+      assert.equal(await acquireFileLock("src/a.ts", "run-2", "task-2", 5000), false);
+      // …but with a bounded wait it polls until the holder releases.
+      assert.equal(
+        await acquireFileLock("src/a.ts", "run-2", "task-2", 5000, { waitMs: 1000, pollIntervalMs: 20 }),
+        true,
+      );
+    }),
+  );
+
+  it(
+    "a bounded wait gives up when the live holder never releases",
+    withStatusEnv(async () => {
+      assert.equal(await acquireFileLock("src/a.ts", "run-1", "task-1", 5000), true);
+      const start = Date.now();
+      assert.equal(
+        await acquireFileLock("src/a.ts", "run-2", "task-2", 5000, { waitMs: 150, pollIntervalMs: 20 }),
+        false,
+        "must fail once the wait budget is exhausted",
+      );
+      assert.ok(Date.now() - start >= 120, "should actually wait, not fail instantly");
+      // The owner's lock survives the failed wait.
+      const conflict = await checkFileConflict("src/a.ts");
+      assert.equal(conflict.locked, true);
+      assert.equal(conflict.runId, "run-1");
+    }),
+  );
+
+  it(
+    "an expired lock is reclaimed by a bounded wait even when the holder never releases",
+    withStatusEnv(async () => {
+      assert.equal(await acquireFileLock("src/a.ts", "run-1", "task-1", 60), true);
+      assert.equal(
+        await acquireFileLock("src/a.ts", "run-2", "task-2", 5000, { waitMs: 2000, pollIntervalMs: 20 }),
+        true,
+        "stale (expired) holder should be reclaimed within the wait",
+      );
+      const conflict = await checkFileConflict("src/a.ts");
+      assert.equal(conflict.runId, "run-2", "the new owner holds the lock");
     }),
   );
 });

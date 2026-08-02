@@ -10,6 +10,20 @@ import { dirname, join } from "node:path";
 import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
+/**
+ * Named configuration error: a settings.json that is malformed JSON, has a
+ * mistyped/unknown key, or is missing a required key fails at load with this
+ * friendly, actionable message instead of surfacing as an opaque downstream
+ * TypeError (e.g. `.filter` on a non-array) or a silent `{}` that hides the
+ * user's misconfiguration.
+ */
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigError";
+  }
+}
+
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
@@ -51,6 +65,83 @@ export interface WorkflowSettings {
   excludeSubagentTools?: string[];
 }
 
+/** A runtime type tag for schema checks (distinguishes array/null from object). */
+type SettingsValueType = "string" | "number" | "boolean" | "object" | "array" | "null";
+
+function settingsTypeOf(value: unknown): SettingsValueType {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value as SettingsValueType;
+}
+
+/**
+ * Declared settings.json schema: known keys with their allowed types.
+ * Value-level normalization (ranges, enums, element filtering) stays lenient
+ * and drop-on-violation (see normalizeSettings); the schema enforces shape:
+ * unknown keys, wrong-typed values, and malformed files fail loudly.
+ */
+const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
+  keywordTriggerEnabled: ["boolean"],
+  keywordTriggerWord: ["string"],
+  defaultAgentTimeoutMs: ["number", "null"],
+  defaultTokenBudget: ["number", "null"],
+  defaultConcurrency: ["number"],
+  defaultAgentRetries: ["number"],
+  progressPanelMode: ["string"],
+  progressPanelMaxAgents: ["number"],
+  persistAgentSessions: ["boolean"],
+  deliveredResultMaxChars: ["number"],
+  excludeSubagentTools: ["array"],
+};
+
+/**
+ * Required settings keys. Every current setting is optional (an empty object
+ * is a valid settings file), so this is deliberately empty; it exists so a
+ * future required key is enforced here rather than silently defaulted.
+ */
+const REQUIRED_SETTINGS_KEYS: readonly string[] = [];
+
+/**
+ * Parse + validate a settings file against the declared schema. Throws
+ * ConfigError (with the file path) on malformed JSON, a non-object root, an
+ * unknown key, a missing required key, or a wrong-typed value.
+ */
+function parseSettingsFile(path: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf-8"));
+  } catch (error) {
+    throw new ConfigError(
+      `Workflow settings at ${path} are not valid JSON: ${error instanceof Error ? error.message : String(error)}.`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ConfigError(
+      `Workflow settings at ${path} must be a JSON object, got ${Array.isArray(parsed) ? "an array" : String(parsed)}.`,
+    );
+  }
+  const raw = parsed as Record<string, unknown>;
+  for (const key of REQUIRED_SETTINGS_KEYS) {
+    if (raw[key] === undefined) {
+      throw new ConfigError(`Workflow settings at ${path} is missing required key "${key}".`);
+    }
+  }
+  for (const key of Object.keys(raw)) {
+    const allowed = SETTINGS_SCHEMA[key];
+    if (!allowed) {
+      throw new ConfigError(
+        `Unknown key "${key}" in workflow settings at ${path}. Known keys: ${Object.keys(SETTINGS_SCHEMA).join(", ")}.`,
+      );
+    }
+    if (!allowed.includes(settingsTypeOf(raw[key]))) {
+      throw new ConfigError(
+        `Key "${key}" in workflow settings at ${path} must be ${allowed.join(" or ")}, got ${settingsTypeOf(raw[key])}.`,
+      );
+    }
+  }
+  return raw;
+}
+
 export interface WorkflowSettingsStore {
   load(): WorkflowSettings;
   save(settings: WorkflowSettings): void;
@@ -77,7 +168,12 @@ export function getWorkflowProjectSettingsPath(cwd: string): string {
   return workflowProjectPaths(cwd).settingsPath;
 }
 
-/** Load settings from disk. Missing, corrupt, or invalid files resolve to {}. */
+/**
+ * Load settings from disk. Missing files resolve to {}; a present file is
+ * validated against the declared schema — malformed JSON, unknown keys,
+ * wrong-typed values, or missing required keys throw a named ConfigError
+ * with the file path (see parseSettingsFile).
+ */
 export function loadWorkflowSettings(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettings {
   const options = normalizeOptions(settingsPathOrOptions);
   const globalSettings = readSettings(options.settingsPath ?? getWorkflowSettingsPath());
@@ -121,11 +217,9 @@ function normalizeOptions(settingsPathOrOptions?: string | WorkflowSettingsOptio
 
 function readSettings(path: string): WorkflowSettings {
   if (!existsSync(path)) return {};
-  try {
-    return normalizeSettings(JSON.parse(readFileSync(path, "utf-8")));
-  } catch {
-    return {};
-  }
+  // A malformed/mistyped/unknown-key settings file fails loudly with a named
+  // ConfigError (see parseSettingsFile) instead of silently resolving to {}.
+  return normalizeSettings(parseSettingsFile(path));
 }
 
 function normalizeSettings(value: unknown): WorkflowSettings {

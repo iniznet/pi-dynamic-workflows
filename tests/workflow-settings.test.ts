@@ -5,6 +5,7 @@ import { dirname, join, normalize } from "node:path";
 import { describe, it } from "node:test";
 import { WORKFLOW_SETTINGS_FILE } from "../src/config.js";
 import {
+  ConfigError,
   getWorkflowProjectSettingsPath,
   getWorkflowSettingsPath,
   loadWorkflowSettings,
@@ -52,9 +53,17 @@ describe("workflow settings", () => {
       writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord: "  pi-workflow  " }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), { keywordTriggerWord: "pi-workflow" });
 
-      for (const keywordTriggerWord of ["", "   ", "/workflow", "pi workflow", 42, false]) {
+      // String values that are invalid trigger words are dropped (still a
+      // string, so the type schema passes and value normalization drops them).
+      for (const keywordTriggerWord of ["", "   ", "/workflow", "pi workflow"]) {
         writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord }), "utf-8");
         assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+
+      // A non-string value is a schema violation and fails loudly.
+      for (const keywordTriggerWord of [42, false, null, ["x"]]) {
+        writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord }), "utf-8");
+        assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
       }
     });
   });
@@ -80,13 +89,14 @@ describe("workflow settings", () => {
       saveWorkflowSettings({ defaultTokenBudget: null }, settingsPath);
       assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultTokenBudget: null });
 
-      // Floats floor; zero/negative/garbage are dropped.
+      // Floats floor; zero/negative are dropped (numbers pass the type schema).
       writeFileSync(settingsPath, JSON.stringify({ defaultTokenBudget: 1000.9 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultTokenBudget: 1000 });
       writeFileSync(settingsPath, JSON.stringify({ defaultTokenBudget: 0 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      // A wrong-typed value fails the declared schema loudly.
       writeFileSync(settingsPath, JSON.stringify({ defaultTokenBudget: "lots" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
@@ -104,8 +114,9 @@ describe("workflow settings", () => {
       // An all-invalid (or empty) list yields no key at all.
       writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: [1, 2, ""] }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      // A non-array value violates the declared schema and fails loudly.
       writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: "nope" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
@@ -232,8 +243,9 @@ describe("workflow settings", () => {
       writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: 0 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 
+      // A string is a schema violation and fails loudly.
       writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: "8" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
@@ -249,18 +261,16 @@ describe("workflow settings", () => {
     });
   });
 
-  it("ignores non-boolean persistAgentSessions values", () => {
+  it("rejects non-boolean persistAgentSessions values with ConfigError", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
-      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: "true" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
-
-      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: 1 }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
-
-      writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions: null }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      // Wrong-typed values violate the declared schema: a named ConfigError,
+      // not a silent drop.
+      for (const persistAgentSessions of ["true", 1, null]) {
+        writeFileSync(settingsPath, JSON.stringify({ persistAgentSessions }), "utf-8");
+        assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+      }
     });
   });
 
@@ -277,8 +287,9 @@ describe("workflow settings", () => {
       writeFileSync(settingsPath, JSON.stringify({ deliveredResultMaxChars: 0 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 
+      // A string is a schema violation and fails loudly.
       writeFileSync(settingsPath, JSON.stringify({ deliveredResultMaxChars: "400" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
@@ -304,15 +315,38 @@ describe("workflow settings", () => {
     }
   });
 
-  it("ignores corrupt or invalid settings", () => {
+  it("a corrupted settings.json fails at load with ConfigError", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, "{not json", "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
 
+      // A JSON array (not an object) is not a valid settings document.
+      writeFileSync(settingsPath, JSON.stringify([1, 2]), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+    });
+  });
+
+  it("a wrong-typed settings value fails at load with ConfigError", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({ keywordTriggerEnabled: "off" }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+    });
+  });
 
+  it("an unknown settings key fails at load with ConfigError", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({ bogusKey: "x" }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+    });
+  });
+
+  it("in-range but semantically invalid numbers are dropped, not fatal", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      // Numbers pass the type schema; value normalization drops out-of-range ones.
       writeFileSync(settingsPath, JSON.stringify({ defaultAgentTimeoutMs: 0 }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 

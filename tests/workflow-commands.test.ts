@@ -527,6 +527,142 @@ test("/workflows save <name> <runId> warns when run has no script", async () => 
   assert.match(notified[0].message, /No run/, "should warn no script");
 });
 
+test("/workflows save validates the run's script before saving — malformed scripts are rejected, nothing is blocked", async () => {
+  const saved: Array<{ name: string; script: string }> = [];
+  let handler: any;
+  const storage: any = {
+    save: (w: any) => {
+      saved.push(w);
+      return { ...w, name: w.name };
+    },
+    list: () => saved,
+  };
+  const notified: Array<{ message: string; type?: string }> = [];
+  const { registerWorkflowCommands: reg4 } = await import("../src/workflow-commands.js");
+  reg4(
+    {
+      getCommands: () => [{ name: "xxx" }],
+      registerCommand: (_n: string, o: any) => {
+        handler = o.handler;
+      },
+      sendMessage: async () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+    } as unknown as ExtensionAPI,
+    {
+      listRuns: () => [
+        {
+          runId: "run-bad",
+          workflowName: "broken",
+          status: "completed",
+          script: "const notAWorkflow = 1",
+          args: undefined,
+          agents: [],
+          logs: [],
+        },
+      ],
+      getSnapshot: () => null,
+      getRun: () => undefined,
+      pause: () => false,
+      resume: async () => false,
+      stop: () => false,
+      deleteRun: () => false,
+    } as unknown as WorkflowManager,
+    { storage, cwd: "/tmp" },
+  );
+
+  assert.ok(handler);
+  await handler("save broken run-bad", {
+    ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) },
+  });
+  assert.equal(saved.length, 0, "a malformed script must not be persisted");
+  assert.ok(
+    notified.some((n) => n.type === "error" && n.message.includes("Cannot save")),
+    "should notify Cannot save",
+  );
+  assert.ok(
+    notified.some((n) => n.message.includes("first statement")),
+    "the validation error should name the concrete problem",
+  );
+});
+
+test("/workflows save derives the arg schema from the run's args and wires /name through the manager", async () => {
+  const saved: Array<{ name: string; parameters?: unknown }> = [];
+  const started: string[] = [];
+  const commands = new Map<string, { handler: (a: string, c: any) => Promise<void> }>();
+  const storage: any = {
+    save: (w: any) => {
+      saved.push(w);
+      return { ...w, name: w.name };
+    },
+    list: () => saved.map((w) => ({ name: w.name })),
+  };
+  const pi = {
+    getCommands: () => [...commands.keys()].map((name) => ({ name })),
+    registerCommand: (name: string, spec: any) => commands.set(name, spec),
+    sendMessage: async () => {},
+    getActiveTools: () => [],
+    setActiveTools: () => {},
+  };
+  const manager: any = {
+    listRuns: () => [
+      {
+        runId: "run-1",
+        workflowName: "scan",
+        status: "completed",
+        script: "export const meta = { name: 'scan', description: 'scan' }\nreturn 1",
+        args: { scope: "src/", depth: 2, verbose: true },
+        agents: [],
+        logs: [],
+      },
+    ],
+    getSnapshot: () => null,
+    getRun: () => undefined,
+    pause: () => false,
+    resume: async () => false,
+    stop: () => false,
+    deleteRun: () => false,
+    startInBackground: (script: string, args: unknown) => {
+      started.push(JSON.stringify({ script, args }));
+      return { runId: "new-run-1" };
+    },
+  };
+
+  const { registerWorkflowCommands: reg5 } = await import("../src/workflow-commands.js");
+  const notified: Array<{ message: string; type?: string }> = [];
+  reg5(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager, { storage, cwd: "/tmp" });
+
+  const ctx = { ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }) } };
+  const workflows = commands.get("workflows");
+  assert.ok(workflows, "/workflows command should be registered");
+  await workflows.handler("save scan run-1", ctx);
+
+  assert.equal(saved.length, 1, "should save exactly one workflow");
+  const parameters = saved[0].parameters as Record<string, { type: string; default: unknown }>;
+  assert.equal(parameters?.scope.type, "string");
+  assert.equal(parameters?.scope.default, "src/");
+  assert.equal(parameters?.depth.type, "integer");
+  assert.equal(parameters?.depth.default, 2);
+  assert.equal(parameters?.verbose.type, "boolean");
+  assert.equal(parameters?.verbose.default, true);
+
+  // The newly registered /scan command runs through the SHARED manager's
+  // background path (full execution parity) instead of the inline fallback.
+  assert.ok(commands.has("scan"), "the saved workflow should be registered as a command");
+  const scan = commands.get("scan");
+  assert.ok(scan, "/scan command should be registered");
+  await scan.handler("", ctx);
+  assert.equal(started.length, 1, "/scan should start through startInBackground");
+  assert.ok(
+    notified.some((n) => n.message.includes("new-run-1")),
+    "the background start notice should include the new run id",
+  );
+  const launch = JSON.parse(started[0]) as { script: string; args: Record<string, unknown> };
+  assert.match(launch.script, /name: 'scan'/);
+  assert.equal(launch.args.scope, "src/", "declared defaults replay the originating invocation");
+  assert.equal(launch.args.depth, 2);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // unknown subcommand
 // ═══════════════════════════════════════════════════════════════════════════

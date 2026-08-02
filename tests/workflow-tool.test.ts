@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
+import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
@@ -315,6 +316,21 @@ function deferredToolAgent() {
   };
 }
 
+/** Fake agent that hangs until its abort signal fires, then rejects. */
+function abortableToolAgent() {
+  return {
+    async run(_prompt: string, options?: { signal?: AbortSignal }) {
+      return new Promise((_resolve, reject) => {
+        if (options?.signal?.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    },
+  };
+}
+
 function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tool-"));
@@ -595,6 +611,238 @@ test(
           undefined,
         ),
       /cannot be combined with `resumeFromRunId`/,
+    );
+  }),
+);
+
+test(
+  "workflow tool: `name` cannot be combined with `script`",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "bad-combo-2",
+          { name: "deep-research", script: resumeToolScript, args: { question: "q" } },
+          undefined,
+          undefined,
+          undefined,
+        ),
+      /cannot be combined with `script`/,
+    );
+    // The rejected call must not have started any run.
+    assert.equal(manager.listRuns().length, 0);
+  }),
+);
+
+// ─── dryRun (validate without launching) ──────────────────────────────────────
+
+test(
+  "workflow tool: dryRun validates a script and launches no run",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "dry-1",
+      { script: resumeToolScript, dryRun: true },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { dryRun?: boolean; name?: string; phases?: string[] };
+    assert.equal(details.dryRun, true);
+    assert.equal(details.name, "resume_tool");
+    assert.deepEqual(details.phases, []);
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /validated/);
+    assert.equal(manager.listRuns().length, 0, "dryRun must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: dryRun validates a named workflow and launches no run",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "dry-2",
+      { name: "deep-research", args: { question: "what is pi?" }, dryRun: true },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { dryRun?: boolean; name?: string };
+    assert.equal(details.dryRun, true);
+    assert.equal(details.name, "deep_research");
+    assert.equal(manager.listRuns().length, 0, "dryRun must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: dryRun cannot be combined with resumeFromRunId",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "dry-3",
+          { script: resumeToolScript, dryRun: true, resumeFromRunId: "some-run" },
+          undefined,
+          undefined,
+          undefined,
+        ),
+      /dryRun.*resumeFromRunId|resumeFromRunId.*dryRun/,
+    );
+  }),
+);
+
+// ─── schema numeric bounds (reject malformed model calls early) ───────────────
+
+test("workflow tool schema bounds numeric parameters", () => {
+  const tool = createWorkflowTool();
+  const properties = (tool.parameters as { properties: Record<string, any> }).properties;
+
+  assert.equal(properties.maxAgents.minimum, 1);
+  assert.equal(properties.maxAgents.maximum, MAX_AGENTS_PER_RUN);
+  assert.equal(properties.concurrency.minimum, 1);
+  assert.equal(properties.concurrency.maximum, MAX_CONCURRENCY);
+  assert.equal(properties.agentRetries.minimum, 0);
+  assert.equal(properties.agentRetries.maximum, MAX_AGENT_RETRIES);
+  assert.equal(properties.agentTimeoutMs.minimum, 1);
+  assert.equal(properties.tokenBudget.minimum, 1);
+});
+
+// ─── saved workflows: typed args (coerce/validate against declared schema) ────
+
+const typedArgsScript = "export const meta = { name: 'typed_args', description: 'typed' }\nreturn 1";
+
+function saveTypedWorkflow(cwd: string) {
+  const storage = createWorkflowStorage(cwd);
+  storage.save({
+    name: "typed",
+    description: "typed args",
+    script: typedArgsScript,
+    parameters: {
+      count: { type: "integer", required: true, description: "how many" },
+      tag: { type: "string", default: "default-tag" },
+      verbose: { type: "boolean", default: false },
+    },
+    location: "project",
+  });
+  return storage;
+}
+
+test(
+  "workflow tool: a saved workflow coerces args against its declared parameter schema",
+  withToolTempCwd(async (cwd) => {
+    const storage = saveTypedWorkflow(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager, storage });
+
+    // CLI-ish string values are coerced to the declared types before launch.
+    const res = await tool.execute(
+      "typed-1",
+      { name: "typed", args: { count: "42", verbose: "true" } },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const runId = (res.details as { runId?: string }).runId;
+    assert.ok(runId, "run should start");
+    const run = manager.getRun(runId);
+    assert.deepEqual(run?.args, { count: 42, tag: "default-tag", verbose: true });
+    await new Promise((r) => setTimeout(r, 50));
+  }),
+);
+
+test(
+  "workflow tool: a saved workflow's missing required arg fails before launch",
+  withToolTempCwd(async (cwd) => {
+    const storage = saveTypedWorkflow(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager, storage });
+    await assert.rejects(
+      () => tool.execute("typed-2", { name: "typed", args: {} }, undefined, undefined, undefined),
+      /Missing required argument: count/,
+    );
+    assert.equal(manager.listRuns().length, 0, "validation failure must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: a saved workflow's mistyped arg fails before launch",
+  withToolTempCwd(async (cwd) => {
+    const storage = saveTypedWorkflow(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager, storage });
+    await assert.rejects(
+      () =>
+        tool.execute("typed-3", { name: "typed", args: { count: "not-a-number" } }, undefined, undefined, undefined),
+      /args\.count must be an integer/,
+    );
+    assert.equal(manager.listRuns().length, 0, "validation failure must not create a run");
+  }),
+);
+
+// ─── background: false — synchronous (blocking) execute path ──────────────────
+
+const noAgentScript = "export const meta = { name: 'no_agents', description: 'none' }\nreturn { ok: true }";
+
+test(
+  "workflow tool: background:false runs synchronously and returns the blocking result",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "sync-1",
+      { script: resumeToolScript, background: false },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { runId?: string; agentCount?: number; result?: unknown };
+    assert.ok(details.runId, "sync run should produce a run id");
+    assert.equal(details.agentCount, 1, "the blocking result reports the agent count");
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /completed with \*\*1\*\* agent/);
+    const runId = details.runId;
+    assert.ok(runId);
+    assert.equal(manager.getRun(runId)?.status, "completed", "sync run is tracked and completes");
+  }),
+);
+
+test(
+  "workflow tool: background:false aborts when the external signal aborts",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: abortableToolAgent() });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const controller = new AbortController();
+    const execution = tool.execute(
+      "sync-2",
+      { script: resumeToolScript, background: false },
+      controller.signal,
+      undefined,
+      undefined,
+    );
+    setTimeout(() => controller.abort(), 30);
+    await assert.rejects(() => execution, /Workflow was aborted/);
+  }),
+);
+
+test(
+  "workflow tool: background:false throws when the workflow never calls agent()",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("sync-3", { script: noAgentScript, background: false }, undefined, undefined, undefined),
+      /must call agent\(\) at least once/,
     );
   }),
 );
