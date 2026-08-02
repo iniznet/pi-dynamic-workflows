@@ -76,14 +76,11 @@ const DEFAULT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
  */
 export function parseResetHintMs(hint?: string, now: number = Date.now()): number | undefined {
   if (!hint) return undefined;
-  // Absolute-timestamp form: "resets at 2025-01-15T03:00:00Z" (with optional
-  // fraction and timezone offset, or a bare YYYY-MM-DD date). Date.parse of the
-  // surrounding prose would fail, so extract the timestamp first.
-  const isoMatch = hint.match(/\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?/);
-  if (isoMatch) {
-    const timestamp = Date.parse(isoMatch[0]);
-    if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
-  }
+  // Relative form FIRST: a hint like "resets in 1h30m — next window 2025-01-15"
+  // contains an incidental date substring that the ISO branch below would
+  // otherwise seize on (anchoring on the first ISO match), misparsing a 90m
+  // relative delay as an absolute timestamp. Run the (number, unit) parser and
+  // only fall back to ISO when NO relative pairs are present.
   // No trailing \b: combined forms like "1h30m" have a digit right after the
   // unit letter, which is itself a word character, so \b would never match
   // there. A negative lookahead for another letter is the correct boundary —
@@ -103,7 +100,17 @@ export function parseResetHintMs(hint?: string, now: number = Date.now()): numbe
     else if (unit.startsWith("m")) totalMs += value * 60_000;
     else if (unit.startsWith("s")) totalMs += value * 1_000;
   }
-  return found ? totalMs : undefined;
+  if (found) return totalMs;
+  // Absolute-timestamp form: "resets at 2025-01-15T03:00:00Z" (with optional
+  // fraction and timezone offset, or a bare YYYY-MM-DD date). Reached only when
+  // no (number, unit) relative pairs were found, so a relative hint that also
+  // carries a date substring is never misclassified as absolute.
+  const isoMatch = hint.match(/\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?/);
+  if (isoMatch) {
+    const timestamp = Date.parse(isoMatch[0]);
+    if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
+  }
+  return undefined;
 }
 
 export interface AutoResumeDelayParams {

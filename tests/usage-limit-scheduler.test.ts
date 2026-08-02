@@ -169,6 +169,13 @@ test("parseResetHintMs: classifyProviderLimit ISO wiring (tests-coverage:f2)", (
   assert.equal(delay, 3 * 3_600_000);
 });
 
+test("parseResetHintMs: relative hint with an incidental date token is parsed as relative (i5 precedence)", () => {
+  // A relative delay that incidentally contains an ISO date substring must NOT
+  // be misparsed as an absolute timestamp (which would collapse to a stale 0).
+  assert.equal(parseResetHintMs("resets in 1h30m — next window 2025-01-15T03:00:00Z"), 3_600_000 + 30 * 60_000);
+  assert.equal(parseResetHintMs("in 5m (window 2025-01-15)"), 5 * 60_000);
+});
+
 // ---- computeAutoResumeDelayMs --------------------------------------------------
 
 test("computeAutoResumeDelayMs: delay floor is enforced", () => {
