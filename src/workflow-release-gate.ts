@@ -10,12 +10,12 @@ import {
   WorkflowReleaseDiagnosticCode,
 } from "./enums.js";
 import {
+  readLf,
   WORKFLOW_AUTHORING_COVERAGE,
   WORKFLOW_AUTHORING_FROZEN_FILES,
   WORKFLOW_AUTHORING_PATTERN_IDS,
   WORKFLOW_AUTHORING_RECIPE_IDS,
   WORKFLOW_COMPREHENSION_SCENARIO_IDS,
-  readLf,
   type WorkflowAuthoringCoverageEntry,
 } from "./workflow-authoring-coverage.js";
 import {
@@ -427,9 +427,7 @@ export function renderWorkflowGuidanceBaseline(root: string): string {
       (name) => `${SKILL_ROOT}/references/${name}.md`,
     ),
   ];
-  const detailed = detailedPaths
-    .map((path) => `${path}\n${readLf(join(root, path))}`)
-    .join("\n");
+  const detailed = detailedPaths.map((path) => `${path}\n${readLf(join(root, path))}`).join("\n");
   return `${JSON.stringify(
     {
       formatVersion: 1,

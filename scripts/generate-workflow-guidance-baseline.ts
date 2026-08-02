@@ -14,9 +14,7 @@ if (check) {
   if (!existsSync(absolute)) {
     console.error(`Missing workflow guidance baseline: ${WORKFLOW_GUIDANCE_BASELINE_PATH}`);
     process.exitCode = 1;
-  } else if (
-    readFileSync(absolute, "utf8").replace(/\r\n/g, "\n") !== renderWorkflowGuidanceBaseline(root)
-  ) {
+  } else if (readFileSync(absolute, "utf8").replace(/\r\n/g, "\n") !== renderWorkflowGuidanceBaseline(root)) {
     console.error(`Non-contractual workflow prose drift: ${WORKFLOW_GUIDANCE_BASELINE_PATH}`);
     process.exitCode = 1;
   } else {

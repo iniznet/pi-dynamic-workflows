@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readLf } from "./workflow-authoring-coverage.js";
 import {
@@ -113,7 +113,12 @@ export function checkWorkflowCapabilityPublications(
 ): string[] {
   const stale: string[] = [];
   for (const path of CAPABILITY_TABLE_PUBLICATION_PATHS) {
-    const actual = normalizeLf(overrides[path] ?? readFileSync(join(root, path), "utf8"));
+    const absolute = join(root, path);
+    if (!existsSync(absolute)) {
+      stale.push(path);
+      continue;
+    }
+    const actual = normalizeLf(overrides[path] ?? readFileSync(absolute, "utf8"));
     if (path === CAPABILITY_INDEX_PATH) {
       if (actual !== renderWorkflowCapabilityReference()) stale.push(path);
       continue;
@@ -121,8 +126,11 @@ export function checkWorkflowCapabilityPublications(
     const refreshed = replaceSupportedCapabilityTable(actual);
     if (refreshed === null || refreshed !== actual) stale.push(path);
   }
-  const details = normalizeLf(overrides[CAPABILITY_DETAIL_PATH] ?? readFileSync(join(root, CAPABILITY_DETAIL_PATH), "utf8"));
-  if (details !== renderWorkflowCapabilityDetails()) stale.push(CAPABILITY_DETAIL_PATH);
+  const detailsAbsolute = join(root, CAPABILITY_DETAIL_PATH);
+  const details = existsSync(detailsAbsolute)
+    ? normalizeLf(overrides[CAPABILITY_DETAIL_PATH] ?? readFileSync(detailsAbsolute, "utf8"))
+    : null;
+  if (details === null || details !== renderWorkflowCapabilityDetails()) stale.push(CAPABILITY_DETAIL_PATH);
   return stale;
 }
 
