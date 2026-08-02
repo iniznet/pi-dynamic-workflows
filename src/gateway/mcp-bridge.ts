@@ -195,10 +195,7 @@ export class MCPBridge {
             // Best-effort: some platforms may not expose chmod on sockets.
             // Surface it once so a permissions regression on the socket
             // capability stays observable rather than failing silently.
-            console.warn(
-              '[MCPBridge] socket chmod 0o600 failed:',
-              (e as Error).message,
-            );
+            console.warn("[MCPBridge] socket chmod 0o600 failed:", (e as Error).message);
           }
         }
         this.installCleanupHandlers();
