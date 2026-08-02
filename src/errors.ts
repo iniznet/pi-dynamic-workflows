@@ -61,6 +61,21 @@ export enum WorkflowErrorCode {
   PERSISTENCE_ERROR = "PERSISTENCE_ERROR",
   /** Unknown error. */
   UNKNOWN = "UNKNOWN",
+  /**
+   * Attempted a non-forward phase transition (numeric value keeps the legacy
+   * `PHASE_TRANSITION_INVALID` constant from phases/state-machine.ts in sync).
+   */
+  PHASE_TRANSITION_INVALID = -31001,
+  /**
+   * Subagent spawn blocked because Phase 3 or human approval not reached
+   * (legacy numeric alias `SUBAGENT_SPAWN_BLOCKED`).
+   */
+  SUBAGENT_SPAWN_BLOCKED = -31002,
+  /**
+   * Human approval required before the requested action is allowed (legacy
+   * numeric alias `APPROVAL_REQUIRED`).
+   */
+  APPROVAL_REQUIRED = -31003,
 }
 
 /** Classified workflow failure with recoverability and optional agent/provider context. */
@@ -157,7 +172,8 @@ export function isAbortError(error: unknown): boolean {
 /** Recognize timeout-like errors by name or message. */
 export function isTimeoutError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /\btimeout\b/i.test(error.message) || error.name === "TimeoutError";
+  // Matches both "request timeout" and the common "request timed out" phrasing.
+  return /\b(timeout|timed out)\b/i.test(error.message) || error.name === "TimeoutError";
 }
 
 /**

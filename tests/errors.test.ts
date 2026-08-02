@@ -67,6 +67,36 @@ describe("wrapError provider-limit classification", () => {
   });
 });
 
+describe("wrapError abort/timeout classification", () => {
+  it("classifies abort-like errors as WORKFLOW_ABORTED (recoverable, no agent label)", () => {
+    const e = wrapError(new Error("The operation was aborted."));
+    assert.equal(e.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(e.recoverable, true);
+    assert.match(e.message, /aborted/i);
+    assert.equal(e.agentLabel, undefined);
+  });
+
+  it("classifies timeout errors as AGENT_TIMEOUT and passes the agent label through", () => {
+    const e = wrapError(new Error("request timed out after 30s"), { agentLabel: "research-agent" });
+    assert.equal(e.code, WorkflowErrorCode.AGENT_TIMEOUT);
+    assert.equal(e.recoverable, true);
+    assert.equal(e.agentLabel, "research-agent");
+    assert.match(e.message, /timed out/i);
+  });
+
+  it("classifies a timeout by error name as well (TimeoutError)", () => {
+    const err = new Error("socket closed");
+    err.name = "TimeoutError";
+    const e = wrapError(err);
+    assert.equal(e.code, WorkflowErrorCode.AGENT_TIMEOUT);
+  });
+
+  it("does not classify non-Error abort-ish values as aborts", () => {
+    const e = wrapError({ message: "aborted" });
+    assert.equal(e.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  });
+});
+
 describe("isProviderUsageLimit", () => {
   it("is true only for a PROVIDER_USAGE_LIMIT WorkflowError", () => {
     assert.equal(
