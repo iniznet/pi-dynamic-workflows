@@ -44,17 +44,19 @@ function withTempCwd(fn: (cwd: string) => void) {
 
 // ─── Registry shape ─────────────────────────────────────────────────────────────
 
-test("BUILTIN_WORKFLOW_NAMES lists exactly the 5 curated patterns", () => {
+test("BUILTIN_WORKFLOW_NAMES lists exactly the 7 curated patterns", () => {
   assert.deepEqual([...BUILTIN_WORKFLOW_NAMES].sort(), [
     "adversarial-review",
     "code-review",
     "codebase-audit",
     "deep-research",
     "multi-perspective",
+    "plan-then-execute",
+    "spec-generation",
   ]);
 });
 
-test("findBuiltinWorkflow resolves each of the 5 names and rejects unknown names", () => {
+test("findBuiltinWorkflow resolves each of the 7 names and rejects unknown names", () => {
   for (const name of BUILTIN_WORKFLOW_NAMES) {
     assert.ok(findBuiltinWorkflow(name), `${name} should be found`);
   }
@@ -188,6 +190,8 @@ test("every built-in pattern's resolve() output is a parseable workflow script",
     "code-review": { diff: "d" },
     "multi-perspective": { topic: "t" },
     "codebase-audit": { scope: "s", checks: ["c"] },
+    "plan-then-execute": { objective: "o" },
+    "spec-generation": { topic: "t" },
   };
   for (const descriptor of BUILTIN_WORKFLOWS) {
     const { script } = descriptor.resolve("/tmp", validArgsByName[descriptor.name]);

@@ -1,7 +1,7 @@
 /**
- * Shared registry of the 5 curated built-in workflow patterns
+ * Shared registry of the 7 curated built-in workflow patterns
  * (`deep-research`, `adversarial-review`, `code-review`, `multi-perspective`,
- * `codebase-audit`).
+ * `codebase-audit`, `plan-then-execute`, `spec-generation`).
  *
  * This is the single place that turns a pattern's name + caller-supplied args
  * into a runnable script (and, where a pattern needs it, an exec context such
@@ -22,6 +22,8 @@ import {
 } from "./builtin-args.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
+import { generatePlanThenExecuteWorkflow, PLAN_THEN_EXECUTE_NUMERIC_ARGS } from "./plan-then-execute.js";
+import { generateSpecGenerationWorkflow, SPEC_GENERATION_FORMATS } from "./spec-generation.js";
 import { createWebTools } from "./web-tools.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 
@@ -69,7 +71,7 @@ function requireStringArray(value: unknown, argName: string, patternName: string
   return value;
 }
 
-/** The 5 curated built-in workflow patterns, keyed by their stable name. */
+/** The 7 curated built-in workflow patterns, keyed by their stable name. */
 export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "deep-research",
@@ -106,7 +108,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "code-review",
     description:
-      "Multi-angle parallel code review: 7 specialized finders (correctness, reuse, simplification, efficiency, altitude) + verify pass → ranked findings. args: { diff: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number }.",
+      "Multi-angle parallel code review: 8 specialized finders (correctness, removed-behavior, call-site, reuse, simplification, efficiency, altitude, security) + verify pass → ranked findings. args: { diff: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number }.",
     resolve(_cwd, args) {
       const record = asRecord(args);
       // Truncation past MAX_DIFF_CHARS already happens inside the generated
@@ -141,6 +143,49 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
       const scope = requireNonEmptyString(record.scope, "scope", "codebase-audit");
       const checks = requireStringArray(record.checks, "checks", "codebase-audit");
       return { script: generateCodebaseAuditWorkflow(scope, checks) };
+    },
+  },
+  {
+    name: "plan-then-execute",
+    description:
+      "Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute each step. args: { objective: string, context?: string, maxSteps?: number, execute?: boolean }.",
+    resolve(_cwd, args) {
+      const record = asRecord(args);
+      requireNonEmptyString(record.objective, "objective", "plan-then-execute");
+      validateNumericArgs(record, PLAN_THEN_EXECUTE_NUMERIC_ARGS, "plan-then-execute");
+      // Optional string/boolean args are type-checked here (loud pre-run failure)
+      // and the generated script re-checks the strings at runtime; the boolean
+      // is read with `=== true` so a present falsy value never becomes a truthy
+      // default (same class of bug the numeric-arg coercion exists to prevent).
+      if (record.context !== undefined && typeof record.context !== "string") {
+        throw new Error(`Built-in workflow "plan-then-execute" requires args.context to be a string when present.`);
+      }
+      if (record.execute !== undefined && typeof record.execute !== "boolean") {
+        throw new Error(`Built-in workflow "plan-then-execute" requires args.execute to be a boolean when present.`);
+      }
+      return { script: generatePlanThenExecuteWorkflow() };
+    },
+  },
+  {
+    name: "spec-generation",
+    description:
+      'Draft a specification from product/technical/risk perspectives, then adversarially review into a structured artifact. args: { topic: string, audience?: string, format?: "markdown" | "json" }.',
+    resolve(_cwd, args) {
+      const record = asRecord(args);
+      requireNonEmptyString(record.topic, "topic", "spec-generation");
+      if (record.audience !== undefined && typeof record.audience !== "string") {
+        throw new Error(`Built-in workflow "spec-generation" requires args.audience to be a string when present.`);
+      }
+      if (
+        record.format !== undefined &&
+        (typeof record.format !== "string" ||
+          !SPEC_GENERATION_FORMATS.includes(record.format as (typeof SPEC_GENERATION_FORMATS)[number]))
+      ) {
+        throw new Error(
+          `Built-in workflow "spec-generation" requires args.format to be one of: ${SPEC_GENERATION_FORMATS.join(", ")}.`,
+        );
+      }
+      return { script: generateSpecGenerationWorkflow() };
     },
   },
 ];
