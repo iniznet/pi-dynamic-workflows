@@ -20,6 +20,7 @@ import {
   type DecisionMap,
   dispatchTicketResearch,
   type FrontierMapper,
+  findCycle,
   getNextAction,
   getSessionTicket,
   loadDecisionMap,
@@ -208,7 +209,8 @@ describe("ticket lifecycle: blocking, resolve, next-action", () => {
     );
     assert.deepEqual(getNextAction(allResolved), { action: "proceed" });
 
-    // degenerate guard: a blocking cycle leaves only blocked tickets
+    // Invariant enforcement: a back-edge that would close a cycle is refused,
+    // so the graph can never self-lock into an all-blocked dead end.
     const mapper: FrontierMapper = () => ({
       rootQuestion: "x",
       tickets: [
@@ -217,8 +219,12 @@ describe("ticket lifecycle: blocking, resolve, next-action", () => {
       ],
     });
     const mapped = await createDecisionMap("x", { mapper });
-    const cyclic = blockTicket(blockTicket(mapped, "t1", "t2"), "t2", "t1");
-    assert.deepEqual(getNextAction(cyclic), { action: "blocked" });
+    const linked = blockTicket(mapped, "t1", "t2");
+    const refused = blockTicket(linked, "t2", "t1");
+    assert.equal(findCycle(refused), null, "the graph stays acyclic after the refused back-edge");
+    assert.deepEqual(refused.tickets.find((t) => t.id === "t1")?.blocks, ["t2"]);
+    assert.deepEqual(refused.tickets.find((t) => t.id === "t2")?.blocks, []);
+    assert.deepEqual(getNextAction(refused), { action: "resolve-task", ticketId: "t1" });
   });
 
   it("blockTicket/unblockTicket add and remove parent-child edges", async () => {
@@ -361,6 +367,223 @@ describe("decision map persistence", () => {
     const { mkdir } = await import("node:fs/promises");
     await mkdir(mapDir, { recursive: true });
     await writeFile(join(mapDir, "map.json"), "{not json", "utf-8");
+    assert.equal(await loadDecisionMap(dir), null);
+  });
+});
+
+describe("decision map invariants (acyclic blocking graph)", () => {
+  async function twoTicketMap(): Promise<DecisionMap> {
+    const mapper: FrontierMapper = () => ({
+      rootQuestion: "x",
+      tickets: [
+        { id: "a", type: TicketType.TASK, title: "A", description: "a" },
+        { id: "b", type: TicketType.TASK, title: "B", description: "b" },
+      ],
+    });
+    return createDecisionMap("x", { mapper });
+  }
+
+  it("findCycle reports null for an acyclic graph", async () => {
+    const map = await twoTicketMap();
+    assert.equal(findCycle(map), null);
+    const linked = blockTicket(map, "a", "b");
+    assert.equal(findCycle(linked), null);
+  });
+
+  it("findCycle detects a hand-built blocking cycle (t1 -> t2 -> t1)", () => {
+    const cycle: DecisionMap = {
+      rootQuestion: "x",
+      tickets: [
+        { id: "t1", type: TicketType.TASK, title: "A", description: "a", blocks: ["t2"] },
+        { id: "t2", type: TicketType.TASK, title: "B", description: "b", blocks: ["t1"] },
+      ],
+    };
+    assert.deepEqual(findCycle(cycle), ["t1", "t2", "t1"]);
+  });
+
+  it("findCycle detects a self-blocking ticket", () => {
+    const selfBlocked: DecisionMap = {
+      rootQuestion: "x",
+      tickets: [{ id: "t1", type: TicketType.TASK, title: "A", description: "a", blocks: ["t1"] }],
+    };
+    assert.deepEqual(findCycle(selfBlocked), ["t1", "t1"]);
+  });
+
+  it("blockTicket refuses an edge that would close a cycle", async () => {
+    const map = await twoTicketMap();
+    const linked = blockTicket(map, "a", "b");
+    const refused = blockTicket(linked, "b", "a");
+    assert.deepEqual(refused, linked, "the cycle-closing edge is a no-op");
+    assert.equal(findCycle(refused), null);
+  });
+
+  it("materializeMap breaks a mapper-supplied cycle by cutting one back-edge", async () => {
+    const mapper: FrontierMapper = () => ({
+      rootQuestion: "x",
+      tickets: [
+        { id: "a", type: TicketType.TASK, title: "A", description: "a", blocks: ["b"], blockedBy: ["b"] },
+        { id: "b", type: TicketType.TASK, title: "B", description: "b", blocks: ["a"], blockedBy: ["a"] },
+      ],
+    });
+    const map = await createDecisionMap("x", { mapper });
+    assert.equal(findCycle(map), null, "the materialized map must be acyclic");
+    const a = map.tickets.find((t) => t.id === "a");
+    const b = map.tickets.find((t) => t.id === "b");
+    assert.ok(a && b);
+    assert.ok(a.blocks.includes("b") !== b.blocks.includes("a"), "exactly one direction of the broken cycle survives");
+    assert.ok(
+      a.blocks.includes("b") === a.blockedBy.includes("b") || a.blockedBy.length === 0,
+      "edges stay reconciled after cycle breaking",
+    );
+  });
+
+  it("recomputeStatuses never reverts a resolved ticket to blocked (f4)", async () => {
+    const map = await twoTicketMap();
+    const resolved = resolveTicket(map, "a", "shipped");
+    assert.equal(resolved.tickets.find((t) => t.id === "a")?.status, "resolved");
+
+    // A NEW blocker appearing after the resolution must not re-block it.
+    const reblocked = blockTicket(resolved, "b", "a");
+    assert.equal(
+      reblocked.tickets.find((t) => t.id === "a")?.status,
+      "resolved",
+      "a resolved ticket survives a new blocker",
+    );
+
+    // Resolving a ticket whose blocker is unresolved must not be reverted
+    // by the status recomputation that follows.
+    const blocked = blockTicket(map, "b", "a");
+    const forced = resolveTicket(blocked, "a", "done");
+    assert.equal(
+      forced.tickets.find((t) => t.id === "a")?.status,
+      "resolved",
+      "resolveTicket's resolution is preserved by recomputeStatuses",
+    );
+  });
+});
+
+describe("sidecar normalization (i4)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "wayfinder-sidecar-"));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it("degrades a hand-edited sidecar to defaults instead of throwing", async () => {
+    const mapDir = join(dir, ".pi", "workflows");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(mapDir, { recursive: true });
+    await writeFile(
+      join(mapDir, "map.json"),
+      JSON.stringify({
+        rootQuestion: "x",
+        tickets: [
+          {
+            id: "a",
+            title: "A",
+            description: "d",
+            type: "bogus",
+            status: "bogus",
+            claims: "not-an-array",
+            blocks: "x",
+            blockedBy: { nope: true },
+            createdAt: "not-a-date",
+            updatedAt: "also-bad",
+          },
+          {
+            id: "b",
+            type: "task",
+            title: "B",
+            description: "d",
+            status: "resolved",
+            resolution: "done",
+            claims: [{ statement: "s", source: "bogus" }],
+          },
+        ],
+        updatedAt: "garbage",
+      }),
+      "utf-8",
+    );
+    const map = await loadDecisionMap(dir);
+    assert.ok(map, "a structurally valid but garbage-typed sidecar loads");
+
+    const a = map.tickets.find((t) => t.id === "a");
+    assert.ok(a);
+    assert.equal(a.type, TicketType.TASK, "invalid type degrades to TASK");
+    assert.equal(a.status, "open", "invalid status degrades to open");
+    assert.deepEqual(a.claims, [], "non-array claims degrade to []");
+    assert.deepEqual(a.blocks, [], "non-array blocks degrade to []");
+    assert.deepEqual(a.blockedBy, [], "non-array blockedBy degrades to []");
+    assert.ok(!Number.isNaN(Date.parse(a.createdAt)), "garbage timestamps degrade to parseable ones");
+
+    const b = map.tickets.find((t) => t.id === "b");
+    assert.ok(b);
+    assert.equal(b.status, "resolved", "a valid resolved status is preserved");
+    assert.deepEqual(b.claims, [{ statement: "s", source: "assumption" }], "invalid claim source degrades");
+    assert.ok(!Number.isNaN(Date.parse(map.updatedAt)));
+  });
+
+  it("breaks a blocking cycle in a hand-edited sidecar", async () => {
+    const mapDir = join(dir, ".pi", "workflows");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(mapDir, { recursive: true });
+    await writeFile(
+      join(mapDir, "map.json"),
+      JSON.stringify({
+        rootQuestion: "x",
+        tickets: [
+          { id: "t1", type: "task", title: "A", description: "a", blocks: ["t2"], blockedBy: ["t2"] },
+          { id: "t2", type: "task", title: "B", description: "b", blocks: ["t1"], blockedBy: ["t1"] },
+        ],
+      }),
+      "utf-8",
+    );
+    const map = await loadDecisionMap(dir);
+    assert.ok(map);
+    assert.equal(findCycle(map), null, "a hand-edited cycle cannot survive loading");
+  });
+
+  it("drops dangling edges and duplicate ids from a hand-edited sidecar", async () => {
+    const mapDir = join(dir, ".pi", "workflows");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(mapDir, { recursive: true });
+    await writeFile(
+      join(mapDir, "map.json"),
+      JSON.stringify({
+        rootQuestion: "x",
+        tickets: [
+          { id: "t1", type: "task", title: "A", description: "a", blocks: ["ghost"], blockedBy: ["ghost"] },
+          { id: "t1", type: "task", title: "duplicate", description: "dropped" },
+          { id: "t2", type: "task", title: "B", description: "b", blockedBy: ["t1"] },
+        ],
+      }),
+      "utf-8",
+    );
+    const map = await loadDecisionMap(dir);
+    assert.ok(map);
+    assert.deepEqual(
+      map.tickets.map((t) => t.id),
+      ["t1", "t2"],
+      "duplicate id is dropped",
+    );
+    const t1 = map.tickets.find((t) => t.id === "t1");
+    assert.ok(t1);
+    assert.deepEqual(t1.blocks, ["t2"], "dangling ghost edge is dropped; mirror edge is reconciled");
+    assert.deepEqual(t1.blockedBy, []);
+    const t2 = map.tickets.find((t) => t.id === "t2");
+    assert.ok(t2);
+    assert.deepEqual(t2.blockedBy, ["t1"], "edges to surviving tickets are kept");
+  });
+
+  it("returns null for a sidecar whose tickets are not an array", async () => {
+    const mapDir = join(dir, ".pi", "workflows");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(mapDir, { recursive: true });
+    await writeFile(join(mapDir, "map.json"), JSON.stringify({ rootQuestion: "x", tickets: "nope" }), "utf-8");
     assert.equal(await loadDecisionMap(dir), null);
   });
 });

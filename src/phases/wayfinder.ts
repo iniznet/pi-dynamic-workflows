@@ -292,32 +292,21 @@ function materializeMap(mapping: FrontierMapping): DecisionMap {
   const tickets: DecisionTicket[] = mapping.tickets.map((raw) => {
     const ticket: DecisionTicket = {
       id: raw.id ?? randomUUID(),
-      type: raw.type,
-      title: raw.title,
-      description: raw.description,
+      type: normalizeTicketType(raw.type),
+      title: raw.title ?? "",
+      description: raw.description ?? "",
       status: "open",
       claims: normalizeClaims(raw.claims),
-      blocks: (raw.blocks ?? []).filter((id) => knownIds.has(id)),
-      blockedBy: (raw.blockedBy ?? []).filter((id) => knownIds.has(id)),
+      blocks: asStringArray(raw.blocks).filter((id) => knownIds.has(id)),
+      blockedBy: asStringArray(raw.blockedBy).filter((id) => knownIds.has(id)),
       createdAt: now,
       updatedAt: now,
     };
     if (raw.question !== undefined) ticket.question = raw.question;
     return ticket;
   });
-  // Reconcile edges so a mapper declaring only one direction still yields a
-  // fully linked parent/child graph (blocks <=> blockedBy stay in sync).
-  const byId = new Map(tickets.map((t) => [t.id, t]));
-  for (const ticket of tickets) {
-    for (const parentId of ticket.blockedBy) {
-      const parent = byId.get(parentId);
-      if (parent && !parent.blocks.includes(ticket.id)) parent.blocks.push(ticket.id);
-    }
-    for (const childId of ticket.blocks) {
-      const child = byId.get(childId);
-      if (child && !child.blockedBy.includes(ticket.id)) child.blockedBy.push(ticket.id);
-    }
-  }
+  reconcileEdges(tickets);
+  breakCycles({ tickets });
   const map: DecisionMap = { tickets, rootQuestion: mapping.rootQuestion, updatedAt: now };
   recomputeStatuses(map);
   return finalize(map);
@@ -356,6 +345,10 @@ export function blockTicket(map: DecisionMap, blockerId: string, blockedId: stri
   const blocker = result.tickets.find((t) => t.id === blockerId);
   const blocked = result.tickets.find((t) => t.id === blockedId);
   if (!blocker || !blocked || blocker.id === blocked.id) return map;
+  // Invariant (i5): the blocking graph must stay acyclic. Adding blocker ->
+  // blocked is refused when blocked already reaches blocker, because that
+  // would close a cycle and let the decision graph self-lock.
+  if (canReachTicket(result.tickets, blockedId, blockerId)) return map;
   if (!blocker.blocks.includes(blockedId)) blocker.blocks.push(blockedId);
   if (!blocked.blockedBy.includes(blockerId)) blocked.blockedBy.push(blockerId);
   recomputeStatuses(result);
@@ -487,10 +480,70 @@ export async function saveDecisionMap(map: DecisionMap, dir: string): Promise<vo
 export async function loadDecisionMap(dir: string): Promise<DecisionMap | null> {
   try {
     const data = await readFile(join(dir, ".pi", "workflows", SIDECAR_FILE_NAME), "utf-8");
-    return JSON.parse(data) as DecisionMap;
+    return normalizeDecisionMap(JSON.parse(data));
   } catch {
     return null;
   }
+}
+
+/**
+ * Normalize a parsed sidecar blob into a structurally valid DecisionMap.
+ *
+ * Stale or hand-edited sidecars degrade to defaults (invalid statuses/types
+ * reset, non-array lists become empty, garbage timestamps are replaced)
+ * instead of throwing TypeErrors downstream; dangling edges are dropped,
+ * blocking cycles are broken, and statuses/nextTicket are recomputed so the
+ * loaded graph can never self-lock. Returns null for a fundamentally
+ * unrecognizable shape (non-object, missing tickets array).
+ */
+export function normalizeDecisionMap(value: unknown): DecisionMap | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (!Array.isArray(raw.tickets)) return null;
+
+  const now = new Date().toISOString();
+  const asString = (v: unknown, fallback: string): string => (typeof v === "string" ? v : fallback);
+  const asTimestamp = (v: unknown): string => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? v : now);
+
+  const knownIds = new Set<string>();
+  const tickets: DecisionTicket[] = [];
+  for (const entry of raw.tickets) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+    const t = entry as Record<string, unknown>;
+    const id = typeof t.id === "string" ? t.id : "";
+    if (!id || knownIds.has(id)) continue; // ids are unique identifiers; duplicates drop
+    knownIds.add(id);
+    const ticket: DecisionTicket = {
+      id,
+      type: normalizeTicketType(t.type),
+      title: asString(t.title, ""),
+      description: asString(t.description, ""),
+      status: normalizeTicketStatus(t.status),
+      claims: normalizeClaims(t.claims),
+      blocks: asStringArray(t.blocks).filter((b) => knownIds.has(b)),
+      blockedBy: asStringArray(t.blockedBy).filter((b) => knownIds.has(b)),
+      createdAt: asTimestamp(t.createdAt),
+      updatedAt: asTimestamp(t.updatedAt),
+    };
+    if (typeof t.question === "string") ticket.question = t.question;
+    if (typeof t.resolution === "string") ticket.resolution = t.resolution;
+    tickets.push(ticket);
+  }
+
+  reconcileEdges(tickets);
+  breakCycles({ tickets });
+
+  const map: DecisionMap = {
+    tickets,
+    rootQuestion: asString(raw.rootQuestion, ""),
+    updatedAt: asTimestamp(raw.updatedAt),
+  };
+  if (typeof raw.activeTicket === "string" && knownIds.has(raw.activeTicket)) {
+    map.activeTicket = raw.activeTicket;
+  }
+  recomputeStatuses(map);
+  recomputeNextTicket(map);
+  return map;
 }
 
 function cloneMap(map: DecisionMap): DecisionMap {
@@ -505,8 +558,50 @@ function cloneMap(map: DecisionMap): DecisionMap {
   };
 }
 
-function normalizeClaims(claims: Array<TicketClaim | string> = []): TicketClaim[] {
-  return dedupeClaims(claims.map((c) => (typeof c === "string" ? { statement: c, source: "assumption" as const } : c)));
+function normalizeClaims(claims: unknown = []): TicketClaim[] {
+  if (!Array.isArray(claims)) return [];
+  return dedupeClaims(
+    claims
+      .map((c): TicketClaim | null => {
+        if (typeof c === "string") return { statement: c, source: "assumption" };
+        if (typeof c === "object" && c !== null && typeof (c as TicketClaim).statement === "string") {
+          return { statement: (c as TicketClaim).statement, source: normalizeSource((c as TicketClaim).source) };
+        }
+        return null;
+      })
+      .filter((c): c is TicketClaim => c !== null),
+  );
+}
+
+const VALID_TYPES: readonly TicketType[] = [
+  TicketType.RESEARCH,
+  TicketType.PROTOTYPE,
+  TicketType.GRILLING,
+  TicketType.TASK,
+];
+
+const VALID_STATUSES: readonly TicketStatus[] = ["open", "in-progress", "resolved", "blocked"];
+
+const VALID_SOURCES: readonly ClaimSource[] = ["grilling", "research", "assumption"];
+
+/** Invalid/unknown ticket types degrade to TASK (the executable default). */
+function normalizeTicketType(value: unknown): TicketType {
+  return VALID_TYPES.includes(value as TicketType) ? (value as TicketType) : TicketType.TASK;
+}
+
+/** Invalid/unknown statuses degrade to open (the safe default). */
+function normalizeTicketStatus(value: unknown): TicketStatus {
+  return VALID_STATUSES.includes(value as TicketStatus) ? (value as TicketStatus) : "open";
+}
+
+/** Invalid claim sources degrade to assumption (the weakest evidence). */
+function normalizeSource(value: unknown): ClaimSource {
+  return VALID_SOURCES.includes(value as ClaimSource) ? (value as ClaimSource) : "assumption";
+}
+
+/** Degrade a non-array (or mixed-type array) edge list to string[] */
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 }
 
 function dedupeClaims(claims: TicketClaim[]): TicketClaim[] {
@@ -530,7 +625,10 @@ function recomputeStatuses(map: DecisionMap): DecisionMap {
       return blocker !== undefined && blocker.status !== "resolved";
     });
     if (hasUnresolvedBlocker) {
-      if (ticket.status !== "blocked") {
+      // A resolved ticket stays resolved even when a new blocker appears later:
+      // the resolution already happened, so re-blocking it would silently
+      // discard completed work (phases-machinery:f4).
+      if (ticket.status !== "blocked" && ticket.status !== "resolved") {
         ticket.status = "blocked";
         ticket.updatedAt = now;
       }
@@ -559,6 +657,13 @@ function propagateClaims(map: DecisionMap, resolvedTicket: DecisionTicket): void
 
 /** Recompute nextTicket and stamp the map's updatedAt. */
 function finalize(map: DecisionMap): DecisionMap {
+  recomputeNextTicket(map);
+  map.updatedAt = new Date().toISOString();
+  return map;
+}
+
+/** Recompute nextTicket without touching the map's timestamp. */
+function recomputeNextTicket(map: DecisionMap): void {
   const active = map.tickets.find((t) => t.id === map.activeTicket && t.status === "in-progress");
   const next = active?.id ?? map.tickets.find((t) => t.status === "open")?.id;
   if (next !== undefined) {
@@ -566,8 +671,117 @@ function finalize(map: DecisionMap): DecisionMap {
   } else {
     delete map.nextTicket;
   }
-  map.updatedAt = new Date().toISOString();
-  return map;
+}
+
+/**
+ * Sync the blocks <=> blockedBy directions so a graph declaring only one
+ * direction still yields a fully linked parent/child pair.
+ */
+function reconcileEdges(tickets: DecisionTicket[]): void {
+  const byId = new Map(tickets.map((t) => [t.id, t]));
+  for (const ticket of tickets) {
+    for (const parentId of ticket.blockedBy) {
+      const parent = byId.get(parentId);
+      if (parent && !parent.blocks.includes(ticket.id)) parent.blocks.push(ticket.id);
+    }
+    for (const childId of ticket.blocks) {
+      const child = byId.get(childId);
+      if (child && !child.blockedBy.includes(ticket.id)) child.blockedBy.push(ticket.id);
+    }
+  }
+}
+
+/**
+ * Detect a blocking cycle (a ticket that can reach itself via blocks edges).
+ * Returns the cycle as a ticket-id path (including the closing repeat) or null
+ * when the graph is acyclic. Self-blocking is a trivial 2-node cycle.
+ */
+export function findCycle(map: Pick<DecisionMap, "tickets">): string[] | null {
+  const byId = new Map(map.tickets.map((t) => [t.id, t]));
+  const color = new Map<string, 0 | 1 | 2>();
+  for (const t of map.tickets) color.set(t.id, 0);
+  const stack: string[] = [];
+
+  const visit = (id: string): string[] | null => {
+    color.set(id, 1);
+    stack.push(id);
+    const ticket = byId.get(id);
+    for (const child of ticket ? ticket.blocks : []) {
+      if (!byId.has(child)) continue;
+      const childColor = color.get(child);
+      if (childColor === 1) {
+        return [...stack.slice(stack.indexOf(child)), child];
+      }
+      if (childColor === 0) {
+        const cycle = visit(child);
+        if (cycle) return cycle;
+      }
+    }
+    stack.pop();
+    color.set(id, 2);
+    return null;
+  };
+
+  for (const t of map.tickets) {
+    if (color.get(t.id) === 0) {
+      const cycle = visit(t.id);
+      if (cycle) return cycle;
+    }
+  }
+  return null;
+}
+
+/**
+ * Break blocking cycles in place by removing back edges, so the decision graph
+ * is always a DAG and can never self-lock. Returns whether any edge was cut.
+ */
+function breakCycles(map: Pick<DecisionMap, "tickets">): boolean {
+  const byId = new Map(map.tickets.map((t) => [t.id, t]));
+  let changed = false;
+  const color = new Map<string, 0 | 1 | 2>();
+  for (const t of map.tickets) color.set(t.id, 0);
+
+  const visit = (id: string): void => {
+    color.set(id, 1);
+    const ticket = byId.get(id);
+    if (!ticket) {
+      color.set(id, 2);
+      return;
+    }
+    for (const child of [...ticket.blocks]) {
+      const childColor = color.get(child);
+      if (childColor === 1) {
+        // Back edge id -> child closes a cycle; cut it from both directions.
+        ticket.blocks = ticket.blocks.filter((b) => b !== child);
+        const childTicket = byId.get(child);
+        if (childTicket) childTicket.blockedBy = childTicket.blockedBy.filter((b) => b !== id);
+        changed = true;
+      } else if (childColor === 0) {
+        visit(child);
+      }
+    }
+    color.set(id, 2);
+  };
+
+  for (const t of map.tickets) if (color.get(t.id) === 0) visit(t.id);
+  return changed;
+}
+
+/** Whether `to` is reachable from `from` via blocks edges (BFS). */
+function canReachTicket(tickets: DecisionTicket[], from: string, to: string): boolean {
+  const byId = new Map(tickets.map((t) => [t.id, t]));
+  const seen = new Set<string>();
+  const queue = [from];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    if (id === undefined) break;
+    if (id === to) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const ticket = byId.get(id);
+    if (ticket) queue.push(...ticket.blocks);
+  }
+  return false;
 }
 
 function truncate(text: string, max: number): string {
