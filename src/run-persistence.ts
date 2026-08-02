@@ -674,8 +674,14 @@ export function createRunPersistence(
       if (landed === json) {
         try {
           _writeFileSync(`${path}.bak`, json);
-        } catch {
-          // Backup is best-effort; the primary write already succeeded.
+        } catch (e) {
+          // The .bak is the documented crash-recovery fallback used by
+          // readJsonWithBackupRecovery; a silent failure here (ENOSPC,
+          // permissions) degrades recovery invisibly, so surface it once.
+          console.warn(
+            `[run-persistence] backup write failed for ${runId}:`,
+            (e as Error).message,
+          );
         }
         invalidateListCache();
         if (TERMINAL_RUN_STATUSES.has(next.status)) enforceRetention();
