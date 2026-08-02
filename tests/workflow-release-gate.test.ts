@@ -1,16 +1,27 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import packageJson from "../package.json" with { type: "json" };
 import { WORKFLOW_AUTHORING_COVERAGE } from "../src/workflow-authoring-coverage.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
 import { checkWorkflowRelease, parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
 
-const ROOT = new URL("..", import.meta.url).pathname;
+const ROOT = join(import.meta.dirname, "..");
+
+/** Invoke npm portably: Windows requires cmd.exe /c for the npm.cmd shim. */
+function runNpm(args: string[], options: { cwd?: string } = {}): string {
+  const cwd = options.cwd ?? ROOT;
+  if (process.platform === "win32") {
+    return execFileSync("cmd.exe", ["/d", "/s", "/c", "npm", ...args], { cwd, encoding: "utf8" });
+  }
+  return execFileSync("npm", args, { cwd, encoding: "utf8" });
+}
 
 function publishableFiles(): string[] {
-  const output = execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" });
+  const output = runNpm(["pack", "--dry-run", "--json"]);
   return parseNpmPackFilePaths(output);
 }
 
@@ -261,7 +272,7 @@ test("release gate names omitted package resources and stale generated surfaces"
     diagnostics.some(
       ({ code, severity, subject }) =>
         code === "NON_CONTRACTUAL_PROSE_DRIFT" &&
-        severity === "warning" &&
+        severity === "error" &&
         subject === "docs/workflow-guidance-baseline.json",
     ),
   );
@@ -289,4 +300,117 @@ test("release gate reports unresolved behavior and reference paths precisely", (
         subject === "skills/workflow-authoring/references/capabilities.md#does-not-exist",
     ),
   );
+});
+
+test("release gate reports missing generated artifacts instead of crashing", () => {
+  const tmpRoot = mkdtempSync(join(tmpdir(), "workflow-release-missing-"));
+  try {
+    const diagnostics = checkWorkflowRelease({ root: tmpRoot, publishableFiles: [] });
+
+    assert.ok(
+      diagnostics.some(
+        ({ code, severity, subject, message }) =>
+          code === "STALE_GENERATED_SURFACE" &&
+          severity === "error" &&
+          subject === "docs/workflow-guidance-baseline.json" &&
+          /missing/i.test(message),
+      ),
+    );
+    assert.ok(
+      diagnostics.some(
+        ({ code, severity, subject, message }) =>
+          code === "STALE_GENERATED_SURFACE" &&
+          severity === "error" &&
+          subject === "docs/workflow-context-surfaces.json" &&
+          /missing/i.test(message),
+      ),
+    );
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("release gate flags frozen entries that claim comprehension coverage or unknown scenarios", () => {
+  const authoringCoverage = structuredClone(WORKFLOW_AUTHORING_COVERAGE);
+  const tournament = authoringCoverage.find(({ id }) => id === "workflow.pattern.tournament");
+  const classifyAndAct = authoringCoverage.find(({ id }) => id === "workflow.pattern.classify-and-act");
+  assert.ok(tournament);
+  assert.ok(classifyAndAct);
+  tournament.comprehensionScenarios = ["quick-write"];
+  classifyAndAct.comprehensionScenarios = ["not-a-real-scenario"];
+
+  const diagnostics = checkWorkflowRelease({
+    root: ROOT,
+    publishableFiles: publishableFiles(),
+    authoringCoverage,
+  });
+
+  assert.ok(
+    diagnostics.some(
+      ({ code, subject, message }) =>
+        code === "UNKNOWN_COMPREHENSION_SCENARIO" &&
+        subject === "workflow.pattern.tournament" &&
+        /frozen.*comprehension|comprehension.*frozen/i.test(message),
+    ),
+  );
+  assert.ok(
+    diagnostics.some(
+      ({ code, subject }) =>
+        code === "UNKNOWN_COMPREHENSION_SCENARIO" && subject === "workflow.pattern.classify-and-act",
+    ),
+  );
+});
+
+test("release gate guidance drift checks are LF-basis", () => {
+  const patternPath = "skills/workflow-authoring/references/pattern-selection.md";
+  const patternSelection = readFileSync(new URL(`../${patternPath}`, import.meta.url), "utf8");
+  // CRLF round-trip of matching content must not create false drift…
+  const crlfMatching = patternSelection.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+  const matching = checkWorkflowRelease({
+    root: ROOT,
+    publishableFiles: publishableFiles(),
+    guidanceOverrides: { [patternPath]: crlfMatching },
+  });
+  assert.equal(
+    matching.some(
+      ({ code, severity, subject }) =>
+        code === "PROTECTED_GUIDANCE_DRIFT" &&
+        severity === "error" &&
+        (subject === "workflow.pattern.tournament" || subject === patternPath),
+    ),
+    false,
+    "CRLF-basis content must still satisfy the LF-normalized drift checks",
+  );
+
+  // …but removing the protected tournament row is real drift regardless of basis.
+  const withoutTournament = patternSelection.replace(
+    "| Pairwise comparison beats absolute scoring | Tournament | Let JavaScript run the bounded bracket and byes; agents compare one pair; ledger match failures | [Adapt](../examples/tournament.js) |",
+    "",
+  );
+  const crlfDrifted = withoutTournament.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+  const drifted = checkWorkflowRelease({
+    root: ROOT,
+    publishableFiles: publishableFiles(),
+    guidanceOverrides: { [patternPath]: crlfDrifted },
+  });
+  assert.ok(
+    drifted.some(
+      ({ code, severity, subject }) =>
+        code === "PROTECTED_GUIDANCE_DRIFT" && severity === "error" && subject === "workflow.pattern.tournament",
+    ),
+    "removing the protected tournament row must still be caught on CRLF-basis overrides",
+  );
+});
+
+test("prose drift in the guidance baseline is a hard error", () => {
+  const diagnostics = checkWorkflowRelease({
+    root: ROOT,
+    publishableFiles: publishableFiles(),
+    guidanceBaseline: "stale",
+  });
+  const prose = diagnostics.find(
+    ({ code, subject }) => code === "NON_CONTRACTUAL_PROSE_DRIFT" && subject === "docs/workflow-guidance-baseline.json",
+  );
+  assert.ok(prose);
+  assert.equal(prose.severity, "error");
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -60,8 +60,11 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
     ["write", "edit", "review", "debug", "loop", "retry"],
   );
   for (const profile of artifact.surfaces.representativeAuthoringProfiles.profiles) {
-    const expected = profile.files.reduce((sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path))), 0);
-    assert.equal(profile.bytes, expected, `${profile.name} profile must sum its declared files`);
+    const expected = profile.files.reduce(
+      (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path), "utf8").replace(/\r\n/g, "\n")),
+      0,
+    );
+    assert.equal(profile.bytes, expected, `${profile.name} profile must sum its LF-normalized files`);
   }
   const profileBytes = artifact.surfaces.representativeAuthoringProfiles.profiles
     .map(({ bytes }) => bytes)
@@ -91,7 +94,9 @@ test("workflow context measurement generation is deterministic and committed art
   const second = renderWorkflowContextMeasurement();
 
   assert.equal(first, second);
-  assert.equal(readFileSync(join(ROOT, WORKFLOW_CONTEXT_MEASUREMENT_PATH), "utf8"), first);
+  // Line-ending normalization keeps the committed artifact comparison identical
+  // on CRLF (Windows) and LF (CI) checkouts.
+  assert.equal(readFileSync(join(ROOT, WORKFLOW_CONTEXT_MEASUREMENT_PATH), "utf8").replace(/\r\n/g, "\n"), first);
   assert.equal(checkWorkflowContextMeasurement(ROOT), true);
   assert.equal(checkWorkflowContextMeasurement(ROOT, `${first}stale`), false);
   assert.equal(packageJson.scripts["context:check"], "tsx scripts/generate-workflow-context-measurement.ts --check");
@@ -99,8 +104,27 @@ test("workflow context measurement generation is deterministic and committed art
   assert.match(packageJson.scripts["release:check"], /context:check/);
 });
 
+test("workflow context byte counts are LF-basis and count corpus files once", () => {
+  const artifact = measureWorkflowContextSurfaces(ROOT);
+  const corpusFiles = artifact.surfaces.workflowAuthoringSkillCorpus;
+  assert.equal(corpusFiles.files, 28);
+  const lfCorpusBytes = readdirRecursive(ROOT, "skills/workflow-authoring").reduce(
+    (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path), "utf8").replace(/\r\n/g, "\n")),
+    0,
+  );
+  assert.equal(corpusFiles.bytes, lfCorpusBytes, "corpus bytes must count LF-normalized file content");
+  assert.notEqual(
+    corpusFiles.bytes,
+    readdirRecursive(ROOT, "skills/workflow-authoring").reduce(
+      (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path))),
+      0,
+    ),
+    "raw disk bytes (CRLF on Windows checkouts) must not equal the LF-basis count",
+  );
+});
+
 test("context freshness command prints both current byte counts", () => {
-  const output = execFileSync("npm", ["run", "context:check"], { cwd: ROOT, encoding: "utf8" });
+  const output = runNpm(["run", "context:check"]);
 
   assert.match(output, /Permanent workflow prompt: \d+ bytes/);
   assert.match(output, /Provider-visible workflow tool definition: \d+ bytes/);
@@ -111,6 +135,33 @@ test("context freshness command prints both current byte counts", () => {
   assert.match(output, /Representative authoring profile median: \d+(?:\.5)? bytes/);
   assert.match(output, /measurement is fresh/i);
 });
+
+/** Invoke npm portably: Windows requires cmd.exe /c for the npm.cmd shim. */
+function runNpm(args: string[]): string {
+  if (process.platform === "win32") {
+    return execFileSync("cmd.exe", ["/d", "/s", "/c", "npm", ...args], { cwd: ROOT, encoding: "utf8" });
+  }
+  return execFileSync("npm", args, { cwd: ROOT, encoding: "utf8" });
+}
+
+/** Package-relative file list under a root directory (sorted, forward slashes). */
+function readdirRecursive(root: string, relativeRoot: string): string[] {
+  const pending: Array<{ absolute: string; relative: string }> = [
+    { absolute: join(root, relativeRoot), relative: relativeRoot },
+  ];
+  const files: string[] = [];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) break;
+    for (const entry of readdirSync(current.absolute, { withFileTypes: true })) {
+      const absolute = join(current.absolute, entry.name);
+      const relative = join(current.relative, entry.name);
+      if (entry.isDirectory()) pending.push({ absolute, relative });
+      else if (entry.isFile()) files.push(relative.replaceAll("\\", "/"));
+    }
+  }
+  return files.sort();
+}
 
 async function withRenderedWorkflow(
   inspect: (surface: {

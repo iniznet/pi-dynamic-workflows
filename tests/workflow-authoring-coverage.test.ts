@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import { CapabilitySupport, DiscoveryPlacement, WorkflowAuthoringProtection } from "../src/enums.js";
 import {
+  readLf,
   WORKFLOW_AUTHORING_COVERAGE,
+  WORKFLOW_AUTHORING_FROZEN_FILES,
   WORKFLOW_AUTHORING_PATTERN_IDS,
   WORKFLOW_AUTHORING_RECIPE_IDS,
   WORKFLOW_COMPREHENSION_SCENARIO_IDS,
 } from "../src/workflow-authoring-coverage.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
 
-const ROOT = new URL("..", import.meta.url).pathname;
+const ROOT = join(import.meta.dirname, "..");
 
 test("authoring coverage inventories every stable contract, pattern, and recipe exactly once", () => {
   const expectedIds = [
@@ -64,4 +68,17 @@ test("only the three agreed coverage scenarios unfreeze their named abilities", 
   assert.deepEqual(scenariosById.get("workflow.pattern.classify-and-act"), []);
   assert.deepEqual(scenariosById.get("workflow.pattern.tournament"), []);
   assert.deepEqual(scenariosById.get("workflow.runtime.completenessCheck"), []);
+});
+
+test("frozen guidance manifest hashes are LF-basis and reject CRLF raw bytes", () => {
+  for (const { path, sha256 } of WORKFLOW_AUTHORING_FROZEN_FILES) {
+    const lfSource = readLf(`${ROOT}/${path}`);
+    assert.equal(createHash("sha256").update(lfSource).digest("hex"), sha256, path);
+    const crlfSource = lfSource.replace(/\n/g, "\r\n");
+    assert.notEqual(
+      createHash("sha256").update(crlfSource).digest("hex"),
+      sha256,
+      `${path} raw CRLF bytes must not satisfy the LF-basis manifest hash`,
+    );
+  }
 });
