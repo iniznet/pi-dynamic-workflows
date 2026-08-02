@@ -242,7 +242,20 @@ export async function renewFileLock(
     await writeFile(tmp, JSON.stringify(renewed, null, 2), { flag: "wx" });
     await rename(tmp, lockPath);
   } catch (err) {
-    await unlink(tmp).catch(() => {});
+    // ENOENT is benign here (the temp was never written or already cleaned up
+    // by a concurrent renewer), but EACCES/EPERM/ENOSPC would signal a
+    // systemic permission/disk problem worth observing rather than masking
+    // behind the rethrown write/rename error.
+    try {
+      await unlink(tmp);
+    } catch (cleanupErr) {
+      if ((cleanupErr as { code?: string }).code !== "ENOENT") {
+        console.warn(
+          `[workflow-status] renewFileLock: temp cleanup failed ${tmp}`,
+          (cleanupErr as { code?: string }).code ?? cleanupErr,
+        );
+      }
+    }
     throw err;
   }
   return true;
