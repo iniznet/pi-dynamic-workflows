@@ -461,9 +461,19 @@ export class MCPBridge {
       let result: unknown;
 
       switch (request.method) {
-        case METHOD_AUTH_HANDSHAKE:
-          result = await this.handleAuthHandshake(socket, request.params as { token?: unknown });
+        case METHOD_AUTH_HANDSHAKE: {
+          // On auth failure handleAuthHandshake replies directly (with the
+          // request's id so the client correlates it) and destroys the
+          // socket, so no outer result is emitted in that case.
+          const authResult = await this.handleAuthHandshake(socket, request.params as { token?: unknown }, request.id);
+          if (!authResult.ok) {
+            // handleAuthHandshake already emitted AUTH_FAILED and destroyed
+            // the socket; suppress the outer result to avoid a double reply.
+            return;
+          }
+          result = authResult;
           break;
+        }
 
         case METHOD_TOOL_CALL:
           result = await this.handleToolCall(
@@ -542,7 +552,11 @@ export class MCPBridge {
    * Authenticate a connection against the bridge token (constant-time compare).
    * On failure the connection is destroyed so a wrong token cannot retry.
    */
-  private async handleAuthHandshake(socket: Socket, params: { token?: unknown }): Promise<{ ok: boolean }> {
+  private async handleAuthHandshake(
+    socket: Socket,
+    params: { token?: unknown },
+    requestId: string | number,
+  ): Promise<{ ok: boolean }> {
     const presented = typeof params?.token === "string" ? params.token : "";
     const presentedBuffer = Buffer.from(presented, "utf-8");
     const expectedBuffer = Buffer.from(this.authToken, "utf-8");
@@ -556,11 +570,13 @@ export class MCPBridge {
     }
 
     // Flush the refusal before destroying the connection so the client always
-    // observes AUTH_FAILED instead of racing socket teardown.
+    // observes AUTH_FAILED instead of racing socket teardown. Echo the
+    // request's id so the client's PendingRequest (keyed by its own id)
+    // correlates the failure and can surface the auth error to the user.
     await this.sendResponse(socket, {
       jsonrpc: "2.0",
       error: { code: AUTH_FAILED, message: "Invalid auth token" },
-      id: 0,
+      id: requestId,
     });
     socket.destroy();
     return { ok: false };

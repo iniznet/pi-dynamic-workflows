@@ -508,11 +508,12 @@ describe("MCPBridge", () => {
         throw new Error("bridge kept a connection alive after a wrong token");
       }),
     ]);
-    assert.match(
-      Buffer.concat(frames).toString("utf-8"),
-      /Invalid auth token/,
-      "a wrong token must be refused with an AUTH_FAILED error frame",
-    );
+    const payload = Buffer.concat(frames).toString("utf-8");
+    assert.match(payload, /Invalid auth token/, "a wrong token must be refused with an AUTH_FAILED error frame");
+    // The AUTH_FAILED frame must echo the request's id so the client's
+    // PendingRequest (keyed by its own generated id) correlates the failure
+    // instead of only learning of it later as 'Connection closed'.
+    assert.ok(payload.includes(`"id":"bad-token"`), "AUTH_FAILED must carry the original request id for correlation");
 
     // The gate is selective: a correct token authenticates normally.
     const good = await connectToBridge(bridge);
