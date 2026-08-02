@@ -48,6 +48,50 @@ describe("model-tier-config", () => {
       const { hintScore } = await loadModule();
       assert.equal(hintScore("x/mini-pro"), -1);
     });
+
+    it("matches hints at token boundaries, not inside longer words (mini vs minimax)", async () => {
+      const { hintScore } = await loadModule();
+      // "mini" is a prefix of "minimax" — a substring match would misclassify it
+      // as small; boundary matching must not.
+      assert.equal(hintScore("vendor/minimax-r1"), 0);
+      assert.equal(hintScore("vendor/minimax-m1"), 0);
+      assert.equal(hintScore("minimax-r1"), 0);
+      // Token-boundary hits still work.
+      assert.equal(hintScore("openai/gpt-4.1-mini"), -1);
+      assert.equal(hintScore("x/mini-pro"), -1);
+    });
+
+    it("does not treat 'pro' as a big hint inside words like 'prompt'", async () => {
+      const { hintScore } = await loadModule();
+      assert.equal(hintScore("vendor/prompt-helper"), 0);
+      assert.equal(hintScore("vendor/gpt-4o-prompter"), 0);
+      assert.equal(hintScore("vendor/x-pro"), 1);
+    });
+  });
+
+  describe("formatTierCostPreview", () => {
+    it("shows output cost and context when the registry reports them", async () => {
+      const { formatTierCostPreview } = await loadModule();
+      const config = { tiers: { small: "openai/gpt-4.1-mini", big: "anthropic/claude-3-opus" } };
+      const models = [
+        { spec: "openai/gpt-4.1-mini", costOutput: 4.4, contextWindow: 128_000 },
+        { spec: "anthropic/claude-3-opus", costOutput: 75, contextWindow: 200_000 },
+      ];
+      const preview = formatTierCostPreview(config, models);
+      assert.match(preview, /small tier → openai\/gpt-4\.1-mini \(\$4\.4\/M output, 128000 ctx\)/);
+      assert.match(preview, /big tier → anthropic\/claude-3-opus \(\$75\/M output, 200000 ctx\)/);
+    });
+
+    it("labels missing cost data as unknown and sorts small < medium < big", async () => {
+      const { formatTierCostPreview } = await loadModule();
+      const config = { tiers: { big: "self/hosted", small: "self/hosted", medium: "self/hosted" } };
+      const preview = formatTierCostPreview(config, []);
+      const lines = preview.split("\n");
+      assert.equal(lines.length, 3);
+      assert.equal(lines[0], "small tier → self/hosted (cost unknown)");
+      assert.equal(lines[1], "medium tier → self/hosted (cost unknown)");
+      assert.equal(lines[2], "big tier → self/hosted (cost unknown)");
+    });
   });
 
   describe("rankByCapability (cost-first, hint fallback)", () => {

@@ -20,8 +20,10 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { tierNameForTask } from "./model-routing.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import {
+  buildDefaultTierConfig,
   formatTierFallbackNotice,
   loadModelTierConfig,
   type ModelTierConfig,
@@ -181,18 +183,42 @@ export async function resolveStructuredOutput<T>(
  *
  * `loadConfig` is injectable for testing; it defaults to reading from disk.
  */
+/**
+ * Prompt-aware tier default for the no-tiers-config fallback: classify the
+ * task from its prompt and pick the fitting tier out of the available models
+ * spread into defaults (see buildDefaultTierConfig). Degrades to mainModel
+ * when the registry is empty or unavailable.
+ */
+export function resolvePromptAwareTier(
+  prompt: string,
+  mainModel: string | undefined,
+  availableModels: readonly RankableModel[],
+): string | undefined {
+  const defaults = buildDefaultTierConfig(mainModel, availableModels);
+  const tier = tierNameForTask("runtime", prompt);
+  return resolveTierModel(tier, defaults) ?? mainModel;
+}
+
 export function resolveAgentModelSpec(
   options: { model?: string; tier?: string },
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
   onTierWithoutConfig?: (tier: string) => void,
+  prompt?: string,
+  listModels: () => readonly RankableModel[] = listAvailableModels,
 ): string | undefined {
   if (options.model) return options.model;
   const config = loadConfig();
   if (options.tier) {
     // Tier requested but unconfigured → it silently falls back to mainModel.
-    // Let the caller surface that (once) so the no-op is discoverable.
-    if (!config) onTierWithoutConfig?.(options.tier);
+    // Let the caller surface that (once) so the no-op is discoverable. When a
+    // prompt is available, prefer a prompt-aware default (classify the task
+    // against the available models) so a "small" scan and a "big" synthesis
+    // stay distinct instead of both collapsing onto mainModel.
+    if (!config) {
+      onTierWithoutConfig?.(options.tier);
+      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels());
+    }
     return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
   }
   // Untagged agent: default to the configured medium tier when one exists.
@@ -933,6 +959,7 @@ export class WorkflowAgent {
       this.mainModel,
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
+      prompt,
     );
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style

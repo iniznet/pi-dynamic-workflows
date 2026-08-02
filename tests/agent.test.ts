@@ -12,13 +12,14 @@ import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
+  resolvePromptAwareTier,
   subagentExcludedTools,
   usageFromStats,
   WorkflowAgent,
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
-import type { ModelTierConfig } from "../src/model-tier-config.js";
+import type { ModelTierConfig, RankableModel } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -148,6 +149,62 @@ test("resolveAgentModelSpec: tier resolves from config when no explicit model", 
 test("resolveAgentModelSpec: unconfigured tier falls back to the main model", () => {
   assert.equal(resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg), "main/model");
   assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
+});
+
+test("resolvePromptAwareTier: classifies the prompt and picks the fitting tier from the ranked registry (i3)", () => {
+  const models = [
+    { spec: "vendor/a-mini", costOutput: 0.4 },
+    { spec: "vendor/b-mid", costOutput: 5 },
+    { spec: "vendor/c-opus", costOutput: 75 },
+  ] satisfies RankableModel[];
+  assert.equal(resolvePromptAwareTier("find the failing test", "main/model", models), "vendor/a-mini");
+  assert.equal(resolvePromptAwareTier("refactor the loader", "main/model", models), "vendor/b-mid");
+  assert.equal(resolvePromptAwareTier("synthesize the findings", "main/model", models), "vendor/c-opus");
+});
+
+test("resolvePromptAwareTier: degrades to mainModel on an empty registry", () => {
+  assert.equal(resolvePromptAwareTier("synthesize the findings", "main/model", []), "main/model");
+});
+
+test("resolveAgentModelSpec: unconfigured tier with a prompt uses the prompt-aware default", () => {
+  const models = [
+    { spec: "vendor/a-mini", costOutput: 0.4 },
+    { spec: "vendor/b-mid", costOutput: 5 },
+    { spec: "vendor/c-opus", costOutput: 75 },
+  ] satisfies RankableModel[];
+  assert.equal(
+    resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg, undefined, "find the failing test", () => models),
+    "vendor/a-mini",
+  );
+  assert.equal(
+    resolveAgentModelSpec({ tier: "big" }, "main/model", noCfg, undefined, "synthesize the findings", () => models),
+    "vendor/c-opus",
+  );
+});
+
+test("resolveAgentModelSpec: prompt-aware fallback degrades to mainModel on an empty registry", () => {
+  assert.equal(
+    resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg, undefined, "find the failing test", () => []),
+    "main/model",
+  );
+});
+
+test("resolveAgentModelSpec: an existing config still wins over the prompt-aware default", () => {
+  const models = [{ spec: "vendor/a-mini", costOutput: 0.4 }];
+  const cfg = {
+    tiers: { small: "configured/small", medium: "configured/medium", big: "configured/big" },
+  } satisfies ModelTierConfig;
+  assert.equal(
+    resolveAgentModelSpec(
+      { tier: "big" },
+      "main/model",
+      () => cfg,
+      undefined,
+      "synthesize the findings",
+      () => models,
+    ),
+    "configured/big",
+  );
 });
 
 test("resolveAgentModelSpec: untagged agent defaults to the configured medium tier", () => {

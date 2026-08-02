@@ -32,6 +32,7 @@ import {
 } from "./model-spec.js";
 import {
   buildDefaultTierConfig,
+  formatTierCostPreview,
   loadModelTierConfig,
   saveModelTierConfig,
   sortedTierNames,
@@ -56,6 +57,9 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
       let config =
         loadModelTierConfig() ?? buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry));
       let dirty = false;
+      // One registry read per menu render: feeds the per-tier cost preview and
+      // the reset-to-defaults mapping.
+      const availableModels = () => listAvailableModels(ctx.modelRegistry);
 
       const ensureFresh = (cfg: typeof config) => {
         config = cfg;
@@ -68,10 +72,8 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         const menuOptions: string[] = [];
 
         menuOptions.push("─".repeat(30));
-        for (const name of tiers) {
-          const model = config.tiers[name];
-          menuOptions.push(`${name} tier → ${model}`);
-        }
+        const preview = formatTierCostPreview(config, availableModels());
+        if (preview) menuOptions.push(...preview.split("\n"));
         menuOptions.push("─".repeat(30));
 
         menuOptions.push("Reset to defaults");
@@ -98,7 +100,7 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
             "This will reset tiers from your available model list. Continue?",
           );
           if (confirmed) {
-            ensureFresh(buildDefaultTierConfig(currentModel, listAvailableModels(ctx.modelRegistry)));
+            ensureFresh(buildDefaultTierConfig(currentModel, availableModels()));
             ctx.ui.notify("Tiers reset to defaults. Use 'Save and exit' to persist.", "info");
           }
         }

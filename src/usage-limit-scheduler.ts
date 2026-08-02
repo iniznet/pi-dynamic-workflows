@@ -65,13 +65,25 @@ const DEFAULT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Best-effort parse of a provider's human reset hint ("Resets in ~3h",
- * "resets in 5m", "in 90s", "1h30m") into milliseconds. Sums every
- * (number, unit) pair found, so combined forms like "1h30m" work for free.
- * Returns undefined when nothing recognizable is found — callers should fall
- * back to a fixed delay rather than guess.
+ * "resets in 5m", "in 90s", "1h30m", or the absolute ISO form "resets at
+ * 2025-01-15T03:00:00Z" that classifyProviderLimit extracts) into milliseconds.
+ * Sums every (number, unit) pair found, so combined forms like "1h30m" work
+ * for free. An ISO timestamp is measured against `now` (injectable for tests;
+ * defaults to the current time) — a timestamp already in the past reports 0,
+ * meaning the quota has already reset. Returns undefined when nothing
+ * recognizable is found — callers should fall back to a fixed delay rather
+ * than guess.
  */
-export function parseResetHintMs(hint?: string): number | undefined {
+export function parseResetHintMs(hint?: string, now: number = Date.now()): number | undefined {
   if (!hint) return undefined;
+  // Absolute-timestamp form: "resets at 2025-01-15T03:00:00Z" (with optional
+  // fraction and timezone offset, or a bare YYYY-MM-DD date). Date.parse of the
+  // surrounding prose would fail, so extract the timestamp first.
+  const isoMatch = hint.match(/\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?/);
+  if (isoMatch) {
+    const timestamp = Date.parse(isoMatch[0]);
+    if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
+  }
   // No trailing \b: combined forms like "1h30m" have a digit right after the
   // unit letter, which is itself a word character, so \b would never match
   // there. A negative lookahead for another letter is the correct boundary —

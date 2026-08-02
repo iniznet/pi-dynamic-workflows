@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { classifyProviderLimit } from "../src/errors.js";
 import type { PersistedRunState, RunPersistence } from "../src/run-persistence.js";
 import {
   computeAutoResumeDelayMs,
@@ -148,6 +149,26 @@ test("parseResetHintMs: unparseable text returns undefined", () => {
   assert.equal(parseResetHintMs("try again later"), undefined);
 });
 
+test("parseResetHintMs: ISO 'resets at' timestamp is measured against now", () => {
+  const now = Date.parse("2025-01-15T00:00:00Z");
+  assert.equal(parseResetHintMs("resets at 2025-01-15T03:00:00Z", now), 3 * 3_600_000);
+  // With a timezone offset.
+  assert.equal(parseResetHintMs("resets at 2025-01-15T03:00:00-02:00", now), 5 * 3_600_000);
+});
+
+test("parseResetHintMs: past ISO timestamp yields 0 (quota already reset)", () => {
+  const now = Date.parse("2025-01-15T04:00:00Z");
+  assert.equal(parseResetHintMs("resets at 2025-01-15T03:00:00Z", now), 0);
+});
+
+test("parseResetHintMs: classifyProviderLimit ISO wiring (tests-coverage:f2)", () => {
+  const limit = classifyProviderLimit("Codex usage limit reached (plus plan). Resets at 2025-01-15T03:00:00Z.");
+  assert.equal(limit.matched, true);
+  assert.equal(limit.resetHint, "Resets at 2025-01-15T03:00:00Z");
+  const delay = parseResetHintMs(limit.resetHint, Date.parse("2025-01-15T00:00:00Z"));
+  assert.equal(delay, 3 * 3_600_000);
+});
+
 // ---- computeAutoResumeDelayMs --------------------------------------------------
 
 test("computeAutoResumeDelayMs: delay floor is enforced", () => {
@@ -170,6 +191,30 @@ test("computeAutoResumeDelayMs: backoff grows with attempts and is capped by max
   assert.equal(attempt1, 10 * 60_000);
   assert.equal(attempt2, 20 * 60_000, "attempt 2 doubles attempt 1");
   assert.equal(attempt10, 3_600_000, "clamped at maxDelayMs instead of overflowing");
+});
+
+test("computeAutoResumeDelayMs: elapsed time is subtracted from the base (elapsedMs > base collapses to the floor)", () => {
+  const delay = computeAutoResumeDelayMs({
+    resetHint: "resets in 5m",
+    attempts: 1,
+    elapsedMs: 400_000, // elapsed (6m40s) exceeds the 5m base
+    minDelayMs: 60_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+  });
+  assert.equal(delay, 60_000, "negative remaining clamps to the minDelayMs floor");
+});
+
+test("computeAutoResumeDelayMs: exponent is capped so pathological attempt counts stay finite", () => {
+  const delay = computeAutoResumeDelayMs({
+    resetHint: "resets in 10m",
+    attempts: 200,
+    elapsedMs: 0,
+    minDelayMs: 1_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+  });
+  assert.equal(delay, 3_600_000, "2^30 backoff still clamps to maxDelayMs");
 });
 
 // ---- scheduler behavior --------------------------------------------------------

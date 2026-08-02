@@ -62,16 +62,28 @@ export function getModelTierConfigPath(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Substrings that identify small/cheap models (case-insensitive), used only as
- * a fallback capability hint when price signals are absent or tied.
+ * Words that identify small/cheap models (case-insensitive), used only as
+ * a fallback capability hint when price signals are absent or tied. Matched at
+ * token boundaries so a short hint like "mini" cannot misclassify a longer
+ * name like "minimax-r1" as small.
  */
 export const SMALL_MODEL_HINTS = ["mini", "flash", "haiku", "nano", "small"] as const;
 
 /**
- * Substrings that identify large/capable models (case-insensitive), used only
+ * Words that identify large/capable models (case-insensitive), used only
  * as a fallback capability hint when price signals are absent or tied.
  */
 export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as const;
+
+/**
+ * Word-boundary match for a hint inside a model spec (case-insensitive): the
+ * hint must be surrounded by non-alphanumerics or the string edges. Matches
+ * "gpt-4.1-mini" and "mini-pro" but not "minimax-r1" or "prompt-helper".
+ */
+function matchesWord(spec: string, word: string): boolean {
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`).test(spec);
+}
 
 /**
  * Fallback capability hint from a model's name: -1 for a small/cheap name, +1
@@ -83,8 +95,8 @@ export const BIG_MODEL_HINTS = ["opus", "pro", "ultra", "large", "plus"] as cons
  */
 export function hintScore(spec: string): number {
   const lower = spec.toLowerCase();
-  if (SMALL_MODEL_HINTS.some((hint) => lower.includes(hint))) return -1;
-  if (BIG_MODEL_HINTS.some((hint) => lower.includes(hint))) return 1;
+  if (SMALL_MODEL_HINTS.some((hint) => matchesWord(lower, hint))) return -1;
+  if (BIG_MODEL_HINTS.some((hint) => matchesWord(lower, hint))) return 1;
   return 0;
 }
 
@@ -293,4 +305,25 @@ export function sortedTierNames(config: ModelTierConfig): string[] {
   const names = Object.keys(config.tiers);
   const rank: Record<string, number> = { small: 0, medium: 1, big: 2 };
   return names.sort((a, b) => (rank[a] ?? 99) - (rank[b] ?? 99) || a.localeCompare(b));
+}
+
+/**
+ * Human-readable per-tier cost preview for /workflows-models: each tier line
+ * carries the configured model's output price and context window when the
+ * registry reports them ("cost unknown" otherwise). Pure — the command renders
+ * the returned string directly.
+ */
+export function formatTierCostPreview(config: ModelTierConfig, models: readonly RankableModel[]): string {
+  const bySpec = new Map(models.map((model) => [model.spec, model]));
+  return sortedTierNames(config)
+    .map((name) => {
+      const modelSpec = config.tiers[name];
+      const info = bySpec.get(modelSpec);
+      const cost = typeof info?.costOutput === "number" && info.costOutput > 0 ? info.costOutput : undefined;
+      const ctx = typeof info?.contextWindow === "number" && info.contextWindow > 0 ? info.contextWindow : undefined;
+      const costText = cost === undefined ? "cost unknown" : `$${cost}/M output`;
+      const ctxText = ctx === undefined ? "" : `, ${ctx} ctx`;
+      return `${name} tier → ${modelSpec} (${costText}${ctxText})`;
+    })
+    .join("\n");
 }

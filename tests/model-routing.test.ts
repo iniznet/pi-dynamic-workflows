@@ -6,6 +6,8 @@ import {
   parseModelRoutingFromMeta,
   resolveModelForPhase,
   TaskClassification,
+  tierNameForClassification,
+  tierNameForTask,
 } from "../src/model-routing.js";
 
 test("resolveModelForPhase returns default when no phases match", () => {
@@ -120,6 +122,20 @@ test("classifyTask scans early reconnaissance phases by scan keywords", () => {
 test("classifyTask maps synthesize and analyze keywords by prompt (any phase)", () => {
   assert.equal(classifyTask("3", "synthesize the findings"), TaskClassification.SYNTHESIZE);
   assert.equal(classifyTask("2", "review this PR"), TaskClassification.ANALYZE);
+});
+
+test("tierNameForClassification maps scan to small, edit to medium, analysis to big", () => {
+  assert.equal(tierNameForClassification(TaskClassification.SCAN), "small");
+  assert.equal(tierNameForClassification(TaskClassification.EDIT), "medium");
+  assert.equal(tierNameForClassification(TaskClassification.ANALYZE), "big");
+  assert.equal(tierNameForClassification(TaskClassification.SYNTHESIZE), "big");
+});
+
+test("tierNameForTask classifies the prompt and returns the fitting tier (i3 wiring)", () => {
+  assert.equal(tierNameForTask("3", "synthesize the findings"), "big");
+  assert.equal(tierNameForTask("2", "review this PR"), "big");
+  assert.equal(tierNameForTask("0", "find the failing test"), "small");
+  assert.equal(tierNameForTask("3", "refactor the loader"), "medium");
 });
 
 test("classifyTask keyword matching is case-insensitive substring matching", () => {

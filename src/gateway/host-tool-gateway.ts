@@ -197,6 +197,7 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
                 text: `Host tool gateway error: ${error instanceof Error ? error.message : "Unknown error"}`,
               },
             ],
+            details: error,
             isError: true,
           };
         }

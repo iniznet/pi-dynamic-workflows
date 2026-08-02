@@ -146,3 +146,30 @@ export function classifyTask(phase: string, prompt: string): TaskClassification 
 
   return TaskClassification.EDIT;
 }
+
+/**
+ * Map a task classification to the model tier whose capability profile fits.
+ * Powers the prompt-aware tier fallback (see tierNameForTask): a cheap scan
+ * routes to "small", a heavy synthesis to "big".
+ */
+export function tierNameForClassification(classification: TaskClassification): "small" | "medium" | "big" {
+  switch (classification) {
+    case TaskClassification.SCAN:
+      return "small";
+    case TaskClassification.SYNTHESIZE:
+    case TaskClassification.ANALYZE:
+      return "big";
+    case TaskClassification.EDIT:
+      return "medium";
+  }
+}
+
+/**
+ * Classify a phase+prompt and return the model tier that fits. Gives the tier
+ * fallback a prompt-aware default when no model-tiers.json is configured, so
+ * a reconnaissance phase and a final synthesis no longer collapse onto the
+ * same fallback model.
+ */
+export function tierNameForTask(phase: string, prompt: string): "small" | "medium" | "big" {
+  return tierNameForClassification(classifyTask(phase, prompt));
+}

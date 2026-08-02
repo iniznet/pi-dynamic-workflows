@@ -79,7 +79,14 @@ export { createPlannotatorBridge, getPlanStatus, submitPlan, waitForApproval } f
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
 export { createWorkflowLogger } from "./logger.js";
 export type { ModelRoute, ModelRoutingConfig } from "./model-routing.js";
-export { classifyTask, parseModelRoutingFromMeta, resolveModelForPhase, TaskClassification } from "./model-routing.js";
+export {
+  classifyTask,
+  parseModelRoutingFromMeta,
+  resolveModelForPhase,
+  TaskClassification,
+  tierNameForClassification,
+  tierNameForTask,
+} from "./model-routing.js";
 export type { ModelThinkingLevel, ResolvedModelSpec } from "./model-spec.js";
 export {
   canonicalModelSpec,
