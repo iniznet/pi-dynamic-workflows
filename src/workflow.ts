@@ -29,7 +29,7 @@ import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } fr
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
-import { createWorktree, removeWorktree, type Worktree } from "./worktree.js";
+import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 /**
  * Batch-scoped cancellation for a single parallel()/pipeline() fan-out. When a
@@ -411,6 +411,14 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   tier?: string;
   isolation?: "worktree";
   /**
+   * Keep the isolated worktree and its branch after the agent finishes instead of
+   * removing them (worktree-isolation:f2). Agent edits are always finalized
+   * (`git add -A` + `git commit --allow-empty`) before teardown, so with this opt-in
+   * the retained branch carries the agent's committed work for inspection; without
+   * it, the finalized branch and worktree are discarded.
+   */
+  keepWorktree?: boolean;
+  /**
    * Name of a registered subagent definition (`.pi/agents/<name>.md`, project >
    * user). Binds that definition's tool allow/denylist, model, and body prompt
    * to this agent. An explicit `model` overrides the definition's model; the
@@ -702,7 +710,7 @@ export async function runWorkflow<T = unknown>(
       const state = await stateManager.getState();
       throw new WorkflowError(
         `agent() is gated: subagent spawning requires Phase 3 with human approval (current: Phase ${state.activePhase}, approved: ${state.humanApproved}).`,
-        WorkflowErrorCode.UNKNOWN,
+        SUBAGENT_SPAWN_BLOCKED,
         {
           recoverable: false,
           details: { code: SUBAGENT_SPAWN_BLOCKED },
@@ -1177,8 +1185,21 @@ export async function runWorkflow<T = unknown>(
         }
         return null;
       } finally {
-        // Always tear down the worktree, even on timeout/abort.
-        if (worktree?.isolated) await removeWorktree(worktree);
+        // Always tear down the worktree, even on timeout/abort. First finalize any
+        // agent edits (git add -A + commit --allow-empty, best-effort) so teardown
+        // never silently destroys them; then honor the keepWorktree opt-in (retain
+        // branch + path for inspection). Otherwise log what is being discarded
+        // before removal (worktree-isolation:f2).
+        if (worktree?.isolated) {
+          const finalized = await finalizeWorktree(worktree);
+          if (!finalized) log(`worktree finalize failed for "${label}"; agent edits may be lost`);
+          if (agentOptions.keepWorktree) {
+            log(`keeping worktree for "${label}": ${worktree.cwd} (branch ${worktree.branch ?? "<detached>"})`);
+          } else {
+            log(`discarding worktree for "${label}": ${worktree.cwd} (branch ${worktree.branch ?? "<detached>"})`);
+            await removeWorktree(worktree);
+          }
+        }
       }
     });
   };

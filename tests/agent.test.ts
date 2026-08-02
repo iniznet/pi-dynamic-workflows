@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -1276,4 +1277,98 @@ test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () =
     cost: 0.01,
   });
   assert.equal(usage?.cost, 0.01);
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// worktree-isolation:f2 — runWorkflow teardown finalizes agent edits and
+// honors the keepWorktree opt-in; the default mode discards the finalized
+// branch + worktree instead of silently destroying uncommitted edits.
+// ═══════════════════════════════════════════════════════════════════════
+
+function initWorktreeTestRepo(): { repo: string; git: (...args: string[]) => string } {
+  const repo = mkdtempSync(join(tmpdir(), "pi-dw-wt-int-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
+  git("init", "-q");
+  git("config", "user.email", "t@t.t");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return { repo, git };
+}
+
+/** Fake subagent that simulates agent edits by writing into its isolated worktree cwd. */
+const worktreeEditingAgent = {
+  async run(_prompt: string, options: { cwd?: string }) {
+    if (options.cwd) writeFileSync(join(options.cwd, "agent-file.txt"), "agent edit\n");
+    return "done";
+  },
+};
+
+function branchForWorktree(wtPath: string): string {
+  const id = wtPath.split(/[\\/]/).pop() ?? "";
+  return `pi/wf/${id}`;
+}
+
+test("workflow teardown removes the worktree + branch after an isolated agent (default mode)", async () => {
+  const { repo, git } = initWorktreeTestRepo();
+  try {
+    let wtPath: string | undefined;
+    // onAgentEnd fires before teardown, so existence must be captured there —
+    // after runWorkflow resolves the default-mode finally has already removed it.
+    let existedDuringRun = false;
+    const result = await runWorkflow(
+      `export const meta = { name: 'test', description: 't' }
+       const r = await agent('edit', { label: 'edit', isolation: 'worktree' })
+       return r`,
+      {
+        agent: worktreeEditingAgent,
+        cwd: repo,
+        persistLogs: false,
+        onAgentEnd: (e) => {
+          wtPath = e.worktree;
+          if (e.worktree) existedDuringRun = existsSync(e.worktree);
+        },
+      },
+    );
+
+    assert.equal(result.result, "done");
+    assert.ok(wtPath, "agent ran in an isolated worktree");
+    assert.equal(existedDuringRun, true, "worktree existed during the run");
+    assert.ok(!existsSync(wtPath as string), "worktree dir removed after the run");
+    assert.equal(git("branch", "--list", branchForWorktree(wtPath as string)), "", "branch deleted after the run");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("workflow keepWorktree retains the branch + path with finalized agent edits", async () => {
+  const { repo, git } = initWorktreeTestRepo();
+  try {
+    let wtPath: string | undefined;
+    const result = await runWorkflow(
+      `export const meta = { name: 'test', description: 't' }
+       const r = await agent('edit', { label: 'edit', isolation: 'worktree', keepWorktree: true })
+       return r`,
+      {
+        agent: worktreeEditingAgent,
+        cwd: repo,
+        persistLogs: false,
+        onAgentEnd: (e) => {
+          wtPath = e.worktree;
+        },
+      },
+    );
+
+    assert.equal(result.result, "done");
+    assert.ok(wtPath, "agent ran in an isolated worktree");
+    assert.ok(existsSync(wtPath as string), "keepWorktree retains the worktree dir for inspection");
+    const branch = branchForWorktree(wtPath as string);
+    assert.ok(git("branch", "--list", branch).includes(branch), "keepWorktree retains the branch");
+    // finalizeWorktree committed the agent edit onto the retained branch.
+    assert.equal(git("show", `${branch}:agent-file.txt`), "agent edit");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });

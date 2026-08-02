@@ -4,7 +4,15 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createWorktree as createWorktreeLive, removeWorktree } from "../src/worktree.js";
+import type { WorktreeTask } from "../src/agent/worktree-runner.js";
+import { createWorktreeRunner } from "../src/agent/worktree-runner.js";
+import {
+  createWorktree as createWorktreeLive,
+  finalizeWorktree,
+  gitExec,
+  removeWorktree,
+  sweepOrphanWorktrees,
+} from "../src/worktree.js";
 
 // ── Existing tests (unchanged) ──
 
@@ -141,6 +149,222 @@ test("removeWorktree does not throw when git operations fail (corrupted metadata
 
     // Both git operations should fail silently — no throw from removeWorktree
     await assert.doesNotReject(removeWorktree(wt));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ── worktree-isolation:f1 — the runner now passes the full worktree shape ──
+
+function initRepo(prefix: string): string {
+  const repo = mkdtempSync(join(tmpdir(), prefix));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "t@t.t");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return repo;
+}
+
+function taskFromWorktree(id: string, wt: { cwd: string; branch?: string; repoRoot?: string }): WorktreeTask {
+  assert.ok(wt.branch, "worktree must carry a branch");
+  assert.ok(wt.repoRoot, "worktree must carry a repoRoot");
+  return {
+    id,
+    description: `task ${id}`,
+    branch: wt.branch,
+    worktreePath: wt.cwd,
+    repoRoot: wt.repoRoot,
+    status: "pending",
+  };
+}
+
+function assertBranchGone(repo: string, branch: string): void {
+  const branches = execFileSync("git", ["-C", repo, "branch", "--list", branch], { encoding: "utf8" });
+  assert.equal(branches.trim(), "", `branch ${branch} should be deleted`);
+}
+
+function assertBranchExists(repo: string, branch: string): void {
+  const branches = execFileSync("git", ["-C", repo, "branch", "--list", branch], { encoding: "utf8" });
+  assert.ok(branches.includes(branch), `branch ${branch} should still exist`);
+}
+
+test("worktree runner cleanup removes the worktree dir and branch after executeTasks", async () => {
+  const repo = initRepo("pi-wt-runner-");
+  try {
+    const wt = await createWorktreeLive(repo, "run-1-0-edit");
+    assert.equal(wt.isolated, true);
+
+    const runner = createWorktreeRunner({ cleanupOnComplete: true });
+    const results = await runner.executeTasks([taskFromWorktree("t1", wt)]);
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].taskId, "t1");
+    assert.ok(!existsSync(wt.cwd), "worktree dir removed after executeTasks cleanup");
+    assertBranchGone(repo, wt.branch as string);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("worktree runner cleanup() removes the worktree dir and branch for every registered task", async () => {
+  const repo = initRepo("pi-wt-runner-cleanup-");
+  try {
+    const wtA = await createWorktreeLive(repo, "run-a-0-edit");
+    const wtB = await createWorktreeLive(repo, "run-b-1-edit");
+    assert.equal(wtA.isolated, true);
+    assert.equal(wtB.isolated, true);
+
+    // cleanupOnComplete: false so executeTasks leaves them for cleanup()
+    const runner = createWorktreeRunner({ cleanupOnComplete: false });
+    const results = await runner.executeTasks([taskFromWorktree("ta", wtA), taskFromWorktree("tb", wtB)]);
+    assert.equal(results.length, 2);
+    assert.ok(existsSync(wtA.cwd), "cleanupOnComplete=false keeps worktrees until cleanup()");
+
+    await runner.cleanup();
+    assert.ok(!existsSync(wtA.cwd), "worktree A removed by cleanup()");
+    assert.ok(!existsSync(wtB.cwd), "worktree B removed by cleanup()");
+    assertBranchGone(repo, wtA.branch as string);
+    assertBranchGone(repo, wtB.branch as string);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ── worktree-isolation:i1 — startup orphan sweep ──
+
+test("sweepOrphanWorktrees reclaims leaked worktrees but keeps active + main", async () => {
+  const repo = initRepo("pi-wt-sweep-");
+  try {
+    const active = await createWorktreeLive(repo, "run-active-0-edit");
+    const orphan = await createWorktreeLive(repo, "run-orphan-0-edit");
+    assert.equal(active.isolated, true);
+    assert.equal(orphan.isolated, true);
+
+    await sweepOrphanWorktrees(repo, [active.cwd]);
+
+    assert.ok(existsSync(repo), "main checkout is never removed");
+    assert.ok(existsSync(active.cwd), "active worktree is preserved");
+    assert.ok(!existsSync(orphan.cwd), "orphan worktree dir is reclaimed");
+    assertBranchExists(repo, active.branch as string);
+    assertBranchGone(repo, orphan.branch as string);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("sweepOrphanWorktrees swallows errors outside a git repo", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-wt-sweep-nogit-"));
+  try {
+    await assert.doesNotReject(sweepOrphanWorktrees(dir, []));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("worktree runner sweeps orphaned worktrees at run start (init path)", async () => {
+  const repo = initRepo("pi-wt-runner-sweep-");
+  try {
+    // Leftover from a "crashed" run — not part of the new run's task set.
+    const leftover = await createWorktreeLive(repo, "run-crashed-0-edit");
+    // This run's own worktree, pre-created by the caller as executeTasks expects.
+    const mine = await createWorktreeLive(repo, "run-new-0-edit");
+
+    const runner = createWorktreeRunner({ cleanupOnComplete: false });
+    const results = await runner.executeTasks([taskFromWorktree("t1", mine)]);
+
+    assert.equal(results.length, 1);
+    assert.ok(!existsSync(leftover.cwd), "crashed run's worktree swept before execution");
+    assert.ok(existsSync(mine.cwd), "this run's own worktree is preserved by the sweep");
+    assertBranchGone(repo, leftover.branch as string);
+    assertBranchExists(repo, mine.branch as string);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ── worktree-isolation:f2 — finalize before teardown ──
+
+test("finalizeWorktree commits agent edits onto the branch before teardown", async () => {
+  const repo = initRepo("pi-wt-finalize-");
+  try {
+    const wt = await createWorktreeLive(repo, "run-finalize-0-edit");
+    assert.equal(wt.isolated, true);
+    writeFileSync(join(wt.cwd, "agent-output.txt"), "agent edit\n");
+
+    const ok = await finalizeWorktree(wt);
+    assert.equal(ok, true, "finalize should succeed with a dirty tree");
+
+    // The edit is committed onto the branch BEFORE teardown — this is exactly what
+    // a keepWorktree consumer inspects after the run (see the workflow integration
+    // test in tests/agent.test.ts).
+    const shown = execFileSync("git", ["-C", repo, "show", `${wt.branch}:agent-output.txt`], { encoding: "utf8" });
+    assert.equal(shown, "agent edit\n");
+
+    // Default teardown then deliberately discards the finalized branch + worktree.
+    await removeWorktree(wt);
+    assert.ok(!existsSync(wt.cwd), "worktree dir removed after teardown");
+    assertBranchGone(repo, wt.branch as string);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("finalizeWorktree creates an empty commit on a clean tree (allow-empty)", async () => {
+  const repo = initRepo("pi-wt-finalize-clean-");
+  try {
+    const wt = await createWorktreeLive(repo, "run-finalize-clean");
+    assert.equal(wt.isolated, true);
+
+    const ok = await finalizeWorktree(wt);
+    assert.equal(ok, true);
+    const head = execFileSync("git", ["-C", repo, "log", "-1", "--format=%s", wt.branch as string], {
+      encoding: "utf8",
+    });
+    assert.match(head, /finalize agent worktree/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("finalizeWorktree is a no-op (false) for a non-isolated Worktree", async () => {
+  assert.equal(await finalizeWorktree({ isolated: false, cwd: "/tmp", reason: "not a git repository" }), false);
+});
+
+// ── worktree-isolation:i4 — central git exec helper ──
+
+test("gitExec rejects on a pre-aborted signal", async () => {
+  await assert.rejects(gitExec(["version"], { signal: AbortSignal.abort() }), /aborted/);
+});
+
+test("gitExec resolves stdout for a successful command", async () => {
+  const out = await gitExec(["version"]);
+  assert.match(out, /git version/);
+});
+
+// ── worktree-isolation:i5 — real-git lifecycle smoke test (Windows-safe) ──
+
+test("smoke: create → edit → finalize → remove lifecycle on real git", async () => {
+  // Full production lifecycle in a temp repo: createWorktree creates the isolated
+  // checkout on pi/wf/<id>, an agent edits files inside it, finalizeWorktree commits
+  // the edits onto the branch, and removeWorktree reclaims the dir + branch. Paths
+  // come from tmpdir() and branch names are ASCII slugs, so this runs on Windows too.
+  const repo = initRepo("pi-wt-smoke-");
+  try {
+    const wt = await createWorktreeLive(repo, "run-smoke-0-edit");
+    assert.equal(wt.isolated, true);
+    assert.ok(existsSync(join(wt.cwd, "file.txt")), "worktree has a checkout");
+
+    // Agent edit must not touch the base tree.
+    writeFileSync(join(wt.cwd, "feature.ts"), "export const feature = true;\n");
+    assert.ok(!existsSync(join(repo, "feature.ts")), "agent edits stay inside the worktree");
+
+    assert.equal(await finalizeWorktree(wt), true, "agent edits are committed");
+    await removeWorktree(wt);
+    assert.ok(!existsSync(wt.cwd), "worktree dir removed");
+    assertBranchGone(repo, wt.branch as string);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

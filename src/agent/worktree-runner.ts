@@ -2,13 +2,20 @@
  * Worktree Subagent Execution & /implement Protocol (Phase 3).
  * Fans out parallel subagent tasks in isolated Git worktrees.
  */
-import { removeWorktree } from "../worktree.js";
+import { removeWorktree, sweepOrphanWorktrees } from "../worktree.js";
 
 export interface WorktreeTask {
   id: string;
   description: string;
   branch: string;
   worktreePath: string;
+  /**
+   * Repo root the worktree belongs to — required so teardown can actually remove
+   * the worktree and its branch. Populated at worktree creation (via
+   * `git rev-parse --show-toplevel` or from `createWorktree`'s returned Worktree).
+   * Without it, cleanup would silently no-op and leak every worktree (worktree-isolation:f1).
+   */
+  repoRoot: string;
   status: "pending" | "running" | "completed" | "failed";
   result?: unknown;
   error?: string;
@@ -85,8 +92,32 @@ export function createWorktreeRunner(config?: Partial<WorktreeRunnerConfig>): Wo
   const tasks = new Map<string, WorktreeTask>();
   let aborted = false;
 
+  /**
+   * Startup orphan-worktree sweep (worktree-isolation:i1): reclaim worktrees left
+   * behind by crashed runs before this run executes, so a stale `pi/wf/<id>` branch
+   * can't block `git worktree add -b` on resume. The active set is THIS run's task
+   * paths — any other worktree in the same repo is reclaimed, per repo root.
+   * Best-effort: a failed sweep is retried on the next run.
+   */
+  const sweepOrphans = async (taskList: WorktreeTask[]): Promise<void> => {
+    const byRoot = new Map<string, string[]>();
+    for (const task of taskList) {
+      const paths = byRoot.get(task.repoRoot) ?? [];
+      paths.push(task.worktreePath);
+      byRoot.set(task.repoRoot, paths);
+    }
+    for (const [repoRoot, activePaths] of byRoot) {
+      try {
+        await sweepOrphanWorktrees(repoRoot, activePaths);
+      } catch {
+        // best-effort — leftovers are retried on the next run
+      }
+    }
+  };
+
   return {
     async executeTasks(taskList: WorktreeTask[]): Promise<RunResult[]> {
+      await sweepOrphans(taskList);
       const results: RunResult[] = [];
       const chunks: WorktreeTask[][] = [];
       for (let i = 0; i < taskList.length; i += cfg.maxConcurrent) {
@@ -94,15 +125,26 @@ export function createWorktreeRunner(config?: Partial<WorktreeRunnerConfig>): Wo
       }
       for (const chunk of chunks) {
         if (aborted) break;
-        const batch = await Promise.all(chunk.map(t => {
-          tasks.set(t.id, t);
-          return executeTask(t, cfg);
-        }));
+        const batch = await Promise.all(
+          chunk.map((t) => {
+            tasks.set(t.id, t);
+            return executeTask(t, cfg);
+          }),
+        );
         results.push(...batch);
       }
       if (cfg.cleanupOnComplete) {
         for (const task of taskList) {
-          try { await removeWorktree({ path: task.worktreePath, branch: task.branch } as any); } catch {}
+          try {
+            await removeWorktree({
+              isolated: true,
+              cwd: task.worktreePath,
+              branch: task.branch,
+              repoRoot: task.repoRoot,
+            });
+          } catch {
+            // best-effort cleanup; leftovers are reclaimed by sweepOrphanWorktrees
+          }
         }
       }
       return results;
@@ -110,10 +152,21 @@ export function createWorktreeRunner(config?: Partial<WorktreeRunnerConfig>): Wo
     getTaskStatus: (taskId: string) => tasks.get(taskId),
     async cleanup() {
       for (const task of tasks.values()) {
-        try { await removeWorktree({ path: task.worktreePath, branch: task.branch } as any); } catch {}
+        try {
+          await removeWorktree({
+            isolated: true,
+            cwd: task.worktreePath,
+            branch: task.branch,
+            repoRoot: task.repoRoot,
+          });
+        } catch {
+          // best-effort cleanup; leftovers are reclaimed by sweepOrphanWorktrees
+        }
       }
       tasks.clear();
     },
-    abort() { aborted = true; },
+    abort() {
+      aborted = true;
+    },
   };
 }
