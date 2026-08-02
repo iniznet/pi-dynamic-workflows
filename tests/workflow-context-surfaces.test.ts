@@ -52,7 +52,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   for (const skill of artifact.surfaces.registeredSkillsDiscovery.skills) {
     assert.ok(skill.bytes > 0, `${skill.root} should report a positive discovery byte count`);
   }
-  assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 28);
+  assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 29);
   assert.ok(artifact.surfaces.workflowAuthoringSkillCorpus.bytes > 0);
   assert.equal(artifact.surfaces.representativeAuthoringProfiles.profiles.length, 6);
   assert.deepEqual(
@@ -107,7 +107,7 @@ test("workflow context measurement generation is deterministic and committed art
 test("workflow context byte counts are LF-basis and count corpus files once", () => {
   const artifact = measureWorkflowContextSurfaces(ROOT);
   const corpusFiles = artifact.surfaces.workflowAuthoringSkillCorpus;
-  assert.equal(corpusFiles.files, 28);
+  assert.equal(corpusFiles.files, 29);
   const corpusPaths = readdirRecursive(ROOT, "skills/workflow-authoring");
   const lfCorpusBytes = corpusPaths.reduce(
     (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path), "utf8").replace(/\r\n/g, "\n")),

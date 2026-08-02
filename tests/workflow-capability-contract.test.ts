@@ -17,9 +17,12 @@ const EXPECTED_RUNTIME_GLOBALS = [
   "args",
   "budget",
   "checkpoint",
+  "chunked",
   "completenessCheck",
+  "consensus",
   "console",
   "cwd",
+  "elapsedMs",
   "gate",
   "judgePanel",
   "log",
@@ -29,6 +32,8 @@ const EXPECTED_RUNTIME_GLOBALS = [
   "pipeline",
   "process",
   "retry",
+  "route",
+  "timeboxed",
   "verify",
   "workflow",
 ] as const;
@@ -66,11 +71,15 @@ test("capability definition inventories the settled runtime and invocation contr
   assert.deepEqual(WORKFLOW_CAPABILITY_DEFINITION.optionShapes.map((shape) => shape.id).sort(), [
     "agent-options",
     "checkpoint-options",
+    "chunked-options",
+    "consensus-options",
     "gate-options",
     "judge-panel-options",
     "loop-until-dry-options",
     "phase-options",
     "retry-options",
+    "route-options",
+    "timeboxed-options",
     "verify-options",
   ]);
   assert.ok(
