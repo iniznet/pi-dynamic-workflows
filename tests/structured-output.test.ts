@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { createStructuredOutputTool } from "../src/structured-output.js";
 
@@ -22,15 +23,36 @@ test("createStructuredOutputTool defaults name to structured_output", () => {
   assert.equal(tool.name, "structured_output");
 });
 
-test("createStructuredOutputTool tool has execute, renderCall, renderResult", () => {
+test("renderCall and renderResult actually render the tool call and result", () => {
   const capture = { called: false, value: undefined };
   const tool = createStructuredOutputTool({
     schema: Type.Object({ ok: Type.Boolean() }),
     capture,
   });
-  assert.equal(typeof tool.execute, "function");
-  assert.ok(tool.description, "description should be truthy");
-  assert.ok(tool.label, "label should be truthy");
+  assert.ok(tool.renderCall, "renderCall must be defined");
+  assert.ok(tool.renderResult, "renderResult must be defined");
+
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+  const call = tool.renderCall({ ok: true }, theme, {} as never);
+  const result = tool.renderResult(
+    { content: [{ type: "text", text: "Structured output received." }], details: { ok: true }, terminate: true },
+    { isPartial: false, expanded: false },
+    theme,
+    {} as never,
+  );
+
+  assert.ok(call instanceof Text, "renderCall returns a TUI Text component");
+  assert.ok(result instanceof Text, "renderResult returns a TUI Text component");
+  assert.match(call.render(80).join(""), /structured_output/, "renderCall shows the tool name");
+  assert.match(result.render(80).join(""), /\{"ok":true\}/, "renderResult shows the captured payload");
+
+  const partial = tool.renderResult(
+    { content: [{ type: "text", text: "Structured output received." }], details: { ok: true }, terminate: true },
+    { isPartial: true, expanded: false },
+    theme,
+    {} as never,
+  );
+  assert.ok(partial instanceof Text);
 });
 
 test("createStructuredOutputTool execute captures value and marks called", async () => {

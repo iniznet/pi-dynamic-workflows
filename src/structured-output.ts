@@ -1,4 +1,5 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
 
 export interface StructuredOutputCapture<T = unknown> {
@@ -43,5 +44,18 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
         terminate: true,
       };
     },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold(name)), 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("muted", "Structured output…"), 0, 0);
+      const summary = JSON.stringify(result.details ?? {});
+      return new Text(theme.fg("toolOutput", truncate(summary, 200)), 0, 0);
+    },
   });
+}
+
+/** Keep the TUI summary bounded for large machine-readable payloads. */
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
