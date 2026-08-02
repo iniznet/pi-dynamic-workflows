@@ -95,9 +95,9 @@ describe("errors", () => {
   it("wrapError handles timeout errors by message", async () => {
     const { wrapError, WorkflowErrorCode } = await loadErrors();
     const result = wrapError(new Error("timed out after 5000ms"));
-    // "timed out" does not match the /\btimeout\b/ pattern (it's "timed", not "timeout")
-    // so it wraps as a generic AGENT_EXECUTION_ERROR
-    assert.equal(result.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    // "timed out" is recognized by isTimeoutError as a timeout signal,
+    // so it wraps as a recoverable AGENT_TIMEOUT.
+    assert.equal(result.code, WorkflowErrorCode.AGENT_TIMEOUT);
     assert.equal(result.recoverable, true);
   });
 
