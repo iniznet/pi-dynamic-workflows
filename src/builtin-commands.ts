@@ -31,6 +31,19 @@ const execFileAsync = promisify(execFile);
  */
 const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
 
+/**
+ * Hard deadline for the diff-source exec (M12). A hung `gh` (network stall) or
+ * a wedged git process must never block /code-review — and with it the session
+ * — indefinitely; the previous exec had no timeout at all.
+ */
+const DIFF_EXEC_TIMEOUT_MS = 60_000;
+
+/**
+ * SIGKILL is uncatchable by the child: a wedged network call dies for real
+ * instead of getting a chance to ignore the signal.
+ */
+const DIFF_EXEC_KILL_SIGNAL = "SIGKILL" as const;
+
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   try {
     return (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === name);
@@ -210,7 +223,16 @@ export function registerBuiltinWorkflows(
           // execFile (not exec/shell) + array args: input can't break out into a
           // shell command. maxBuffer raised well past Node's 1MB default so a
           // large `gh pr diff` doesn't throw ERR_CHILD_PROCESS_STDOUT_MAXBUFFER.
-          const { stdout } = await execFileAsync(cmd, cmdArgs, { cwd, maxBuffer: DIFF_EXEC_MAX_BUFFER });
+          // The 60s timeout + SIGKILL keep a hung gh/git from wedging the
+          // session, and the notify says what is happening while the fetch runs
+          // (M12: the exec used to be silent until it returned or hung).
+          ctx.ui.notify(`Fetching diff from ${diffSource}…`, "info");
+          const { stdout } = await execFileAsync(cmd, cmdArgs, {
+            cwd,
+            maxBuffer: DIFF_EXEC_MAX_BUFFER,
+            timeout: DIFF_EXEC_TIMEOUT_MS,
+            killSignal: DIFF_EXEC_KILL_SIGNAL,
+          });
           diff = stdout;
           if (!diff.trim()) {
             return ctx.ui.notify(`No diff output from: ${diffSource}`, "warning");
@@ -221,6 +243,13 @@ export function registerBuiltinWorkflows(
             return ctx.ui.notify(
               `Diff from ${diffSource} exceeds the ${Math.floor(DIFF_EXEC_MAX_BUFFER / (1024 * 1024))}MB capture limit — ` +
                 `narrow the target (e.g. a specific file or path) and try again.`,
+              "error",
+            );
+          }
+          if (code === "ETIMEDOUT") {
+            return ctx.ui.notify(
+              `Diff fetch from ${diffSource} timed out after ${DIFF_EXEC_TIMEOUT_MS / 1000}s — ` +
+                `check that the command works in your shell, then try again.`,
               "error",
             );
           }

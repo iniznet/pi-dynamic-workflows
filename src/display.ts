@@ -330,8 +330,80 @@ export function renderWorkflowLines(
 }
 
 export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
-  const header = completed ? "Workflow completed" : "Workflow running";
-  return [header, ...renderWorkflowLines(snapshot)].join("\n");
+  return [workflowFinalHeader(completed ? "completed" : "running"), ...renderWorkflowLines(snapshot)].join("\n");
+}
+
+/**
+ * Truthful header for a finished run, mapped from its FINAL status (M7). Never
+ * the generic "Workflow completed" for a run that stopped, failed, or paused:
+ * a paused run is explicitly labeled resumable so a usage-limit pause does not
+ * read as a dead end, and stopped/failed runs say so.
+ */
+export function workflowFinalHeader(status: string): string {
+  switch (status) {
+    case "completed":
+    case "done":
+      return "Workflow completed";
+    case "failed":
+    case "error":
+      return "Workflow failed";
+    case "stopped":
+    case "aborted":
+      return "Workflow stopped";
+    case "paused":
+      return "Workflow paused (resumable)";
+    default:
+      return "Workflow running";
+  }
+}
+
+/** Render a snapshot with a truthful final-status header (see {@link workflowFinalHeader}). */
+export function renderWorkflowStatusText(snapshot: WorkflowSnapshot, status: string): string {
+  return [workflowFinalHeader(status), ...renderWorkflowLines(snapshot)].join("\n");
+}
+
+// ─── Live cost-meter math (task-panel detailed mode) ──────────────────────────
+
+/**
+ * Price per token (USD) from a provider's per-1M-OUTPUT-token price — the same
+ * figure the tier ranking and /workflows-models preview use. Output price is a
+ * rough proxy for blended spend, which is honest enough for a live estimate.
+ * Undefined when the registry reports no price (self-hosted, unknown).
+ */
+export function pricePerToken(costOutputPerMillion: number | undefined): number | undefined {
+  if (typeof costOutputPerMillion !== "number" || !Number.isFinite(costOutputPerMillion) || costOutputPerMillion <= 0) {
+    return undefined;
+  }
+  return costOutputPerMillion / 1_000_000;
+}
+
+/** Estimated USD/second at a token rate × per-token price; undefined when either is unknown. */
+export function costPerSecond(tokensPerSecondRate: number, perTokenPrice: number | undefined): number | undefined {
+  if (!Number.isFinite(tokensPerSecondRate) || tokensPerSecondRate <= 0) return undefined;
+  if (perTokenPrice === undefined || !Number.isFinite(perTokenPrice) || perTokenPrice <= 0) return undefined;
+  return tokensPerSecondRate * perTokenPrice;
+}
+
+/** Estimated total USD for a token spend at a per-token price; undefined when unknown. */
+export function estimatedCost(tokens: number, perTokenPrice: number | undefined): number | undefined {
+  if (!Number.isFinite(tokens) || tokens <= 0) return undefined;
+  if (perTokenPrice === undefined || !Number.isFinite(perTokenPrice) || perTokenPrice <= 0) return undefined;
+  return tokens * perTokenPrice;
+}
+
+/**
+ * Compact spend-vs-budget bar for a run with a hard tokenBudget:
+ * "[█████░░░░░] 45%". Empty when the run carries no budget, so budget-free runs
+ * render nothing new. Ten cells keeps it readable in a narrow panel.
+ */
+const BUDGET_BAR_FILL = "█";
+/** Empty budget-bar cell. */
+const BUDGET_BAR_EMPTY = "░";
+export function formatBudgetBar(spentTokens: number, budgetTokens: number | null | undefined): string {
+  if (typeof budgetTokens !== "number" || !Number.isFinite(budgetTokens) || budgetTokens <= 0) return "";
+  const pct = Math.max(0, Math.min(1, spentTokens / budgetTokens));
+  const filled = Math.round(pct * 10);
+  return `[${BUDGET_BAR_FILL.repeat(filled)}${BUDGET_BAR_EMPTY.repeat(10 - filled)}] ${Math.round(pct * 100)}%`;
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {

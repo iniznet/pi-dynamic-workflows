@@ -9,10 +9,15 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { listAvailableModels } from "./agent.js";
 import {
   aggregateAgentUsage,
+  costPerSecond,
+  estimatedCost,
   fmtCost,
   fmtTokenSegment,
+  formatBudgetBar,
+  pricePerToken,
   shorten,
   statusIcon,
   tokenFigures,
@@ -25,21 +30,10 @@ import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 import { shortModel } from "./workflow-ui.js";
 
-// `tokenUsage` is included so the detailed panel's live token/s counter refreshes
-// as tokens accrue (not only on agent start/end). It is harmless in compact mode —
-// it redraws identical content.
-const RUN_EVENTS = [
-  "agentStart",
-  "agentEnd",
-  "phase",
-  "log",
-  "tokenUsage",
-  "complete",
-  "error",
-  "stopped",
-  "paused",
-  "resumed",
-];
+// `tokenUsage` is deliberately NOT subscribed: the event fires once at script
+// end and the detailed panel's 2s timer refreshes the live tok/s readout, so
+// subscribing only added a redraw of identical content in compact mode (M17).
+const RUN_EVENTS = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
 const RUN_END_EVENTS = ["complete", "error", "stopped"] as const;
 
@@ -150,15 +144,42 @@ function deliveredMaxChars(opts: { loadSettings?: () => WorkflowSettings }): num
  *
  * Set up once per extension; idempotent via an internal guard.
  */
+export interface ResultDeliveryOptions {
+  loadSettings?: () => WorkflowSettings;
+  /**
+   * Fallback user-notification surface used when sendMessage fails (e.g. a
+   * stale ctx after /reload). The extension entry has no command context at
+   * install time, so this is wired wherever a ctx exists; console.warn always
+   * records the original failure either way (L22 — never swallow silently).
+   */
+  notify?: (message: string, type?: "info" | "warning" | "error") => void;
+}
+
+/**
+ * Log the original delivery failure with run context and fall back to a visible
+ * notify when one is configured — the result stays reachable via /workflows,
+ * but the user must not be left thinking the delivery succeeded (L22).
+ */
+function reportDeliveryFailure(holder: { notify?: ResultDeliveryOptions["notify"] }, error: unknown): void {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(`[workflows] background result delivery failed: ${detail}`);
+  holder.notify?.("Workflow result delivery failed — see /workflows for the full result.", "error");
+}
+
+/**
+ * Install the background-run result delivery (see {@link ResultDeliveryOptions}
+ * for the delivery contract). Set up once per extension; idempotent via an
+ * internal guard.
+ */
 export function installResultDelivery(
   pi: ExtensionAPI,
   manager: WorkflowManager,
-  opts: { loadSettings?: () => WorkflowSettings } = {},
+  opts: ResultDeliveryOptions = {},
 ): void {
   // Mutable holder on the manager shared by extension generations across /reload.
   const m = manager as unknown as {
     __deliveryInstalled?: boolean;
-    __holder?: { pi: ExtensionAPI; loadSettings?: () => WorkflowSettings };
+    __holder?: { pi: ExtensionAPI; loadSettings?: () => WorkflowSettings; notify?: ResultDeliveryOptions["notify"] };
   };
   if (m.__deliveryInstalled) {
     // The manager and listeners survive /reload. Refresh every generation-bound
@@ -166,24 +187,29 @@ export function installResultDelivery(
     if (m.__holder) {
       m.__holder.pi = pi;
       m.__holder.loadSettings = opts.loadSettings;
+      m.__holder.notify = opts.notify;
     }
     return;
   }
   m.__deliveryInstalled = true;
-  m.__holder = { pi, loadSettings: opts.loadSettings };
+  m.__holder = { pi, loadSettings: opts.loadSettings, notify: opts.notify };
 
   const deliver = (content: string) => {
+    const holder = m.__holder;
+    if (!holder) return;
     try {
-      const ret = m.__holder?.pi.sendMessage(
+      const ret = holder.pi.sendMessage(
         { customType: "workflow-result", content, display: true },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       // sendMessage may return a promise; a sync try/catch can't catch its
-      // rejection, so swallow the async path too. A stale ctx after /reload is
-      // the expected failure — the result is still visible via /workflows.
-      void Promise.resolve(ret).catch(() => {});
-    } catch {
-      // Synchronous failure (e.g. stale ctx) — result still visible via /workflows.
+      // rejection, so swallow the async path too — but only after reporting it
+      // (L22): a stale ctx after /reload is the expected failure, and the result
+      // is still visible via /workflows.
+      void Promise.resolve(ret).catch((error: unknown) => reportDeliveryFailure(holder, error));
+    } catch (error) {
+      // Synchronous failure (e.g. stale ctx) — same reporting contract.
+      reportDeliveryFailure(holder, error);
     }
   };
 
@@ -239,7 +265,11 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
   if (!active.length) return [];
   const rows = active.map((r) => {
     const live = manager.getRun(r.runId);
-    const agents = live?.snapshot.agents ?? r.agents;
+    // Array guard (M6): a structurally corrupt persisted run (agents not an
+    // array) would otherwise throw "agents is not iterable" here and take the
+    // whole panel down; mirror the navigator's #110 coercion.
+    const rawAgents = live?.snapshot.agents ?? r.agents;
+    const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
@@ -363,7 +393,8 @@ function renderRunBody(
 
 /**
  * Detailed variant of {@link renderPanel}: per-run header with aggregate tokens,
- * cost, and a live token/s rate, followed by per-phase progress and per-agent rows
+ * cost, a live token/s rate, an estimated cost/s, a spend-vs-budget bar, and a
+ * session-aggregate cost line, followed by per-phase progress and per-agent rows
  * (capped at `maxAgents` per phase). `now` is injected for testability.
  */
 export function renderPanelDetailed(
@@ -378,11 +409,18 @@ export function renderPanelDetailed(
   if (!active.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
   const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
+  // One registry price lookup per render: the host model registry is in-memory,
+  // so this stays cheap, and every miss degrades to the finalized-cost fallback.
+  const prices = resolveRunPriceMap(manager);
+  let sessionCost = 0;
+  let sessionCostKnownRuns = 0;
 
   for (const r of active) {
     const live = manager.getRun(r.runId);
     const snap = live?.snapshot;
-    const agents = (snap?.agents ?? r.agents) as WorkflowAgentSnapshot[];
+    // Array guard (M6): corrupt persisted agents must not take the panel down.
+    const rawAgents = snap?.agents ?? r.agents;
+    const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
@@ -397,13 +435,31 @@ export function renderPanelDetailed(
     const runUsage = aggregateAgentUsage(agents);
     sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    // Cost meter (FEATURE): price the run's newest agent that has a known model;
+    // the run-level tokenUsage.cost is the finalized figure and wins when it
+    // exists, otherwise observed tokens × price is the live estimate. Output
+    // price is a rough proxy, so estimates carry a "~" marker.
+    const perToken = runPricePerToken(prices, agents);
+    const cps = costPerSecond(rate, perToken);
+    const spentTokens = runUsage.fresh + runUsage.cacheRead;
+    // Finalized cost wins when the provider reported one (>0; a zero aggregate
+    // is the "not yet billed" signal and stays hidden like before); until then,
+    // observed tokens × price is the live estimate. Output price is a rough
+    // proxy, so estimates carry a "~" marker.
+    const finalizedCost = usage && typeof usage.cost === "number" && usage.cost > 0 ? usage.cost : undefined;
+    const spentCost = finalizedCost ?? estimatedCost(spentTokens, perToken);
+    if (spentCost !== undefined) {
+      sessionCost += spentCost;
+      sessionCostKnownRuns++;
+    }
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
       fmtTokenSegment(runUsage, fmtTokensShort),
-      // (cost is only known once the run finalizes its usage.)
-      usage?.cost ? fmtCost(usage.cost) : "",
+      spentCost !== undefined ? (finalizedCost !== undefined ? fmtCost(spentCost) : `~${fmtCost(spentCost)}`) : "",
       rate > 0 ? `${Math.round(rate)} tok/s` : "",
+      cps !== undefined ? `~${fmtCost(cps)}/s` : "",
+      formatBudgetBar(spentTokens, r.tokenBudget),
     ]
       .filter(Boolean)
       .join(" · ");
@@ -412,6 +468,10 @@ export function renderPanelDetailed(
   }
 
   const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  if (sessionCostKnownRuns > 0) {
+    const plural = sessionCostKnownRuns === 1 ? "run" : "runs";
+    out.push(dim(`  ~${fmtCost(sessionCost)} estimated spend across ${sessionCostKnownRuns} active ${plural}`));
+  }
   out.push(
     dim(
       finished > 0
@@ -420,6 +480,45 @@ export function renderPanelDetailed(
     ),
   );
   return out.map((line) => fitLine(line, width));
+}
+
+/**
+ * Build the model-spec → per-token-price map from the host model registry, once
+ * per render. Empty when no registry is exposed (headless/tests) — every call
+ * site then degrades to the finalized-cost fallback. Never throws: a registry
+ * hiccup must not take the always-on panel down.
+ */
+function resolveRunPriceMap(manager: WorkflowManager): ReadonlyMap<string, number> {
+  const map = new Map<string, number>();
+  const registry = manager.getModelRegistry?.();
+  if (!registry) return map;
+  try {
+    for (const model of listAvailableModels(registry)) {
+      const perToken = pricePerToken(model.costOutput);
+      if (perToken !== undefined) map.set(model.spec, perToken);
+    }
+  } catch {
+    // Registry hiccup — estimates degrade to finalized cost; never break the panel.
+  }
+  return map;
+}
+
+/**
+ * The per-token price of the run's newest agent that has a known model — the
+ * agent the run is most likely to be spending on right now. Undefined when no
+ * agent's model has a known price.
+ */
+function runPricePerToken(
+  prices: ReadonlyMap<string, number>,
+  agents: readonly WorkflowAgentSnapshot[],
+): number | undefined {
+  for (let i = agents.length - 1; i >= 0; i--) {
+    const model = agents[i]?.model;
+    if (!model) continue;
+    const price = prices.get(model);
+    if (price !== undefined) return price;
+  }
+  return undefined;
 }
 
 /**

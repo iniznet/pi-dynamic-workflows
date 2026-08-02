@@ -670,7 +670,9 @@ test("renderNavigator shows agents view", () => {
   const lines = renderNavigator(state, model, 80);
   const text = lines.join("\n");
   assert.match(text, /Scan · 2 agents/);
-  assert.match(text, /› ● scan a/);
+  // M15: the status glyph carries shape (✓ done) with color as reinforcement —
+  // never a color-only dot.
+  assert.match(text, /› ✓ scan a/);
   assert.match(text, /scan b/);
   assert.match(text, /enter open/);
 });

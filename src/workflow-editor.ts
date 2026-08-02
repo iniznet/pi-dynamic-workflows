@@ -47,7 +47,6 @@ export interface WorkflowModeState {
   active: boolean;
   keywordTriggerEnabled: boolean;
   keywordTriggerWord?: string;
-  suppressedKeywordText?: string;
 }
 
 export interface InstallWorkflowKeywordArmingOptions {
@@ -175,7 +174,6 @@ export function registerWorkflowTriggerCommand(
       const say = (content: string) => pi.sendMessage({ customType: "workflows-trigger", content, display: true });
       if (arg === "on") {
         state.keywordTriggerEnabled = true;
-        state.suppressedKeywordText = undefined;
         const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerEnabled: true });
         await say(
           saved
@@ -187,7 +185,6 @@ export function registerWorkflowTriggerCommand(
       if (arg === "off") {
         state.keywordTriggerEnabled = false;
         state.active = false;
-        state.suppressedKeywordText = undefined;
         const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerEnabled: false });
         await say(
           saved
@@ -206,7 +203,6 @@ export function registerWorkflowTriggerCommand(
           return;
         }
         state.keywordTriggerWord = keywordTriggerWord;
-        state.suppressedKeywordText = undefined;
         const saved = persistWorkflowTriggerSettings(settingsStore, { keywordTriggerWord });
         await say(
           saved
@@ -217,7 +213,6 @@ export function registerWorkflowTriggerCommand(
       }
       if (arg === "reset") {
         state.keywordTriggerWord = DEFAULT_KEYWORD_TRIGGER_WORD;
-        state.suppressedKeywordText = undefined;
         const saved = persistWorkflowTriggerSettings(settingsStore, {
           keywordTriggerWord: DEFAULT_KEYWORD_TRIGGER_WORD,
         });
@@ -334,10 +329,7 @@ export function installWorkflowKeywordArming(
     if (event.source !== "interactive" || !event.text) return { action: "continue" } as const;
     // Arm either when the user typed the "workflow(s)" trigger, or when standing
     // effort mode is on and the message is a substantive request.
-    const normalizedText = event.text.trim();
-    const suppressed = state.suppressedKeywordText === normalizedText;
-    if (suppressed) state.suppressedKeywordText = undefined;
-    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text, state.keywordTriggerWord);
+    const triggered = state.keywordTriggerEnabled && hasTrigger(event.text, state.keywordTriggerWord);
     const byEffort = !triggered && !!effort && effort.level !== "off" && isSubstantive(event.text);
     if (!triggered && !byEffort) return { action: "continue" } as const;
     try {

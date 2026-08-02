@@ -42,6 +42,14 @@ import {
  * Register the `/workflows-models` command with Pi.
  */
 export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
+  /**
+   * Menu separator row (L26). The host `ui.select` API only accepts plain
+   * strings — there is no disabled/header item type — so separators are inert
+   * LABELS: selecting one is an explicit no-op (see the loop guard) rather than
+   * a selectable action, and the visual rule keeps tiers apart from actions.
+   */
+  const MENU_SEPARATOR = "─".repeat(30);
+
   pi.registerCommand("workflows-models", {
     description: "View and edit model tiers used by workflows (small/medium/big)",
     handler: async (_args, ctx) => {
@@ -71,10 +79,10 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         const tiers = sortedTierNames(config);
         const menuOptions: string[] = [];
 
-        menuOptions.push("─".repeat(30));
+        menuOptions.push(MENU_SEPARATOR);
         const preview = formatTierCostPreview(config, availableModels());
         if (preview) menuOptions.push(...preview.split("\n"));
-        menuOptions.push("─".repeat(30));
+        menuOptions.push(MENU_SEPARATOR);
 
         menuOptions.push("Reset to defaults");
         menuOptions.push(dirty ? "Save and exit" : "Exit");
@@ -82,6 +90,9 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         const choice = await ctx.ui.select("Model tier configuration", menuOptions);
 
         if (!choice) break;
+        // Separators are inert labels (L26): a separator "selection" must never
+        // match a tier/action branch — treat it as a no-op and re-show the menu.
+        if (choice === MENU_SEPARATOR) continue;
 
         // Handle "<tier> → [model]" selections
         for (const name of tiers) {

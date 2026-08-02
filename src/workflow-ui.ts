@@ -602,7 +602,6 @@ function pad(n: number): string {
 // Light box-drawing glyphs (no heavy/double variants).
 const BX = { h: "─", v: "│", tl: "┌", tr: "┐", bl: "└", br: "┘", tj: "┬", bj: "┴" } as const;
 const CARET = "›";
-const DOT = "●";
 const ELLIPSIS = "…";
 
 // Tunables (exposed for clarity / future tuning) — see spec §0/§10.
@@ -638,7 +637,21 @@ function phaseStatusColor(p: { done: number; total: number }, agents: AgentRow[]
   return "dim";
 }
 
-const AGENT_DOT_COLOR: Record<string, string> = {
+const AGENT_STATUS_GLYPH: Record<string, string> = {
+  running: "●",
+  queued: "○",
+  pending: "○",
+  paused: "·",
+  done: "✓",
+  completed: "✓",
+  error: "✗",
+  failed: "✗",
+  skipped: "·",
+  aborted: "·",
+};
+
+/** Glyph color per agent status — color reinforces the glyph, never the only signal (M15). */
+const AGENT_STATUS_COLOR: Record<string, string> = {
   running: "warning",
   queued: "dim",
   pending: "dim",
@@ -651,6 +664,14 @@ const AGENT_DOT_COLOR: Record<string, string> = {
   aborted: "dim",
 };
 
+/** Textual aggregate phase status (a11y M15): ✗ error > ▶ running > ✓ done > · pending. */
+function phaseStatusGlyph(p: { done: number; total: number }, agents: AgentRow[]): string {
+  if (agents.some((a) => a.status === "error" || a.status === "failed")) return "✗";
+  if (agents.some((a) => a.status === "running")) return "▶";
+  if (p.total > 0 && p.done === p.total) return "✓";
+  return "·";
+}
+
 /** Compute the left ("Phases") box outer width, clamped per spec §3.1. */
 function computeLeftWidth(phases: PhaseRow[], width: number): number {
   const titleNeed = visibleWidth("Phases") + 2 /*spaces*/ + 1 /*┌*/ + 1 /*┬*/ + 3 /*min dashes*/;
@@ -658,12 +679,13 @@ function computeLeftWidth(phases: PhaseRow[], width: number): number {
   phases.forEach((p, i) => {
     const idx = String(i + 1);
     const hasAgents = p.total > 0;
+    // Progress carries a 1-wide status glyph + separator before the counts.
     const need =
       2 /*marker*/ +
       visibleWidth(idx) +
       1 /*sp*/ +
       visibleWidth(p.title) +
-      (hasAgents ? 1 + visibleWidth(`${p.done}/${p.total}`) : 0);
+      (hasAgents ? 1 /*sp*/ + 1 /*glyph*/ + 1 /*sp*/ + visibleWidth(`${p.done}/${p.total}`) : 0);
     if (need > contentMax) contentMax = need;
   });
   const innerNeed = Math.max(contentMax, titleNeed - 2);
@@ -685,8 +707,8 @@ function leftPhaseRow(
   const hasAgents = p.total > 0;
   const progress = hasAgents ? `${p.done}/${p.total}` : "";
   const marker = selected ? `${CARET} ` : "  ";
-  // Fixed parts width: marker + idx + space + (space+progress if shown)
-  const fixed = 2 + visibleWidth(idx) + 1 + (progress ? 1 + visibleWidth(progress) : 0);
+  // Fixed parts width: marker + idx + space + (space + status glyph + space + progress if shown)
+  const fixed = 2 + visibleWidth(idx) + 1 + (progress ? 1 + 1 + 1 + visibleWidth(progress) : 0);
   const nameRoom = Math.max(0, innerW - fixed);
   const name = truncateToWidth(p.title, nameRoom, ELLIPSIS, false);
 
@@ -696,7 +718,7 @@ function leftPhaseRow(
 
   const caret = selected ? theme.fg("accent", theme.bold(marker)) : marker;
   let row = caret + styleMain(`${idx} ${name}`);
-  if (progress) row += ` ${progStyle(progress)}`;
+  if (progress) row += ` ${progStyle(`${phaseStatusGlyph(p, agents)} ${progress}`)}`;
   return truncateToWidth(row, innerW, "", true); // pad to exact innerW
 }
 
@@ -708,7 +730,9 @@ function rightAgentRow(
   innerW: number,
   theme: ThemeLike,
 ): string {
-  const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
+  // Status glyph carries meaning by shape; color reinforces it (M15).
+  const glyph = AGENT_STATUS_GLYPH[a.status] ?? "·";
+  const glyphColor = AGENT_STATUS_COLOR[a.status] ?? "dim";
   const stats = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), compactTokens);
   const model = shortModel(a.model) ?? "";
 
@@ -738,7 +762,7 @@ function rightAgentRow(
   }
 
   const marker = selected ? theme.fg("accent", theme.bold(`${CARET} `)) : "  ";
-  const dot = theme.fg(dotColor, DOT);
+  const dot = theme.fg(glyphColor, glyph);
   const nameStyled = selected ? theme.fg("accent", theme.bold(nameOut)) : theme.fg("accent", nameOut);
   const modelStyled = modelOut ? theme.fg("dim", modelOut) : "";
   const statsStyled = theme.fg("dim", stats);
@@ -1560,9 +1584,23 @@ export function openWorkflowNavigator(
       const rerender = () => tui.requestRender();
       const markdownTheme = getMarkdownTheme();
       const renderCache = new NavigatorTextRenderCache();
-      const events = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
-      const onEvent = () => rerender();
-      for (const ev of events) manager.on(ev, onEvent);
+      // L18 render discipline: only views that consume an event class redraw on
+      // it. Run logs are rendered NOWHERE in the navigator (detail shows per-agent
+      // prompt/result/history through the coalesced agentHistory channel), so
+      // "log" events are not subscribed at all; "phase" events only matter while
+      // a phases/agents pane (which lists phases) is on screen.
+      const PHASE_VIEWS: ReadonlySet<ViewKind> = new Set(["phases", "agents"]);
+      const events = ["agentStart", "agentEnd", "phase", "complete", "error", "stopped", "paused", "resumed"] as const;
+      const eventHandlers = new Map<string, () => void>();
+      const onEvent = (kind: string) => {
+        if (kind === "phase" && !PHASE_VIEWS.has(state.kind)) return;
+        rerender();
+      };
+      for (const ev of events) {
+        const handler = () => onEvent(ev);
+        eventHandlers.set(ev, handler);
+        manager.on(ev, handler);
+      }
 
       // Histories can update several times per second for every parallel agent.
       // Only agent detail consumes those updates, so ignore unrelated agents and
@@ -1597,134 +1635,214 @@ export function openWorkflowNavigator(
       manager.on("agentHistory", onAgentHistory);
 
       const cleanup = () => {
-        for (const ev of events) manager.off(ev, onEvent);
+        for (const [ev, handler] of eventHandlers) manager.off(ev, handler);
         manager.off("agentHistory", onAgentHistory);
         if (historyRenderTimer) clearTimeout(historyRenderTimer);
         historyRenderTimer = undefined;
         historyRenderTarget = undefined;
       };
 
-      const act = (data: string) => {
-        const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
-        const action = keyToAction(parseKey(data), state.kind, itemKind);
+      // ── destructive-action helpers (L20 confirmation contract) ───────────────
+      // A headless host has no confirm surface: act immediately there (there is
+      // no user to ask); a dialog-capable host confirms first. The no-confirm
+      // path stays fully synchronous so tests and RPC hosts get the same
+      // immediate behavior they always had.
+      const performStop = (id: string) => {
+        try {
+          ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
+        } catch (error) {
+          // Same message shape as act()'s outer catch — the confirm path runs
+          // outside it, so it formats its own failure.
+          ui.notify(`Workflow action "stop" failed: ${error instanceof Error ? error.message : error}`, "error");
+        }
+      };
+      const deleteSavedAtCursor = (savedName?: string) => {
+        if (!savedName) return;
+        model.deleteSaved(savedName);
+        ui.notify(`Deleted /${savedName}`, "info");
+        if (state.kind === "savedDetail") state.back();
+      };
+      const saveAs = (name: string, run: NonNullable<PersistedRunState>, storage: WorkflowStorage) => {
+        try {
+          const saved = storage.save({
+            name,
+            description: run.workflowName,
+            script: run.script,
+            location: "project",
+          });
+          registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
+            storage.list().some((w) => w.name === saved.name),
+          );
+          ui.notify(`Saved /${name}`, "info");
+        } catch (error) {
+          ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+      };
+      /** M13: resolve the user-chosen name and guard an overwrite before saving. */
+      const saveWithOverwriteGuard = async (
+        suggested: string,
+        run: NonNullable<PersistedRunState>,
+        storage: WorkflowStorage,
+      ) => {
+        const name = ui.input ? ((await ui.input("Save workflow as", suggested))?.trim() ?? "") : suggested;
+        if (!name) return; // user cancelled the name prompt
+        const existing = storage.load(name);
+        const confirmed =
+          existing && ui.confirm
+            ? await ui.confirm("Overwrite saved workflow", `/${name} already exists — overwrite it?`)
+            : true;
+        if (confirmed) saveAs(name, run, storage);
+      };
+
+      /**
+       * What a key press does, dispatched inside ONE render frame (L19): every
+       * model read for the press — itemKindAt, currentCount, activeRunId, drill —
+       * reads model.runs(), which is a disk-backed listRuns() scan. Sharing a
+       * frame collapses the up-to-3 scans per keypress into one.
+       */
+      const act = async (data: string) => {
+        let action: NavAction = { type: "none" };
+        let rerenderAfter = true;
         // Keep the whole dispatch behind one error boundary so corrupt on-disk
         // data or persistence failures cannot crash the overlay input handler.
         try {
-          switch (action.type) {
-            case "move":
-              state.move(action.delta, currentCount(state, model));
-              break;
-            case "page":
-              state.movePage(action.direction, currentCount(state, model));
-              break;
-            case "jump":
-              state.jump(action.edge, currentCount(state, model));
-              break;
-            case "toggleTail":
-              state.toggleTail();
-              break;
-            case "togglePager":
-              state.togglePager();
-              break;
-            case "openPager":
-              state.openPager();
-              break;
-            case "drill":
-              state.drill(model);
-              break;
-            case "back":
-              if (!state.back()) {
+          model.withRenderFrame(() => {
+            const itemKind = state.kind === "runs" ? state.itemKindAt(model, state.cursor) : undefined;
+            const resolved = keyToAction(parseKey(data), state.kind, itemKind);
+            // Capture BEFORE the switch: the outer catch names the failing action,
+            // so a throw inside a case must not report the stale "none" placeholder.
+            action = resolved;
+            switch (resolved.type) {
+              case "move":
+                state.move(resolved.delta, currentCount(state, model));
+                break;
+              case "page":
+                state.movePage(resolved.direction, currentCount(state, model));
+                break;
+              case "jump":
+                state.jump(resolved.edge, currentCount(state, model));
+                break;
+              case "toggleTail":
+                state.toggleTail();
+                break;
+              case "togglePager":
+                state.togglePager();
+                break;
+              case "openPager":
+                state.openPager();
+                break;
+              case "drill":
+                state.drill(model);
+                break;
+              case "back":
+                // L23: closing the overlay must not fall through to the trailing
+                // rerender() — done() tears the overlay down.
+                if (!state.back()) {
+                  cleanup();
+                  done(undefined);
+                  rerenderAfter = false;
+                }
+                break;
+              case "close":
                 cleanup();
                 done(undefined);
-              }
-              break;
-            case "close":
-              cleanup();
-              done(undefined);
-              return;
-            case "deleteSaved": {
-              if (state.kind === "runs") {
-                const saved = model.saved();
-                const runCount = model.runs().length;
-                const item = saved[state.cursor - runCount];
-                if (item) {
-                  model.deleteSaved(item.name);
-                  ui.notify(`Deleted /${item.name}`, "info");
+                rerenderAfter = false;
+                break;
+              case "deleteSaved": {
+                const target =
+                  state.kind === "runs"
+                    ? model.saved()[state.cursor - model.runs().length]?.name
+                    : state.kind === "savedDetail"
+                      ? state.savedName
+                      : undefined;
+                if (!target) break;
+                if (ui.confirm) {
+                  void ui.confirm("Delete saved workflow", `Delete /${target}?`).then((ok) => {
+                    if (!ok) return;
+                    try {
+                      deleteSavedAtCursor(target);
+                    } catch (error) {
+                      ui.notify(
+                        `Workflow action "deleteSaved" failed: ${error instanceof Error ? error.message : error}`,
+                        "error",
+                      );
+                    }
+                    rerender();
+                  });
+                  rerenderAfter = false; // the confirm path schedules its own redraw
+                } else {
+                  deleteSavedAtCursor(target);
                 }
-              } else if (state.kind === "savedDetail" && state.savedName) {
-                model.deleteSaved(state.savedName);
-                ui.notify(`Deleted /${state.savedName}`, "info");
-                state.back();
-              }
-              break;
-            }
-            case "pause": {
-              const id = state.activeRunId(model);
-              if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
-              break;
-            }
-            case "stop": {
-              const id = state.activeRunId(model);
-              if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
-              break;
-            }
-            case "restart": {
-              const id = state.activeRunId(model);
-              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-              if (!run?.script) {
-                ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                 break;
               }
-              try {
-                const { runId: newId } = manager.startInBackground(run.script, run.args);
-                ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
-              } catch (error) {
-                ui.notify(
-                  `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
-                  "error",
-                );
+              case "pause": {
+                const id = state.activeRunId(model);
+                if (id) ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id}`, "info");
+                break;
               }
-              break;
-            }
-            case "save": {
-              const id = state.activeRunId(model);
-              const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
-              if (!run?.script) {
-                ui.notify("No saved run script to save", "warning");
-              } else if (!opts.storage) {
-                ui.notify("Saving is not available (no storage)", "error");
-              } else {
-                const storage = opts.storage;
-                const name = run.workflowName || "workflow";
-                let saved: ReturnType<WorkflowStorage["save"]>;
-                try {
-                  saved = storage.save({
-                    name,
-                    description: run.workflowName,
-                    script: run.script,
-                    location: "project",
+              case "stop": {
+                const id = state.activeRunId(model);
+                if (!id) break;
+                if (ui.confirm) {
+                  void ui.confirm("Stop workflow run", `Stop run ${id}?`).then((ok) => {
+                    if (!ok) return;
+                    performStop(id);
+                    rerender();
                   });
-                } catch (error) {
-                  ui.notify(error instanceof Error ? error.message : String(error), "error");
+                  rerenderAfter = false; // the confirm path schedules its own redraw
+                } else {
+                  performStop(id);
+                }
+                break;
+              }
+              case "restart": {
+                const id = state.activeRunId(model);
+                const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+                if (!run?.script) {
+                  ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                   break;
                 }
-                registerSavedWorkflow(pi, opts.cwd ?? process.cwd(), saved, undefined, () =>
-                  storage.list().some((w) => w.name === saved.name),
-                );
-                ui.notify(`Saved /${name}`, "info");
+                try {
+                  const { runId: newId } = manager.startInBackground(run.script, run.args);
+                  ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+                } catch (error) {
+                  ui.notify(
+                    `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
+                    "error",
+                  );
+                }
+                break;
               }
-              break;
+              case "save": {
+                const id = state.activeRunId(model);
+                const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
+                const storage = opts.storage;
+                if (!run?.script) {
+                  ui.notify("No saved run script to save", "warning");
+                  break;
+                }
+                if (!storage) {
+                  ui.notify("Saving is not available (no storage)", "error");
+                  break;
+                }
+                // M13: prompt for a name (pre-filled with the run's) and confirm
+                // before overwriting an existing saved workflow of that name. The
+                // dialog path runs async and schedules its own redraw.
+                void saveWithOverwriteGuard(run.workflowName || "workflow", run, storage).then(() => rerender());
+                rerenderAfter = false;
+                break;
+              }
+              default:
+                return resolved;
             }
-            default:
-              return;
-          }
+          });
         } catch (error) {
           ui.notify(
             `Workflow action "${action.type}" failed: ${error instanceof Error ? error.message : error}`,
             "error",
           );
         }
-        rerender();
+        if (rerenderAfter) rerender();
       };
 
       // Wrap the rendered content inside a visual box border for better
@@ -1768,7 +1886,9 @@ export function openWorkflowNavigator(
           };
           return [bgColor(topBorder), ...raw.map(wrapAndBg), bgColor(botBorder)];
         },
-        handleInput: (data: string) => act(data),
+        handleInput: (data: string) => {
+          void act(data);
+        },
         invalidate: () => {},
         dispose: () => cleanup(),
       };

@@ -704,7 +704,7 @@ describe("installWorkflowKeywordArming", () => {
     assert.equal(setActiveToolsCalls, 0);
   });
 
-  it("does not transform one-shot backspace-suppressed keyword input", async () => {
+  it("drops the one-shot suppression slot — dead since the editor-ownership drop (#101, M16): repeated keyword submits always arm", async () => {
     const mod = await load();
     const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
     let setActiveToolsCalls = 0;
@@ -721,18 +721,18 @@ describe("installWorkflowKeywordArming", () => {
     } as unknown as ExtensionAPI;
 
     const state = mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
-    state.suppressedKeywordText = "Please discuss workflows as a normal topic.";
+    assert.ok(!("suppressedKeywordText" in state), "the dead suppression slot is gone (M16)");
 
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({
-      source: "interactive",
-      text: "Please discuss workflows as a normal topic.",
-    });
-
-    assert.deepEqual(result, { action: "continue" });
-    assert.equal(setActiveToolsCalls, 0);
-    assert.equal(state.suppressedKeywordText, undefined, "suppression should be consumed after one submit");
+    const text = "Please discuss workflows as a normal topic.";
+    const first = inputHandler({ source: "interactive", text });
+    const second = inputHandler({ source: "interactive", text });
+    assert.deepEqual(first, { action: "transform", text: mod.buildArmedWorkflowPrompt(text) });
+    assert.deepEqual(second, { action: "transform", text: mod.buildArmedWorkflowPrompt(text) });
+    // The tool set is captured once and restored on turn_end, so both submits
+    // arm through the SAME armed turn (setActiveTools fires once).
+    assert.equal(setActiveToolsCalls, 1, "the armed turn adds the workflow tool once");
   });
 
   it("transforms the same keyword input later when it was not just suppressed", async () => {

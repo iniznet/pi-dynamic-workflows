@@ -38,13 +38,20 @@ export function effortDirective(level: EffortLevel): string | undefined {
 }
 
 /**
+ * Minimum trimmed message length (characters) for a message to count as a
+ * substantive request under standing effort mode (L25) — terse acknowledgements
+ * like "ok" and slash commands must never auto-arm a workflow.
+ */
+export const SUBSTANTIVE_MIN_LENGTH = 16;
+
+/**
  * Whether a message should auto-arm under effort mode: a real interactive request,
  * not a terse acknowledgement or a slash command. (hasTrigger handles the explicit
  * "workflow(s)" keyword separately.)
  */
 export function isSubstantive(text: string): boolean {
   const t = text.trim();
-  return t.length >= 16 && !t.startsWith("/");
+  return t.length >= SUBSTANTIVE_MIN_LENGTH && !t.startsWith("/");
 }
 
 export function registerEffortCommand(pi: ExtensionAPI, state: EffortState): void {

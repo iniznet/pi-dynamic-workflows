@@ -51,6 +51,10 @@ function harness(
     listRuns: () => [],
     getSnapshot: () => null,
     getRun: () => undefined,
+    // The real WorkflowManager extends EventEmitter, so watchRun's attach-first
+    // listener registration (L17) requires these on every manager-shaped fixture.
+    on: () => manager,
+    off: () => manager,
     stop: (id: string) => {
       calls.push(`stop:${id}`);
       return true;
