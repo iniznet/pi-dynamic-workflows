@@ -155,6 +155,28 @@ test("SharedStore.commitDelta (success) does not roll back — the discardDelta 
   assert.equal(store.get("k"), "w1", "a successful commit keeps the write live — commitDelta must not roll back");
 });
 
+test("SharedStore.discardDelta must not evict a concurrent sibling's live entry under cap pressure", () => {
+  // The rollback path restores prior values WITHOUT going through the
+  // guardrails (`assertWriteFits` / eviction). If it did, a failing agent's
+  // rollback could silently destroy a concurrently-running sibling agent's
+  // live data when the store is near its maxTotalBytes cap. The scenario:
+  // an agent OVERWRITES a previously-large key with a small value (freeing
+  // space), a sibling fills that freed space with its own key, then the
+  // first agent fails and rolls back to its large prior value. A bounded
+  // restore would evict the sibling to make room — the failing agent's own
+  // undo must never destroy an unrelated entry it never wrote.
+  const big = "B".repeat(40); // JSON = 42 B
+  const small = "s".repeat(5); // JSON = 7 B
+  const store = new SharedStore({ maxTotalBytes: 60, maxValueBytes: 60 });
+  store.put("k", big); // total = 42 B
+  store.trackPut("k", small, "run-1:0"); // shrinks k to 7 B; total = 7 B
+  // A sibling covers the freed space with its own key.
+  store.trackPut("sib", "x".repeat(40), "run-1:1"); // 42 B; total = 7 + 42 = 49 B (fits)
+  store.discardDelta("run-1:0"); // restores k to `big` (42 B) — would exceed cap if bounded
+  assert.equal(store.get("k"), big, "the rolled-back key is restored to its pre-window value");
+  assert.equal(store.get("sib"), "x".repeat(40), "sibling key survives the rollback untouched (not evicted)");
+});
+
 // ─── Delta-key collision regression (defect: nested workflow() shares a store
 // but restarts callSeq at 0) ───────────────────────────────────────────────────
 

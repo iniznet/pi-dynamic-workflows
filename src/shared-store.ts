@@ -135,6 +135,25 @@ export class SharedStore {
     else this.expiresAt.delete(key);
   }
 
+  /**
+   * Write `key` -> `value` WITHOUT invoking the size/count guardrails (and so
+   * WITHOUT evicting anything). Used only to UNDO a prior write — a rollback
+   * is contractually an "undo", never a new bounded write, so it must never
+   * destroy a live sibling agent's entry under cap pressure the way
+   * `assertWriteFits` would. The restored value is the exact bytes/entry that
+   * previously fit (it was accepted when first written), so it always fits
+   * again by construction: it strictly shrinks or matches the store's prior
+   * footprint for `key`, and leaves every other key untouched.
+   */
+  private restoreKey(key: string, value: unknown): void {
+    const bytes = this.measure(value);
+    const oldBytes = this.bytesByKey.get(key) ?? 0;
+    this.map.set(key, value);
+    this.totalBytes += bytes - oldBytes;
+    this.bytesByKey.set(key, bytes);
+    this.setExpiry(key);
+  }
+
   private isExpired(key: string): boolean {
     const at = this.expiresAt.get(key);
     return at !== undefined && Date.now() >= at;
@@ -265,7 +284,7 @@ export class SharedStore {
       if (!Object.is(this.map.get(key), delta[key])) continue;
       const prior = priors?.get(key);
       if (prior?.existed) {
-        this.put(key, prior.value);
+        this.restoreKey(key, prior.value);
       } else {
         this.removeKey(key);
       }
