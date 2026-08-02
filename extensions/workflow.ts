@@ -8,6 +8,7 @@ import {
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
 import {
+  applyEnvSettingsOverride,
   createEffortState,
   createGatewayProxiedTools,
   createWebTools,
@@ -39,7 +40,13 @@ export default function extension(pi: ExtensionAPI) {
   // manager even though their persisted snapshots remained visible on disk.
   const cwd = process.cwd();
   const storage = createWorkflowStorage(cwd);
-  const settings = loadWorkflowSettings({ cwd });
+  // PI_WORKFLOW_* env vars override settings.json (and the project override)
+  // per key — the headless/CI/containerized channel. Every settings reader in
+  // this generation goes through this single merged view so the extension
+  // cannot drift between the manager options, the result-delivery reader, the
+  // task panel, and keyword arming.
+  const loadSettings = () => applyEnvSettingsOverride(loadWorkflowSettings({ cwd }));
+  const settings = loadSettings();
   const managerOptions = {
     loadSavedWorkflow: (name: string) => storage.load(name)?.script,
     // Named toolsets survive on the persisted run (the tag, not the functions),
@@ -90,11 +97,28 @@ export default function extension(pi: ExtensionAPI) {
     extensionVersion: WORKFLOW_EXTENSION_VERSION,
     manager,
     effort,
+    // Deterministic reload dispose fanout (runs exactly once per generation,
+    // via extension-reload's stage/discard/expiry paths). Every step is
+    // idempotent. The live manager is deliberately NOT disposed here — a
+    // compatible reload claims it and reconfigures it.
+    dispose: () => {
+      // Clear the usage-limit scheduler's re-arm timers so a paused run can't
+      // resurrect itself from a dead generation's scheduler.
+      usageLimitScheduler.dispose();
+      // End the MCP bridge socket and null the gateway client (stop() is
+      // idempotent and drops its bridge reference).
+      stopHostToolGateway();
+      // Cross-slice handoff: an on-demand plannotator review bridge (if this
+      // generation ever creates one) is closed here via its close() — it ends
+      // the tracked SSE responses, settles pending waits, and closes the
+      // review server. The current extension generation owns no bridge
+      // instance, so there is nothing to close today.
+    },
   };
   // Refresh the delivery holder immediately after claiming the manager. On a
   // reload handoff its listener survives, but Pi invalidates the old ExtensionAPI
   // before loading this generation.
-  installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd }) });
+  installResultDelivery(pi, manager, { loadSettings });
 
   const workflowTool = createWorkflowTool({ cwd, manager, storage });
   const workflowControlTool = createWorkflowControlTool({ manager });
@@ -114,8 +138,9 @@ export default function extension(pi: ExtensionAPI) {
   // started (cold start), so restarting pi doesn't strand a paused run.
   const usageLimitScheduler = new UsageLimitScheduler(manager);
   pi.on("session_shutdown", (event?: { reason?: string }) => {
-    usageLimitScheduler.dispose();
-    stopHostToolGateway();
+    // Resources owned by this generation are disposed inside the runtime's
+    // dispose hook: handoff/discard run it deterministically (at most once)
+    // on both the reload and non-reload shutdown paths.
     if (event?.reason === "reload") {
       handoffWorkflowRuntime(runtime);
     } else {
@@ -167,11 +192,11 @@ export default function extension(pi: ExtensionAPI) {
     // Live "workflows running" panel below the input (focus + enter to open).
     // Pass a live settings loader so /workflows-progress (compact|detailed) takes
     // effect without a restart.
-    installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings: () => loadWorkflowSettings({ cwd }) });
+    installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings });
     if (!armingInstalled) {
       installWorkflowKeywordArming(pi, effort, {
         settingsStore: {
-          load: () => loadWorkflowSettings({ cwd }),
+          load: loadSettings,
           save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, cwd),
         },
       });

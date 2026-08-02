@@ -16,6 +16,16 @@ export interface WorkflowReloadRuntime {
   extensionVersion: string;
   manager: WorkflowManager;
   effort: EffortState;
+  /**
+   * Deterministic dispose fanout for resources owned by the extension
+   * generation that created this runtime — timers, the host-tool gateway, and
+   * any on-demand bridge (e.g. a plannotator review server, whose close() ends
+   * its SSE responses and closes the server). Runs at most once per runtime
+   * object (stage, replacement, discard, or TTL expiry), and must be
+   * idempotent. The live manager itself is deliberately NOT disposed here: a
+   * compatible reload claims it and reconfigures it.
+   */
+  dispose?: () => void;
 }
 
 export interface WorkflowRuntimeClaim {
@@ -31,6 +41,15 @@ interface HandoffEntry {
 const RELOAD_HANDOFF_KEY = Symbol.for("@quintinshaw/pi-dynamic-workflows:reload-handoffs");
 const RELOAD_HANDOFF_TTL_MS = 30_000;
 
+/** Runtimes whose dispose fanout has already run; guarantees at-most-once. */
+const disposedRuntimes = new WeakSet<WorkflowReloadRuntime>();
+
+function disposeRuntimeOnce(runtime: WorkflowReloadRuntime): void {
+  if (!runtime.dispose || disposedRuntimes.has(runtime)) return;
+  disposedRuntimes.add(runtime);
+  runtime.dispose();
+}
+
 function handoffs(): Map<string, HandoffEntry> {
   const root = globalThis as typeof globalThis & { [RELOAD_HANDOFF_KEY]?: Map<string, HandoffEntry> };
   const existing = root[RELOAD_HANDOFF_KEY];
@@ -45,11 +64,28 @@ function handoffs(): Map<string, HandoffEntry> {
  *
  * `ttlMs` is only ever overridden by tests; production callers rely on the
  * default so a slow/failed reload doesn't strand a staged runtime forever.
+ *
+ * Idempotent against double-fired shutdowns: handing off the SAME runtime
+ * object twice (a same-state reload race) is a no-op — the entry is already
+ * staged and in flight, so nothing is re-staged or disposed twice. A
+ * DIFFERENT runtime for the same cwd (a newer extension generation replacing
+ * an unclaimed handoff) replaces the stale entry and disposes it first.
+ *
+ * The leaving generation's owned resources are closed deterministically
+ * (disposeRuntimeOnce) BEFORE staging, so the claiming generation starts from
+ * a clean resource surface.
  */
 export function handoffWorkflowRuntime(runtime: WorkflowReloadRuntime, ttlMs: number = RELOAD_HANDOFF_TTL_MS): void {
   const store = handoffs();
   const previous = store.get(runtime.cwd);
-  if (previous) clearTimeout(previous.timer);
+  if (previous) {
+    // Same-state reload: the identical runtime is already staged and waiting
+    // to be claimed — re-fired session_shutdown, not a new generation.
+    if (previous.runtime === runtime) return;
+    clearTimeout(previous.timer);
+    disposeRuntimeOnce(previous.runtime);
+  }
+  disposeRuntimeOnce(runtime);
 
   const entry = {} as HandoffEntry;
   entry.runtime = runtime;
@@ -58,8 +94,10 @@ export function handoffWorkflowRuntime(runtime: WorkflowReloadRuntime, ttlMs: nu
     // No new extension generation ever claimed this runtime. Anything still
     // "running" in it would otherwise burn tokens to completion and deliver
     // its result into a manager nobody can reach anymore, so pause it onto
-    // the same journal-recovery path a version-mismatch reload uses.
+    // the same journal-recovery path a version-mismatch reload uses, then
+    // close the abandoned generation's owned resources.
     pauseStrandedWorkflowRuntime(runtime);
+    disposeRuntimeOnce(runtime);
     store.delete(runtime.cwd);
   }, ttlMs);
   entry.timer.unref?.();
@@ -80,6 +118,9 @@ export function takeWorkflowRuntime(cwd: string): WorkflowReloadRuntime | undefi
  * Claim a staged runtime and compare its package version with this extension
  * generation. Any package update falls back to a fresh manager; only reloads
  * within the exact same installed version retain live workflow state.
+ *
+ * The claimed runtime's resources were already disposed at stage time; only
+ * the manager (never disposed) is carried forward.
  */
 export function claimWorkflowRuntime(cwd: string): WorkflowRuntimeClaim {
   const runtime = takeWorkflowRuntime(cwd);
@@ -109,4 +150,5 @@ export function discardWorkflowRuntime(cwd: string, runtime?: WorkflowReloadRunt
   if (!entry || (runtime && entry.runtime !== runtime)) return;
   clearTimeout(entry.timer);
   store.delete(cwd);
+  disposeRuntimeOnce(entry.runtime);
 }

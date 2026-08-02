@@ -60,6 +60,22 @@ function runtime(cwd: string): WorkflowReloadRuntime {
   };
 }
 
+/** Runtime that counts dispose-fanout invocations (each must be idempotent). */
+function disposableRuntime(cwd: string): WorkflowReloadRuntime & { disposeCount: () => number } {
+  let disposeCount = 0;
+  const value = {
+    ...runtime(cwd),
+    // The TTL-expiry path pauses stranded runs, so the mock manager must
+    // present the minimal listRuns/pause surface (no runs to pause here).
+    manager: { listRuns: () => [], pause: () => false } as unknown as WorkflowReloadRuntime["manager"],
+    dispose: () => {
+      disposeCount++;
+    },
+    disposeCount: () => disposeCount,
+  };
+  return value;
+}
+
 test("reload handoff transfers the exact live runtime once", () => {
   const cwd = `/tmp/reload-handoff-${process.pid}-once`;
   const value = runtime(cwd);
@@ -176,4 +192,73 @@ test("reload handoffs are isolated by cwd and identity-guarded on cleanup", () =
 
   assert.equal(takeWorkflowRuntime(cwdA), replacement, "stale cleanup cannot delete a newer generation");
   assert.equal(takeWorkflowRuntime(cwdB), other);
+});
+
+test("same-state reload is a no-op: a re-fired shutdown cannot re-stage or double-dispose", () => {
+  const cwd = `/tmp/reload-handoff-${process.pid}-same-state`;
+  const value = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd);
+
+  handoffWorkflowRuntime(value);
+  // A second session_shutdown for the same generation (double-fire race): the
+  // identical runtime is already staged and in flight — nothing may change.
+  handoffWorkflowRuntime(value);
+  handoffWorkflowRuntime(value);
+
+  assert.equal(value.disposeCount(), 1, "the runtime's resources close exactly once (at stage time)");
+  assert.equal(takeWorkflowRuntime(cwd), value, "the single staged entry is still claimable");
+  assert.equal(takeWorkflowRuntime(cwd), undefined, "and still only claimable once");
+});
+
+test("a newer generation replacing an unclaimed handoff disposes the stale one", () => {
+  const cwd = `/tmp/reload-handoff-${process.pid}-replace`;
+  const stale = disposableRuntime(cwd);
+  const fresh = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd);
+
+  handoffWorkflowRuntime(stale);
+  handoffWorkflowRuntime(fresh);
+
+  assert.equal(stale.disposeCount(), 1, "the replaced generation's resources are closed");
+  assert.equal(fresh.disposeCount(), 1, "the staging generation's resources are closed");
+  assert.equal(takeWorkflowRuntime(cwd), fresh, "the newest generation wins the claim");
+});
+
+test("discard runs the dispose fanout exactly once", () => {
+  const cwd = `/tmp/reload-handoff-${process.pid}-discard`;
+  const value = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd);
+
+  handoffWorkflowRuntime(value);
+  discardWorkflowRuntime(cwd, value);
+  discardWorkflowRuntime(cwd, value); // idempotent re-discard
+
+  assert.equal(value.disposeCount(), 1, "resources close once even when discard re-fires");
+  assert.equal(takeWorkflowRuntime(cwd), undefined);
+});
+
+test("an unclaimed handoff past its TTL disposes the abandoned generation's resources", async () => {
+  const cwd = `/tmp/reload-handoff-${process.pid}-expiry-dispose`;
+  const value = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd);
+
+  handoffWorkflowRuntime(value, 10);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(value.disposeCount(), 1, "the abandoned generation's resources are closed on expiry");
+  assert.equal(takeWorkflowRuntime(cwd), undefined);
+});
+
+test("dispose is at-most-once even across handoff + expiry paths", async () => {
+  const cwd = `/tmp/reload-handoff-${process.pid}-once-across-paths`;
+  const value = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd);
+
+  // Stage (dispose #1), then let the TTL expiry path fire (would be #2
+  // without the WeakSet guard).
+  handoffWorkflowRuntime(value, 10);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.equal(value.disposeCount(), 1, "stage + expiry must never double-close");
+  assert.equal(takeWorkflowRuntime(cwd), undefined);
 });
