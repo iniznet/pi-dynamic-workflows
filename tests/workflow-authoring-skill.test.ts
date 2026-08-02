@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 import test from "node:test";
@@ -13,7 +12,7 @@ import {
   renderWorkflowCapabilityReference,
 } from "../src/workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_CONTRACT } from "../src/workflow-capability-contract.js";
-import { parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
+import { runNpmPack } from "../src/workflow-release-gate.js";
 import { createWorkflowTool } from "../src/workflow-tool.js";
 
 const ROOT = join(import.meta.dirname, "..");
@@ -54,8 +53,7 @@ function requiredSchemaFields(schema?: Record<string, unknown>): unknown[] {
 }
 
 function publishableFiles(): Set<string> {
-  const output = execFileSync("npm", ["pack", "--dry-run", "--json"], { cwd: ROOT, encoding: "utf8" });
-  return new Set(parseNpmPackFilePaths(output));
+  return new Set(runNpmPack({ cwd: ROOT }));
 }
 
 test("publishable Pi package discovers the workflow-authoring skill and all linked resources", () => {
@@ -79,7 +77,7 @@ test("publishable Pi package discovers the workflow-authoring skill and all link
   for (const sourcePath of REQUIRED_RESOURCES.filter((path) => path.endsWith(".md"))) {
     const source = readFileSync(join(ROOT, sourcePath), "utf8");
     for (const match of source.matchAll(/\[[^\]]+\]\(([^)#]+)(?:#([^)]+))?\)/g)) {
-      const target = normalize(join(dirname(sourcePath), match[1]));
+      const target = normalize(join(dirname(sourcePath), match[1])).replace(/\\/g, "/");
       assert.equal(
         relative(".", target).startsWith(".."),
         false,

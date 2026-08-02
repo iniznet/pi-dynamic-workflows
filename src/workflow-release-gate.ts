@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
@@ -543,6 +544,23 @@ function validatePackage(root: string, publishableFiles: readonly string[]): Wor
 }
 
 /** Parse publishable paths from `npm pack --dry-run --json` without trusting external JSON shapes. */
+/**
+ * Invoke `npm pack --dry-run --json` portably and return the parsed file paths.
+ *
+ * Windows ships npm as `npm.cmd`, so spawning `npm` directly throws ENOENT;
+ * routing through `cmd.exe /d /s /c` resolves the shim on win32 while staying
+ * a direct exec everywhere else.
+ */
+export function runNpmPack(options: { cwd?: string } = {}): string[] {
+  const cwd = options.cwd ?? process.cwd();
+  const args = ["pack", "--dry-run", "--json", "--ignore-scripts"];
+  const output =
+    process.platform === "win32"
+      ? execFileSync("cmd.exe", ["/d", "/s", "/c", "npm", ...args], { cwd, encoding: "utf8" })
+      : execFileSync("npm", args, { cwd, encoding: "utf8" });
+  return parseNpmPackFilePaths(output);
+}
+
 export function parseNpmPackFilePaths(output: string): string[] {
   const parsed: unknown = JSON.parse(output);
   if (!Array.isArray(parsed)) {

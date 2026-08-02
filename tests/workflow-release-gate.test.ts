@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,22 +6,12 @@ import test from "node:test";
 import packageJson from "../package.json" with { type: "json" };
 import { WORKFLOW_AUTHORING_COVERAGE } from "../src/workflow-authoring-coverage.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
-import { checkWorkflowRelease, parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
+import { checkWorkflowRelease, parseNpmPackFilePaths, runNpmPack } from "../src/workflow-release-gate.js";
 
 const ROOT = join(import.meta.dirname, "..");
 
-/** Invoke npm portably: Windows requires cmd.exe /c for the npm.cmd shim. */
-function runNpm(args: string[], options: { cwd?: string } = {}): string {
-  const cwd = options.cwd ?? ROOT;
-  if (process.platform === "win32") {
-    return execFileSync("cmd.exe", ["/d", "/s", "/c", "npm", ...args], { cwd, encoding: "utf8" });
-  }
-  return execFileSync("npm", args, { cwd, encoding: "utf8" });
-}
-
 function publishableFiles(): string[] {
-  const output = runNpm(["pack", "--dry-run", "--json"]);
-  return parseNpmPackFilePaths(output);
+  return runNpmPack({ cwd: ROOT });
 }
 
 test("npm pack parsing keeps only valid publishable file paths", () => {

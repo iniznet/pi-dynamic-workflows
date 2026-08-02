@@ -1,13 +1,8 @@
-import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
-import { checkWorkflowRelease, parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
+import { checkWorkflowRelease, runNpmPack } from "../src/workflow-release-gate.js";
 
 const root = resolve(import.meta.dirname, "..");
-const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], {
-  cwd: root,
-  encoding: "utf8",
-});
-const publishableFiles = parseNpmPackFilePaths(output);
+const publishableFiles = runNpmPack({ cwd: root });
 const diagnostics = checkWorkflowRelease({ root, publishableFiles });
 
 for (const item of diagnostics) {
