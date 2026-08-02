@@ -6,6 +6,9 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
+/** Max log entries retained in memory (a ring buffer; persisted logs are not capped). */
+const DEFAULT_MAX_LOG_ENTRIES = 1000;
+
 export interface WorkflowLogger {
   log(message: string): void;
   error(message: string): void;
@@ -23,9 +26,12 @@ export interface WorkflowLoggerOptions {
   persist?: boolean;
   /** Callback for each log entry. */
   onLog?: (message: string) => void;
+  /** In-memory ring-buffer cap. Defaults to {@link DEFAULT_MAX_LOG_ENTRIES}. */
+  maxLogEntries?: number;
 }
 
 export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): WorkflowLogger {
+  const maxEntries = Math.max(1, options.maxLogEntries ?? DEFAULT_MAX_LOG_ENTRIES);
   const logs: string[] = [];
   const persistLogs = options.persist ?? true;
   const cwd = options.cwd ?? process.cwd();
@@ -36,8 +42,17 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
   const write = (level: string, message: string) => {
     const timestamp = new Date().toISOString();
     const entry = `[${timestamp}] [${level}] ${message}`;
+    // Ring buffer: drop the oldest entry once the cap is hit, so the array
+    // (and every getLogs() copy) stays bounded however long the run lives.
+    if (logs.length >= maxEntries) logs.shift();
     logs.push(entry);
-    options.onLog?.(message);
+    try {
+      options.onLog?.(message);
+    } catch {
+      // A throwing log sink must never corrupt the caller's control flow: a
+      // caller that logs an error and then runs cleanup (e.g. a store-delta
+      // rollback) would silently skip that cleanup if the throw propagated.
+    }
 
     if (persistLogs && logFile) {
       try {
