@@ -143,11 +143,29 @@ export function pauseStrandedWorkflowRuntime(runtime: WorkflowReloadRuntime): nu
   return paused;
 }
 
-/** Test/cleanup helper; identity guard avoids deleting a newer handoff. */
+/**
+ * Dispose a generation's owned resources on the non-reload shutdown path.
+ *
+ * A plain (non-reload) shutdown never stages a handoff entry, so without an
+ * explicit dispose here the usage-limit scheduler timers and the host-tool
+ * gateway (MCP bridge socket / spawned bridge process) would be leaked on every
+ * normal shutdown. When the caller passes the runtime it is disposing, run its
+ * dispose fanout regardless of whether a handoff was ever staged — bounded by
+ * disposeRuntimeOnce's at-most-once guard, so a double-fired shutdown is safe.
+ *
+ * Identity guard: when a handoff IS staged, a stale cleanup cannot delete or
+ * dispose a newer generation that replaced the staged entry.
+ */
 export function discardWorkflowRuntime(cwd: string, runtime?: WorkflowReloadRuntime): void {
   const store = handoffs();
   const entry = store.get(cwd);
-  if (!entry || (runtime && entry.runtime !== runtime)) return;
+  if (!entry) {
+    // Non-reload shutdown (no handoff ever staged): still release the
+    // explicitly-passed runtime's owned resources.
+    if (runtime) disposeRuntimeOnce(runtime);
+    return;
+  }
+  if (runtime && entry.runtime !== runtime) return;
   clearTimeout(entry.timer);
   store.delete(cwd);
   disposeRuntimeOnce(entry.runtime);

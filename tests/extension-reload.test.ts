@@ -237,6 +237,24 @@ test("discard runs the dispose fanout exactly once", () => {
   assert.equal(takeWorkflowRuntime(cwd), undefined);
 });
 
+test("a non-reload shutdown disposes the passed runtime even with no staged handoff", () => {
+  // Regression: a plain session_shutdown never stages a handoff entry, so the
+  // old discard path early-returned and leaked the usage-limit scheduler
+  // timers and host-tool gateway on every normal shutdown.
+  const cwd = `/tmp/reload-handoff-${process.pid}-non-reload-dispose`;
+  const value = disposableRuntime(cwd);
+  discardWorkflowRuntime(cwd); // ensure no stale entry
+
+  discardWorkflowRuntime(cwd, value); // non-reload shutdown path
+
+  assert.equal(value.disposeCount(), 1, "owned resources must close on a non-reload shutdown");
+  assert.equal(takeWorkflowRuntime(cwd), undefined, "no entry was ever staged");
+
+  // A double-fired shutdown stays at-most-once.
+  discardWorkflowRuntime(cwd, value);
+  assert.equal(value.disposeCount(), 1, "a re-fired non-reload shutdown must not double-dispose");
+});
+
 test("an unclaimed handoff past its TTL disposes the abandoned generation's resources", async () => {
   const cwd = `/tmp/reload-handoff-${process.pid}-expiry-dispose`;
   const value = disposableRuntime(cwd);
