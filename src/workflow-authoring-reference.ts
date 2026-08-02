@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readLf } from "./workflow-authoring-coverage.js";
 import {
   CapabilityClassification,
   CapabilitySupport,
@@ -84,6 +85,11 @@ function replaceSupportedCapabilityTable(document: string): string | null {
   return `${document.slice(0, start)}${renderSupportedCapabilityTable()}${document.slice(after)}`;
 }
 
+/** Normalize CRLF line endings to LF for generated-surface comparisons. */
+function normalizeLf(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
+
 /** Regenerates only contract-owned content, preserving hand-written prose around marked blocks. */
 export function writeWorkflowCapabilityPublications(root: string): void {
   for (const path of CAPABILITY_TABLE_PUBLICATION_PATHS) {
@@ -92,7 +98,7 @@ export function writeWorkflowCapabilityPublications(root: string): void {
       writeFileSync(absolutePath, renderWorkflowCapabilityReference());
       continue;
     }
-    const source = readFileSync(absolutePath, "utf8");
+    const source = readLf(absolutePath);
     const refreshed = replaceSupportedCapabilityTable(source);
     if (refreshed === null) throw new Error(`Missing or duplicate generated capability-table anchors in ${path}.`);
     writeFileSync(absolutePath, refreshed);
@@ -107,7 +113,7 @@ export function checkWorkflowCapabilityPublications(
 ): string[] {
   const stale: string[] = [];
   for (const path of CAPABILITY_TABLE_PUBLICATION_PATHS) {
-    const actual = overrides[path] ?? readFileSync(join(root, path), "utf8");
+    const actual = normalizeLf(overrides[path] ?? readFileSync(join(root, path), "utf8"));
     if (path === CAPABILITY_INDEX_PATH) {
       if (actual !== renderWorkflowCapabilityReference()) stale.push(path);
       continue;
@@ -115,7 +121,7 @@ export function checkWorkflowCapabilityPublications(
     const refreshed = replaceSupportedCapabilityTable(actual);
     if (refreshed === null || refreshed !== actual) stale.push(path);
   }
-  const details = overrides[CAPABILITY_DETAIL_PATH] ?? readFileSync(join(root, CAPABILITY_DETAIL_PATH), "utf8");
+  const details = normalizeLf(overrides[CAPABILITY_DETAIL_PATH] ?? readFileSync(join(root, CAPABILITY_DETAIL_PATH), "utf8"));
   if (details !== renderWorkflowCapabilityDetails()) stale.push(CAPABILITY_DETAIL_PATH);
   return stale;
 }

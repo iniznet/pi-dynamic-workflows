@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import {
   CapabilityClassification,
   CapabilitySupport,
@@ -6,6 +7,14 @@ import {
 } from "./enums.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "./workflow-capability-contract.js";
 import { COMPREHENSION_SCENARIOS } from "./workflow-comprehension.js";
+
+/**
+ * Read a text file with CRLF line endings normalized to LF so hashes and byte
+ * counts are platform-independent across Windows and LF checkouts/CI.
+ */
+export function readLf(absolutePath: string): string {
+  return readFileSync(absolutePath, "utf8").replace(/\r\n/g, "\n");
+}
 
 /** Exact installed guidance location retained for an authoring surface without model evidence. */
 export interface ProtectedGuidanceSurface {
@@ -45,11 +54,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "7597c94bbacea885697fb2d05a96ed9ec39403ca6d3a94547bf8ce5e233b2c76",
+    sha256: "923f26e9deea2944052272624ec5c694c6fa1ceef384421025306e4b983bed29",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "04a07ddbc03ac7b4452e4bea82418000ff84e429c4a3de602fbc47abaaae8843",
+    sha256: "3ff602c61453400396767d23bf0a50b4b04fd6777678860b72780229e48fbcd4",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -69,7 +78,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/debugging.md",
-    sha256: "080cf85ee2d41c064935ed64491a724b24b705dc40a7010af862fa22b733b71e",
+    sha256: "f84ad7be4d2a375ce9ed38b0cdd130e2da43611dc8e9894e30a69b16ac30ee24",
   },
   {
     path: "skills/workflow-authoring/examples/classify-and-act.js",
@@ -158,7 +167,7 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:
-        "`checkpoint(prompt, options?)` | Journals a human/default decision. Only foreground confirm and documented headless behavior work; input, select, and timeout are declared-only.",
+        "`checkpoint(prompt, options?)` | Journals a human/default decision. Foreground confirm, headless behavior, and the visual approve/deny gate (`runWorkflow({ checkpointGate })`) are implemented; with a gate configured, the payload is published to the gate and the human verdict resolves the reply (approve → `true`/declared default, deny/timeout → `false`).",
     },
     {
       path: LIFECYCLE_PATH,

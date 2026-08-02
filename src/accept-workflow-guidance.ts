@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { WORKFLOW_AUTHORING_FROZEN_FILES } from "./workflow-authoring-coverage.js";
+import { readLf, WORKFLOW_AUTHORING_FROZEN_FILES } from "./workflow-authoring-coverage.js";
 
 const COVERAGE_MANIFEST_PATH = "src/workflow-authoring-coverage.ts";
 
@@ -48,7 +48,9 @@ export function acceptWorkflowGuidance(root: string, requestedPaths: readonly st
     return {
       path,
       previousSha256: frozen.sha256,
-      sha256: sha256(readFileSync(absolute, "utf8")),
+      // Normalize line endings before hashing so acceptance is identical on
+      // CRLF (Windows) and LF (CI) checkouts and never bakes CRLF into the manifest.
+      sha256: sha256(readLf(absolute)),
     };
   });
 

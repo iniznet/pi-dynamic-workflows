@@ -1,5 +1,6 @@
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { readLf } from "./workflow-authoring-coverage.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 
 /** Package-relative generated context-measurement artifact. */
@@ -117,8 +118,12 @@ function bytes(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 
+/**
+ * UTF-8 byte count of a file's content normalized to LF so measurements are
+ * identical on CRLF (Windows) and LF (CI) checkouts.
+ */
 function fileBytes(root: string, path: string): number {
-  return bytes(readFileSync(join(root, path), "utf8"));
+  return bytes(readLf(join(root, path)));
 }
 
 function skillFiles(root: string): string[] {
@@ -257,6 +262,14 @@ export function writeWorkflowContextMeasurement(root: string): WorkflowContextMe
 
 /** Report whether committed or supplied measurement JSON matches current package bytes. */
 export function checkWorkflowContextMeasurement(root: string, actual?: string): boolean {
-  const committed = actual ?? readFileSync(join(root, WORKFLOW_CONTEXT_MEASUREMENT_PATH), "utf8");
-  return committed === `${JSON.stringify(measureWorkflowContextSurfaces(root), null, 2)}\n`;
+  const committed =
+    actual ??
+    (existsSync(join(root, WORKFLOW_CONTEXT_MEASUREMENT_PATH))
+      ? readFileSync(join(root, WORKFLOW_CONTEXT_MEASUREMENT_PATH), "utf8")
+      : null);
+  if (committed === null) {
+    return false;
+  }
+  const rendered = `${JSON.stringify(measureWorkflowContextSurfaces(root), null, 2)}\n`;
+  return committed.replace(/\r\n/g, "\n") === rendered;
 }
