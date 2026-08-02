@@ -246,16 +246,18 @@ test("adversarial-review preserves a present threshold: 0 (0 refutes survive unl
     agent: {
       async run(prompt: string) {
         if (prompt.includes("Investigate the following")) return { findings: ["f1", "f2"] };
-        if (prompt.includes("skeptical reviewer")) return { real: false }; // 0/1 real votes
+        if (prompt.includes("skeptical reviewer")) return { real: false }; // 0/2 real votes
         if (prompt.includes("final review report")) return "report";
         return null;
       },
     } as never,
     persistLogs: false,
-    args: { task: "t", reviewers: 1, threshold: 0, maxFindings: 5 },
+    // reviewers must be >= 2 (M22); with the explicit threshold: 0 the 0/2
+    // ratio (0 >= 0) still survives — the point is a present 0 is honored.
+    args: { task: "t", reviewers: 2, threshold: 0, maxFindings: 5 },
   });
   const r = result.result as { total: number; survivors: unknown[] };
-  // With threshold: 0 (not the 0.5 default), a 0/1 real ratio survives.
+  // With threshold: 0 (not the 0.66 default), a 0/2 real ratio survives.
   assert.equal(r.total, 2);
   assert.equal(r.survivors.length, 2);
 });
@@ -463,9 +465,11 @@ test("code-review pre-caps the candidate pool and batches verify calls", async (
     persistLogs: false,
     args: { diff: "a small diff", maxCandidates: 10, verifyBatchSize: 5 },
   });
-  // 7 finders produce 84 deduped candidates → pool capped at 10 → 2 batches of 5.
+  // 8 finders produce 84 deduped candidates (the security finder sees an empty
+  // shard on this header-less diff and returns nothing) → pool capped at 10 →
+  // 2 batches of 5.
   assert.equal(verifyCalls, 2, "ceil(10 / 5) verifier agents, not 10 (one per candidate)");
-  assert.equal(result.agentCount, 7 + 2 + 1, "7 finders + 2 verify batches + 1 synthesis");
+  assert.equal(result.agentCount, 8 + 2 + 1, "8 finders + 2 verify batches + 1 synthesis");
   const r = result.result as { total: number; verified: number; diffTruncated: boolean };
   assert.equal(r.total, 84, "total still reflects every deduped candidate found");
   assert.equal(r.verified, 10, "verified reflects the pre-capped pool");

@@ -88,10 +88,19 @@ const judged = await parallel(findings.map((f, i) => () =>
       { label: 'refute ' + (i + 1) + '.' + (r + 1), schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } }
     )
   )).then((votes) => {
-    const valid = votes.filter(Boolean)
-    const realCount = valid.filter((v) => v && v.real).length
-    const ratio = valid.length ? realCount / valid.length : 0
-    return { finding: f, realVotes: realCount, totalVotes: valid.length, survives: ratio >= threshold }
+    // H6: a null vote (recoverable agent failure) is a FAILED vote, not a
+    // missing one — it still occupies a reviewer slot, never counts as real,
+    // and shrinks the survival ratio. Logged so silent reviewer loss is visible.
+    const failedVotes = votes.filter((v) => v === null || v === undefined).length
+    if (failedVotes > 0) {
+      log(
+        'Adversarial review: ' + failedVotes + ' of ' + votes.length + ' refute vote(s) for finding "' +
+        f.slice(0, 60) + '" failed and count as real=false.'
+      )
+    }
+    const realCount = votes.filter((v) => v && v.real).length
+    const ratio = votes.length ? realCount / votes.length : 0
+    return { finding: f, realVotes: realCount, totalVotes: votes.length, survives: ratio >= threshold }
   })
 ))
 

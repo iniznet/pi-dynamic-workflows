@@ -118,8 +118,11 @@ export const DEEP_RESEARCH_NUMERIC_ARGS: readonly NumericArgSpec[] = [
 
 /** adversarial-review: refute fan-out (findings × reviewers) and the survival gate. */
 export const ADVERSARIAL_REVIEW_NUMERIC_ARGS: readonly NumericArgSpec[] = [
-  { name: "reviewers", default: 2, min: 1, max: 8, integer: true },
-  { name: "threshold", default: 0.5, min: 0, max: 1 },
+  // reviewers >= 2 and the 0.66 default threshold guarantee a 1-of-2 split
+  // never survives the refute phase (M22): 1/2 = 0.5 < 0.66. A lone reviewer
+  // could never be cross-checked at all, so a 1-reviewer config is rejected.
+  { name: "reviewers", default: 2, min: 2, max: 8, integer: true },
+  { name: "threshold", default: 0.66, min: 0, max: 1 },
   { name: "maxFindings", default: 25, min: 1, max: 50, integer: true },
 ];
 

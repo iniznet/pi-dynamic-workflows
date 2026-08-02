@@ -73,21 +73,65 @@ const allSources = gathered.filter(Boolean).flatMap((g) => (g && g.sources) || [
 
 phase('Verify')
 const verdict = await agent(
-  'Cross-check these research sources. Group claims that assert the same fact across different source URLs. ' +
-  'Keep a claim only if it is supported by at least ' + minSupport + ' distinct source URLs OR by one clearly authoritative source. ' +
-  'Discard claims found in a single weak source or that conflict with others.\\n\\nSOURCES JSON:\\n' + JSON.stringify(allSources),
-  { label: 'cross-check', schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } } }, required: ['supported'] } }
+  'You are a fact-checking cross-checker. Sources below list claims extracted from fetched pages.\\n' +
+  'Group claims that assert the SAME fact into one normalized claim — paraphrase-equivalent wording, not identical text.\\n' +
+  'A normalized claim survives ONLY when at least ' + minSupport + ' DISTINCT source URLs state it. There is no ' +
+  'authoritative-source exception: one source never meets the threshold, no matter how authoritative it looks.\\n' +
+  'When a claim is important or its source content is unclear, use web_fetch to re-fetch the source URL and confirm ' +
+  'the page actually states the claim before counting it.\\n' +
+  'Return:\\n' +
+  '- supported: each normalized claim with the DISTINCT source URLs that state it (at least ' + minSupport + ').\\n' +
+  '- discarded: claims found in fewer than ' + minSupport + ' sources, or whose sources you could not verify on the fetched pages.\\n' +
+  '- conflicts: claims that contradict a supported claim, with the claim text and the contradictory evidence.\\n' +
+  '\\n\\nSOURCES JSON:\\n' + JSON.stringify(allSources),
+  { label: 'cross-check', schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } }, conflicts: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, contradicting: { type: 'string' } }, required: ['claim'] } } }, required: ['supported'] } }
 )
+// minSupport is enforced HERE, deterministically, not only in the prompt: the
+// cross-check LLM may still keep an under-supported claim or count the same
+// page twice. Every supported claim must cite >= minSupport DISTINCT source
+// URLs or it is moved to Conflicts (H5) — never silently dropped (M19).
+const rawSupported = (verdict && Array.isArray(verdict.supported)) ? verdict.supported : []
+const supported = []
+const underSupported = []
+for (const c of rawSupported) {
+  if (!c || typeof c.claim !== 'string') continue
+  const sources = Array.isArray(c.sources) ? c.sources.filter((u) => typeof u === 'string' && u.trim().length > 0) : []
+  const distinct = new Set(sources)
+  if (distinct.size >= minSupport) supported.push({ claim: c.claim, sources: Array.from(distinct) })
+  else underSupported.push({ claim: c.claim, sources: Array.from(distinct) })
+}
+if (underSupported.length > 0) {
+  log(
+    'Deep research: ' + underSupported.length + ' claimed-supported claim(s) cited fewer than ' + minSupport +
+    ' distinct source URLs — moved to Conflicts.'
+  )
+}
+const verdictConflicts = (verdict && Array.isArray(verdict.conflicts))
+  ? verdict.conflicts.filter((c) => c && typeof c.claim === 'string')
+  : []
+const discarded = (verdict && Array.isArray(verdict.discarded))
+  ? verdict.discarded.filter((d) => typeof d === 'string' && d.trim().length > 0)
+  : []
+// Conflicts section = cross-check mismatches + discarded claims + claims whose
+// support fell below minSupport. Contradictions and dropped claims must never
+// silently vanish from the report (M19).
+const conflicts = [
+  ...verdictConflicts,
+  ...underSupported.map((c) => ({ claim: c.claim, reason: 'fewer than ' + minSupport + ' distinct source URLs' })),
+  ...discarded.map((d) => ({ claim: d, reason: 'discarded by cross-check' })),
+]
 
 phase('Report')
 const report = await agent(
   'Write a concise, well-structured research report that answers the question using ONLY the supported claims below. ' +
-  'Cite source URLs inline next to each claim. If the evidence is thin, say so explicitly.\\n\\n' +
-  'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify((verdict && verdict.supported) || []),
+  'Cite source URLs inline next to each claim. If the evidence is thin, say so explicitly. Include a short Conflicts ' +
+  'section listing the entries below and why each was excluded — never present them as fact.\\n\\n' +
+  'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify(supported) +
+  '\\n\\nCONFLICTS JSON:\\n' + JSON.stringify(conflicts),
   { label: 'write report' }
 )
 
-return { question, queries, supported: (verdict && verdict.supported) || [], report }`;
+return { question, queries, supported, conflicts, report }`;
 }
 
 /**
