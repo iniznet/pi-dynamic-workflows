@@ -285,6 +285,121 @@ test("adversarial-review caps the refute pool at maxFindings and logs the degrad
   );
 });
 
+test("adversarial-review bounds the refute product at MAX_REFUTE_AGENTS by reducing reviewers (i5)", async () => {
+  // 50 findings (max) x 8 reviewers (max) = 400 refute agents — 60% over the
+  // 250 budget. The refute phase must cut reviewers down to 5 (ceil(250/50))
+  // so the product never exceeds the documented ceiling. Logged, never silent.
+  let refuteCalls = 0;
+  const result = await runWorkflow(generateAdversarialReviewWorkflow(), {
+    agent: {
+      async run(prompt: string) {
+        if (prompt.includes("Investigate the following")) {
+          return { findings: Array.from({ length: 50 }, (_, i) => `f${i + 1}`) };
+        }
+        if (prompt.includes("skeptical reviewer")) {
+          refuteCalls++;
+          return { real: true };
+        }
+        if (prompt.includes("final review report")) return "report";
+        return null;
+      },
+    } as never,
+    persistLogs: false,
+    args: { task: "t", reviewers: 8, maxFindings: 50 },
+  });
+  assert.equal(refuteCalls, 250, "50 findings x 5 effective reviewers = 250, never over the budget");
+  assert.ok(
+    result.logs.some((l) => l.includes("exceeding the 250 budget") && l.includes("reducing reviewers to 5")),
+    "the reviewer reduction must be logged, never silent",
+  );
+});
+
+// ─── Runtime: code-review null/partial batch verdicts stay aligned (i1) ────────
+
+test("code-review keeps verdicts aligned when a middle batch is null (i1)", async () => {
+  // Pool = first 10 of 84 deduped candidates (A0..A9). verifyBatchSize 3 →
+  // 4 batches: b0(A0,A1,A2), b1(A3,A4,A5) NULL, b2(A6,A7,A8), b3(A9). A null
+  // middle batch must degrade its candidates to PLAUSIBLE and MUST NOT shift
+  // later batches' verdicts onto those slots.
+  const result = await runWorkflow(generateCodeReviewWorkflow(), {
+    agent: {
+      async run(prompt: string) {
+        if (prompt.includes("line-by-line correctness scanner")) return { candidates: makeCandidates("A") };
+        if (prompt.includes("removed-behavior auditor")) return { candidates: [] };
+        if (prompt.includes("cross-file call-site tracer")) return { candidates: [] };
+        if (prompt.includes("reuse finder")) return { candidates: [] };
+        if (prompt.includes("simplification finder")) return { candidates: [] };
+        if (prompt.includes("efficiency finder")) return { candidates: [] };
+        if (prompt.includes("altitude reviewer")) return { candidates: [] };
+        if (prompt.includes("You are a verifier")) {
+          const files = [...prompt.matchAll(/File: (A\d+)/g)].map((m) => m[1]);
+          if (files.includes("A3")) return null; // middle batch fails
+          const verdict = files.includes("A0") ? "REFUTED" : "CONFIRMED";
+          return { verdicts: files.map(() => ({ verdict, reason: "ok" })) };
+        }
+        if (prompt.includes("senior code reviewer")) return "report";
+        return null;
+      },
+    } as never,
+    persistLogs: false,
+    args: { diff: "d", maxCandidates: 10, verifyBatchSize: 3 },
+  });
+  const findings = (result.result as { findings: Array<{ file: string; verdict: string }> }).findings;
+  const byFile = new Map(findings.map((f) => [f.file, f.verdict]));
+  // b0 (A0,A1,A2) REFUTED → filtered out, never present.
+  assert.ok(!byFile.has("A0") && !byFile.has("A1") && !byFile.has("A2"), "REFUTED findings are filtered out");
+  // b1 (A3,A4,A5) NULL → degrade to PLAUSIBLE exactly on their own candidates.
+  assert.equal(byFile.get("A3"), "PLAUSIBLE", "null batch's candidates degrade to PLAUSIBLE");
+  assert.equal(byFile.get("A4"), "PLAUSIBLE");
+  assert.equal(byFile.get("A5"), "PLAUSIBLE");
+  // b2/b3 (A6..A9) CONFIRMED landed on their OWN candidates — not shifted onto A3-A5.
+  assert.equal(byFile.get("A6"), "CONFIRMED", "later batches' verdicts land on their own candidates");
+  assert.equal(byFile.get("A7"), "CONFIRMED");
+  assert.equal(byFile.get("A8"), "CONFIRMED");
+  assert.equal(byFile.get("A9"), "CONFIRMED");
+});
+
+test("code-review pads a short LLM output with PLAUSIBLE without shifting later batches (i1)", async () => {
+  // b1 returns half its verdicts; the missing slots must pad to PLAUSIBLE and
+  // b2's verdicts must still land on b2's candidates.
+  const result = await runWorkflow(generateCodeReviewWorkflow(), {
+    agent: {
+      async run(prompt: string) {
+        if (prompt.includes("line-by-line correctness scanner")) return { candidates: makeCandidates("A") };
+        if (prompt.includes("removed-behavior auditor")) return { candidates: [] };
+        if (prompt.includes("cross-file call-site tracer")) return { candidates: [] };
+        if (prompt.includes("reuse finder")) return { candidates: [] };
+        if (prompt.includes("simplification finder")) return { candidates: [] };
+        if (prompt.includes("efficiency finder")) return { candidates: [] };
+        if (prompt.includes("altitude reviewer")) return { candidates: [] };
+        if (prompt.includes("You are a verifier")) {
+          const files = [...prompt.matchAll(/File: (A\d+)/g)].map((m) => m[1]);
+          if (files.includes("A3")) {
+            // B1 should have A3,A4,A5 but returns only one verdict.
+            return { verdicts: [{ verdict: "REFUTED", reason: "short" }] };
+          }
+          if (files.includes("A0")) return { verdicts: files.map(() => ({ verdict: "CONFIRMED", reason: "ok" })) };
+          return { verdicts: files.map(() => ({ verdict: "CONFIRMED", reason: "ok" })) };
+        }
+        if (prompt.includes("senior code reviewer")) return "report";
+        return null;
+      },
+    } as never,
+    persistLogs: false,
+    args: { diff: "d", maxCandidates: 10, verifyBatchSize: 3 },
+  });
+  const findings = (result.result as { findings: Array<{ file: string; verdict: string }> }).findings;
+  const byFile = new Map(findings.map((f) => [f.file, f.verdict]));
+  // A3 REFUTED → filtered; the two missing slots (A4, A5) pad to PLAUSIBLE.
+  assert.ok(!byFile.has("A3"), "the one returned short-batch verdict lands on its own candidate");
+  assert.equal(byFile.get("A4"), "PLAUSIBLE", "missing short-output slots pad to PLAUSIBLE");
+  assert.equal(byFile.get("A5"), "PLAUSIBLE");
+  // b2 unaffected: A6,A7,A8 stay CONFIRMED — not shifted into A4/A5.
+  assert.equal(byFile.get("A6"), "CONFIRMED");
+  assert.equal(byFile.get("A7"), "CONFIRMED");
+  assert.equal(byFile.get("A8"), "CONFIRMED");
+});
+
 // ─── Runtime: deep-research query cap + default angles (i5/i1) ─────────────────
 
 test("deep-research defaults angles to 4 and logs when the planner's queries are capped", async () => {

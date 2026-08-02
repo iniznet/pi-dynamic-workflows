@@ -3,7 +3,7 @@
  * Agents cross-check each other's findings for higher quality results.
  */
 
-import { ADVERSARIAL_REVIEW_NUMERIC_ARGS, numericArgCoercionSource } from "./builtin-args.js";
+import { ADVERSARIAL_REVIEW_NUMERIC_ARGS, MAX_REFUTE_AGENTS, numericArgCoercionSource } from "./builtin-args.js";
 
 export interface AdversarialReviewConfig {
   /** Number of independent reviewers per finding. */
@@ -61,10 +61,26 @@ if (rawFindings.length > maxFindings) {
     ' findings to bound fan-out (' + (rawFindings.length - maxFindings) + ' findings are not cross-checked).'
   )
 }
+// i5: the refute fan-out is findings x reviewers agents. Bound the PRODUCT under
+// MAX_REFUTE_AGENTS by cutting reviewers (never findings, which are already
+// capped) — a research burst must not spawn hundreds of parallel refute agents.
+// Logged so a reduced reviewer count is never silent.
+const MAX_REFUTE_AGENTS = ${MAX_REFUTE_AGENTS}
+const effectiveReviewers = findings.length > 0
+  ? Math.min(reviewers, Math.ceil(MAX_REFUTE_AGENTS / findings.length))
+  : 0
+if (effectiveReviewers < reviewers) {
+  log(
+    'Adversarial review: ' + findings.length + ' findings x ' + reviewers + ' reviewers = ' +
+    (findings.length * reviewers) + ' refute agents, exceeding the ' + MAX_REFUTE_AGENTS +
+    ' budget — reducing reviewers to ' + effectiveReviewers +
+    ' (' + (findings.length * effectiveReviewers) + ' agents).'
+  )
+}
 
 phase('Refute')
 const judged = await parallel(findings.map((f, i) => () =>
-  parallel(Array.from({ length: reviewers }, (_, r) => () =>
+  parallel(Array.from({ length: effectiveReviewers }, (_, r) => () =>
     agent(
       'You are a skeptical reviewer. Try to REFUTE this finding for the task below. ' +
       'Default to real=false when uncertain. Investigate with the available tools if needed.\\n\\n' +

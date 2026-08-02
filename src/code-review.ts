@@ -206,9 +206,21 @@ const batchVerdicts = batches.length > 0
       )
     ))
   : []
-// Flatten batch verdicts back into pool order; a null batch (recoverable
-// agent failure) degrades to PLAUSIBLE per candidate, same as a null verdict.
-const verdicts = batchVerdicts.flatMap((b) => (b && Array.isArray(b.verdicts) ? b.verdicts : []))
+// Flatten batch verdicts back into pool order, preserving per-candidate slots.
+// A null batch (recoverable agent failure) or a short LLM output degrades to
+// PLAUSIBLE per candidate — indices are filled by batch slice position so a
+// verdict ALWAYS lands on the finding it judged and a failed/short batch never
+// shifts later batches' verdicts onto the wrong findings.
+const verdicts = new Array(pool.length)
+batches.forEach((batch, b) => {
+  const out = batchVerdicts[b]
+  const returned = out && Array.isArray(out.verdicts) ? out.verdicts : []
+  batch.forEach((_, i) => {
+    const slot = returned[i]
+    verdicts[b * verifyBatchSize + i] =
+      slot && typeof slot === 'object' ? slot : { verdict: 'PLAUSIBLE' }
+  })
+})
 
 const surviving = pool
   .map((c, i) => ({ ...c, verdict: (verdicts[i] && verdicts[i].verdict) || 'PLAUSIBLE', verifyReason: (verdicts[i] && verdicts[i].reason) || '' }))
