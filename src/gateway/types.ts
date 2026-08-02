@@ -72,6 +72,12 @@ export interface ToolCallParams {
   toolName: string;
   /** Tool arguments. */
   args: Record<string, unknown>;
+  /**
+   * Deduplication key for side-effectful tools. When a client retries a call
+   * (e.g. after its own request timed out) with the same key, the bridge joins
+   * the original execution instead of running the tool a second time.
+   */
+  idempotencyKey?: string;
 }
 
 /** Result from a tool call execution. */
@@ -87,7 +93,7 @@ export interface ToolCallResult {
 // ─── Bridge Configuration ────────────────────────────────────────────────────
 
 /** Tool executor function signature. */
-export type ToolExecutor = (args: Record<string, unknown>) => Promise<ToolCallResult>;
+export type ToolExecutor = (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolCallResult>;
 
 /** Configuration for MCPBridge (host-side). */
 export interface MCPBridgeOptions {
@@ -101,6 +107,15 @@ export interface MCPBridgeOptions {
   timeout?: number;
   /** Maximum concurrent connections (default: 10). */
   maxConnections?: number;
+  /**
+   * Handshake token every connection must present via `auth.handshake` before
+   * any method is accepted. Defaults to a random per-bridge token; hosts that
+   * want a stable credential (e.g. shared with subagent processes via env)
+   * can pass their own.
+   */
+  authToken?: string;
+  /** Hard cap for a single IPC frame payload in bytes (default: 8 MiB). */
+  maxFrameSize?: number;
 }
 
 /** Configuration for MCPProxyClient (client-side). */
@@ -113,6 +128,18 @@ export interface MCPProxyClientOptions {
   maxReconnectAttempts?: number;
   /** Reconnect delay in milliseconds (default: 1000). */
   reconnectDelay?: number;
+  /**
+   * Bridge handshake token presented via `auth.handshake` on connect. Must
+   * match the token the bridge was started with, or the connection is refused.
+   */
+  authToken?: string;
+  /**
+   * Bound on how long `connect()` may take (socket + handshake) before it
+   * fails with an error instead of wedging forever (default: 5000).
+   */
+  connectTimeout?: number;
+  /** Hard cap for a single IPC frame payload in bytes (default: 8 MiB). */
+  maxFrameSize?: number;
 }
 
 // ─── JSON-RPC Error Codes ────────────────────────────────────────────────────
@@ -131,6 +158,11 @@ export const TOOL_EXECUTION_ERROR = -32003;
 export const CONNECTION_CLOSED = -32004;
 export const BRIDGE_NOT_STARTED = -32005;
 
+/** Custom error codes for channel-level protection. */
+export const AUTH_REQUIRED = -32006;
+export const AUTH_FAILED = -32007;
+export const FRAME_TOO_LARGE = -32008;
+
 // ─── Protocol Methods ────────────────────────────────────────────────────────
 
 /** JSON-RPC method names for the IPC protocol. */
@@ -139,6 +171,11 @@ export const METHOD_TOOL_LIST = "tool.list";
 export const METHOD_TOOL_DESCRIBE = "tool.describe";
 export const METHOD_PING = "ping";
 export const METHOD_SHUTDOWN = "shutdown";
+export const METHOD_AUTH_HANDSHAKE = "auth.handshake";
+export const METHOD_TOOL_ABORT = "tool.abort";
+
+/** Default hard cap for a single IPC frame payload (8 MiB). */
+export const MAX_IPC_FRAME_SIZE = 8 * 1024 * 1024;
 
 // ─── Utility Types ───────────────────────────────────────────────────────────
 

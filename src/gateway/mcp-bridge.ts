@@ -10,25 +10,36 @@
  * - JSON-RPC 2.0 protocol with length-prefixed framing
  * - Handles multiple concurrent subagent connections
  * - Per-call timeout handling (configurable, default 30s)
+ * - Socket auth handshake: every connection must present the bridge token via
+ *   `auth.handshake` before any method (including ping) is accepted
+ * - Idempotency keys dedupe replayed tool executions (client timeout + retry)
+ * - Abort support: `tool.abort` cancels an in-flight call's AbortSignal
+ * - Hard frame-size cap defending against corrupt/malformed frames (OOM)
  * - Graceful shutdown with process lifecycle hooks
  */
 
-import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { randomUUID, timingSafeEqual } from "node:crypto";
+import { chmodSync, unlinkSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { platform } from "node:os";
 import { join } from "node:path";
 import {
+  AUTH_FAILED,
+  AUTH_REQUIRED,
+  FRAME_TOO_LARGE,
   INTERNAL_ERROR,
   INVALID_REQUEST,
   type JsonRpcError,
   type JsonRpcRequest,
   type JsonRpcResponse,
+  MAX_IPC_FRAME_SIZE,
   type MCPBridgeOptions,
+  METHOD_AUTH_HANDSHAKE,
   METHOD_NOT_FOUND,
   METHOD_PING,
   METHOD_SHUTDOWN,
+  METHOD_TOOL_ABORT,
   METHOD_TOOL_CALL,
   METHOD_TOOL_DESCRIBE,
   METHOD_TOOL_LIST,
@@ -47,6 +58,19 @@ const DEFAULT_MAX_CONNECTIONS = 10;
 
 /** Length prefix size in bytes (4-byte big-endian uint32). */
 const LENGTH_PREFIX_SIZE = 4;
+
+/** Bound on the idempotency-result cache (FIFO eviction past this). */
+const IDEMPOTENCY_CACHE_LIMIT = 256;
+
+/** Sentinel returned by handleToolCall when the call was aborted mid-flight. */
+const ABORTED_RESULT = Symbol("aborted-tool-call");
+
+/** Tracks an in-flight tool call so `tool.abort` can cancel it. */
+interface ActiveCall {
+  controller: AbortController;
+  socket: Socket;
+  aborted: boolean;
+}
 
 /**
  * Raised when a tool call exceeds the configured per-call timeout.
@@ -79,7 +103,7 @@ export class ToolTimeoutError extends Error {
  * });
  * await bridge.start();
  * console.log(`Bridge listening on ${bridge.getSocketPath()}`);
- * // ... subagents connect via MCPProxyClient
+ * // ... subagents connect via MCPProxyClient with the bridge's auth token
  * await bridge.stop();
  * ```
  */
@@ -88,9 +112,17 @@ export class MCPBridge {
   private readonly toolDefs: ProxiedToolDef[];
   private readonly timeout: number;
   private readonly maxConnections: number;
+  private readonly maxFrameSize: number;
+  private readonly authToken: string;
   private readonly socketPath: string;
   private server: Server | null = null;
   private connections: Set<Socket> = new Set();
+  /** Sockets that completed the `auth.handshake` and may issue requests. */
+  private readonly authenticated = new Set<Socket>();
+  /** In-flight tool calls keyed by request id, for `tool.abort`. */
+  private readonly activeCalls = new Map<string | number, ActiveCall>();
+  /** Dedupe cache: idempotency key -> the execution it maps to. */
+  private readonly idempotentExecutions = new Map<string, Promise<ToolCallResult>>();
   private started = false;
   private cleanupHandlersInstalled = false;
   /** Outstanding per-call timeout timers; every settled call must leave this empty. */
@@ -101,6 +133,8 @@ export class MCPBridge {
     this.toolDefs = options.toolDefs ?? [];
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
     this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
+    this.maxFrameSize = options.maxFrameSize ?? MAX_IPC_FRAME_SIZE;
+    this.authToken = options.authToken ?? randomUUID();
     this.socketPath = options.socketPath ?? this.generateSocketPath();
   }
 
@@ -151,6 +185,16 @@ export class MCPBridge {
 
       this.server.listen(this.socketPath, () => {
         this.started = true;
+        // Restrict the socket to the owner where the platform allows: the
+        // socket is the capability that lets other local processes invoke
+        // host tools, so it must not be world-readable/writable.
+        if (platform() !== "win32") {
+          try {
+            chmodSync(this.socketPath, 0o600);
+          } catch {
+            // Best-effort: some platforms may not expose chmod on sockets.
+          }
+        }
         this.installCleanupHandlers();
         resolve();
       });
@@ -167,6 +211,19 @@ export class MCPBridge {
 
     this.started = false;
 
+    // Cancel outstanding per-call timers so a hung in-flight call cannot keep
+    // the process alive past shutdown.
+    for (const handle of this.activeTimeoutHandles) {
+      clearTimeout(handle);
+    }
+    this.activeTimeoutHandles.clear();
+
+    // Abort in-flight calls so signal-aware executors can stop promptly.
+    for (const call of this.activeCalls.values()) {
+      call.controller.abort();
+    }
+    this.activeCalls.clear();
+
     // Close all active connections
     for (const socket of this.connections) {
       try {
@@ -176,13 +233,7 @@ export class MCPBridge {
       }
     }
     this.connections.clear();
-
-    // Cancel outstanding per-call timers so a hung in-flight call cannot keep
-    // the process alive past shutdown.
-    for (const handle of this.activeTimeoutHandles) {
-      clearTimeout(handle);
-    }
-    this.activeTimeoutHandles.clear();
+    this.authenticated.clear();
 
     // Close the server
     const server = this.server;
@@ -203,6 +254,17 @@ export class MCPBridge {
    */
   getSocketPath(): string {
     return this.socketPath;
+  }
+
+  /**
+   * The handshake token clients must present before any method is accepted.
+   *
+   * The host is responsible for handing this to subagent processes (e.g. via
+   * env) so their MCPProxyClient can authenticate; it is the capability that
+   * stops other local processes from invoking host tools.
+   */
+  getAuthToken(): string {
+    return this.authToken;
   }
 
   /**
@@ -295,11 +357,21 @@ export class MCPBridge {
 
     socket.on("close", () => {
       this.connections.delete(socket);
+      this.authenticated.delete(socket);
+      // A dying connection must not keep in-flight calls running forever;
+      // signal-aware executors stop, signal-oblivious ones settle on their own.
+      for (const [requestId, call] of this.activeCalls) {
+        if (call.socket === socket) {
+          call.controller.abort();
+          this.activeCalls.delete(requestId);
+        }
+      }
     });
 
     socket.on("error", (error) => {
       console.error("[MCPBridge] Socket error:", error.message);
       this.connections.delete(socket);
+      this.authenticated.delete(socket);
     });
   }
 
@@ -311,6 +383,22 @@ export class MCPBridge {
     while (buffer.length >= LENGTH_PREFIX_SIZE) {
       const messageLength = buffer.readUInt32BE(0);
 
+      if (messageLength > this.maxFrameSize) {
+        // The length prefix lies beyond the accepted cap: either a corrupt
+        // frame or an OOM attempt. The framing is untrustworthy past this
+        // point, so respond once and drop the connection.
+        this.sendResponse(socket, {
+          jsonrpc: "2.0",
+          error: {
+            code: FRAME_TOO_LARGE,
+            message: `Frame of ${messageLength} bytes exceeds the ${this.maxFrameSize}-byte cap`,
+          },
+          id: 0,
+        });
+        socket.destroy();
+        return Buffer.alloc(0) as Buffer<ArrayBuffer>;
+      }
+
       if (buffer.length < LENGTH_PREFIX_SIZE + messageLength) {
         // Incomplete message, wait for more data
         return buffer;
@@ -321,7 +409,7 @@ export class MCPBridge {
       buffer = buffer.subarray(LENGTH_PREFIX_SIZE + messageLength) as Buffer<ArrayBuffer>;
 
       // Process message asynchronously
-      this.handleMessage(socket, messageBuffer.toString("utf-8"));
+      void this.handleMessage(socket, messageBuffer.toString("utf-8"));
     }
 
     return buffer;
@@ -354,13 +442,39 @@ export class MCPBridge {
       return;
     }
 
+    // Socket auth gate: nothing except the handshake itself is accepted until
+    // the connection has proven it holds the bridge token.
+    if (request.method !== METHOD_AUTH_HANDSHAKE && !this.authenticated.has(socket)) {
+      this.sendResponse(socket, {
+        jsonrpc: "2.0",
+        error: {
+          code: AUTH_REQUIRED,
+          message: "Socket not authenticated: send auth.handshake with the bridge token first",
+        },
+        id: request.id,
+      });
+      return;
+    }
+
     // Route to appropriate handler
     try {
       let result: unknown;
 
       switch (request.method) {
+        case METHOD_AUTH_HANDSHAKE:
+          result = await this.handleAuthHandshake(socket, request.params as { token?: unknown });
+          break;
+
         case METHOD_TOOL_CALL:
-          result = await this.handleToolCall(request.params as { toolName: string; args: Record<string, unknown> });
+          result = await this.handleToolCall(
+            request.params as { toolName: string; args: Record<string, unknown>; idempotencyKey?: string },
+            { requestId: request.id, socket },
+          );
+          if (result === ABORTED_RESULT) {
+            // The caller already got its tool.abort ack; suppress the late
+            // result so a cancelled request never resolves post-abort.
+            return;
+          }
           break;
 
         case METHOD_TOOL_LIST:
@@ -376,12 +490,18 @@ export class MCPBridge {
           break;
 
         case METHOD_SHUTDOWN:
-          this.sendResponse(socket, {
+          // Flush the ack before the server stops so the caller reliably
+          // observes it instead of racing socket teardown.
+          await this.sendResponse(socket, {
             jsonrpc: "2.0",
             result: { shuttingDown: true },
             id: request.id,
           });
           await this.stop();
+          return;
+
+        case METHOD_TOOL_ABORT:
+          this.handleToolAbort(request.params as { requestId?: string | number });
           return;
 
         default:
@@ -419,10 +539,59 @@ export class MCPBridge {
   }
 
   /**
+   * Authenticate a connection against the bridge token (constant-time compare).
+   * On failure the connection is destroyed so a wrong token cannot retry.
+   */
+  private async handleAuthHandshake(socket: Socket, params: { token?: unknown }): Promise<{ ok: boolean }> {
+    const presented = typeof params?.token === "string" ? params.token : "";
+    const presentedBuffer = Buffer.from(presented, "utf-8");
+    const expectedBuffer = Buffer.from(this.authToken, "utf-8");
+
+    const matches =
+      presentedBuffer.length === expectedBuffer.length && timingSafeEqual(presentedBuffer, expectedBuffer);
+
+    if (matches) {
+      this.authenticated.add(socket);
+      return { ok: true };
+    }
+
+    // Flush the refusal before destroying the connection so the client always
+    // observes AUTH_FAILED instead of racing socket teardown.
+    await this.sendResponse(socket, {
+      jsonrpc: "2.0",
+      error: { code: AUTH_FAILED, message: "Invalid auth token" },
+      id: 0,
+    });
+    socket.destroy();
+    return { ok: false };
+  }
+
+  /**
+   * Abort an in-flight tool call. Fire-and-forget: the original requester's
+   * response is suppressed (handleToolCall returns ABORTED_RESULT), so there
+   * is no response to correlate on the abort channel itself. Unknown request
+   * ids are silently ignored: the call may have already settled.
+   */
+  private handleToolAbort(params: { requestId?: string | number }): void {
+    const requestId = params?.requestId;
+    if (requestId === undefined) {
+      return;
+    }
+    const call = this.activeCalls.get(requestId);
+    if (call) {
+      call.aborted = true;
+      call.controller.abort();
+    }
+  }
+
+  /**
    * Handle a tool.call request.
    */
-  private async handleToolCall(params: { toolName: string; args: Record<string, unknown> }): Promise<ToolCallResult> {
-    const { toolName, args } = params;
+  private async handleToolCall(
+    params: { toolName: string; args: Record<string, unknown>; idempotencyKey?: string },
+    callInfo: { requestId: string | number; socket: Socket },
+  ): Promise<ToolCallResult | typeof ABORTED_RESULT> {
+    const { toolName, args, idempotencyKey } = params;
 
     if (!toolName || typeof toolName !== "string") {
       return {
@@ -439,20 +608,38 @@ export class MCPBridge {
       };
     }
 
-    // Execute with timeout. The handle is registered so it can be cleared when
-    // the call settles — otherwise every completed call leaks a live 30s timer.
-    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+    const call: ActiveCall = { controller, socket: callInfo.socket, aborted: false };
+    this.activeCalls.set(callInfo.requestId, call);
 
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => {
-        reject(new ToolTimeoutError(toolName, this.timeout));
-      }, this.timeout);
-      this.activeTimeoutHandles.add(timeoutHandle);
-    });
+    // A replayed call (client timeout + retry) joins the original execution
+    // instead of running the side-effectful tool a second time. The replay's
+    // own controller only governs its response, never the shared execution.
+    let execution: Promise<ToolCallResult>;
+    if (idempotencyKey !== undefined && this.idempotentExecutions.has(idempotencyKey)) {
+      execution = this.idempotentExecutions.get(idempotencyKey) as Promise<ToolCallResult>;
+    } else {
+      execution = this.executeWithTimeout(toolName, executor, args ?? {}, controller);
+      if (idempotencyKey !== undefined) {
+        this.idempotentExecutions.set(idempotencyKey, execution);
+        if (this.idempotentExecutions.size > IDEMPOTENCY_CACHE_LIMIT) {
+          const oldest = this.idempotentExecutions.keys().next().value;
+          if (oldest !== undefined) {
+            this.idempotentExecutions.delete(oldest);
+          }
+        }
+      }
+    }
 
     try {
-      return await Promise.race([executor(args ?? {}), timeoutPromise]);
+      const result = await execution;
+      // Suppress the response when the caller aborted this specific request;
+      // the tool.abort ack already told the client it is cancelled.
+      return call.aborted ? ABORTED_RESULT : result;
     } catch (error) {
+      if (call.aborted) {
+        return ABORTED_RESULT;
+      }
       if (error instanceof ToolTimeoutError) {
         // Let the JSON-RPC layer map this to a TOOL_TIMEOUT error response.
         throw error;
@@ -462,11 +649,40 @@ export class MCPBridge {
         isError: true,
       };
     } finally {
+      this.activeCalls.delete(callInfo.requestId);
+    }
+  }
+
+  /**
+   * Run one executor under the per-call timeout. The signal (owned by the
+   * active-call record) is aborted both on timeout and on `tool.abort`, so
+   * signal-aware executors can stop promptly instead of running to completion
+   * with nobody listening.
+   */
+  private executeWithTimeout(
+    toolName: string,
+    executor: ToolExecutor,
+    args: Record<string, unknown>,
+    controller: AbortController,
+  ): Promise<ToolCallResult> {
+    // The handle is registered so it can be cleared when the call settles —
+    // otherwise every completed call leaks a live 30s timer.
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        controller.abort();
+        reject(new ToolTimeoutError(toolName, this.timeout));
+      }, this.timeout);
+      this.activeTimeoutHandles.add(timeoutHandle);
+    });
+
+    return Promise.race([executor(args, controller.signal), timeoutPromise]).finally(() => {
       if (timeoutHandle !== undefined) {
         this.activeTimeoutHandles.delete(timeoutHandle);
         clearTimeout(timeoutHandle);
       }
-    }
+    });
   }
 
   /**
@@ -492,18 +708,23 @@ export class MCPBridge {
   }
 
   /**
-   * Send a JSON-RPC response to a client socket.
+   * Send a JSON-RPC response to a client socket. Resolves once the frame has
+   * been flushed to the kernel (write callback), so shutdown acks are reliably
+   * delivered before the socket is destroyed.
    */
-  private sendResponse(socket: Socket, response: JsonRpcResponse): void {
-    try {
-      const json = JSON.stringify(response);
-      const messageBuffer = Buffer.from(json, "utf-8");
-      const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
-      lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
-      const frame = Buffer.concat([lengthPrefix, messageBuffer]);
-      socket.write(frame);
-    } catch (error) {
-      console.error("[MCPBridge] Failed to send response:", error);
-    }
+  private sendResponse(socket: Socket, response: JsonRpcResponse): Promise<void> {
+    return new Promise<void>((resolve) => {
+      try {
+        const json = JSON.stringify(response);
+        const messageBuffer = Buffer.from(json, "utf-8");
+        const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
+        lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
+        const frame = Buffer.concat([lengthPrefix, messageBuffer]);
+        socket.write(frame, () => resolve());
+      } catch (error) {
+        console.error("[MCPBridge] Failed to send response:", error);
+        resolve();
+      }
+    });
   }
 }

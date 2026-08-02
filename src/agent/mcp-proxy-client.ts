@@ -9,6 +9,14 @@
  * - Uses node:net to connect to host IPC socket
  * - Platform detection: Unix domain socket on Linux/macOS, named pipe on Windows
  * - JSON-RPC 2.0 protocol with length-prefixed framing
+ * - Bounded connect (socket + handshake) timeout so a dead socket surfaces an
+ *   error instead of wedging forever
+ * - Socket auth handshake: presents the bridge token before any tool call
+ * - Idempotency keys so a timed-out call can be retried without re-executing
+ *   the side-effectful host tool
+ * - Abort propagation: an external AbortSignal cancels the in-flight call on
+ *   the bridge and fails the local request promptly
+ * - Hard frame-size cap defending against corrupt/malformed frames (OOM)
  * - Auto-reconnect capability (configurable)
  * - Request/response correlation via id field
  */
@@ -17,12 +25,15 @@ import { randomUUID } from "node:crypto";
 import { Socket } from "node:net";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import {
   type ConnectionState,
   type JsonRpcRequest,
   type JsonRpcResponse,
+  MAX_IPC_FRAME_SIZE,
   type MCPProxyClientOptions,
+  METHOD_AUTH_HANDSHAKE,
+  METHOD_TOOL_ABORT,
   METHOD_TOOL_CALL,
   METHOD_TOOL_LIST,
   type PendingRequest,
@@ -39,15 +50,46 @@ const DEFAULT_RECONNECT_DELAY = 1000;
 /** Maximum reconnect attempts. */
 const DEFAULT_MAX_RECONNECT_ATTEMPTS = 3;
 
+/** Default bound on connect() (socket + handshake) in milliseconds. */
+const DEFAULT_CONNECT_TIMEOUT = 5_000;
+
 /** Length prefix size in bytes (4-byte big-endian uint32). */
 const LENGTH_PREFIX_SIZE = 4;
+
+/**
+ * Raised when a proxied tool call is cancelled via its AbortSignal.
+ *
+ * Deliberately not converted into an isError result: the subagent runtime
+ * aborted this call, so the rejection must surface as an abort, not as a
+ * normal tool failure the agent could recover from.
+ */
+export class ProxyAbortError extends Error {
+  constructor() {
+    super("Tool call aborted by caller signal");
+    this.name = "ProxyAbortError";
+  }
+}
+
+/**
+ * Convert a serialized JSON Schema into a TypeBox schema for defineTool.
+ *
+ * The bridge ships the host tool's real argument shape; passing it through
+ * (instead of the previous empty `Type.Object({})`) lets subagent models see
+ * and call the actual parameters.
+ */
+export function proxiedParameters(inputSchema: unknown): TSchema {
+  if (inputSchema !== null && typeof inputSchema === "object" && !Array.isArray(inputSchema)) {
+    return Type.Unsafe(inputSchema as TSchema);
+  }
+  return Type.Object({});
+}
 
 /**
  * MCPProxyClient connects to a host MCPBridge and provides proxied tool definitions.
  *
  * @example
  * ```typescript
- * const client = new MCPProxyClient("/tmp/pi-workflow-1234.sock");
+ * const client = new MCPProxyClient("/tmp/pi-workflow-1234.sock", { authToken });
  * await client.connect();
  * const tools = client.getToolDefinitions();
  * // Inject tools into subagent session
@@ -60,15 +102,21 @@ export class MCPProxyClient {
   private readonly reconnect: boolean;
   private readonly maxReconnectAttempts: number;
   private readonly reconnectDelay: number;
+  private readonly connectTimeout: number;
+  private readonly maxFrameSize: number;
+  private readonly authToken: string | undefined;
 
   private socket: Socket | null = null;
   private state: ConnectionState = "disconnected";
   private buffer: Buffer = Buffer.alloc(0);
   private pendingRequests: Map<string | number, PendingRequest> = new Map();
+  private abortCleanups: Map<string | number, () => void> = new Map();
   private requestIdCounter = 0;
   private toolDefs: ProxiedToolDef[] = [];
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** In-flight connect attempt; concurrent callers await the same promise. */
+  private connectPromise: Promise<void> | null = null;
 
   constructor(socketPath: string, options?: MCPProxyClientOptions) {
     this.socketPath = socketPath;
@@ -76,25 +124,43 @@ export class MCPProxyClient {
     this.reconnect = options?.reconnect ?? false;
     this.maxReconnectAttempts = options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
     this.reconnectDelay = options?.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
+    this.connectTimeout = options?.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT;
+    this.maxFrameSize = options?.maxFrameSize ?? MAX_IPC_FRAME_SIZE;
+    this.authToken = options?.authToken;
   }
 
   /**
-   * Connect to the host MCPBridge.
-   * @throws {Error} If connection fails.
+   * Connect to the host MCPBridge (bounded by connectTimeout), present the
+   * auth token, and fetch the tool list.
+   * @throws {Error} If connection, handshake, or tool-list fetch fails.
    */
   async connect(): Promise<void> {
     if (this.state === "connected") {
       return;
     }
+    if (this.connectPromise) {
+      // A previous connect() is still in flight; share it rather than stacking
+      // a second socket.
+      return this.connectPromise;
+    }
 
+    this.connectPromise = this.doConnect().finally(() => {
+      this.connectPromise = null;
+    });
+    return this.connectPromise;
+  }
+
+  private async doConnect(): Promise<void> {
     this.state = "connecting";
 
-    return new Promise<void>((resolve, reject) => {
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    const connectPromise = new Promise<void>((resolve, reject) => {
       this.socket = new Socket();
 
       const onError = (error: Error) => {
         if (this.state === "connecting") {
           this.state = "disconnected";
+          this.socket = null;
           reject(error);
         } else {
           console.error("[MCPProxyClient] Socket error:", error.message);
@@ -106,13 +172,15 @@ export class MCPProxyClient {
 
       this.socket.on("connect", async () => {
         this.state = "connected";
-        this.reconnectAttempts = 0;
-
-        // Fetch tool list from bridge
         try {
+          await this.performHandshake();
+          this.reconnectAttempts = 0;
           await this.fetchToolList();
           resolve();
         } catch (error) {
+          this.state = "disconnected";
+          this.socket?.destroy();
+          this.socket = null;
           reject(error);
         }
       });
@@ -134,6 +202,24 @@ export class MCPProxyClient {
       // Initiate connection
       this.socket.connect(this.socketPath);
     });
+
+    try {
+      return await Promise.race([
+        connectPromise,
+        new Promise<never>((_, reject) => {
+          connectTimer = setTimeout(() => {
+            this.socket?.destroy();
+            this.socket = null;
+            this.state = "disconnected";
+            reject(new Error(`Connect timed out after ${this.connectTimeout}ms: ${this.socketPath}`));
+          }, this.connectTimeout);
+        }),
+      ]);
+    } finally {
+      if (connectTimer !== undefined) {
+        clearTimeout(connectTimer);
+      }
+    }
   }
 
   /**
@@ -148,7 +234,12 @@ export class MCPProxyClient {
       this.reconnectTimer = null;
     }
 
-    // Reject all pending requests
+    // Release abort listeners and reject all pending requests
+    for (const cleanup of this.abortCleanups.values()) {
+      cleanup();
+    }
+    this.abortCleanups.clear();
+
     for (const [_id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("Connection closed"));
@@ -192,6 +283,14 @@ export class MCPProxyClient {
   }
 
   /**
+   * Present the bridge auth token. Fails loudly (and the bridge closes the
+   * connection) when the token is missing or wrong.
+   */
+  private async performHandshake(): Promise<void> {
+    await this.sendRequest(METHOD_AUTH_HANDSHAKE, { token: this.authToken });
+  }
+
+  /**
    * Create a ToolDefinition for a proxied tool.
    */
   private createToolDefinition(def: ProxiedToolDef): ToolDefinition {
@@ -200,15 +299,15 @@ export class MCPProxyClient {
       name: def.name,
       label: def.name,
       description: `[Proxied] ${def.description}`,
-      parameters: Type.Object({}),
+      parameters: proxiedParameters(def.inputSchema),
       async execute(
         _toolCallId: string,
         params: Record<string, unknown>,
-        _signal: AbortSignal | undefined,
+        signal: AbortSignal | undefined,
         _onUpdate: unknown,
         _ctx: ExtensionContext,
       ) {
-        const result = await client.executeToolCall(def.name, params);
+        const result = await client.executeToolCall(def.name, params, { signal });
         return {
           content: [{ type: "text" as const, text: result.content }],
           details: result.details,
@@ -220,9 +319,14 @@ export class MCPProxyClient {
   /**
    * Send a JSON-RPC request and await the response.
    */
-  private async sendRequest(method: string, params: unknown): Promise<unknown> {
+  private async sendRequest(method: string, params: unknown, options?: { signal?: AbortSignal }): Promise<unknown> {
     if (this.state !== "connected" || !this.socket) {
       throw new Error("Not connected to bridge");
+    }
+
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      throw new ProxyAbortError();
     }
 
     const id = this.generateRequestId();
@@ -236,6 +340,8 @@ export class MCPProxyClient {
     return new Promise<unknown>((resolve, reject) => {
       // Set up timeout
       const timeout = setTimeout(() => {
+        this.abortCleanups.get(id)?.();
+        this.abortCleanups.delete(id);
         this.pendingRequests.delete(id);
         reject(new Error(`Request timed out after ${this.timeout}ms: ${method}`));
       }, this.timeout);
@@ -249,19 +355,54 @@ export class MCPProxyClient {
         startedAt: Date.now(),
       });
 
+      // Propagate an external abort: tell the bridge to cancel the in-flight
+      // host tool, then fail this request promptly instead of awaiting a
+      // response that will never be observed.
+      if (signal) {
+        const onAbort = () => {
+          this.writeFrame({
+            jsonrpc: "2.0",
+            method: METHOD_TOOL_ABORT,
+            params: { requestId: id },
+            id: this.generateRequestId(),
+          });
+          const pending = this.pendingRequests.get(id);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            this.pendingRequests.delete(id);
+            pending.reject(new ProxyAbortError());
+          }
+          this.abortCleanups.delete(id);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.abortCleanups.set(id, () => signal.removeEventListener("abort", onAbort));
+      }
+
       // Send request
       try {
-        const json = JSON.stringify(request);
-        const messageBuffer = Buffer.from(json, "utf-8");
-        const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
-        lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
-        this.socket?.write(Buffer.concat([lengthPrefix, messageBuffer]));
+        this.writeFrame(request);
       } catch (error) {
         clearTimeout(timeout);
+        this.abortCleanups.get(id)?.();
+        this.abortCleanups.delete(id);
         this.pendingRequests.delete(id);
         reject(error);
       }
     });
+  }
+
+  /**
+   * Serialize and write one frame; throws when the socket rejects the write.
+   */
+  private writeFrame(request: JsonRpcRequest): void {
+    if (!this.socket) {
+      throw new Error("Not connected to bridge");
+    }
+    const json = JSON.stringify(request);
+    const messageBuffer = Buffer.from(json, "utf-8");
+    const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
+    lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
+    this.socket.write(Buffer.concat([lengthPrefix, messageBuffer]));
   }
 
   /**
@@ -278,6 +419,26 @@ export class MCPProxyClient {
   private processBuffer(): void {
     while (this.buffer.length >= LENGTH_PREFIX_SIZE) {
       const messageLength = this.buffer.readUInt32BE(0);
+
+      if (messageLength > this.maxFrameSize) {
+        // A corrupt or malicious length prefix. The channel cannot be trusted
+        // past this point, so drop it and fail every in-flight request.
+        const error = new Error(`Frame of ${messageLength} bytes exceeds the ${this.maxFrameSize}-byte cap`);
+        this.socket?.destroy();
+        this.state = "disconnected";
+        this.socket = null;
+        for (const [_id, pending] of this.pendingRequests) {
+          clearTimeout(pending.timeout);
+          pending.reject(error);
+        }
+        this.pendingRequests.clear();
+        for (const cleanup of this.abortCleanups.values()) {
+          cleanup();
+        }
+        this.abortCleanups.clear();
+        this.buffer = Buffer.alloc(0);
+        return;
+      }
 
       if (this.buffer.length < LENGTH_PREFIX_SIZE + messageLength) {
         // Incomplete message, wait for more data
@@ -314,6 +475,8 @@ export class MCPProxyClient {
     }
 
     this.pendingRequests.delete(response.id);
+    this.abortCleanups.get(response.id)?.();
+    this.abortCleanups.delete(response.id);
     clearTimeout(pending.timeout);
 
     if (response.error) {
@@ -335,6 +498,11 @@ export class MCPProxyClient {
     this.socket = null;
 
     // Reject all pending requests
+    for (const cleanup of this.abortCleanups.values()) {
+      cleanup();
+    }
+    this.abortCleanups.clear();
+
     for (const [_id, pending] of this.pendingRequests) {
       clearTimeout(pending.timeout);
       pending.reject(new Error("Connection lost"));
@@ -363,11 +531,22 @@ export class MCPProxyClient {
    * Execute a tool call through the proxy.
    * This is the main method used by proxied tool definitions.
    */
-  async executeToolCall(toolName: string, args: Record<string, unknown>): Promise<ToolCallResult> {
+  async executeToolCall(
+    toolName: string,
+    args: Record<string, unknown>,
+    options?: { idempotencyKey?: string; signal?: AbortSignal },
+  ): Promise<ToolCallResult> {
     try {
-      const result = await this.sendRequest(METHOD_TOOL_CALL, { toolName, args });
+      const result = await this.sendRequest(
+        METHOD_TOOL_CALL,
+        { toolName, args, idempotencyKey: options?.idempotencyKey },
+        { signal: options?.signal },
+      );
       return result as ToolCallResult;
     } catch (error) {
+      if (error instanceof ProxyAbortError) {
+        throw error;
+      }
       return {
         content: `Proxy error: ${error instanceof Error ? error.message : "Unknown error"}`,
         isError: true,
@@ -398,15 +577,15 @@ export function createProxiedTools(client: MCPProxyClient, toolDefs: ProxiedTool
       name: def.name,
       label: def.name,
       description: `[Proxied] ${def.description}`,
-      parameters: Type.Object({}),
+      parameters: proxiedParameters(def.inputSchema),
       async execute(
         _toolCallId: string,
         params: Record<string, unknown>,
-        _signal: AbortSignal | undefined,
+        signal: AbortSignal | undefined,
         _onUpdate: unknown,
         _ctx: ExtensionContext,
       ) {
-        const result = await client.executeToolCall(def.name, params);
+        const result = await client.executeToolCall(def.name, params, { signal });
         return {
           content: [{ type: "text" as const, text: result.content }],
           details: result.details,

@@ -23,8 +23,7 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import { MCPProxyClient } from "../agent/mcp-proxy-client.js";
+import { MCPProxyClient, proxiedParameters } from "../agent/mcp-proxy-client.js";
 import { MCPBridge } from "./mcp-bridge.js";
 import type { ProxiedToolDef, ToolExecutor } from "./types.js";
 
@@ -50,9 +49,9 @@ export function hostToolsFromDefinitions(definitions: ToolDefinition[]): HostToo
 
   for (const def of definitions) {
     if (tools.has(def.name)) continue;
-    tools.set(def.name, async (args) => {
+    tools.set(def.name, async (args, signal) => {
       try {
-        const result = await def.execute(randomUUID(), (args ?? {}) as never, undefined, undefined, minimalCtx);
+        const result = await def.execute(randomUUID(), (args ?? {}) as never, signal, undefined, minimalCtx);
         const text = result.content
           .filter((part) => part.type === "text")
           .map((part) => (part as { type: "text"; text: string }).text)
@@ -93,6 +92,15 @@ export class HostToolGateway {
 
   getSocketPath(): string | undefined {
     return this.bridge?.getSocketPath();
+  }
+
+  /**
+   * The auth token proxied clients must present on connect. The host passes it
+   * to subagent processes (e.g. via env) so they can authenticate; it is the
+   * capability that stops other local processes from invoking host tools.
+   */
+  getAuthToken(): string | undefined {
+    return this.bridge?.getAuthToken();
   }
 
   /** The proxied tool metadata for the running bridge (empty when stopped). */
@@ -147,7 +155,7 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
         name: def.name,
         label: def.name,
         description: `[Proxied host tool — unavailable] ${def.description}`,
-        parameters: Type.Object({}),
+        parameters: proxiedParameters(def.inputSchema),
         async execute() {
           throw new Error(GATEWAY_NOT_RUNNING_MESSAGE);
         },
@@ -155,24 +163,43 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
     );
   }
 
-  const client = new MCPProxyClient(socketPath);
+  const client = new MCPProxyClient(socketPath, { authToken: gateway.getAuthToken() });
   // Fire the connection in the background; each proxied execute awaits it, so
-  // the first call made by a subagent never races the socket handshake.
+  // the first call made by a subagent never races the socket handshake. The
+  // catch detaches the rejection when the socket is stale/dead: with Node's
+  // default --unhandled-rejections=throw an unattached rejection would crash
+  // the host; the per-call `await connecting` still surfaces the error.
   const connecting = client.connect();
+  connecting.catch(() => {});
 
   return gateway.getProxiedToolDefinitions().map((def) =>
     defineTool({
       name: def.name,
       label: def.name,
       description: `[Proxied host tool] ${def.description}`,
-      parameters: Type.Object({}),
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        await connecting;
-        const result = await client.executeToolCall(def.name, (params ?? {}) as Record<string, unknown>);
-        return {
-          content: [{ type: "text", text: result.content }],
-          details: result.details,
-        };
+      parameters: proxiedParameters(def.inputSchema),
+      async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+        try {
+          await connecting;
+          const result = await client.executeToolCall(def.name, (params ?? {}) as Record<string, unknown>, {
+            signal,
+          });
+          return {
+            content: [{ type: "text", text: result.content }],
+            details: result.details,
+            isError: result.isError,
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Host tool gateway error: ${error instanceof Error ? error.message : "Unknown error"}`,
+              },
+            ],
+            isError: true,
+          };
+        }
       },
     }),
   );
