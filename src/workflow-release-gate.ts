@@ -15,6 +15,7 @@ import {
   WORKFLOW_AUTHORING_PATTERN_IDS,
   WORKFLOW_AUTHORING_RECIPE_IDS,
   WORKFLOW_COMPREHENSION_SCENARIO_IDS,
+  readLf,
   type WorkflowAuthoringCoverageEntry,
 } from "./workflow-authoring-coverage.js";
 import {
@@ -90,6 +91,11 @@ export const REQUIRED_WORKFLOW_PACKAGE_RESOURCES = [
   ...RECIPES.map((name) => `${SKILL_ROOT}/examples/${name}.js`),
 ] as const;
 
+/** Normalize CRLF line endings to LF for any in-memory guidance content. */
+function normalizeLf(value: string): string {
+  return value.replace(/\r\n/g, "\n");
+}
+
 function diagnostic(
   code: WorkflowReleaseDiagnosticCode,
   subject: string,
@@ -100,8 +106,11 @@ function diagnostic(
 }
 
 function skillVersion(root: string): string | null {
-  const skill = readFileSync(join(root, SKILL_ROOT, "SKILL.md"), "utf8");
-  return /^\s{2}version:\s*["']?([^"'\s]+)["']?\s*$/m.exec(skill)?.[1] ?? null;
+  const skillPath = join(root, SKILL_ROOT, "SKILL.md");
+  if (!existsSync(skillPath)) {
+    return null;
+  }
+  return /^\s{2}version:\s*["']?([^"'\s]+)["']?\s*$/m.exec(readLf(skillPath))?.[1] ?? null;
 }
 
 function anchorExists(markdown: string, anchor: string): boolean {
@@ -185,7 +194,7 @@ function validateCapabilityLinks(root: string, definition: WorkflowCapabilityDef
       const { path, anchor } = capability.staticReference;
       const absolute = join(root, path);
       const subject = `${path}#${anchor}`;
-      if (!existsSync(absolute) || !anchorExists(readFileSync(absolute, "utf8"), anchor)) {
+      if (!existsSync(absolute) || !anchorExists(readLf(absolute), anchor)) {
         diagnostics.push(
           diagnostic(
             WorkflowReleaseDiagnosticCode.BROKEN_CONTRACT_REFERENCE,
@@ -226,18 +235,35 @@ function validateAuthoringCoverage(
     );
 
   const knownScenarioIds = new Set(WORKFLOW_COMPREHENSION_SCENARIO_IDS);
-  for (const entry of coverage.filter(
-    ({ protection }) => protection === WorkflowAuthoringProtection.BEHAVIORALLY_COVERED,
-  )) {
+  for (const entry of coverage) {
+    const unknownScenario = entry.comprehensionScenarios.some((scenarioId) => !knownScenarioIds.has(scenarioId));
+    const frozenCoverageClaim =
+      entry.protection === WorkflowAuthoringProtection.GUIDANCE_FROZEN && entry.comprehensionScenarios.length > 0;
     if (
-      entry.comprehensionScenarios.length === 0 ||
-      entry.comprehensionScenarios.some((scenarioId) => !knownScenarioIds.has(scenarioId))
+      entry.protection === WorkflowAuthoringProtection.BEHAVIORALLY_COVERED &&
+      entry.comprehensionScenarios.length === 0
     ) {
       diagnostics.push(
         diagnostic(
           WorkflowReleaseDiagnosticCode.UNKNOWN_COMPREHENSION_SCENARIO,
           entry.id,
-          `Behaviorally covered authoring surface ${entry.id} references a missing comprehension scenario.`,
+          `Behaviorally covered authoring surface ${entry.id} references no comprehension scenario.`,
+        ),
+      );
+    } else if (unknownScenario) {
+      diagnostics.push(
+        diagnostic(
+          WorkflowReleaseDiagnosticCode.UNKNOWN_COMPREHENSION_SCENARIO,
+          entry.id,
+          `Authoring surface ${entry.id} references a missing comprehension scenario.`,
+        ),
+      );
+    } else if (frozenCoverageClaim) {
+      diagnostics.push(
+        diagnostic(
+          WorkflowReleaseDiagnosticCode.UNKNOWN_COMPREHENSION_SCENARIO,
+          entry.id,
+          `Guidance-frozen authoring surface ${entry.id} claims comprehension coverage; only the agreed provider-backed scenarios may unfreeze an untested surface.`,
         ),
       );
     }
@@ -257,7 +283,7 @@ function validateAuthoringCoverage(
     const drifted = entry.protectedGuidance.find(({ path, anchor, requiredText }) => {
       const absolute = join(root, path);
       if (!existsSync(absolute) && guidanceOverrides[path] === undefined) return true;
-      const source = guidanceOverrides[path] ?? readFileSync(absolute, "utf8");
+      const source = normalizeLf(guidanceOverrides[path] ?? readLf(absolute));
       return (
         (anchor !== undefined && !anchorExists(source, anchor)) ||
         (requiredText !== undefined && !source.includes(requiredText))
@@ -268,7 +294,7 @@ function validateAuthoringCoverage(
       const source =
         !existsSync(absolute) && guidanceOverrides[drifted.path] === undefined
           ? null
-          : (guidanceOverrides[drifted.path] ?? readFileSync(absolute, "utf8"));
+          : normalizeLf(guidanceOverrides[drifted.path] ?? readLf(absolute));
       const failedChecks: string[] = [];
       if (source === null) {
         failedChecks.push("protected file");
@@ -306,7 +332,7 @@ function validateFrozenGuidanceFiles(
         ),
       ];
     }
-    const source = guidanceOverrides[path] ?? readFileSync(absolute, "utf8");
+    const source = normalizeLf(guidanceOverrides[path] ?? readLf(absolute));
     return sha256(source) === expected
       ? []
       : [
@@ -401,7 +427,9 @@ export function renderWorkflowGuidanceBaseline(root: string): string {
       (name) => `${SKILL_ROOT}/references/${name}.md`,
     ),
   ];
-  const detailed = detailedPaths.map((path) => `${path}\n${readFileSync(join(root, path), "utf8")}`).join("\n");
+  const detailed = detailedPaths
+    .map((path) => `${path}\n${readLf(join(root, path))}`)
+    .join("\n");
   return `${JSON.stringify(
     {
       formatVersion: 1,
@@ -421,15 +449,46 @@ export function writeWorkflowGuidanceBaseline(root: string): void {
   writeFileSync(join(root, WORKFLOW_GUIDANCE_BASELINE_PATH), renderWorkflowGuidanceBaseline(root));
 }
 
+/**
+ * Read the committed guidance baseline, normalized to LF, or null when missing.
+ * Missing is reported as a diagnostic instead of an uncaught ENOENT crash.
+ */
+function readGuidanceBaseline(root: string): string | null {
+  const absolute = join(root, WORKFLOW_GUIDANCE_BASELINE_PATH);
+  return existsSync(absolute) ? normalizeLf(readFileSync(absolute, "utf8")) : null;
+}
+
 function validateGuidanceBaseline(root: string, actual?: string): WorkflowReleaseDiagnostic[] {
-  const committed = actual ?? readFileSync(join(root, WORKFLOW_GUIDANCE_BASELINE_PATH), "utf8");
-  if (committed === renderWorkflowGuidanceBaseline(root)) return [];
+  const committed = actual ?? readGuidanceBaseline(root);
+  if (committed === null) {
+    return [
+      diagnostic(
+        WorkflowReleaseDiagnosticCode.STALE_GENERATED_SURFACE,
+        WORKFLOW_GUIDANCE_BASELINE_PATH,
+        `Generated workflow guidance baseline is missing: ${WORKFLOW_GUIDANCE_BASELINE_PATH}. Run npm run guidance:generate to create it.`,
+      ),
+    ];
+  }
+  let rendered: string;
+  try {
+    rendered = renderWorkflowGuidanceBaseline(root);
+  } catch (error) {
+    return [
+      diagnostic(
+        WorkflowReleaseDiagnosticCode.STALE_GENERATED_SURFACE,
+        WORKFLOW_GUIDANCE_BASELINE_PATH,
+        `Cannot render workflow guidance baseline: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    ];
+  }
+  if (committed === rendered) return [];
   return [
     diagnostic(
       WorkflowReleaseDiagnosticCode.NON_CONTRACTUAL_PROSE_DRIFT,
       WORKFLOW_GUIDANCE_BASELINE_PATH,
       `Compact guidance or detailed hand-written prose changed; review intent and refresh ${WORKFLOW_GUIDANCE_BASELINE_PATH} if intentional.`,
-      "warning",
+      // Prose drift is a hard gate so drift commits are blocked at PR time.
+      "error",
     ),
   ];
 }
@@ -452,13 +511,24 @@ function validatePackage(root: string, publishableFiles: readonly string[]): Wor
   for (const sourcePath of publishableFiles.filter(
     (path) => path.startsWith(`${SKILL_ROOT}/`) && path.endsWith(".md"),
   )) {
-    const source = readFileSync(join(root, sourcePath), "utf8");
+    const absolute = join(root, sourcePath);
+    if (!existsSync(absolute)) {
+      diagnostics.push(
+        diagnostic(
+          WorkflowReleaseDiagnosticCode.MISSING_PACKAGE_RESOURCE,
+          sourcePath,
+          `Publishable workflow skill file is missing from the repository: ${sourcePath}.`,
+        ),
+      );
+      continue;
+    }
+    const source = readLf(absolute);
     for (const match of source.matchAll(/\[[^\]]+\]\(([^)#]+)(?:#([^)]+))?\)/g)) {
-      const target = normalize(join(dirname(sourcePath), match[1]));
+      const target = normalize(join(dirname(sourcePath), match[1])).replaceAll("\\", "/");
       const anchor = match[2];
       const outsidePackage = relative(".", target).startsWith("..");
       const targetMissing = !files.has(target);
-      const targetSource = !targetMissing && anchor ? readFileSync(join(root, target), "utf8") : null;
+      const targetSource = !targetMissing && anchor ? readLf(join(root, target)) : null;
       if (outsidePackage || targetMissing || (anchor && targetSource !== null && !anchorExists(targetSource, anchor))) {
         const subject = `${sourcePath} -> ${target}${anchor ? `#${anchor}` : ""}`;
         diagnostics.push(
@@ -521,7 +591,7 @@ export function checkWorkflowRelease(options: WorkflowReleaseCheckOptions): Work
       diagnostic(
         WorkflowReleaseDiagnosticCode.STALE_GENERATED_SURFACE,
         WORKFLOW_CONTEXT_MEASUREMENT_PATH,
-        `Generated workflow context measurement is stale: ${WORKFLOW_CONTEXT_MEASUREMENT_PATH}.`,
+        `Generated workflow context measurement is stale or missing: ${WORKFLOW_CONTEXT_MEASUREMENT_PATH}. Run npm run context:generate to refresh it.`,
       ),
     );
   }

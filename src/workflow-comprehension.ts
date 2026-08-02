@@ -466,7 +466,9 @@ export async function runComprehensionScenario(
           callIndex: call?.index ?? -1,
           label,
           message: error,
-          errorCode: errorCode ?? null,
+          // WorkflowErrorCode gained numeric members (phase gates); serialize to
+          // a string so evidence stays JSON-safe and string-typed.
+          errorCode: errorCode === null ? null : String(errorCode),
           recoverable: recoverable ?? null,
         });
       },
