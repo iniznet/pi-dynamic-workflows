@@ -108,19 +108,30 @@ test("workflow context byte counts are LF-basis and count corpus files once", ()
   const artifact = measureWorkflowContextSurfaces(ROOT);
   const corpusFiles = artifact.surfaces.workflowAuthoringSkillCorpus;
   assert.equal(corpusFiles.files, 28);
-  const lfCorpusBytes = readdirRecursive(ROOT, "skills/workflow-authoring").reduce(
+  const corpusPaths = readdirRecursive(ROOT, "skills/workflow-authoring");
+  const lfCorpusBytes = corpusPaths.reduce(
     (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path), "utf8").replace(/\r\n/g, "\n")),
     0,
   );
   assert.equal(corpusFiles.bytes, lfCorpusBytes, "corpus bytes must count LF-normalized file content");
-  assert.notEqual(
-    corpusFiles.bytes,
-    readdirRecursive(ROOT, "skills/workflow-authoring").reduce(
-      (sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path))),
-      0,
-    ),
-    "raw disk bytes (CRLF on Windows checkouts) must not equal the LF-basis count",
-  );
+  const rawDiskBytes = corpusPaths.reduce((sum, path) => sum + Buffer.byteLength(readFileSync(join(ROOT, path))), 0);
+  // In LF-only checkouts (e.g. CI with core.autocrlf=false) the raw disk bytes
+  // already match the LF-normalized count, so this distinguishing assertion only
+  // holds where any corpus file actually carries CRLF line endings.
+  const anyCorpusHasCrlf = corpusPaths.some((path) => readFileSync(join(ROOT, path)).includes("\r\n"));
+  if (anyCorpusHasCrlf) {
+    assert.notEqual(
+      corpusFiles.bytes,
+      rawDiskBytes,
+      "raw disk bytes (CRLF on Windows checkouts) must not equal the LF-basis count",
+    );
+  } else {
+    assert.equal(
+      corpusFiles.bytes,
+      rawDiskBytes,
+      "LF-only checkouts must report identical raw and normalized corpus bytes",
+    );
+  }
 });
 
 test("context freshness command prints both current byte counts", () => {
