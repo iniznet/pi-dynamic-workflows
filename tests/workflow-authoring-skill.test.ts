@@ -306,8 +306,8 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["maxRounds", "50"],
     ],
   );
-  assert.match(loopUntilDry?.constraints.join(" ") ?? "", /capacity exhaustion.*partial array/i);
-  assert.match(loopUntilDry?.constraints.join(" ") ?? "", /does not report whether termination/i);
+  assert.match(loopUntilDry?.constraints.join(" ") ?? "", /capacity exhaustion.*partial (array|items)/i);
+  assert.match(loopUntilDry?.constraints.join(" ") ?? "", /termination.*dry.*maxRounds.*capacity.*failed/i);
 
   assert.match(completenessCheck?.signature ?? "", /complete: boolean.*missing\?: string\[\].*null/i);
   assert.match(completenessCheck?.constraints.join(" ") ?? "", /4,000.*serialized result/i);

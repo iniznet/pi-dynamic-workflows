@@ -65,15 +65,37 @@ export function ensureDir(fs: PersistenceFsLayer, dir: string): void {
  * the recovery fallback readJsonWithBackupRecovery() uses if the primary is
  * later found truncated (e.g. a rename that itself got interrupted by a
  * power loss on a filesystem/OS combination where rename isn't fully atomic).
+ * L9: a failed rename unlinks the orphaned `.tmp` before rethrowing, and the
+ * `.bak` itself is written atomically (tmp + rename) so a crash mid-backup
+ * can never leave a half-written sidecar that shadows the good primary.
  */
 export function writeJsonAtomicWithBackup(fs: PersistenceFsLayer, path: string, data: unknown): void {
   const json = JSON.stringify(data, null, 2);
   fs.writeFileSync(`${path}.tmp`, json);
-  fs.renameSync(`${path}.tmp`, path);
   try {
-    fs.writeFileSync(`${path}.bak`, json);
+    fs.renameSync(`${path}.tmp`, path);
+  } catch (error) {
+    // The primary write failed — never leave the orphaned .tmp behind, then
+    // surface the original failure.
+    try {
+      fs.unlinkSync(`${path}.tmp`);
+    } catch {
+      // unlink is best-effort cleanup; the rename failure is the real error.
+    }
+    throw error;
+  }
+  try {
+    const bakPath = `${path}.bak`;
+    fs.writeFileSync(`${bakPath}.tmp`, json);
+    fs.renameSync(`${bakPath}.tmp`, bakPath);
   } catch {
-    // Backup is best-effort; the primary write already succeeded.
+    // Backup is best-effort; the primary write already succeeded. Clean any
+    // half-written backup tmp so it can't accumulate.
+    try {
+      fs.unlinkSync(`${path}.bak.tmp`);
+    } catch {
+      // ignore
+    }
   }
 }
 

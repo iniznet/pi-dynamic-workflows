@@ -123,8 +123,13 @@ const out = await loopUntilDry({
   consecutiveEmpty: 2,
 })
 return out`;
-  const res = await runWorkflow<number[]>(script, { agent: yesAgent, persistLogs: false });
-  assert.deepEqual([...res.result], [1, 2, 3], "deduped union across rounds");
+  const res = await runWorkflow<{ items: number[]; termination: string; failedRounds: number }>(script, {
+    agent: yesAgent,
+    persistLogs: false,
+  });
+  assert.deepEqual([...res.result.items], [1, 2, 3], "deduped union across rounds");
+  assert.equal(res.result.termination, "dry", "two consecutive successful empty rounds end the loop as dry");
+  assert.equal(res.result.failedRounds, 0);
 });
 
 test("loopUntilDry(): returns partial results when a round hits the budget", async () => {
@@ -136,8 +141,12 @@ const out = await loopUntilDry({
   },
 })
 return out`;
-  const res = await runWorkflow<number[]>(script, { agent: yesAgent, persistLogs: false });
-  assert.deepEqual([...res.result], [1], "partial result returned, not an abort");
+  const res = await runWorkflow<{ items: number[]; termination: string; failedRounds: number }>(script, {
+    agent: yesAgent,
+    persistLogs: false,
+  });
+  assert.deepEqual([...res.result.items], [1], "partial result returned, not an abort");
+  assert.equal(res.result.termination, "capacity", "budget exhaustion reports capacity, not dryness");
 });
 
 test("loopUntilDry(): returns indistinguishable partial data for capacity exhaustion", async () => {
@@ -150,11 +159,15 @@ return await loopUntilDry({
   },
   maxRounds: 4,
 })`;
-    const res = await runWorkflow<Array<{ id: string }>>(script, { agent: yesAgent, persistLogs: false });
+    const res = await runWorkflow<{ items: Array<{ id: string }>; termination: string }>(script, {
+      agent: yesAgent,
+      persistLogs: false,
+    });
     assert.deepEqual(
-      Array.from(res.result, ({ id }) => ({ id })),
+      Array.from(res.result.items, ({ id }) => ({ id })),
       [{ id: "alpha" }],
     );
+    assert.equal(res.result.termination, "capacity");
   }
 
   await assert.rejects(() =>

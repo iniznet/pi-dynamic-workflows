@@ -176,6 +176,12 @@ export interface PersistedRunState {
    */
   agentTimeoutMs?: number | null;
   /**
+   * The run's resolved drain-side grace period in milliseconds (H1), fixed at
+   * start/resume so a resumed run keeps the same completion deadline it
+   * started with. Absent = runWorkflow's DRAIN_ABORT_TIMEOUT_MS default.
+   */
+  drainTimeoutMs?: number;
+  /**
    * The run's resolved concurrency, fixed at start (per-run value, else the
    * manager's concurrency at the time). Same rationale as tokenBudget.
    */
@@ -416,6 +422,14 @@ export function createRunPersistence(
     if (typeof lock.expiresAt !== "string") return false;
     const expiry = Date.parse(lock.expiresAt);
     return !Number.isNaN(expiry) && expiry <= Date.now();
+  };
+
+  // Age-based staleness (L2): a lock started more than MAX_RUN_LEASE_AGE_MS
+  // ago is stale even while its pid appears alive (pid reuse) and its TTL is
+  // unexpired (a runaway renew loop). Complements leaseIsExpired.
+  const leaseIsStaleByAge = (lock: LockFile): boolean => {
+    const started = Date.parse(lock.startedAt);
+    return !Number.isNaN(started) && Date.now() - started > MAX_RUN_LEASE_AGE_MS;
   };
 
   // list() cache: recomputed lazily, invalidated synchronously by every
@@ -794,9 +808,16 @@ export function createRunPersistence(
           if (code !== "EEXIST") throw err;
           const existing = readLock(runId);
           // Refuse only while the owner is BOTH alive and within its lease
-          // expiry; a dead pid or an expired lease (bounded-delay reclaim) is
-          // stale and gets replaced below.
-          if (existing && existing.runPath === path && pidIsAlive(existing.pid) && !leaseIsExpired(existing)) {
+          // expiry; a dead pid, an expired lease (bounded-delay reclaim), or an
+          // age-stale lease (recycled PID / runaway renew — L2) is stale and
+          // gets replaced below.
+          if (
+            existing &&
+            existing.runPath === path &&
+            pidIsAlive(existing.pid) &&
+            !leaseIsExpired(existing) &&
+            !leaseIsStaleByAge(existing)
+          ) {
             return null;
           }
           try {
@@ -1003,6 +1024,16 @@ export function capJournalBudget(journal: JournalEntry[], maxBytes = DEFAULT_JOU
  * TTL wait.
  */
 export const DEFAULT_RUN_LEASE_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Absolute ceiling on a lease's age before it is reclaimable even when its pid
+ * is alive and its TTL has not expired (L2). Covers the recycled-PID class (a
+ * dead owner's pid reused by an unrelated process) and a runaway owner that
+ * keeps renewing a lease it no longer legitimately holds: no single run in
+ * this package legitimately outlives 24h, so any lease older than this is
+ * stale by definition. Belt-and-suspenders alongside the TTL expiry.
+ */
+export const MAX_RUN_LEASE_AGE_MS = 24 * 60 * 60 * 1000;
 
 // ─── Task 8: Checkpointing & Crash Recovery ─────────────────────────────────
 

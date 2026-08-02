@@ -208,7 +208,10 @@ const SCENARIO_AGENT_FIXTURES: Readonly<Record<string, ScenarioAgentFixture>> = 
   "full-write": fullWriteAgentFixture,
   "full-edit": ordinaryAgentFixture,
   "full-review": (request) => {
-    const reviewerMatch = /^verify (\d+)$/.exec(request.label);
+    // Labels are `verify <reviewer>.<callSeq>` (a trailing per-invocation
+    // counter makes them unique across verify() calls — L14); the reviewer
+    // number is the first group.
+    const reviewerMatch = /^verify (\d+)\.(\d+)$/.exec(request.label);
     if (!reviewerMatch) {
       return ordinaryAgentFixture(request, { attempt: 0 });
     }
@@ -311,7 +314,10 @@ const SCENARIO_AGENT_FIXTURES: Readonly<Record<string, ScenarioAgentFixture>> = 
     };
   },
   "coverage-judge-panel": (request, state) => {
-    const judgeMatch = /^judge (\d+)\.(\d+)$/.exec(request.label);
+    // Labels are `judge <attempt>.<judge>.<callSeq>` (a trailing per-invocation
+    // counter makes them unique across judgePanel() calls — L14); the
+    // per-candidate attempt and per-candidate judge numbers are groups 1 and 2.
+    const judgeMatch = /^judge (\d+)\.(\d+)\.(\d+)$/.exec(request.label);
     if (judgeMatch) {
       const attempt = Number(judgeMatch[1]);
       const judge = Number(judgeMatch[2]);

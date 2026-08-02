@@ -66,6 +66,7 @@ const FOCUSED_REFERENCES = [
   "quality-helpers",
   "retry-helper",
   "specialized-helpers",
+  "authoring-helpers",
   "lifecycle",
   "versions",
   "pattern-selection",

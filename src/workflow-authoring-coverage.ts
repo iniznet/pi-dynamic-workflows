@@ -42,7 +42,7 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "997f4fde4e4e25653d354e66b47c772910337138f2669363604f867a2fe52ff2",
+    sha256: "d34780f3e791344169dafe28e650c1996dc4b8ebab43dfeef9656c2d3eeecae3",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
@@ -54,7 +54,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "923f26e9deea2944052272624ec5c694c6fa1ceef384421025306e4b983bed29",
+    sha256: "b08bcdf14a3b1ae9bce45dd3b7bcd4df1c25039c6fa55bdffbbde3b0449d4807",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
@@ -96,6 +96,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
 
 const RUNTIME_PATH = "skills/workflow-authoring/references/runtime.md";
 const SPECIALIZED_HELPERS_PATH = "skills/workflow-authoring/references/specialized-helpers.md";
+const AUTHORING_HELPERS_PATH = "skills/workflow-authoring/references/authoring-helpers.md";
 const LIFECYCLE_PATH = "skills/workflow-authoring/references/lifecycle.md";
 const PATTERN_PATH = "skills/workflow-authoring/references/pattern-selection.md";
 const RECIPE_PATH = "skills/workflow-authoring/references/focused-recipes.md";
@@ -108,7 +109,7 @@ const WRITE_EDIT_ROUTE: ProtectedGuidanceSurface = {
 const HELPER_ROUTE: ProtectedGuidanceSurface = {
   path: SKILL_PATH,
   requiredText:
-    "- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, and [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`.",
+    "- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`, and [authoring helpers](references/authoring-helpers.md) for `chunked`, `route`, `timeboxed`/`elapsedMs`, or `consensus`.",
 };
 const ROUTING_ROUTE: ProtectedGuidanceSurface = {
   path: SKILL_PATH,
@@ -146,7 +147,7 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:
-        "`loopUntilDry({ round, key, consecutiveEmpty, maxRounds })` | `round(index)` is zero-based. Defaults: `JSON.stringify` key, two dry rounds, 50 rounds. Null, non-array, and duplicate-only rounds are dry. Token-budget or agent-limit exhaustion returns the partial array without a termination reason; keep failed-round identity and stopping state outside the helper.",
+        'Returns `{ items, termination: "dry" | "maxRounds" | "capacity" | "failed", failedRounds }`. Only a successful round that yields no fresh items is dry; a round returning `null` is a FAILED round',
     },
   ],
   "workflow.runtime.completenessCheck": [
@@ -154,6 +155,41 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:
         "`completenessCheck(args, results)` | Returns `{ complete, missing? }` or recoverable `null`. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory.",
+    },
+  ],
+  "workflow.runtime.chunked": [
+    {
+      path: AUTHORING_HELPERS_PATH,
+      requiredText:
+        "`chunked(items, { chunkSize, mapper, synthesizer? })` | Splits the input into deterministic `chunkSize` slices and runs `mapper(chunk, chunkIndex)` once per chunk through `parallel()`.",
+    },
+  ],
+  "workflow.runtime.route": [
+    {
+      path: AUTHORING_HELPERS_PATH,
+      requiredText:
+        "`route(value, { cases, fallback })` | One schema'd classification agent picks among the enum of eligible case keys, then pure-JS dispatch runs the matched case.",
+    },
+  ],
+  "workflow.runtime.timeboxed": [
+    {
+      path: AUTHORING_HELPERS_PATH,
+      requiredText:
+        "`timeboxed(fn, { maxElapsedMs })` | Cooperative wall-clock bound: `fn(context)` checks `context.expired()` / `context.remaining()` at its own decision points and returns early with partial results.",
+    },
+  ],
+  "workflow.runtime.elapsedMs": [
+    {
+      path: AUTHORING_HELPERS_PATH,
+      requiredText:
+        "`elapsedMs()` | Monotonic non-negative milliseconds since the top-level run start, shared across nested `workflow()` frames. **Never** embed its value in prompts or hashes",
+    },
+  ],
+  "workflow.runtime.consensus": [
+    {
+      path: AUTHORING_HELPERS_PATH,
+      requiredText:
+        "`consensus(question, { panelists, rounds, agreeThreshold, arbitrator? })` | N independent schema'd verdicts per round via `parallel()` + `tolerantVote`.",
     },
   ],
   "workflow.runtime.gate": [
@@ -463,6 +499,11 @@ const HELPER_CAPABILITY_IDS = new Set([
   "workflow.runtime.retry",
   "workflow.runtime.gate",
   "workflow.runtime.checkpoint",
+  "workflow.runtime.chunked",
+  "workflow.runtime.route",
+  "workflow.runtime.timeboxed",
+  "workflow.runtime.elapsedMs",
+  "workflow.runtime.consensus",
 ]);
 
 const CONTRACT_COVERAGE: readonly WorkflowAuthoringCoverageEntry[] = WORKFLOW_CAPABILITY_DEFINITION.capabilities

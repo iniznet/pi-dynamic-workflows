@@ -195,7 +195,10 @@ test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)",
   assert.equal(result.agentCount, 2);
   assert.equal(result.tokenUsage?.input, 200);
   assert.equal(result.tokenUsage?.output, 80);
-  assert.equal(result.tokenUsage?.total, 280);
+  // M26 invariant: the aggregate total is the sum of its components, so a
+  // provider-reported total (140) that disagrees with its own breakdown
+  // (100+40+50+10 = 200 per agent) is discarded.
+  assert.equal(result.tokenUsage?.total, 400);
   assert.ok(Math.abs((result.tokenUsage?.cost ?? 0) - 0.004) < 1e-9, "should be within tolerance");
   assert.equal(result.tokenUsage?.cacheRead, 100, "cacheRead accumulates across agents");
   assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
@@ -1331,21 +1334,21 @@ return { caught, after }`;
   assert.equal(state.completed, 2, "the caught sibling and the later agent() both ran to completion");
 });
 
-test("parallel()'s recoverable-error-to-null contract does not seal the run's fate (siblings unaffected)", async () => {
+test("parallel() rethrows a plain thunk error (M2) — a script bug is never silently nulled", async () => {
   const { state, runner } = abortAwareAgent(20);
-  // A plain (non-WorkflowError) throw from a thunk is classified recoverable by
-  // wrapError()'s default — parallel() must swallow it to null, not rethrow,
-  // and must NOT abort the sibling still in flight.
-  const script = `export const meta = { name: 'recoverable_null', description: 'recoverable swallowed' }
+  // M2 semantics: a plain (non-WorkflowError) throw from a thunk is a SCRIPT
+  // BUG and must propagate like the identical bug in a directly-awaited
+  // agent() — not be swallowed into a null that corrupts the fan-out's data.
+  const script = `export const meta = { name: 'recoverable_null', description: 'script bug propagates' }
 const xs = await parallel([
   () => { throw new Error('plain failure') },
   () => agent('sib', { label: 'sib' }),
 ])
 return xs`;
-  const result = await runWorkflow<Array<unknown>>(script, { agent: runner, persistLogs: false });
-  assert.deepEqual(result.result, [null, "done:sib"], "the thrown thunk resolves to null; the sibling still succeeds");
-  assert.equal(state.aborted, 0, "a recoverable, swallowed-to-null error must never trigger a run-fatal abort");
-  assert.equal(state.completed, 1);
+  await assert.rejects(() => runWorkflow(script, { agent: runner, persistLogs: false }), /plain failure/);
+  // The uncaught error seals the run's fate, so the in-flight sibling is
+  // aborted (run-fatal) rather than left spending on a doomed run.
+  assert.equal(state.aborted, 1, "a propagated script bug seals the run, aborting in-flight siblings");
 });
 
 test("a parent script that catches a nested workflow()'s uncaught child error can still run agents afterward (isTopLevelRun gate)", async () => {

@@ -149,31 +149,58 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
  * plan). Resets in ~3h.". Callers reading message metadata MUST gate on
  * stopReason === "error" before trusting this, so a task whose own output merely
  * mentions "rate limit" is never misclassified. Patterns mirror the SDK's own
- * non-retryable-limit table. Deliberately excludes transient overloaded/5xx
- * errors, which stay recoverable and keep retrying.
+ * non-retryable-limit table and are ANCHORED to limit semantics (H2): a bare
+ * "quota" or "billing" mention in an unrelated error — "quota usage at 40%",
+ * "billing is handled separately" — must never checkpoint-pause a run.
+ * Deliberately excludes transient overloaded/5xx errors, which stay recoverable
+ * and keep retrying.
  */
+const PROVIDER_LIMIT_PATTERN =
+  /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|available balance|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError/i;
+
 export function classifyProviderLimit(text: string | undefined): { matched: boolean; resetHint?: string } {
   if (!text) return { matched: false };
-  const matched =
-    /usage limit|limit reached|insufficient[_\s]?quota|quota exceeded|exceeded your current quota|out of budget|available balance|\bquota\b|rate.?limit|too many requests|\b429\b|GoUsageLimitError|FreeUsageLimitError|\bbilling\b/i.test(
-      text,
-    );
-  if (!matched) return { matched: false };
+  if (!PROVIDER_LIMIT_PATTERN.test(text)) return { matched: false };
   const reset = text.match(/resets?\s+(?:in|at)\s+[^.\n]+/i);
   return { matched: true, resetHint: reset?.[0]?.trim() };
 }
 
-/** Recognize abort-like Error messages without assuming a provider-specific class. */
+/**
+ * Standard JS error names a workflow SCRIPT can throw directly. These can never
+ * be SDK/API-layer failures, so their messages must not be classified as
+ * provider limits (H2 gating) — a script bug whose message merely mentions
+ * "usage limit" is still a bug, not a quota pause.
+ */
+const SCRIPT_ERROR_NAMES: ReadonlySet<string> = new Set([
+  "TypeError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "EvalError",
+  "URIError",
+]);
+
+/**
+ * Recognize abort-like errors: gate on the standard `error.name` first, then an
+ * ANCHORED message match (L12). A message-substring scan would classify a task
+ * that merely QUOTES "aborted" in its output as an abort.
+ */
 export function isAbortError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  return /\babort(?:ed)?\b/i.test(error.message);
+  if (error.name === "AbortError") return true;
+  return /^\s*(?:the operation was |subagent was |request was )?abort(?:ed)?\.?\s*$/i.test(error.message);
 }
 
-/** Recognize timeout-like errors by name or message. */
+/**
+ * Recognize timeout-like errors: gate on the standard `error.name` first, then
+ * an ANCHORED message match (L12) covering the real SDK phrasings ("request
+ * timed out after Nms", "connect timed out after Nms") without substring-
+ * matching arbitrary text that merely mentions the word timeout.
+ */
 export function isTimeoutError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  // Matches both "request timeout" and the common "request timed out" phrasing.
-  return /\b(timeout|timed out)\b/i.test(error.message) || error.name === "TimeoutError";
+  if (error.name === "TimeoutError") return true;
+  return /^\s*(?:the )?(?:request|connect|socket|operation)?\s*(?:timed out|timeout)/i.test(error.message);
 }
 
 /**
@@ -202,7 +229,9 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
   // assistant message (detected in agent.ts), but a future SDK might throw them.
   // Classify a thrown limit here too — recoverable:false so the run checkpoints
   // (paused) instead of being retried into the same wall or silently nulled.
-  if (error instanceof Error) {
+  // Gated to non-script-origin errors (H2): a plain script bug whose message
+  // merely mentions quota/usage must stay a normal recoverable execution error.
+  if (error instanceof Error && !SCRIPT_ERROR_NAMES.has(error.name)) {
     const limit = classifyProviderLimit(error.message);
     if (limit.matched) {
       return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {

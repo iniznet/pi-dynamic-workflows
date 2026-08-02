@@ -3,8 +3,10 @@
  */
 
 import { EventEmitter } from "node:events";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { WorkflowAgent } from "./agent.js";
+import { usageComponentsTotal, type WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
@@ -23,6 +25,7 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import { gitExec, pruneWorktrees } from "./worktree.js";
 
 export interface ManagedRunBase {
   runId: string;
@@ -119,6 +122,23 @@ export interface ManagedRunBase {
    */
   agentTimeoutMs?: number | null;
   /**
+   * The run's resolved drain-side grace period in milliseconds (H1): how long
+   * the top-level completion may wait for outstanding (possibly un-awaited)
+   * agent() calls to settle before aborting them and completing anyway. Fixed
+   * at run start/resume and persisted so a resumed run keeps the same grace.
+   * Absent = runWorkflow's DRAIN_ABORT_TIMEOUT_MS default.
+   */
+  drainTimeoutMs?: number;
+  /**
+   * Seed of per-agent start/end timestamps for REPLAYED (cache-hit) agents
+   * (L4): keyed by the agent call id (the same `${runId}:${callIndex}` id
+   * onAgentStart/onAgentEnd receive), populated by resume() from the persisted
+   * agents[] so a replayed agent reports its ORIGINAL timestamps instead of
+   * fabricated resume-time ones. Live agents (calls that never completed
+   * before the pause) have no seed and keep real captured times.
+   */
+  seededAgentTimestamps?: Map<string, { startedAt: string; endedAt?: string }>;
+  /**
    * The run's resolved concurrency (per-run value, else the manager's
    * concurrency at the time), fixed at run start/resume for the same reason
    * as tokenBudget.
@@ -204,6 +224,13 @@ export interface ExecOptions {
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * Drain-side grace period in milliseconds (H1): how long this run's
+   * completion may wait for outstanding (possibly un-awaited) agent() calls to
+   * settle before aborting them via the run-fatal controller and completing
+   * anyway. Defaults to runWorkflow's DRAIN_ABORT_TIMEOUT_MS when omitted.
+   */
+  drainTimeoutMs?: number;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /** Called with the live snapshot on every progress event. */
@@ -491,6 +518,7 @@ export class WorkflowManager extends EventEmitter {
     this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
+    this.opportunisticWorktreePrune();
   }
 
   /** Bind the manager to the current pi session, so new runs are tagged with it and
@@ -521,6 +549,28 @@ export class WorkflowManager extends EventEmitter {
     } catch {
       // Recovery is best-effort; never let it block manager construction.
     }
+  }
+
+  /**
+   * Fire-and-forget `git worktree prune` (M14): reclaim stale worktree
+   * registrations (metadata for directories that no longer exist) so a
+   * deterministic slug's reuse path never collides with ghost registrations.
+   * Best-effort. Gated by a cheap synchronous `.git` existence probe: spawning
+   * git is only worthwhile inside a repository, and `git -C` chdirs into the
+   * target — holding a Windows handle on that directory for the child's
+   * lifetime — so an un-gated spawn would race directory deletion (EPERM in
+   * tests/CI) and add a pointless child process for every non-repo consumer.
+   */
+  private opportunisticWorktreePrune(): void {
+    if (!existsSync(join(this.cwd, ".git"))) return;
+    void (async () => {
+      try {
+        const repoRoot = (await gitExec(["-C", this.cwd, "rev-parse", "--show-toplevel"])).trim();
+        await pruneWorktrees(repoRoot);
+      } catch {
+        // not a git repository / git unavailable — nothing to prune
+      }
+    })();
   }
 
   /**
@@ -614,6 +664,7 @@ export class WorkflowManager extends EventEmitter {
       // manager's current defaults (see ManagedRun doc comments).
       maxAgents: exec.maxAgents,
       agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      drainTimeoutMs: exec.drainTimeoutMs,
       concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       agentTimestamps: new Map(),
@@ -644,6 +695,7 @@ export class WorkflowManager extends EventEmitter {
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
         agentTimeoutMs: managed.agentTimeoutMs,
+        drainTimeoutMs: managed.drainTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
       });
@@ -684,6 +736,7 @@ export class WorkflowManager extends EventEmitter {
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
     executing.maxAgents = exec.maxAgents;
     executing.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
+    executing.drainTimeoutMs = exec.drainTimeoutMs;
     executing.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
     executing.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
     this.runs.set(executing.runId, executing);
@@ -747,6 +800,7 @@ export class WorkflowManager extends EventEmitter {
       resumeJournal,
       maxAgents,
       agentTimeoutMs,
+      drainTimeoutMs,
       externalSignal,
       onProgress,
       tokenBudget,
@@ -775,6 +829,9 @@ export class WorkflowManager extends EventEmitter {
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
       managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
+    // Same freeze-at-start pattern as the other per-run knobs (H1): a resumed
+    // run keeps the drain grace it started with.
+    const resolvedDrainTimeoutMs = managed.drainTimeoutMs !== undefined ? managed.drainTimeoutMs : drainTimeoutMs;
     // The budget was resolved (per-run value, else defaultTokenBudget) and frozen
     // on the managed run at start/resume — read it from there so a resumed run
     // keeps the budget it started with. exec.tokenBudget is a safety net for
@@ -791,19 +848,20 @@ export class WorkflowManager extends EventEmitter {
       if (this.isCurrent(managed)) onProgress?.(managed.snapshot);
     };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
+    let onExternalAbort: (() => void) | undefined;
     if (externalSignal) {
       if (externalSignal.aborted) {
         managed.controller.abort();
         this.armSettleWatchdog(managed);
       } else {
-        externalSignal.addEventListener(
-          "abort",
-          () => {
-            managed.controller.abort();
-            this.armSettleWatchdog(managed);
-          },
-          { once: true },
-        );
+        onExternalAbort = () => {
+          managed.controller.abort();
+          this.armSettleWatchdog(managed);
+        };
+        // { once: true } covers the fired case; the listener is ALSO removed in
+        // executeRun's finally (L3) so a long-lived host signal can never
+        // accumulate one leaked listener per settled run.
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
       }
     }
     try {
@@ -824,6 +882,7 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: resolvedAgentRetries,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
+        drainTimeoutMs: resolvedDrainTimeoutMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,
@@ -845,8 +904,8 @@ export class WorkflowManager extends EventEmitter {
         // shared.spent/tokenUsage, but onAgentEnd never sees a retried
         // (non-final) attempt — fold it into the same persisted aggregate here
         // so a run paused after a retry doesn't under-count against the budget.
-        onRetrySpend: (tokens) => {
-          this.accumulateTokenUsage(managed, tokens);
+        onRetrySpend: (spend) => {
+          this.accumulateTokenUsage(managed, spend.total, spend);
         },
         onAgentJournal: (entry) => {
           // O(1) upsert via the journalIndex side-index (see its doc comment):
@@ -903,8 +962,15 @@ export class WorkflowManager extends EventEmitter {
           // THIS entry even when a concurrent sibling shares its label.
           managed.agentsById.set(event.id, agentSnapshot);
           // Real per-agent start time, captured the moment the agent actually
-          // starts (not the run's startedAt) — see agentTimestamps.
-          managed.agentTimestamps.set(id, { startedAt: new Date().toISOString() });
+          // starts (not the run's startedAt) — see agentTimestamps. A REPLAYED
+          // (cache-hit) agent carries its ORIGINAL start time seeded from the
+          // persisted agents[] by call id (L4), so resume never fabricates
+          // fresh timestamps for work that actually finished before the pause.
+          const seeded = managed.seededAgentTimestamps?.get(event.id);
+          managed.agentTimestamps.set(
+            id,
+            seeded ? { startedAt: seeded.startedAt, endedAt: seeded.endedAt } : { startedAt: new Date().toISOString() },
+          );
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
         },
@@ -924,9 +990,11 @@ export class WorkflowManager extends EventEmitter {
             if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
             // Real per-agent end time — only terminal agents get one; a still-
-            // running agent's entry keeps endedAt undefined.
+            // running agent's entry keeps endedAt undefined. A replayed agent's
+            // seeded endedAt (its original completion time) is preserved; only
+            // agents that genuinely finish in THIS execution get "now" (L4).
             const ts = managed.agentTimestamps.get(agent.id);
-            if (ts) ts.endedAt = new Date().toISOString();
+            if (ts) ts.endedAt = ts.endedAt ?? new Date().toISOString();
           }
           // Progressive run-wide token aggregate (A2): workflow.ts's onTokenUsage
           // callback below fires exactly once, only when the whole script finishes
@@ -1075,6 +1143,13 @@ export class WorkflowManager extends EventEmitter {
       this.disarmSettleWatchdog(managed);
 
       throw workflowError;
+    } finally {
+      // L3: the run has settled (success or failure) — drop the host-signal
+      // listener so a long-lived external signal never accumulates one leaked
+      // listener per run. ({ once: true } already handled the fired case.)
+      if (onExternalAbort && externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
     }
   }
 
@@ -1110,7 +1185,20 @@ export class WorkflowManager extends EventEmitter {
    * at the moment they fire, same precedent as their persist/lease calls.
    */
   private emitLive(managed: ManagedRun, event: string, payload: unknown): void {
-    if (this.isCurrent(managed)) this.emit(event, payload);
+    if (this.isCurrent(managed)) {
+      try {
+        this.emit(event, payload);
+      } catch (error) {
+        // M1: a throwing EventEmitter listener (e.g. a task-panel renderer
+        // mid-delivery) must never abort the run's control flow — the event is
+        // observability, not execution. Log and continue.
+        console.warn(
+          `[workflow-manager] a "${event}" listener threw (run continues): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   }
 
   /**
@@ -1164,13 +1252,20 @@ export class WorkflowManager extends EventEmitter {
       cacheRead: prior?.cacheRead ?? 0,
       cacheWrite: prior?.cacheWrite ?? 0,
     };
-    usage.total += tokens;
     if (tokenUsage) {
       usage.input += tokenUsage.input;
       usage.output += tokenUsage.output;
       usage.cost += tokenUsage.cost;
       usage.cacheRead += tokenUsage.cacheRead;
       usage.cacheWrite += tokenUsage.cacheWrite;
+      // M26: same invariant as workflow.ts's recordTokens — when a breakdown
+      // exists, the aggregate total is the component sum, so the persisted
+      // aggregate satisfies total === input+output+cacheRead+cacheWrite by
+      // construction (a breakdown-less usage falls back to the scalar).
+      const components = usageComponentsTotal(tokenUsage);
+      usage.total += components > 0 ? components : tokens;
+    } else {
+      usage.total += tokens;
     }
     managed.snapshot.tokenUsage = usage;
   }
@@ -1426,6 +1521,7 @@ export class WorkflowManager extends EventEmitter {
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
         agentTimeoutMs: managed.agentTimeoutMs,
+        drainTimeoutMs: managed.drainTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
         // Why a usage-limit pause happened, so the navigator / a future cold start
@@ -1477,10 +1573,41 @@ export class WorkflowManager extends EventEmitter {
         durationMs: managed.result?.durationMs,
       });
     } catch (err) {
-      // Persistence is best-effort: the run is still healthy in memory.
-      // Log so an operator debugging state-loss has a lead, but never crash
-      // the workflow over a disk-full situation.
+      // Persistence is best-effort: the run is still healthy in memory. Log so
+      // an operator debugging state-loss has a lead, but never crash the
+      // workflow over a disk-full situation. M27: a SWALLOWED terminal-persist
+      // failure would leave the run "running" on disk — a ghost run in
+      // listRuns() whose lease is already released. Retry once with a minimal
+      // status-only write (the CAS merge layers it onto whatever is on disk,
+      // flipping just the status); if even that fails, surface a distinct
+      // persist-error event so the host never mistakes the run for alive.
       console.warn("[workflow-manager] Persist run failed:", err);
+      try {
+        // Minimal status-only retry (M27): flip the status so the disk never
+        // keeps a ghost "running" for a settled run. agents[] is deliberately
+        // empty here (the run's rich detail lives in memory; the journal below
+        // is preserved for resumable statuses so resume() can still replay).
+        this.persistence.save({
+          runId: managed.runId,
+          workflowName: managed.snapshot.name,
+          script: managed.script,
+          args: managed.args,
+          status: managed.status,
+          phases: managed.snapshot.phases,
+          agents: [],
+          logs: managed.snapshot.logs,
+          journal: keepsResumeJournal(managed.status) ? managed.journal : undefined,
+          startedAt: managed.startedAt.toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (retryErr) {
+        console.warn(`[workflow-manager] Minimal status-only persist also failed for ${managed.runId}:`, retryErr);
+        this.emitLive(managed, "persist-error", {
+          runId: managed.runId,
+          status: managed.status,
+          error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+        });
+      }
     }
   }
 
@@ -1520,14 +1647,26 @@ export class WorkflowManager extends EventEmitter {
   async resume(runId: string, opts?: ResumeOptions): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
+    // This in-memory check (and the load below) is ADVISORY — see M23.
     const active = this.runs.get(runId);
     if (active?.status === "running") return false;
     if (active?.status === "aborted") return false;
 
-    const persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+    const advisory = this.persistence.load(runId);
+    if (!advisory?.script || advisory.status === "completed" || advisory.status === "aborted") return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
+
+    // M23 (resume TOCTOU): the pre-lease load above was advisory only. A
+    // concurrent process may have completed/aborted this run between that read
+    // and the lease acquisition — re-load UNDER the lease and re-validate
+    // before committing to resume. Refusing here releases the lease and leaves
+    // the freshest on-disk state untouched (no partial resume is ever started).
+    const persisted = this.persistence.load(runId);
+    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") {
+      this.persistence.releaseRunLease(lease);
+      return false;
+    }
 
     // Use the edited script when supplied, else the persisted one (backward-compat).
     const { script: editedScript, args: overrideArgs, ...exec } = opts ?? {};
@@ -1552,6 +1691,18 @@ export class WorkflowManager extends EventEmitter {
     // ONCE and reused for the in-memory seed, the upsert side-index, and the
     // resume-replay map below (see loadPersistedJournal).
     const persistedJournal = loadPersistedJournal(persisted);
+
+    // L4: seed per-agent timestamps from the persisted agents[] by call id so
+    // REPLAYED (cache-hit) agents report their ORIGINAL startedAt/endedAt
+    // instead of fabricated resume-time stamps. Only agents with a stored call
+    // id + start time qualify; a call that was interrupted mid-flight before
+    // the pause has a seed with no endedAt (its live re-run completes it).
+    const seededAgentTimestamps = new Map<string, { startedAt: string; endedAt?: string }>();
+    for (const agent of persisted.agents) {
+      if (agent.callId && agent.startedAt) {
+        seededAgentTimestamps.set(agent.callId, { startedAt: agent.startedAt, endedAt: agent.endedAt });
+      }
+    }
 
     const controller = new AbortController();
     const managed: ManagedRun = {
@@ -1622,11 +1773,15 @@ export class WorkflowManager extends EventEmitter {
       // resolved unset concurrency/agentRetries before this fix ever existed.
       concurrency: persisted.concurrency !== undefined ? persisted.concurrency : this.concurrency,
       agentRetries: persisted.agentRetries !== undefined ? persisted.agentRetries : this.defaultAgentRetries,
+      drainTimeoutMs: persisted.drainTimeoutMs,
       // Fresh per-resume: agents (and any prior timing) are rebuilt live as
       // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
       // above); the journal, not this map, is what makes replayed agents cheap.
+      // REPLAYED (cache-hit) agents keep their ORIGINAL persisted timestamps
+      // via seededAgentTimestamps (L4) — never fabricated resume-time ones.
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      seededAgentTimestamps,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for

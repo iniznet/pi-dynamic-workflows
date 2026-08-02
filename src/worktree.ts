@@ -15,6 +15,7 @@
  */
 
 import { type ChildProcess, execFile } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 export interface Worktree {
@@ -101,6 +102,13 @@ export async function gitExec(args: string[], opts: GitExecOptions = {}): Promis
  * Create an isolated worktree under `<repoRoot>/.pi/worktrees/<name>` on branch
  * `pi/wf/<name>`. The `name` must be deterministic (derived from runId + call index,
  * never wall-clock) so resume keys stay stable. Returns a no-op Worktree on any failure.
+ *
+ * M14: the deterministic slug means a crashed prior run (or a keepWorktree'd run)
+ * may have left the exact path behind — `git worktree add` would fail on it and
+ * silently degrade this agent to the shared tree while the stale worktree leaks.
+ * So the path is checked FIRST: a REGISTERED worktree at that path is reused (with
+ * its real branch surfaced for teardown), an orphaned directory is cleaned and
+ * recreated, and only a genuine creation failure falls back with a surfaced reason.
  */
 export async function createWorktree(baseCwd: string, name: string, opts: GitExecOptions = {}): Promise<Worktree> {
   const id = slug(name);
@@ -113,11 +121,115 @@ export async function createWorktree(baseCwd: string, name: string, opts: GitExe
 
   const path = join(repoRoot, WORKTREES_SUBDIR, id);
   const branch = `pi/wf/${id}`;
+  // Existence/registration pre-check (M14): a deterministic slug means a
+  // crashed prior run (or a keepWorktree'd run) may have left this exact path
+  // behind — `git worktree add` would fail on it and silently degrade this
+  // agent to the shared tree while the stale worktree leaks. Handle every
+  // stale shape explicitly and surface the outcome:
+  //   - REGISTERED worktree whose directory still EXISTS -> reuse it (report
+  //     the real branch for teardown);
+  //   - registered but the directory is GONE (crashed run removed files) ->
+  //     clear the stale registration and recreate fresh;
+  //   - orphaned directory (exists but not registered) -> clean + recreate;
+  //   - anything else -> a plain `git worktree add`.
+  const registered = await findRegisteredWorktree(repoRoot, path, opts);
+  if (registered && existsSync(path)) {
+    return {
+      isolated: true,
+      cwd: path,
+      branch: registered.branch ?? branch,
+      repoRoot,
+      reason: "reused existing worktree (registered at this path)",
+    };
+  }
+  if (registered) {
+    // Registration without a directory: clear it (best-effort) so the add
+    // below can mint a fresh, usable worktree; never return an isolated cwd
+    // that doesn't exist.
+    try {
+      await gitExec(["-C", repoRoot, "worktree", "remove", "--force", path], opts);
+    } catch {
+      // a removal that fails (locked/missing metadata) is retried below via
+      // the add failure path with a surfaced reason
+    }
+    try {
+      if (registered.branch) await gitExec(["-C", repoRoot, "branch", "-D", registered.branch], opts);
+    } catch {
+      // branch may already be gone or checked out elsewhere — the add below
+      // decides
+    }
+  }
+  if (existsSync(path)) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch (error) {
+      return {
+        isolated: false,
+        cwd: baseCwd,
+        reason: `stale worktree at ${path} could not be removed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
   try {
     await gitExec(["-C", repoRoot, "worktree", "add", "-b", branch, path, "HEAD"], opts);
-    return { isolated: true, cwd: path, branch, repoRoot };
+    return {
+      isolated: true,
+      cwd: path,
+      branch,
+      repoRoot,
+      reason: registered ? "recreated after clearing a stale registration" : undefined,
+    };
   } catch (error) {
     return { isolated: false, cwd: baseCwd, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Look up a registered git worktree at `path` via `git worktree list
+ * --porcelain`, returning its branch when present. Returns null when the path
+ * is NOT registered (an orphaned directory left behind by a crashed run).
+ */
+async function findRegisteredWorktree(
+  repoRoot: string,
+  path: string,
+  opts: GitExecOptions = {},
+): Promise<{ branch?: string } | null> {
+  let list: string;
+  try {
+    list = await gitExec(["-C", repoRoot, "worktree", "list", "--porcelain"], opts);
+  } catch {
+    return null;
+  }
+  const target = normalizePath(path);
+  for (const record of list.split(/\n\s*\n/)) {
+    const lines = record.split("\n");
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (!pathLine) continue;
+    if (normalizePath(pathLine.slice("worktree ".length).trim()) !== target) continue;
+    const branchLine = lines.find((line) => line.startsWith("branch "));
+    return {
+      branch: branchLine
+        ? branchLine
+            .slice("branch ".length)
+            .trim()
+            .replace(/^refs\/heads\//, "")
+        : undefined,
+    };
+  }
+  return null;
+}
+
+/**
+ * Reclaim stale worktree administrative data (M14): `git worktree prune`
+ * removes metadata for worktrees whose directories are already gone. Best-effort;
+ * callers (e.g. the manager constructor) invoke it opportunistically so a
+ * deterministic slug's reuse path never collides with ghost registrations.
+ */
+export async function pruneWorktrees(repoRoot: string, opts: GitExecOptions = {}): Promise<void> {
+  try {
+    await gitExec(["-C", repoRoot, "worktree", "prune"], opts);
+  } catch {
+    // best-effort — a locked/odd repo is retried on the next opportunistic call
   }
 }
 

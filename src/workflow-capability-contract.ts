@@ -43,7 +43,11 @@ export interface OptionShape {
     | "judge-panel-options"
     | "loop-until-dry-options"
     | "retry-options"
-    | "gate-options";
+    | "gate-options"
+    | "chunked-options"
+    | "route-options"
+    | "timeboxed-options"
+    | "consensus-options";
   options: readonly OptionDescriptor[];
 }
 
@@ -119,6 +123,11 @@ export interface WorkflowRuntimeImplementations {
   judgePanel: unknown;
   loopUntilDry: unknown;
   completenessCheck: unknown;
+  chunked: unknown;
+  route: unknown;
+  timeboxed: unknown;
+  elapsedMs: unknown;
+  consensus: unknown;
   retry: unknown;
   gate: unknown;
   checkpoint: unknown;
@@ -249,6 +258,40 @@ const GATE_OPTIONS: OptionShape = {
     ]),
   ],
 };
+const CHUNKED_OPTIONS: OptionShape = {
+  id: "chunked-options",
+  options: [
+    option("chunkSize", "number", false, null, ["finite values are floored and clamped to at least 1"]),
+    option("mapper", "(chunk: unknown[], chunkIndex: number) => unknown | Promise<unknown>", false),
+    option("synthesizer", "(results, meta) => unknown | Promise<unknown>", true),
+  ],
+};
+const ROUTE_OPTIONS: OptionShape = {
+  id: "route-options",
+  options: [
+    option(
+      "cases",
+      "Array<{ key: string; when?: (value) => boolean | Promise<boolean>; run: (value) => unknown | Promise<unknown> }",
+      false,
+      null,
+      ["keys must be nonblank and unique"],
+    ),
+    option("fallback", "(value, context) => unknown | Promise<unknown>", false),
+  ],
+};
+const TIMEBOXED_OPTIONS: OptionShape = {
+  id: "timeboxed-options",
+  options: [option("maxElapsedMs", "number", false, null, ["finite values are floored and clamped to at least 0"])],
+};
+const CONSENSUS_OPTIONS: OptionShape = {
+  id: "consensus-options",
+  options: [
+    option("panelists", "number", true, "3", ["finite values are floored and clamped to at least 1"]),
+    option("rounds", "number", true, "2", ["finite values are floored and clamped to at least 1"]),
+    option("agreeThreshold", "number", true, "0.66", ["finite values are clamped to [0, 1]"]),
+    option("arbitrator", "(context) => unknown | Promise<unknown>", true),
+  ],
+};
 
 interface RuntimeDescriptorOptions {
   signature?: string;
@@ -372,14 +415,15 @@ const capabilities: readonly CapabilityDescriptor[] = [
   }),
   runtimeGlobal("loopUntilDry", {
     signature:
-      "loopUntilDry(options: { round: (roundIndex: number) => unknown[] | Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<unknown[]>",
+      'loopUntilDry(options: { round: (roundIndex: number) => unknown[] | Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<{ items: unknown[]; termination: "dry" | "maxRounds" | "capacity" | "failed"; failedRounds: number }>',
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "loop-until-dry-options",
     constraints: [
-      "roundIndex is zero-based; null, non-array, or duplicate-only round results count as empty",
-      "token-budget or agent-limit capacity exhaustion returns the accumulated partial array instead of throwing",
-      "the returned array does not report whether termination came from dryness, maxRounds, or capacity exhaustion",
-      "authors must retain failed-round identity and truthful termination state outside the helper",
+      "roundIndex is zero-based; only a successful round that yields no fresh items counts as dry",
+      'a round returning null/undefined is a FAILED round (termination: "failed", failedRounds incremented), never dry',
+      'token-budget or agent-limit capacity exhaustion returns the accumulated partial items with termination: "capacity"',
+      "the result reports its termination reason (dry | maxRounds | capacity | failed) and the failed-round count",
+      "non-finite maxRounds/consecutiveEmpty throw a TypeError; finite values are floored and clamped to at least 1",
     ],
     evidence: ["tests/quality-stdlib.test.ts"],
   }),
@@ -393,6 +437,68 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "large evidence sets must be chunked or summarized before relying on the advisory verdict",
     ],
     evidence: ["tests/quality-stdlib.test.ts"],
+  }),
+  runtimeGlobal("chunked", {
+    signature:
+      "chunked(items: unknown[], options: { chunkSize: number; mapper: (chunk: unknown[], chunkIndex: number) => unknown | Promise<unknown>; synthesizer?: (results: Array<unknown | null>, meta: { failed: Array<{ index: number; chunk: unknown[] }>; chunkCount: number; items: unknown[] }) => unknown | Promise<unknown> }) => Promise<{ results: Array<unknown | null>; failed: Array<{ index: number; chunk: unknown[] }>; chunkCount: number } | unknown>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "chunked-options",
+    constraints: [
+      "chunk boundaries depend only on item order and chunkSize, so agent() calls inside mapper keep stable resume hashes when the prompt embeds chunk content + chunkIndex",
+      "a recoverable-null chunk result stays null in results and is recorded in failed with its stable index and chunk",
+      "non-recoverable failures (token budget, agent limit, abort) and plain mapper errors rethrow",
+      "with synthesizer the helper returns the synthesizer output; else it returns { results, failed, chunkCount }",
+    ],
+    evidence: ["tests/slices/helpers/chunked.test.ts"],
+  }),
+  runtimeGlobal("route", {
+    signature:
+      'route(value: unknown, options: { cases: Array<{ key: string; when?: (value: unknown) => boolean | Promise<boolean>; run: (value: unknown) => unknown | Promise<unknown> }>; fallback: (value: unknown, context: { reason: "no-eligible-case" | "classification-failed" | "unknown"; classification: string | null }) => unknown | Promise<unknown> }) => Promise<{ key: string | null; result: unknown; fallback: boolean; reason: "none" | "no-eligible-case" | "classification-failed" | "unknown" }>',
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "route-options",
+    constraints: [
+      "one schema'd classification agent picks among the enum of eligible case keys; the classification prompt embeds the value and the eligible key list, so the resume hash is stable per value + case list",
+      "a case whose when(value) guard fails never reaches the classification enum; when no case is eligible the fallback runs with reason no-eligible-case and no agent() is called",
+      "a recoverable-null classification routes to fallback with reason classification-failed; an out-of-enum key routes to fallback with reason unknown",
+      "the matched case's run(value) executes in pure JavaScript and may call agent()",
+      "budget, agent-limit, and abort failures rethrow",
+    ],
+    evidence: ["tests/slices/helpers/route.test.ts"],
+  }),
+  runtimeGlobal("timeboxed", {
+    signature:
+      "timeboxed(fn: (context: { elapsed(): number; remaining(): number; expired(): boolean }) => unknown | Promise<unknown>, options: { maxElapsedMs: number }) => Promise<{ result: unknown; timedOut: boolean; elapsedMs: number; maxElapsedMs: number }>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "timeboxed-options",
+    constraints: [
+      "cooperative: fn must check context.expired()/remaining() at its own decision points and return early with partial results; timeboxed never interrupts a running fn",
+      "after fn settles, timedOut reports whether the deadline was exceeded",
+      "elapsedMs() and context.elapsed() are wall-clock values that must NEVER appear in prompts or hashes — use an args-seeded counter instead (the determinism prelude blocks clocks; a resumed run replays cached calls fast and observes different elapsed values)",
+      "non-finite maxElapsedMs throws a TypeError; finite values are floored and clamped to at least 0",
+    ],
+    evidence: ["tests/slices/helpers/timeboxed.test.ts"],
+  }),
+  runtimeGlobal("elapsedMs", {
+    signature: "elapsedMs() => number",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    constraints: [
+      "monotonic non-negative milliseconds since the top-level run start, shared across nested workflow() frames",
+      "NEVER inside prompts or hashes: wall-clock values are not resume-stable; use a counter seeded from args",
+    ],
+    evidence: ["tests/slices/helpers/timeboxed.test.ts"],
+  }),
+  runtimeGlobal("consensus", {
+    signature:
+      "consensus(question: string, options?: { panelists?: number; rounds?: number; agreeThreshold?: number; arbitrator?: (context: { question: string; votes: Array<{ verdict: boolean; reasoning?: string } | null>; rounds: number }) => unknown | Promise<unknown> }) => Promise<{ agreed: boolean; verdict: boolean | null; count: number; total: number; votes: Array<{ verdict: boolean; reasoning?: string } | null>; rounds: number; omitted: number; arbitration?: unknown }>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "consensus-options",
+    constraints: [
+      "each round polls panelists independently with a structured verdict schema; per-vote recoverable nulls are omitted and shrink the denominator (logged)",
+      "the pairwise agreement gate passes when the largest mutually-agreeing group covers at least agreeThreshold of valid votes",
+      "rounds are bounded; after the budget an optional arbitrator (typically one structured agent() call) decides, else the disagreement is returned with agreed false",
+      "non-finite panelists/rounds throw a TypeError; finite values are floored and clamped to at least 1; agreeThreshold is clamped to [0, 1]",
+    ],
+    evidence: ["tests/slices/helpers/consensus.test.ts"],
   }),
   runtimeGlobal("retry", {
     signature:
@@ -629,6 +735,10 @@ export const WORKFLOW_CAPABILITY_DEFINITION: WorkflowCapabilityDefinition = {
     LOOP_UNTIL_DRY_OPTIONS,
     RETRY_OPTIONS,
     GATE_OPTIONS,
+    CHUNKED_OPTIONS,
+    ROUTE_OPTIONS,
+    TIMEBOXED_OPTIONS,
+    CONSENSUS_OPTIONS,
   ],
   capabilities,
   dynamicReferences: [

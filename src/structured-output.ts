@@ -1,6 +1,18 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
+import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
+
+// Lazy pi-tui load (H4): this module is part of the runtime core (agent.ts
+// imports createStructuredOutputTool), so its module scope must stay pi-tui-free
+// — the render closures below only ever run inside a TUI host. The MissingPeerError
+// is raised at render time; pi-tui is a hard dependency of pi-coding-agent in any
+// working pi, so the holder is populated in practice.
+let tuiText: typeof import("@earendil-works/pi-tui")["Text"] | undefined;
+try {
+  ({ Text: tuiText } = await lazyPeerImport<typeof import("@earendil-works/pi-tui")>("@earendil-works/pi-tui"));
+} catch {
+  // Deferred to the render closures.
+}
 
 export interface StructuredOutputCapture<T = unknown> {
   value: T | undefined;
@@ -36,6 +48,21 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
     ],
     parameters: schema,
     async execute(_toolCallId, params) {
+      // L16: a second call to the terminating output channel must never
+      // silently overwrite the first captured value (the agent's result).
+      // Reject it with a guiding error and keep the FIRST call's capture; no
+      // terminate flag, so the agent can correct course within this turn.
+      if (capture.called) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${name} was already called and the result was already captured — it is the single final answer channel for this task; do not call it again.`,
+            },
+          ],
+          details: params,
+        };
+      }
       capture.value = params;
       capture.called = true;
       return {
@@ -45,12 +72,14 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
       };
     },
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold(name)), 0, 0);
+      if (!tuiText) throw new MissingPeerError("@earendil-works/pi-tui", PEER_DEPENDENCIES["@earendil-works/pi-tui"]);
+      return new tuiText(theme.fg("toolTitle", theme.bold(name)), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("muted", "Structured output…"), 0, 0);
+      if (!tuiText) throw new MissingPeerError("@earendil-works/pi-tui", PEER_DEPENDENCIES["@earendil-works/pi-tui"]);
+      if (isPartial) return new tuiText(theme.fg("muted", "Structured output…"), 0, 0);
       const summary = JSON.stringify(result.details ?? {});
-      return new Text(theme.fg("toolOutput", truncate(summary, 200)), 0, 0);
+      return new tuiText(theme.fg("toolOutput", truncate(summary, 200)), 0, 0);
     },
   });
 }

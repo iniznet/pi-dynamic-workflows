@@ -94,16 +94,17 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<unknown[]>`
+- Signature: `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<{ items: unknown[]; termination: "dry" \| "maxRounds" \| "capacity" \| "failed"; failedRounds: number }>`
 - Option shape: `loop-until-dry-options`
 - `round`: (roundIndex: number) => unknown[] | Promise<unknown[]> (required)
 - `key`: (item: unknown) => string (optional; default: JSON.stringify)
 - `consecutiveEmpty`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
 - `maxRounds`: number (optional; default: 50; authors should provide a finite positive integer)
-- Constraint: roundIndex is zero-based; null, non-array, or duplicate-only round results count as empty
-- Constraint: token-budget or agent-limit capacity exhaustion returns the accumulated partial array instead of throwing
-- Constraint: the returned array does not report whether termination came from dryness, maxRounds, or capacity exhaustion
-- Constraint: authors must retain failed-round identity and truthful termination state outside the helper
+- Constraint: roundIndex is zero-based; only a successful round that yields no fresh items counts as dry
+- Constraint: a round returning null/undefined is a FAILED round (termination: "failed", failedRounds incremented), never dry
+- Constraint: token-budget or agent-limit capacity exhaustion returns the accumulated partial items with termination: "capacity"
+- Constraint: the result reports its termination reason (dry | maxRounds | capacity | failed) and the failed-round count
+- Constraint: non-finite maxRounds/consecutiveEmpty throw a TypeError; finite values are floored and clamped to at least 1
 
 <a id="completenesscheck"></a>
 ## completenessCheck
@@ -114,6 +115,74 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: only the first 4,000 characters of serialized result evidence are sent to the critic
 - Constraint: missing is optional and recoverable critic failure returns null
 - Constraint: large evidence sets must be chunked or summarized before relying on the advisory verdict
+
+<a id="chunked"></a>
+## chunked
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `chunked(items: unknown[], options: { chunkSize: number; mapper: (chunk: unknown[], chunkIndex: number) => unknown \| Promise<unknown>; synthesizer?: (results: Array<unknown \| null>, meta: { failed: Array<{ index: number; chunk: unknown[] }>; chunkCount: number; items: unknown[] }) => unknown \| Promise<unknown> }) => Promise<{ results: Array<unknown \| null>; failed: Array<{ index: number; chunk: unknown[] }>; chunkCount: number } \| unknown>`
+- Option shape: `chunked-options`
+- `chunkSize`: number (required; finite values are floored and clamped to at least 1)
+- `mapper`: (chunk: unknown[], chunkIndex: number) => unknown | Promise<unknown> (required)
+- `synthesizer`: (results, meta) => unknown | Promise<unknown> (optional)
+- Constraint: chunk boundaries depend only on item order and chunkSize, so agent() calls inside mapper keep stable resume hashes when the prompt embeds chunk content + chunkIndex
+- Constraint: a recoverable-null chunk result stays null in results and is recorded in failed with its stable index and chunk
+- Constraint: non-recoverable failures (token budget, agent limit, abort) and plain mapper errors rethrow
+- Constraint: with synthesizer the helper returns the synthesizer output; else it returns { results, failed, chunkCount }
+
+<a id="route"></a>
+## route
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `route(value: unknown, options: { cases: Array<{ key: string; when?: (value: unknown) => boolean \| Promise<boolean>; run: (value: unknown) => unknown \| Promise<unknown> }>; fallback: (value: unknown, context: { reason: "no-eligible-case" \| "classification-failed" \| "unknown"; classification: string \| null }) => unknown \| Promise<unknown> }) => Promise<{ key: string \| null; result: unknown; fallback: boolean; reason: "none" \| "no-eligible-case" \| "classification-failed" \| "unknown" }>`
+- Option shape: `route-options`
+- `cases`: Array<{ key: string; when?: (value) => boolean | Promise<boolean>; run: (value) => unknown | Promise<unknown> } (required; keys must be nonblank and unique)
+- `fallback`: (value, context) => unknown | Promise<unknown> (required)
+- Constraint: one schema'd classification agent picks among the enum of eligible case keys; the classification prompt embeds the value and the eligible key list, so the resume hash is stable per value + case list
+- Constraint: a case whose when(value) guard fails never reaches the classification enum; when no case is eligible the fallback runs with reason no-eligible-case and no agent() is called
+- Constraint: a recoverable-null classification routes to fallback with reason classification-failed; an out-of-enum key routes to fallback with reason unknown
+- Constraint: the matched case's run(value) executes in pure JavaScript and may call agent()
+- Constraint: budget, agent-limit, and abort failures rethrow
+
+<a id="timeboxed"></a>
+## timeboxed
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `timeboxed(fn: (context: { elapsed(): number; remaining(): number; expired(): boolean }) => unknown \| Promise<unknown>, options: { maxElapsedMs: number }) => Promise<{ result: unknown; timedOut: boolean; elapsedMs: number; maxElapsedMs: number }>`
+- Option shape: `timeboxed-options`
+- `maxElapsedMs`: number (required; finite values are floored and clamped to at least 0)
+- Constraint: cooperative: fn must check context.expired()/remaining() at its own decision points and return early with partial results; timeboxed never interrupts a running fn
+- Constraint: after fn settles, timedOut reports whether the deadline was exceeded
+- Constraint: elapsedMs() and context.elapsed() are wall-clock values that must NEVER appear in prompts or hashes — use an args-seeded counter instead (the determinism prelude blocks clocks; a resumed run replays cached calls fast and observes different elapsed values)
+- Constraint: non-finite maxElapsedMs throws a TypeError; finite values are floored and clamped to at least 0
+
+<a id="elapsedms"></a>
+## elapsedMs
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `elapsedMs() => number`
+- Constraint: monotonic non-negative milliseconds since the top-level run start, shared across nested workflow() frames
+- Constraint: NEVER inside prompts or hashes: wall-clock values are not resume-stable; use a counter seeded from args
+
+<a id="consensus"></a>
+## consensus
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `consensus(question: string, options?: { panelists?: number; rounds?: number; agreeThreshold?: number; arbitrator?: (context: { question: string; votes: Array<{ verdict: boolean; reasoning?: string } \| null>; rounds: number }) => unknown \| Promise<unknown> }) => Promise<{ agreed: boolean; verdict: boolean \| null; count: number; total: number; votes: Array<{ verdict: boolean; reasoning?: string } \| null>; rounds: number; omitted: number; arbitration?: unknown }>`
+- Option shape: `consensus-options`
+- `panelists`: number (optional; default: 3; finite values are floored and clamped to at least 1)
+- `rounds`: number (optional; default: 2; finite values are floored and clamped to at least 1)
+- `agreeThreshold`: number (optional; default: 0.66; finite values are clamped to [0, 1])
+- `arbitrator`: (context) => unknown | Promise<unknown> (optional)
+- Constraint: each round polls panelists independently with a structured verdict schema; per-vote recoverable nulls are omitted and shrink the denominator (logged)
+- Constraint: the pairwise agreement gate passes when the largest mutually-agreeing group covers at least agreeThreshold of valid votes
+- Constraint: rounds are bounded; after the budget an optional arbitrator (typically one structured agent() call) decides, else the disagreement is returned with agreed false
+- Constraint: non-finite panelists/rounds throw a TypeError; finite values are floored and clamped to at least 1; agreeThreshold is clamped to [0, 1]
 
 <a id="retry"></a>
 ## retry

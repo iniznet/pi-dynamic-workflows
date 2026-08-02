@@ -7,7 +7,7 @@ Preserve candidate or work identity outside helper results that may omit failed 
 | Helper | Authoring contract |
 | --- | --- |
 | `completenessCheck(args, results)` | Returns `{ complete, missing? }` or recoverable `null`. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory. |
-| `loopUntilDry({ round, key, consecutiveEmpty, maxRounds })` | `round(index)` is zero-based. Defaults: `JSON.stringify` key, two dry rounds, 50 rounds. Null, non-array, and duplicate-only rounds are dry. Token-budget or agent-limit exhaustion returns the partial array without a termination reason; keep failed-round identity and stopping state outside the helper. |
+| `loopUntilDry({ round, key, consecutiveEmpty, maxRounds })` | `round(index)` is zero-based. Defaults: `JSON.stringify` key, two dry rounds, 50 rounds. Returns `{ items, termination: "dry" | "maxRounds" | "capacity" | "failed", failedRounds }`. Only a successful round that yields no fresh items is dry; a round returning `null` is a FAILED round (termination `"failed"`, `failedRounds` incremented) — never dry. Token-budget or agent-limit exhaustion returns the partial items with termination `"capacity"`. Non-finite `maxRounds`/`consecutiveEmpty` throw a `TypeError`; finite values are floored and clamped. |
 
 ## Control
 

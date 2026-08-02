@@ -434,6 +434,17 @@ export interface AgentUsage {
 }
 
 /**
+ * Sum of an AgentUsage's component counters — the invariant total (M26). Every
+ * aggregate (workflow.ts's SharedRuntime.tokenUsage and the manager's persisted
+ * snapshot) derives `total` from this helper so `total === input + output +
+ * cacheRead + cacheWrite` holds by construction, instead of trusting a
+ * provider-reported total that may disagree with its own breakdown.
+ */
+export function usageComponentsTotal(usage: Pick<AgentUsage, "input" | "output" | "cacheRead" | "cacheWrite">): number {
+  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+/**
  * Map session stats to an AgentUsage, or undefined when the provider reported
  * no usage at all (all-zero stats). Returning undefined — instead of a zero
  * breakdown — lets displays fall back to their scalar token count, so setups

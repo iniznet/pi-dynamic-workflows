@@ -5,7 +5,7 @@ import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type { AgentUsage, OperationTrace } from "./agent.js";
-import { type AgentRunOptions, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import { type AgentRunOptions, usageComponentsTotal, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
@@ -22,7 +22,7 @@ import {
   MAX_CONCURRENCY,
   MAX_NESTED_WORKFLOW_DEPTH,
 } from "./config.js";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
@@ -167,13 +167,25 @@ export interface SharedRuntime {
    * after the run has been marked complete and torn down. See the drain below.
    */
   inFlight: Set<Promise<unknown>>;
+  /**
+   * Host-clock start of the TOP-LEVEL run — the seed for the injected
+   * elapsedMs() global. Nested workflow() frames inherit the parent's value via
+   * the shared runtime so elapsedMs() is consistent across nesting levels.
+   * Deliberately never part of any resume hash: elapsed values are
+   * timing-dependent and must not influence call identity (see elapsedMs).
+   */
+  runStartedAtMs: number;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
 export type WorkflowRuntimeEvent =
   | { type: "phase"; title: string; budget: number | null }
   | { type: "workflow"; stage: "start" | "end"; name: string; args: unknown }
-  | { type: "quality"; stage: "start" | "end"; helper: "verify" | "judgePanel" | "completenessCheck" }
+  | {
+      type: "quality";
+      stage: "start" | "end";
+      helper: "verify" | "judgePanel" | "completenessCheck" | "consensus";
+    }
   | { type: "control-attempt"; helper: "retry" | "gate"; attempt: number; accepted: boolean };
 
 /** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
@@ -282,17 +294,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   /**
    * Called once per FAILED-AND-RETRIED attempt (not the final attempt of an
    * agent() call, which reports its own tokens via onAgentEnd as before),
-   * with that attempt's token cost. recordTokens() already folds a retried
-   * attempt's spend into shared.spent/shared.tokenUsage (so the run-wide
-   * budget was never leaky) — but onAgentEnd only ever reports the FINAL
-   * attempt's tokens, so a caller accumulating a persisted total purely from
-   * onAgentEnd (see WorkflowManager) would under-count by exactly the
+   * with that attempt's full usage breakdown. recordTokens() already folds a
+   * retried attempt's spend into shared.spent/shared.tokenUsage (so the
+   * run-wide budget was never leaky) — but onAgentEnd only ever reports the
+   * FINAL attempt's tokens, so a caller accumulating a persisted total purely
+   * from onAgentEnd (see WorkflowManager) would under-count by exactly the
    * wasted retried attempts' spend. This is a separate, silent channel
    * specifically so retried-attempt spend can be accounted for without
    * changing onAgentEnd's one-call-per-agent-call cadence (a contract other
-   * code depends on).
+   * code depends on). M26: the payload is the FULL breakdown (AgentUsage
+   * shape) — never a scalar — so the persisted aggregate keeps the invariant
+   * `total === input+output+cacheRead+cacheWrite` across retries.
    */
-  onRetrySpend?: (tokens: number) => void;
+  onRetrySpend?: (spend: AgentUsage) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -530,12 +544,24 @@ interface RuntimeState {
   currentPhase?: string;
   /**
    * Per-phase soft sub-budgets carved from the run total: phase title -> the
-   * ceiling and the run-wide spent at the moment the budget was declared. A phase
-   * exceeding its ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall
-   * budget is untouched. Soft gate (like the global one): spent accrues after each
-   * agent, so an in-flight wave may overshoot slightly.
+   * ceiling. Spend is attributed via phaseSpend (M25): every token an agent
+   * spends is charged to the phase it was ASSIGNED at call time (assignedPhase),
+   * recorded when the agent finishes (recordTokens). A phase exceeding its
+   * ceiling throws TOKEN_BUDGET_EXHAUSTED while the run's overall budget is
+   * untouched. Soft gate (like the global one): spend accrues after each agent,
+   * so an in-flight wave may overshoot slightly. Attribution limitation (honest):
+   * an agent whose call spans a phase() transition is charged to the phase it was
+   * assigned when the call STARTED, and retried attempts charge the same phase —
+   * interleaved phases therefore attribute by assignment, not by wall-clock time.
    */
-  phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
+  phaseBudgets: Map<string, { budget: number; warned: boolean }>;
+  /**
+   * Per-phase accumulated token spend (M25), keyed by assignedPhase, reset to 0
+   * whenever phase(title, { budget }) (re-)declares the phase's budget. Kept
+   * separate from phaseBudgets so the budget ceiling and the running spend are
+   * independently observable and re-declaration re-bases cleanly.
+   */
+  phaseSpend: Map<string, number>;
   logs: string[];
   phases: string[];
   /** Monotonic, assigned at lexical agent() call time — the stable resume key. */
@@ -595,6 +621,18 @@ const DETERMINISM_PRELUDE = [
   "}",
 ].join("\n");
 
+/** Default number of independent panelists polled per consensus() round. */
+const CONSENSUS_DEFAULT_PANELISTS = 3;
+
+/** Default bounded round count before consensus() arbitrates or gives up. */
+const CONSENSUS_DEFAULT_ROUNDS = 2;
+
+/**
+ * Default pairwise-agreement gate: the largest mutually-agreeing panelist
+ * group must cover at least this fraction of valid votes for consensus().
+ */
+const CONSENSUS_DEFAULT_AGREE_THRESHOLD = 0.66;
+
 export async function runWorkflow<T = unknown>(
   script: string,
   options: WorkflowRunOptions = {},
@@ -640,6 +678,7 @@ export async function runWorkflow<T = unknown>(
     phases: meta.phases?.[0]?.title ? [meta.phases[0].title] : [],
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
+    phaseSpend: new Map(),
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
     sawTopLevelAgent: false,
@@ -677,6 +716,9 @@ export async function runWorkflow<T = unknown>(
     nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
+    // Seed the elapsedMs() global from the true top-level start; a nested
+    // workflow() frame inherits this exact value via options.sharedRuntime.
+    runStartedAtMs: Date.now(),
   };
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
@@ -742,14 +784,39 @@ export async function runWorkflow<T = unknown>(
     logger.log(text);
   };
 
+  /**
+   * Guarded host-callback dispatch (M1): every host-invoked callback
+   * (onAgentStart/onAgentEnd/onAgentJournal/onAgentHistory/onTokenUsage/onPhase/
+   * onRuntimeEvent/onRetrySpend) goes through this so a throwing host callback
+   * can never corrupt the run's control flow. In particular a throwing onAgentEnd
+   * must not turn a successful agent attempt into a caught failure (which would
+   * re-run recordTokens(null) and double-count tokens, then null the result) and
+   * a throwing onTokenUsage must not fail a completing run. Log and continue.
+   */
+  const safeCallback = <A extends unknown[]>(
+    label: string,
+    fn: ((...args: A) => void) | undefined,
+    ...args: A
+  ): void => {
+    if (fn === undefined) return;
+    try {
+      fn(...args);
+    } catch (error) {
+      log(`host callback ${label} threw (run continues): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   const phase = (title: string, phaseOptions?: PhaseOptions) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
     // Carve a soft sub-budget from the run total for work done under this phase.
-    // Re-declaring re-bases from the current spent (idempotent across resume: the
-    // script re-runs phase() and the ceiling is recomputed from live spent).
+    // Re-declaring re-bases from the current phase-attributed spend (idempotent
+    // across resume: the script re-runs phase() and the ceiling is recomputed
+    // from live spend). Spend itself is attributed per-agent via phaseSpend
+    // (M25), so the gate reads the attributed total, not the run-wide counter.
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
-      state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
+      state.phaseBudgets.set(title, { budget: phaseOptions.budget, warned: false });
+      state.phaseSpend.set(title, 0);
     }
     // Deterministic stage for the persisted phase state machine (opt-in, see
     // PhaseStateIntegration). Queued — phase() stays synchronous — and flushed
@@ -764,8 +831,8 @@ export async function runWorkflow<T = unknown>(
     ) {
       queuePhaseTransition(phaseOptions.stage as PhaseStage);
     }
-    options.onPhase?.(title);
-    options.onRuntimeEvent?.({
+    safeCallback("onPhase", options.onPhase, title);
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "phase",
       title,
       budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
@@ -839,13 +906,14 @@ export async function runWorkflow<T = unknown>(
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
 
     // Per-phase soft sub-budget gate: a noisy phase can exhaust its own ceiling
-    // without touching the run's overall budget. Soft (spent accrues post-agent),
+    // without touching the run's overall budget. Soft (spend accrues post-agent),
     // warns once at ~80%, throws at 100%. Scripts can try/catch around a phase's
-    // work so later phases still proceed.
+    // work so later phases still proceed. Spend is attributed per-agent to the
+    // phase it was assigned at call time (M25, see phaseSpend).
     if (assignedPhase) {
       const pb = state.phaseBudgets.get(assignedPhase);
       if (pb) {
-        const phaseSpent = shared.spent - pb.startSpent;
+        const phaseSpent = state.phaseSpend.get(assignedPhase) ?? 0;
         if (phaseSpent >= pb.budget) {
           throw new WorkflowError(
             `phase "${assignedPhase}" token sub-budget exhausted (${pb.budget})`,
@@ -905,6 +973,7 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
+    const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
     const tierModel = resolveRoutingModelSignature(
       agentOptions,
       agentDef,
@@ -919,6 +988,8 @@ export async function runWorkflow<T = unknown>(
       assignedPhase,
       agentOptions,
       agentDefinitionKey(agentDef),
+      options.mainModel,
+      resolvedIsolation,
     );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
@@ -955,8 +1026,14 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
-      options.onAgentEnd?.({
+      safeCallback("onAgentStart", options.onAgentStart, {
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+      });
+      safeCallback("onAgentEnd", options.onAgentEnd, {
         id: deltaKey,
         label,
         phase: assignedPhase,
@@ -986,15 +1063,22 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
+      safeCallback("onAgentStart", options.onAgentStart, {
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        prompt,
+        model: displayModel,
+      });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
-      // Precedence: explicit call-site isolation > agentDef isolation.
-      // Note: passing { isolation: undefined } falls through ?? to the def's value — there
-      // is no sentinel to suppress a def's isolation at the call site. Remove the agentType
-      // or override with a def that has no isolation field if opt-out is needed.
+      // Precedence: explicit call-site isolation > agentDef isolation (resolvedIsolation is
+      // computed at the call-hash site above so a change of isolation invalidates the
+      // cached replay result — M5). Note: passing { isolation: undefined } falls through ??
+      // to the def's value — there is no sentinel to suppress a def's isolation at the call
+      // site. Remove the agentType or override with a def that has no isolation field if
+      // opt-out is needed.
       let worktree: Worktree | undefined;
-      const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
       if (resolvedIsolation === "worktree") {
         worktree = await createWorktree(baseCwd, `${runId}-${callIndex}-${label}`);
         if (!worktree.isolated) log(`isolation ignored for "${label}" (${worktree.reason})`);
@@ -1005,17 +1089,39 @@ export async function runWorkflow<T = unknown>(
       // estimate when the provider reports no usage (total === 0). Usage is reset
       // per retry attempt so a failed attempt does not double-count the next one.
       let usage: AgentUsage | undefined;
+      // Fold one attempt's spend into the run-wide aggregate, enforcing the M26
+      // invariant `total === input+output+cacheRead+cacheWrite` in this ONE place:
+      // the component sum is the total whenever the provider reported a breakdown
+      // (a provider total that disagrees with its own components is discarded); a
+      // breakdown-less usage falls back to its reported total; a provider with no
+      // usage at all falls back to the length-based estimate (the only
+      // approximation allowed). The returned total also drives the run budget
+      // (shared.spent), so budget and aggregate can never disagree.
       const recordTokens = (result: unknown): number => {
-        const tokens = usage && usage.total > 0 ? usage.total : estimateTokens(result) + estimateTokens(prompt);
+        let tokens: number;
         if (usage) {
           shared.tokenUsage.input += usage.input;
           shared.tokenUsage.output += usage.output;
           shared.tokenUsage.cost += usage.cost;
           shared.tokenUsage.cacheRead += usage.cacheRead;
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
+          const components = usageComponentsTotal(usage);
+          tokens =
+            components > 0
+              ? components
+              : usage.total > 0
+                ? usage.total
+                : estimateTokens(result) + estimateTokens(prompt);
+        } else {
+          tokens = estimateTokens(result) + estimateTokens(prompt);
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
+        // M25: attribute spend to the phase this call was assigned to, so a
+        // phase's sub-budget gate sees only its own agents' spend.
+        if (assignedPhase) {
+          state.phaseSpend.set(assignedPhase, (state.phaseSpend.get(assignedPhase) ?? 0) + tokens);
+        }
         return tokens;
       };
 
@@ -1105,7 +1211,12 @@ export async function runWorkflow<T = unknown>(
                 usage = u;
               },
               onHistory: (history: AgentHistoryEntry[]) => {
-                options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
+                safeCallback("onAgentHistory", options.onAgentHistory, {
+                  id: deltaKey,
+                  label,
+                  phase: assignedPhase,
+                  history,
+                });
               },
             });
             // After a timeout the run() promise still settles later, rejecting with
@@ -1123,7 +1234,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
-            options.onAgentJournal?.({
+            safeCallback("onAgentJournal", options.onAgentJournal, {
               index: callIndex,
               runId,
               hash: callHash,
@@ -1133,7 +1244,7 @@ export async function runWorkflow<T = unknown>(
               // reported none).
               operations: operations.length ? operations : undefined,
             });
-            options.onAgentEnd?.({
+            safeCallback("onAgentEnd", options.onAgentEnd, {
               id: deltaKey,
               label,
               phase: assignedPhase,
@@ -1169,8 +1280,22 @@ export async function runWorkflow<T = unknown>(
               // This attempt's spend already accrued into shared.spent/tokenUsage
               // above (recordTokens) — but it will never reach onAgentEnd (only
               // the final attempt does), so report it on the dedicated channel
-              // instead (see WorkflowRunOptions.onRetrySpend).
-              options.onRetrySpend?.(tokens);
+              // instead (see WorkflowRunOptions.onRetrySpend). M26: ship the FULL
+              // breakdown, not a scalar, so a persisted aggregate keeps the
+              // invariant total === input+output+cacheRead+cacheWrite across
+              // retried attempts too. (`usage` is re-widened here — the CFA
+              // narrows it to never after the onUsage closure assignment;
+              // runtime value is the real attempt usage.)
+              const attemptUsage = usage as AgentUsage | undefined;
+              const retrySpend: AgentUsage = {
+                input: attemptUsage?.input ?? 0,
+                output: attemptUsage?.output ?? 0,
+                cacheRead: attemptUsage?.cacheRead ?? 0,
+                cacheWrite: attemptUsage?.cacheWrite ?? 0,
+                total: tokens,
+                cost: attemptUsage?.cost ?? 0,
+              };
+              safeCallback("onRetrySpend", options.onRetrySpend, retrySpend);
               continue;
             }
 
@@ -1180,7 +1305,7 @@ export async function runWorkflow<T = unknown>(
               operations.length > 0
                 ? ([...operations].reverse().find((t) => t.outcome !== "ok") ?? operations[operations.length - 1])
                 : undefined;
-            options.onAgentEnd?.({
+            safeCallback("onAgentEnd", options.onAgentEnd, {
               id: deltaKey,
               label,
               phase: assignedPhase,
@@ -1252,7 +1377,15 @@ export async function runWorkflow<T = unknown>(
             return await thunk();
           } catch (error) {
             if (isAborted()) throw error;
-            const workflowError = wrapError(error);
+            // A plain (non-WorkflowError) error is a script bug in this thunk —
+            // propagate it instead of swallowing it into a null (M2): the same
+            // bug in a directly-awaited agent() would fail the run, and a null
+            // would silently corrupt the fan-out's result data. Only WorkflowError
+            // carries the recoverable class that decides null-vs-throw (a
+            // recoverable-exhausted agent() already RESOLVES null on its own, so
+            // a WorkflowError reaching here is always a genuinely fatal class).
+            if (!isWorkflowError(error)) throw error;
+            const workflowError = error;
             // Non-recoverable failures (token budget / agent limit exhausted) must
             // halt the whole run, exactly like a directly-awaited agent() — not be
             // swallowed into a null in the result array.
@@ -1294,7 +1427,10 @@ export async function runWorkflow<T = unknown>(
               throwIfAborted();
             } catch (error) {
               if (isAborted()) throw error;
-              const workflowError = wrapError(error);
+              // Plain (non-WorkflowError) errors are script bugs in this stage —
+              // propagate them (M2), same rationale as parallel() above.
+              if (!isWorkflowError(error)) throw error;
+              const workflowError = error;
               // Non-recoverable failures halt the whole run (see parallel()).
               if (!workflowError.recoverable) {
                 if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
@@ -1331,7 +1467,12 @@ export async function runWorkflow<T = unknown>(
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
     const workflowName = String(nameOrScript);
-    options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "workflow",
+      stage: "start",
+      name: workflowName,
+      args: childArgs,
+    });
     shared.depth++;
     try {
       // Propagate the resumeJournal into the child frame ONLY while the
@@ -1370,13 +1511,57 @@ export async function runWorkflow<T = unknown>(
       return child.result;
     } finally {
       shared.depth--;
-      options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "workflow",
+        stage: "end",
+        name: workflowName,
+        args: childArgs,
+      });
     }
   };
 
   // ── Quality-pattern stdlib: reusable, deterministic helpers built purely on
   // agent()/parallel() (so callSeq ordering stays stable and resume keeps working).
   // Injected as globals so workflow scripts compose them directly. ──
+
+  /**
+   * Monotonic per-run counter for quality-helper invocations, embedded in agent
+   * labels so the same helper called twice never reuses a label (L14) — labels
+   * double as display identity, and duplicate labels across invocations make two
+   * different votes indistinguishable in the run's agent list.
+   */
+  let qualityCallSeq = 0;
+
+  /**
+   * Per-vote tolerance wrapper (M4): a single reviewer/judge hitting the schema
+   * wall (SCHEMA_NONCOMPLIANCE) or an execution failure (AGENT_EXECUTION_ERROR)
+   * must not abort the whole verify()/judgePanel() — the documented contract is
+   * "failed reviewers are omitted" — so those two classes log and yield a null
+   * vote. Budget/limit/abort classes still fail the run: they are run-wide
+   * conditions, not per-vote noise.
+   */
+  const tolerantVote = async (prompt: string, label: string, schema: TSchema | undefined): Promise<unknown> => {
+    try {
+      return await agent(prompt, { label, schema });
+    } catch (error) {
+      if (
+        isWorkflowError(error) &&
+        (error.code === WorkflowErrorCode.SCHEMA_NONCOMPLIANCE ||
+          error.code === WorkflowErrorCode.AGENT_EXECUTION_ERROR)
+      ) {
+        log(`${label} omitted (${error.code}): ${error.message}`);
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  /** Clamp a judge's raw score into [0, 1] (L15); a non-finite score counts as 0. */
+  const clampScore = (value: unknown): number => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(1, n));
+  };
 
   const VERIFY_SCHEMA = {
     type: "object",
@@ -1387,7 +1572,12 @@ export async function runWorkflow<T = unknown>(
     item: unknown,
     opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
   ) => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "verify" });
+    const callSeq = ++qualityCallSeq;
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "start",
+      helper: "verify",
+    });
     const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
@@ -1397,9 +1587,12 @@ export async function runWorkflow<T = unknown>(
         Array.from(
           { length: reviewers },
           (_v, i) => () =>
-            agent(
+            tolerantVote(
               `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
-              { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA },
+              // reviewer.callSeq order keeps the `verify <reviewer>` prefix stable
+              // across invocations while the trailing counter makes labels unique (L14).
+              `verify ${i + 1}.${callSeq}`,
+              VERIFY_SCHEMA,
             ),
         ),
       )
@@ -1411,7 +1604,11 @@ export async function runWorkflow<T = unknown>(
       total: votes.length,
       votes,
     };
-    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "verify" });
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "end",
+      helper: "verify",
+    });
     return verdict;
   };
 
@@ -1421,7 +1618,12 @@ export async function runWorkflow<T = unknown>(
     required: ["score"],
   };
   const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "judgePanel" });
+    const callSeq = ++qualityCallSeq;
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "start",
+      helper: "judgePanel",
+    });
     const judges = Math.max(1, opts.judges ?? 3);
     const rubric = opts.rubric ?? "overall quality and correctness";
     const scored = (
@@ -1433,17 +1635,20 @@ export async function runWorkflow<T = unknown>(
               Array.from(
                 { length: judges },
                 (_v, j) => () =>
-                  agent(
+                  tolerantVote(
                     `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
-                    {
-                      label: `judge ${idx + 1}.${j + 1}`,
-                      schema: JUDGE_SCHEMA,
-                    },
+                    // attempt.judge.callSeq order keeps the `judge <attempt>.<judge>`
+                    // prefix stable across invocations (consumers group by it) while
+                    // the trailing per-invocation counter makes labels unique (L14).
+                    `judge ${idx + 1}.${j + 1}.${callSeq}`,
+                    JUDGE_SCHEMA,
                   ),
               ),
             )
           ).filter(Boolean) as Array<{ score?: number }>;
-          const score = js.length ? js.reduce((s, v) => s + (Number(v?.score) || 0), 0) / js.length : 0;
+          // Each judge's score is clamped to [0, 1] before averaging (L15) so a
+          // single out-of-range score cannot skew a candidate's mean.
+          const score = js.length ? js.reduce((s, v) => s + clampScore(v?.score), 0) / js.length : 0;
           return { index: idx, attempt: att, score, judgments: js };
         }),
       )
@@ -1451,37 +1656,75 @@ export async function runWorkflow<T = unknown>(
     // Highest mean score; stable tie-break by input index.
     let best = scored[0];
     for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
-    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "end",
+      helper: "judgePanel",
+    });
     return best;
   };
+
+  /**
+   * Result of {@link loopUntilDry}: the accumulated items plus an honest
+   * termination reason. A NULL round is a FAILED round (M3) — the round's
+   * work could not complete (e.g. a recoverable-exhausted agent), which is
+   * categorically different from a successful-but-empty round (dry).
+   */
+  interface LoopUntilDryResult {
+    items: unknown[];
+    /** "dry": K consecutive successful empty rounds; "maxRounds": cap hit;
+     * "capacity": budget/agent-limit exhaustion broke the loop; "failed": a
+     * round returned null/undefined. */
+    termination: "dry" | "maxRounds" | "capacity" | "failed";
+    /** How many rounds failed (returned null) before the loop stopped. */
+    failedRounds: number;
+  }
 
   const loopUntilDry = async (opts: {
     round: (roundIndex: number) => Promise<unknown[]> | unknown[];
     key?: (item: unknown) => string;
     consecutiveEmpty?: number;
     maxRounds?: number;
-  }) => {
+  }): Promise<LoopUntilDryResult> => {
     if (!opts || typeof opts.round !== "function")
       throw new TypeError("loopUntilDry requires { round: (i) => items[] }");
     const key = opts.key ?? ((x: unknown) => JSON.stringify(x));
-    const consecutiveEmpty = Math.max(1, opts.consecutiveEmpty ?? 2);
-    const maxRounds = opts.maxRounds ?? 50;
+    const consecutiveEmpty = normalizeBoundedCount(opts.consecutiveEmpty, 2, Number.MAX_SAFE_INTEGER);
+    const maxRounds = normalizeBoundedCount(opts.maxRounds, 50, Number.MAX_SAFE_INTEGER);
     const seen = new Set<string>();
     const all: unknown[] = [];
     let dry = 0;
-    for (let r = 0; r < maxRounds && dry < consecutiveEmpty; r++) {
-      let items: unknown[];
+    let failedRounds = 0;
+    let termination: LoopUntilDryResult["termination"] = "maxRounds";
+    for (let r = 0; r < maxRounds; r++) {
+      let items: unknown[] | null;
       try {
-        items = (await opts.round(r)) ?? [];
+        items = (await opts.round(r)) ?? null;
       } catch (error) {
         // Budget / agent-limit exhaustion: return the partial result, don't abort.
         const code = (error as { code?: string })?.code;
-        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
+        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) {
+          termination = "capacity";
+          break;
+        }
         throw error;
       }
-      const fresh = (Array.isArray(items) ? items : []).filter((x) => x != null && !seen.has(key(x)));
+      // null/undefined from the round = the round FAILED (its work did not
+      // complete) — not dry. A dry round is a successful round that found
+      // nothing new. Treating a failed round as dry would silently terminate
+      // a loop whose work is genuinely incomplete (M3).
+      if (items === null) {
+        failedRounds++;
+        termination = "failed";
+        break;
+      }
+      const fresh = items.filter((x) => x != null && !seen.has(key(x)));
       if (!fresh.length) {
         dry++;
+        if (dry >= consecutiveEmpty) {
+          termination = "dry";
+          break;
+        }
         continue;
       }
       dry = 0;
@@ -1490,7 +1733,7 @@ export async function runWorkflow<T = unknown>(
         all.push(x);
       }
     }
-    return all;
+    return { items: all, termination, failedRounds };
   };
 
   const COMPLETENESS_SCHEMA = {
@@ -1499,30 +1742,369 @@ export async function runWorkflow<T = unknown>(
     required: ["complete"],
   };
   const completenessCheck = async (taskArgs: unknown, results: unknown) => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "completenessCheck" });
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "start",
+      helper: "completenessCheck",
+    });
     const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
       { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
     );
-    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "completenessCheck" });
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "end",
+      helper: "completenessCheck",
+    });
     return verdict;
+  };
+
+  // ── Authoring helpers: deterministic, resume-safe combinators built purely ──
+  // ── on agent()/parallel() (so callSeq ordering stays stable and resume      ──
+  // ── keeps working). They never mint agent() calls of their own beyond what  ──
+  // ── the author's callbacks request.                                         ──
+
+  /**
+   * Monotonic elapsed-milliseconds global, seeded at the TOP-LEVEL run start
+   * (nested workflow() frames share the same seed via SharedRuntime). Runs on
+   * the host clock: the vm determinism prelude blocks Date.now() inside
+   * scripts, but this closure lives on the host and is injected as a global.
+   *
+   * Determinism contract: the value is wall-clock-dependent and is NEVER part
+   * of any resume hash, so it must never be embedded in agent() prompts or fed
+   * into anything that influences call identity — a resumed run replays cached
+   * calls fast and would observe different elapsed values than the original
+   * run did. Use an args-seeded counter for content that must be stable across
+   * resume (see timeboxed's docs).
+   */
+  const elapsedMs = () => Math.max(0, Date.now() - shared.runStartedAtMs);
+
+  /** One chunk whose work failed recoverably, with its stable identity. */
+  interface ChunkedFailure {
+    /** Zero-based chunk index — deterministic for a fixed item order + chunkSize. */
+    index: number;
+    /** The exact chunk whose mapper resolved null. */
+    chunk: unknown[];
+  }
+
+  /**
+   * Split a long input list into bounded chunks and run one unit of work per
+   * chunk through parallel(). Closes the hand-chunking gap behind
+   * completenessCheck's 4,000-char evidence truncation: authors chunk large
+   * inputs instead of hand-rolling loops, and each chunk's agent() calls keep
+   * stable resume hashes as long as the mapper embeds the chunk content and
+   * chunkIndex in its prompts.
+   *
+   * Error contract: a recoverable-null chunk result stays null in `results`
+   * AND is recorded in `failed` with its stable index and chunk (positional
+   * integrity preserved for downstream mapping). Non-recoverable failures
+   * (token budget / agent limit / abort) and plain mapper script errors
+   * rethrow exactly like a directly-awaited parallel() fan-out (M2).
+   */
+  const chunked = async (
+    items: unknown[],
+    opts: {
+      chunkSize: number;
+      mapper: (chunk: unknown[], chunkIndex: number) => Promise<unknown> | unknown;
+      synthesizer?: (
+        results: Array<unknown | null>,
+        meta: { failed: ChunkedFailure[]; chunkCount: number; items: unknown[] },
+      ) => Promise<unknown> | unknown;
+    },
+  ): Promise<unknown> => {
+    if (!Array.isArray(items)) throw new TypeError("chunked() expects an array of items");
+    if (!opts || typeof opts.mapper !== "function")
+      throw new TypeError("chunked() requires { mapper: (chunk, chunkIndex) => result }");
+    const chunkSize = normalizeBoundedCount(opts.chunkSize, 1, Number.MAX_SAFE_INTEGER, "chunkSize");
+    // Deterministic partitioning: identical item order + chunkSize always yield
+    // identical chunk boundaries, so chunk-indexed agent() prompts hash stably.
+    const chunks: unknown[][] = [];
+    for (let i = 0; i < items.length; i += chunkSize) chunks.push(items.slice(i, i + chunkSize));
+    const results = await parallel(chunks.map((chunk, index) => async () => opts.mapper(chunk, index)));
+    const failed: ChunkedFailure[] = [];
+    for (let i = 0; i < results.length; i++) {
+      if (results[i] === null) failed.push({ index: i, chunk: chunks[i] });
+    }
+    if (opts.synthesizer !== undefined) {
+      return opts.synthesizer(results, { failed, chunkCount: chunks.length, items });
+    }
+    return { results, failed, chunkCount: chunks.length };
+  };
+
+  interface RouteCase {
+    /** Stable dispatch key; also the enum value the classifier must return. */
+    key: string;
+    /**
+     * Eligibility guard: a case whose guard fails never reaches the
+     * classification enum, so the enum only contains reachable keys and the
+     * classification hash stays stable per value + case list.
+     */
+    when?: (value: unknown) => boolean | Promise<boolean>;
+    /** Pure-JS action for the classified value; may call agent(). */
+    run: (value: unknown) => Promise<unknown> | unknown;
+  }
+
+  interface RouteOutcome {
+    /** Matched case key, or null when fallback dispatched. */
+    key: string | null;
+    /** The dispatched case's or fallback's result. */
+    result: unknown;
+    /** True when fallback ran instead of a case. */
+    fallback: boolean;
+    /** Why: a case matched, or the fallback reason. */
+    reason: "none" | "no-eligible-case" | "classification-failed" | "unknown";
+  }
+
+  /**
+   * One schema'd classification agent (enum of eligible case keys) followed by
+   * pure-JS dispatch — automates the classify-and-act pattern's classification
+   * step. The classification prompt embeds the value and the eligible key
+   * list, so the resume hash is stable per value + case list; a changed value
+   * or case list invalidates the cached classification exactly when it should.
+   *
+   * Fallback semantics: no eligible case (all when() guards fail) → fallback
+   * with reason "no-eligible-case" and NO agent() call; a recoverable-null
+   * classification (exhausted agent or schema/execution failure tolerated by
+   * tolerantVote) → fallback with reason "classification-failed"; an
+   * out-of-enum key (defensive; the enum schema should prevent it) → fallback
+   * with reason "unknown". Budget/limit/abort failures always rethrow.
+   */
+  const route = async (
+    value: unknown,
+    opts: {
+      cases: RouteCase[];
+      fallback: (
+        value: unknown,
+        context: { reason: RouteOutcome["reason"]; classification: string | null },
+      ) => Promise<unknown> | unknown;
+    },
+  ): Promise<RouteOutcome> => {
+    const callSeq = ++qualityCallSeq;
+    if (!opts || !Array.isArray(opts.cases) || opts.cases.length === 0)
+      throw new TypeError("route() requires { cases: [{ key, run, when? }] } with at least one case");
+    if (typeof opts.fallback !== "function")
+      throw new TypeError("route() requires a fallback(value, context) function");
+    const seenKeys = new Set<string>();
+    for (const routeCase of opts.cases) {
+      if (typeof routeCase.key !== "string" || !routeCase.key.trim())
+        throw new TypeError("route() case keys must be nonblank strings");
+      if (seenKeys.has(routeCase.key)) throw new TypeError(`route() duplicate case key "${routeCase.key}"`);
+      seenKeys.add(routeCase.key);
+      if (typeof routeCase.run !== "function")
+        throw new TypeError(`route() case "${routeCase.key}" needs a run function`);
+    }
+    // Pure-JS eligibility first: guards run synchronously-or-async and decide
+    // the enum, so the classifier never sees unreachable keys (and no agent is
+    // spent when nothing is eligible).
+    const eligible: RouteCase[] = [];
+    for (const routeCase of opts.cases) {
+      if (routeCase.when === undefined || (await routeCase.when(value))) eligible.push(routeCase);
+    }
+    if (eligible.length === 0) {
+      const result = await opts.fallback(value, { reason: "no-eligible-case", classification: null });
+      return { key: null, result, fallback: true, reason: "no-eligible-case" };
+    }
+    const keys = eligible.map((routeCase) => routeCase.key);
+    const classification = await tolerantVote(
+      `Classify the following value into exactly one of these categories: ${keys.join(
+        ", ",
+      )}. Reply with the matching category key.\n\nValue:\n${JSON.stringify(value)}`,
+      `route ${callSeq}`,
+      { type: "object", properties: { key: { type: "string", enum: keys } }, required: ["key"] },
+    );
+    if (classification === null) {
+      const result = await opts.fallback(value, { reason: "classification-failed", classification: null });
+      return { key: null, result, fallback: true, reason: "classification-failed" };
+    }
+    const returnedKey = (classification as { key?: unknown } | null)?.key;
+    const matched =
+      typeof returnedKey === "string" ? eligible.find((routeCase) => routeCase.key === returnedKey) : undefined;
+    if (!matched) {
+      const result = await opts.fallback(value, {
+        reason: "unknown",
+        classification: typeof returnedKey === "string" ? returnedKey : null,
+      });
+      return { key: null, result, fallback: true, reason: "unknown" };
+    }
+    return { key: matched.key, result: await matched.run(value), fallback: false, reason: "none" };
+  };
+
+  /**
+   * Cooperative wall-clock bound for a unit of work. fn(context) checks
+   * context.expired() / context.remaining() at its OWN decision points and
+   * returns early with partial results; timeboxed itself never interrupts a
+   * running fn (racing would abandon the vm script's continuation, which could
+   * keep calling agent() after the run's drain has begun). After fn settles,
+   * timedOut truthfully reports whether the deadline was exceeded.
+   *
+   * Resume note: the timedOut flag is timing-dependent and never journaled — a
+   * resumed run replays cached agent() calls fast, so the same timeboxed() call
+   * may NOT time out where the original run did. Treat it as steering, never
+   * as part of run identity; never embed elapsed values in prompts/hashes.
+   */
+  const timeboxed = async <T>(
+    fn: (context: { elapsed: () => number; remaining: () => number; expired: () => boolean }) => Promise<T> | T,
+    opts: { maxElapsedMs: number },
+  ): Promise<{ result: T; timedOut: boolean; elapsedMs: number; maxElapsedMs: number }> => {
+    if (typeof opts?.maxElapsedMs !== "number" || !Number.isFinite(opts.maxElapsedMs))
+      throw new TypeError(`timeboxed() requires a finite maxElapsedMs, got ${String(opts?.maxElapsedMs)}`);
+    const maxElapsedMs = Math.max(0, Math.floor(opts.maxElapsedMs));
+    const startedAt = Date.now();
+    const localElapsed = () => Math.max(0, Date.now() - startedAt);
+    const context = {
+      elapsed: localElapsed,
+      remaining: () => Math.max(0, maxElapsedMs - localElapsed()),
+      expired: () => localElapsed() >= maxElapsedMs,
+    };
+    const result = await fn(context);
+    const elapsed = localElapsed();
+    return { result, timedOut: elapsed >= maxElapsedMs, elapsedMs: elapsed, maxElapsedMs };
+  };
+
+  interface ConsensusVote {
+    verdict: boolean;
+    reasoning?: string;
+  }
+
+  /**
+   * Panel consensus with an agreement gate and optional arbitration. Each round
+   * polls `panelists` (default 3) independently via parallel() + tolerantVote
+   * with a structured { verdict, reasoning? } schema. A per-vote recoverable
+   * null is omitted and SHRINKS the denominator (logged) — a failed panelist
+   * never vetoes or dilutes the surviving votes. The pairwise agreement gate
+   * passes when the largest mutually-agreeing group (every pair within it
+   * agrees) covers at least agreeThreshold (default 0.66) of valid votes.
+   * Rounds are bounded (default 2); after the budget an optional arbitrator —
+   * typically one structured agent() call by the author — decides, otherwise
+   * the disagreement is returned honestly with agreed: false.
+   */
+  const consensus = async (
+    question: string,
+    opts: {
+      panelists?: number;
+      rounds?: number;
+      agreeThreshold?: number;
+      arbitrator?: (context: {
+        question: string;
+        votes: Array<ConsensusVote | null>;
+        rounds: number;
+      }) => Promise<unknown> | unknown;
+    } = {},
+  ): Promise<{
+    agreed: boolean;
+    verdict: boolean | null;
+    count: number;
+    total: number;
+    votes: Array<ConsensusVote | null>;
+    rounds: number;
+    omitted: number;
+    arbitration?: unknown;
+  }> => {
+    const callSeq = ++qualityCallSeq;
+    if (typeof question !== "string" || !question.trim())
+      throw new TypeError("consensus() requires a nonblank question string");
+    const panelists = normalizeBoundedCount(
+      opts.panelists,
+      CONSENSUS_DEFAULT_PANELISTS,
+      Number.MAX_SAFE_INTEGER,
+      "panelists",
+    );
+    const rounds = normalizeBoundedCount(opts.rounds, CONSENSUS_DEFAULT_ROUNDS, Number.MAX_SAFE_INTEGER, "rounds");
+    const rawThreshold = opts.agreeThreshold ?? CONSENSUS_DEFAULT_AGREE_THRESHOLD;
+    if (typeof rawThreshold !== "number" || !Number.isFinite(rawThreshold))
+      throw new TypeError(`consensus() agreeThreshold must be finite, got ${String(rawThreshold)}`);
+    const threshold = Math.max(0, Math.min(1, rawThreshold));
+    let omitted = 0;
+    let lastRound: Array<ConsensusVote | null> = [];
+    let executedRounds = 0;
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "start",
+      helper: "consensus",
+    });
+    try {
+      for (let round = 1; round <= rounds; round++) {
+        executedRounds = round;
+        const votes = (await parallel(
+          Array.from(
+            { length: panelists },
+            (_v, i) => () =>
+              tolerantVote(
+                `Independent panelist ${i + 1} of ${panelists} (round ${round}). Do you AGREE or DISAGREE with the statement below? Reply with your verdict.\n\nStatement:\n${question}`,
+                `consensus ${round}.${i + 1}.${callSeq}`,
+                {
+                  type: "object",
+                  properties: { verdict: { type: "boolean" }, reasoning: { type: "string" } },
+                  required: ["verdict"],
+                },
+              ),
+          ),
+        )) as Array<ConsensusVote | null>;
+        lastRound = votes;
+        const valid = votes.filter((vote): vote is ConsensusVote => vote !== null && typeof vote.verdict === "boolean");
+        const invalid = votes.length - valid.length;
+        if (invalid > 0) {
+          omitted += invalid;
+          log(
+            `consensus round ${round}: ${invalid}/${votes.length} panelist vote(s) omitted (recoverable); ` +
+              `denominator shrinks to ${valid.length}`,
+          );
+        }
+        if (valid.length > 0) {
+          const yes = valid.filter((vote) => vote.verdict).length;
+          const no = valid.length - yes;
+          const [value, count] = yes >= no ? [true, yes] : [false, no];
+          if (count / valid.length >= threshold) {
+            return { agreed: true, verdict: value, count, total: valid.length, votes, rounds: executedRounds, omitted };
+          }
+        }
+      }
+    } finally {
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "quality",
+        stage: "end",
+        helper: "consensus",
+      });
+    }
+    const total = lastRound.filter((vote) => vote !== null && typeof vote.verdict === "boolean").length;
+    if (opts.arbitrator !== undefined) {
+      const arbitration = await opts.arbitrator({ question, votes: lastRound, rounds: executedRounds });
+      return {
+        agreed: false,
+        verdict: null,
+        count: 0,
+        total,
+        votes: lastRound,
+        rounds: executedRounds,
+        omitted,
+        arbitration,
+      };
+    }
+    return { agreed: false, verdict: null, count: 0, total, votes: lastRound, rounds: executedRounds, omitted };
   };
 
   // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
   // agent() pattern, but each attempt is a real agent() call so it auto-journals
   // under a stable callSeq (resume-safe). No backoff: there is no timer in the vm
-  // and a delay has no resume value. NOTE: attempt N+1's call hash depends on N's
-  // live result, so a retry/gate chain cache-miss-cascades on resume (correct).
+  // and a delay has no resume value. NOTE (L27): each attempt journals under its
+  // own stable call index, so on resume the completed attempts REPLAY from the
+  // journal and the chain resumes from the last journaled attempt — attempt N+1's
+  // hash depends on N's live result, so only attempts that actually ran re-run.
   const retry = async (
     thunk: (attempt: number) => Promise<unknown> | unknown,
     opts: { attempts?: number; until?: (r: unknown) => boolean } = {},
   ) => {
-    const attempts = Math.max(1, opts.attempts ?? 3);
+    const attempts = normalizeBoundedCount(opts.attempts, 3, Number.MAX_SAFE_INTEGER);
     let last: unknown;
     for (let i = 0; i < attempts; i++) {
       last = await thunk(i);
       const accepted = !opts.until || opts.until(last);
-      options.onRuntimeEvent?.({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "control-attempt",
+        helper: "retry",
+        attempt: i + 1,
+        accepted,
+      });
       if (accepted) return last;
     }
     return last; // attempts exhausted — return the last result (caller inspects it)
@@ -1532,14 +2114,19 @@ export async function runWorkflow<T = unknown>(
     validator: (r: unknown) => Promise<{ ok: boolean; feedback?: string }> | { ok: boolean; feedback?: string },
     opts: { attempts?: number } = {},
   ) => {
-    const attempts = Math.max(1, opts.attempts ?? 3);
+    const attempts = normalizeBoundedCount(opts.attempts, 3, Number.MAX_SAFE_INTEGER);
     let feedback: string | undefined;
     let last: unknown;
     for (let i = 0; i < attempts; i++) {
       last = await thunk(feedback, i);
       const verdict = await validator(last);
       const accepted = Boolean(verdict?.ok);
-      options.onRuntimeEvent?.({ type: "control-attempt", helper: "gate", attempt: i + 1, accepted });
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "control-attempt",
+        helper: "gate",
+        attempt: i + 1,
+        accepted,
+      });
       if (accepted) return { ok: true, value: last, attempts: i + 1 };
       feedback = verdict?.feedback; // fed into the next attempt
     }
@@ -1618,7 +2205,12 @@ export async function runWorkflow<T = unknown>(
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();
-    options.onAgentJournal?.({ index: callIndex, runId, hash: callHash, result: reply });
+    safeCallback("onAgentJournal", options.onAgentJournal, {
+      index: callIndex,
+      runId,
+      hash: callHash,
+      result: reply,
+    });
     return reply;
   };
 
@@ -1631,6 +2223,11 @@ export async function runWorkflow<T = unknown>(
     judgePanel,
     loopUntilDry,
     completenessCheck,
+    chunked,
+    route,
+    timeboxed,
+    elapsedMs,
+    consensus,
     retry,
     gate,
     checkpoint,
@@ -1696,8 +2293,9 @@ export async function runWorkflow<T = unknown>(
       log(`Logs persisted to ${logFile}`);
     }
 
-    // Emit final token usage
-    options.onTokenUsage?.(shared.tokenUsage);
+    // Emit final token usage — guarded so a throwing onTokenUsage listener can
+    // never fail a run that already completed (M1).
+    safeCallback("onTokenUsage", options.onTokenUsage, shared.tokenUsage);
 
     return {
       meta,
@@ -2013,13 +2611,24 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
 function createLimiter(limit: number) {
   let active = 0;
   const queue: Array<() => void> = [];
+  // Semaphore-style handoff (audit L1): the slot is taken (`active++`) BEFORE
+  // the queued waiter is released, so there is no microtask window where a
+  // caller sees a free slot that is already spoken for. The waiter must NOT
+  // increment again when it wakes — `next()` already did it on its behalf.
   const next = () => {
     active--;
-    queue.shift()?.();
+    const release = queue.shift();
+    if (release) {
+      active++;
+      release();
+    }
   };
   return async <T>(fn: () => Promise<T>): Promise<T> => {
-    if (active >= limit) await new Promise<void>((resolve) => queue.push(resolve));
-    active++;
+    if (active >= limit) {
+      await new Promise<void>((resolve) => queue.push(resolve));
+    } else {
+      active++;
+    }
     try {
       return await fn();
     } finally {
@@ -2069,6 +2678,8 @@ function hashAgentCall(
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
+  mainModel: string | undefined,
+  isolation: "worktree" | undefined,
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -2083,12 +2694,24 @@ function hashAgentCall(
     // explicit model/agentType model/default tier — so it does not vary across
     // calls within one run for a fixed config.
     tierModel: tierModel ?? null,
+    // The session default model (M5): an UNTAGGED agent with no phase route
+    // and no tier config runs on the session's main model, so a default-model
+    // change must invalidate its cached replay result too. Included only when
+    // neither `model` nor `tierModel` encoded an explicit choice (both are
+    // the session-default path); a tiered call's tierModel already falls back
+    // to mainModel inside resolveRoutingModelSignature, so this field never
+    // double-encodes.
+    defaultModel: model == null && tierModel == null ? (mainModel ?? null) : null,
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     // Resolved definition (tools/model/prompt) so editing an agent .md invalidates
     // this call's cached result on a later resume.
     agentDef: agentDefKey,
+    // Worktree isolation changes where the agent runs (a different working tree
+    // with different file state), so a result computed in one environment must
+    // not replay in another (M5).
+    isolation: isolation ?? null,
     schema: options.schema ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
@@ -2165,6 +2788,22 @@ function normalizeConcurrency(value: unknown): number {
 function normalizeAgentRetries(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
+}
+
+/**
+ * Clamp a user-supplied attempt/round/bound value (L13): undefined falls back
+ * to `fallback`; a NON-finite value (NaN/±Infinity) throws a TypeError instead
+ * of producing an unbounded loop; finite values are floored and clamped to
+ * [1, max]. Shared by retry()/gate() attempts, loopUntilDry's
+ * maxRounds/consecutiveEmpty, chunked()'s chunkSize, and consensus()'s
+ * panelists/rounds. `what` names the bound in the error message.
+ */
+function normalizeBoundedCount(value: unknown, fallback: number, max: number, what = "attempts/rounds"): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new TypeError(`expected a finite number of ${what}, got ${String(value)}`);
+  }
+  return Math.max(1, Math.min(max, Math.floor(value)));
 }
 
 /**
