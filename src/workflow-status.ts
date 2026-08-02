@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRunPersistence, type PersistedRunState, type RunStatus } from "./run-persistence.js";
+import { safeSetTimeout } from "./timing.js";
 
 export interface WorkflowStatus {
   runId: string;
@@ -188,7 +189,11 @@ export async function acquireFileLock(
     // A live holder with no wait budget fails fast (historical behavior).
     if (!deadline) return false;
     if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    // unref'd so a polling wait never pins the event loop on its own —
+    // matches the timing.ts safe-timer contract used across the codebase.
+    await new Promise<void>((resolve) => {
+      safeSetTimeout(resolve, pollIntervalMs).unref();
+    });
   }
 }
 
@@ -205,31 +210,42 @@ export async function renewFileLock(
   ttl: number = DEFAULT_LOCK_TTL_MS,
 ): Promise<boolean> {
   const lockPath = lockPathFor(filePath);
+  // Only the initial read+parse is an expected, recoverable failure: a missing
+  // lock file (ENOENT) means "nothing we own to renew", and a corrupt record
+  // is treated the same way (logged so the failure stays observable). Genuine
+  // write/rename errors (EACCES, ENOSPC, cross-device rename, EEXIST on the
+  // temp) are NOT caught here — they propagate so a caller can distinguish
+  // "no lock owned by me" from "disk/io failure".
+  let lock: LockFileRecord;
   try {
-    const lock = JSON.parse(await readFile(lockPath, "utf-8")) as LockFileRecord;
-    if (!lock.filePath || lock.runId !== runId) return false;
-    const now = Date.now();
-    const renewed: LockFileRecord = {
-      ...lock,
-      lockedAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + ttl).toISOString(),
-      token: `${process.pid}-${now.toString(36)}-${Math.random().toString(36).slice(2)}`,
-    };
-    // Write via a temp file + atomic rename so a concurrent reader never sees
-    // a truncated lock, and the rotated token makes our own read→unlink
-    // reclamation (or another process's) safely miss.
-    const tmp = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-    try {
-      await writeFile(tmp, JSON.stringify(renewed, null, 2), { flag: "wx" });
-      await rename(tmp, lockPath);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
+    lock = JSON.parse(await readFile(lockPath, "utf-8")) as LockFileRecord;
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code !== "ENOENT") {
+      console.warn(`[workflow-status] renewFileLock: unreadable lock ${lockPath}`, code ?? err);
     }
-    return true;
-  } catch {
     return false;
   }
+  if (!lock.filePath || lock.runId !== runId) return false;
+  const now = Date.now();
+  const renewed: LockFileRecord = {
+    ...lock,
+    lockedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ttl).toISOString(),
+    token: `${process.pid}-${now.toString(36)}-${Math.random().toString(36).slice(2)}`,
+  };
+  // Write via a temp file + atomic rename so a concurrent reader never sees
+  // a truncated lock, and the rotated token makes our own read→unlink
+  // reclamation (or another process's) safely miss.
+  const tmp = `${lockPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(renewed, null, 2), { flag: "wx" });
+    await rename(tmp, lockPath);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+  return true;
 }
 
 export async function getWorkflowStatus(runId?: string): Promise<WorkflowStatus | null> {
