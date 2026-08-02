@@ -295,7 +295,7 @@ test("finalizeWorktree commits agent edits onto the branch before teardown", asy
     writeFileSync(join(wt.cwd, "agent-output.txt"), "agent edit\n");
 
     const ok = await finalizeWorktree(wt);
-    assert.equal(ok, true, "finalize should succeed with a dirty tree");
+    assert.equal(ok.ok, true, "finalize should succeed with a dirty tree");
 
     // The edit is committed onto the branch BEFORE teardown — this is exactly what
     // a keepWorktree consumer inspects after the run (see the workflow integration
@@ -319,7 +319,7 @@ test("finalizeWorktree creates an empty commit on a clean tree (allow-empty)", a
     assert.equal(wt.isolated, true);
 
     const ok = await finalizeWorktree(wt);
-    assert.equal(ok, true);
+    assert.equal(ok.ok, true);
     const head = execFileSync("git", ["-C", repo, "log", "-1", "--format=%s", wt.branch as string], {
       encoding: "utf8",
     });
@@ -330,7 +330,7 @@ test("finalizeWorktree creates an empty commit on a clean tree (allow-empty)", a
 });
 
 test("finalizeWorktree is a no-op (false) for a non-isolated Worktree", async () => {
-  assert.equal(await finalizeWorktree({ isolated: false, cwd: "/tmp", reason: "not a git repository" }), false);
+  assert.equal((await finalizeWorktree({ isolated: false, cwd: "/tmp", reason: "not a git repository" })).ok, false);
 });
 
 // ── worktree-isolation:i4 — central git exec helper ──
@@ -361,7 +361,7 @@ test("smoke: create → edit → finalize → remove lifecycle on real git", asy
     writeFileSync(join(wt.cwd, "feature.ts"), "export const feature = true;\n");
     assert.ok(!existsSync(join(repo, "feature.ts")), "agent edits stay inside the worktree");
 
-    assert.equal(await finalizeWorktree(wt), true, "agent edits are committed");
+    assert.equal((await finalizeWorktree(wt)).ok, true, "agent edits are committed");
     await removeWorktree(wt);
     assert.ok(!existsSync(wt.cwd), "worktree dir removed");
     assertBranchGone(repo, wt.branch as string);

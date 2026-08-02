@@ -1192,7 +1192,10 @@ export async function runWorkflow<T = unknown>(
         // before removal (worktree-isolation:f2).
         if (worktree?.isolated) {
           const finalized = await finalizeWorktree(worktree);
-          if (!finalized) log(`worktree finalize failed for "${label}"; agent edits may be lost`);
+          if (!finalized.ok) {
+            const reason = finalized.reason ? ` (${finalized.reason})` : "";
+            log(`worktree finalize failed for "${label}"; agent edits may be lost${reason}`);
+          }
           if (agentOptions.keepWorktree) {
             log(`keeping worktree for "${label}": ${worktree.cwd} (branch ${worktree.branch ?? "<detached>"})`);
           } else {

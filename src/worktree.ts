@@ -138,22 +138,44 @@ export async function removeWorktree(wt: Worktree, opts: GitExecOptions = {}): P
   }
 }
 
+/** Result of {@link finalizeWorktree}; surfaces the failing git step + stderr so an
+ * operator can distinguish trivially fixable failures (e.g. no user.identity) from
+ * ones requiring different remediation (worktree gone / locked / git broken). */
+export interface FinalizeResult {
+  ok: boolean;
+  /** `git` step that failed (`add -A` or `commit`) plus the trimmed stderr, when !ok. */
+  reason?: string;
+}
+
 /**
  * Commit any uncommitted agent edits in an isolated worktree so teardown can never
  * silently destroy them (worktree-isolation:f2). Runs `git add -A` + `git commit
- * --allow-empty` inside the worktree. Best-effort: returns false (leaving the tree
- * untouched) when the repo has no user identity, the worktree is gone, or any git
- * call fails. A no-op Worktree also returns false.
+ * --allow-empty` inside the worktree. Best-effort: returns `{ ok: false }` (leaving
+ * the tree untouched) when the repo has no user identity, the worktree is gone, or
+ * any git call fails — with `reason` naming the failing git step + trimmed stderr so
+ * the caller can log actionable context rather than a generic string. A no-op
+ * Worktree also returns `{ ok: false }`.
  */
-export async function finalizeWorktree(wt: Worktree, opts: GitExecOptions = {}): Promise<boolean> {
-  if (!wt.isolated || !wt.repoRoot || !wt.cwd) return false;
-  try {
-    await gitExec(["-C", wt.cwd, "add", "-A"], opts);
-    await gitExec(["-C", wt.cwd, "commit", "--allow-empty", "-m", FINALIZE_COMMIT_MESSAGE], opts);
-    return true;
-  } catch {
-    return false;
+export async function finalizeWorktree(wt: Worktree, opts: GitExecOptions = {}): Promise<FinalizeResult> {
+  if (!wt.isolated || !wt.repoRoot || !wt.cwd) return { ok: false };
+  // Each git step is run sequentially and tracked so the surfaced `reason`
+  // identifies WHICH step failed (`add -A` vs `commit`) plus the trimmed stderr.
+  const steps: Array<{ step: string; run: () => Promise<string> }> = [
+    { step: "add -A", run: () => gitExec(["-C", wt.cwd, "add", "-A"], opts) },
+    {
+      step: "commit",
+      run: () => gitExec(["-C", wt.cwd, "commit", "--allow-empty", "-m", FINALIZE_COMMIT_MESSAGE], opts),
+    },
+  ];
+  for (const { step, run } of steps) {
+    try {
+      await run();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      return { ok: false, reason: `git ${step} failed: ${detail}` };
+    }
   }
+  return { ok: true };
 }
 
 function normalizePath(path: string): string {
