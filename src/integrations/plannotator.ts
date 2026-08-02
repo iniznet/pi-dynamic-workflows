@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { type SafeTimer, safeSetInterval, safeSetTimeout } from "../timing.js";
 
 export interface ReviewPlan {
   id: string;
@@ -23,6 +24,8 @@ export interface PlannotatorConfig {
   port: number;
   autoOpenBrowser: boolean;
   approvalTimeout: number;
+  /** SSE heartbeat cadence; comments keep middleboxes from timing out idle streams. */
+  sseHeartbeatMs?: number;
 }
 
 export interface PlannotatorBridge {
@@ -42,6 +45,8 @@ const DEFAULT_CONFIG: PlannotatorConfig = {
 
 /** Re-read cadence for waitForApproval; responsive for a human gate, bounded, and abortable. */
 const POLL_INTERVAL_MS = 250;
+/** Default SSE heartbeat cadence: comfortably under typical proxy idle timeouts (60s+). */
+const DEFAULT_SSE_HEARTBEAT_MS = 15000;
 
 function planDir(): string {
   return join(process.cwd(), ".pi", "workflows", "plans");
@@ -55,26 +60,41 @@ function abortError(signal: AbortSignal): Error {
   return error;
 }
 
-interface WaitOptions {
+export interface WaitOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   /** Invoked with the plan whenever a non-pending status is observed. */
   onStatusChange?: (plan: ReviewPlan) => void;
   /** Lets a caller fail an in-flight wait externally (e.g. server error). Returns cleanup. */
   registerFailure?: (reject: (error: Error) => void) => () => void;
+  /** Injectable plan reader (test seam); defaults to reading `<dir>/<planId>.json`. */
+  readPlanFile?: (planId: string) => Promise<ReviewPlan | null>;
 }
 
-function waitForStatus(dir: string, planId: string, options: WaitOptions): Promise<boolean> {
-  const { timeoutMs, signal, onStatusChange, registerFailure } = options;
+function defaultPlanReader(dir: string): (planId: string) => Promise<ReviewPlan | null> {
+  return async (planId) => {
+    try {
+      const data = await readFile(join(dir, `${planId}.json`), "utf-8");
+      return JSON.parse(data) as ReviewPlan;
+    } catch {
+      // Not readable yet (missing or mid-write); the poller keeps waiting.
+      return null;
+    }
+  };
+}
+
+export function waitForStatus(dir: string, planId: string, options: WaitOptions): Promise<boolean> {
+  const { timeoutMs, signal, onStatusChange, registerFailure, readPlanFile } = options;
+  const readPlan = readPlanFile ?? defaultPlanReader(dir);
   if (signal?.aborted) return Promise.reject(abortError(signal));
 
   return new Promise<boolean>((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: SafeTimer | undefined;
     let unregisterFailure: (() => void) | undefined;
     let settled = false;
 
     const cleanup = () => {
-      if (timer !== undefined) clearTimeout(timer);
+      timer?.clear();
       if (signal) signal.removeEventListener("abort", onAbort);
       unregisterFailure?.();
     };
@@ -99,22 +119,32 @@ function waitForStatus(dir: string, planId: string, options: WaitOptions): Promi
 
     const startedAt = Date.now();
     const tick = async () => {
+      // Never resume polling after settle: a tick that was already re-armed
+      // when the promise settled (abort / registerFailure / timeout) must
+      // return immediately instead of re-arming again.
+      if (settled) return;
+      let plan: ReviewPlan | null | undefined;
       try {
-        const data = await readFile(join(dir, `${planId}.json`), "utf-8");
-        const plan = JSON.parse(data) as ReviewPlan;
-        if (plan.status !== "pending") {
-          onStatusChange?.(plan);
-          finish(plan.status === "approved");
-          return;
-        }
+        plan = await readPlan(planId);
       } catch {
-        // Plan not readable yet; keep polling until the deadline.
+        // Reader threw unexpectedly; keep polling until the deadline.
+        plan = null;
+      }
+      // The await above is the settle window: fail()/finish() may have run
+      // while the plan file was being read. Polling past that is a leak.
+      if (settled) return;
+      if (plan && plan.status !== "pending") {
+        onStatusChange?.(plan);
+        finish(plan.status === "approved");
+        return;
       }
       if (Date.now() - startedAt >= timeoutMs) {
         finish(false);
         return;
       }
-      timer = setTimeout(tick, POLL_INTERVAL_MS);
+      // Unref'd: a pending poll must never hold the process open on its own.
+      timer = safeSetTimeout(tick, POLL_INTERVAL_MS);
+      timer.unref();
     };
     void tick();
   });
@@ -150,20 +180,62 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const emitter = new EventEmitter();
   const pendingWaits = new Set<(error: Error) => void>();
+  // Registry of open SSE streams. A keep-alive SSE response is never closed by
+  // the client's silence alone, so the bridge must track every response to end
+  // it on close() and to heartbeat/drop dead clients.
+  const sseClients = new Set<ServerResponse>();
+  // Per-client emitter listener cleanup (a res -> remove-listener fn).
+  const sseHandlers = new Map<ServerResponse, () => void>();
   let serverError: Error | undefined;
+
+  const dropClient = (res: ServerResponse) => {
+    if (!sseClients.has(res)) return;
+    sseClients.delete(res);
+    sseHandlers.get(res)?.();
+    sseHandlers.delete(res);
+    try {
+      res.end();
+    } catch {
+      // Already closed; nothing to release.
+    }
+  };
+
+  /** Register an SSE response and stream `update` events (optionally as a named event). */
+  const registerSse = (req: IncomingMessage, res: ServerResponse, eventName?: string) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    // writeHead alone does not flush on Node 26; the client would never see headers (or data) without this.
+    res.flushHeaders();
+    sseClients.add(res);
+    const onUpdate = (plan: ReviewPlan) => {
+      if (res.destroyed || res.writableEnded) {
+        dropClient(res);
+        return;
+      }
+      const payload = eventName
+        ? `event: ${eventName}\ndata: ${JSON.stringify(plan)}\n\n`
+        : `data: ${JSON.stringify(plan)}\n\n`;
+      res.write(payload);
+    };
+    emitter.on("update", onUpdate);
+    sseHandlers.set(res, () => emitter.off("update", onUpdate));
+    const onClosed = () => dropClient(res);
+    req.on("close", onClosed);
+    res.on("close", onClosed);
+    res.on("error", onClosed);
+  };
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (req.url === "/sse") {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-      // writeHead alone does not flush on Node 26; the client would never see headers (or data) without this.
-      res.flushHeaders();
-      const onUpdate = (plan: ReviewPlan) => res.write(`data: ${JSON.stringify(plan)}\n\n`);
-      emitter.on("update", onUpdate);
-      req.on("close", () => emitter.off("update", onUpdate));
+      registerSse(req, res);
+    } else if (req.url === "/reviewed") {
+      // Event-driven review stream: pushes a `reviewed` event to connected
+      // clients when a review settles (observed by an active poll). Polling
+      // via waitForApproval/getPlanStatus remains the fallback.
+      registerSse(req, res, "reviewed");
     } else {
       res.writeHead(404);
       res.end();
@@ -178,6 +250,25 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
     pendingWaits.clear();
   });
   server.listen(cfg.port);
+
+  // Heartbeat: SSE comments keep proxies/middleboxes from timing out idle
+  // connections, and dead clients (destroyed or unwritable) are force-dropped
+  // from the registry so they stop receiving writes. Unref'd: idle with no
+  // clients, the heartbeat must not hold the process open.
+  const heartbeat = safeSetInterval(() => {
+    for (const res of sseClients) {
+      if (res.destroyed || res.writableEnded) {
+        dropClient(res);
+        continue;
+      }
+      try {
+        res.write(": ping\n\n");
+      } catch {
+        dropClient(res);
+      }
+    }
+  }, cfg.sseHeartbeatMs ?? DEFAULT_SSE_HEARTBEAT_MS);
+  heartbeat.unref();
 
   return {
     submitPlan: (blueprint: unknown) => submitPlan(blueprint, cfg),
@@ -199,8 +290,27 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
       return () => emitter.off("update", callback);
     },
     close: () => {
+      heartbeat.clear();
       emitter.removeAllListeners();
-      if (server.listening) server.close();
+      // End every open SSE stream BEFORE closing the server: Node keeps
+      // keep-alive SSE sockets open, so server.close() alone would never
+      // release them (or their sockets) until the browser disconnects.
+      for (const res of sseClients) {
+        try {
+          res.end();
+        } catch {
+          // Already closed.
+        }
+      }
+      sseClients.clear();
+      sseHandlers.clear();
+      if (server.listening) {
+        server.close();
+        // Node >=18.2: force-close the underlying sockets so a client that
+        // never observes the end-of-stream doesn't linger after close().
+        const withCloseAll = server as unknown as { closeAllConnections?: () => void };
+        withCloseAll.closeAllConnections?.();
+      }
     },
   };
 }

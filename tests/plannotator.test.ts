@@ -14,6 +14,7 @@ import {
   type ReviewPlan,
   submitPlan,
   waitForApproval,
+  waitForStatus,
 } from "../src/integrations/plannotator.js";
 
 describe("plan submission and status", () => {
@@ -241,6 +242,155 @@ describe("createPlannotatorBridge", () => {
         }
         await reader.cancel();
         assert.ok(body.includes('"status":"approved"'), `expected approved SSE payload, got: ${body}`);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+});
+
+// ─── Settle guard (infra-utils:f1): a tick that resumes after the promise
+// settled must return instead of re-arming the 250ms poll ──────────────────────
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Fetch a URL with retries until the bridge server accepts connections. */
+async function fetchRetry(url: string): Promise<Response> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      return await fetch(url);
+    } catch {
+      await sleep(20);
+    }
+  }
+  throw new Error("bridge server did not become reachable");
+}
+
+/** Read SSE chunks until `predicate` matches the accumulated body or the deadline passes. */
+async function readUntil(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  predicate: (body: string) => boolean,
+  timeoutMs: number,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  const decoder = new TextDecoder();
+  let body = "";
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return body;
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("read deadline")), remaining);
+        timer.unref();
+      }),
+    ]);
+    if (result.done) return body;
+    body += decoder.decode(result.value, { stream: true });
+    if (predicate(body)) return body;
+  }
+}
+
+/** True when the stream closed (done or error) within the window; false on timeout. */
+async function readUntilClosed(reader: ReadableStreamDefaultReader<Uint8Array>, timeoutMs = 2000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    try {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error("read deadline")), remaining);
+          timer.unref();
+        }),
+      ]);
+      if (result.done) return true;
+    } catch {
+      return true; // a connection error also means the stream is gone
+    }
+  }
+}
+
+describe("waitForStatus settle guard", () => {
+  it("stops polling after the promise settles — no re-armed tick reads the plan again", async () => {
+    await inTempDir(async () => {
+      let reads = 0;
+      let trigger: ((error: Error) => void) | undefined;
+      const waiting = waitForStatus(process.cwd(), "plan-1", {
+        timeoutMs: 10_000,
+        readPlanFile: async () => {
+          reads++;
+          return null; // never settles via plan status
+        },
+        registerFailure: (reject) => {
+          trigger = reject;
+          return () => {};
+        },
+      });
+      await sleep(600); // ≥ 2 poll intervals (250ms) — polling is live before settle
+      assert.ok(reads >= 1, `expected the poll to be running, saw ${reads} reads`);
+      trigger?.(new Error("server error"));
+      await assert.rejects(waiting, /server error/);
+      const readsAtSettle = reads;
+      await sleep(600); // a buggy re-arm would read again within this window
+      assert.equal(reads, readsAtSettle, "no further plan reads after settle — the poll must not re-arm");
+    });
+  });
+});
+
+describe("SSE lifecycle", () => {
+  it("close() ends every open SSE stream so keep-alive sockets are released", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        const response = await fetchRetry(`http://127.0.0.1:${port}/sse`);
+        const reader = response.body?.getReader();
+        assert.ok(reader, "expected an SSE body reader");
+        bridge.close();
+        const closed = await readUntilClosed(reader);
+        assert.equal(closed, true, "the SSE stream must be ended by close()");
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("heartbeats idle SSE connections with comments to keep middleboxes alive", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false, sseHeartbeatMs: 20 });
+      try {
+        const response = await fetchRetry(`http://127.0.0.1:${port}/sse`);
+        const reader = response.body?.getReader();
+        assert.ok(reader);
+        const body = await readUntil(reader, (b) => b.includes(": ping"), 2000);
+        assert.ok(body.includes(": ping"), `expected a heartbeat comment; got: ${JSON.stringify(body)}`);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("pushes a reviewed event to /reviewed clients when a review settles", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        const plan = await bridge.submitPlan({ task: "event-driven review" });
+        const response = await fetchRetry(`http://127.0.0.1:${port}/reviewed`);
+        assert.equal(response.status, 200);
+        const reader = response.body?.getReader();
+        assert.ok(reader);
+        const waiting = bridge.waitForApproval(plan.id, 5000);
+        const plansDir = join(process.cwd(), ".pi", "workflows", "plans");
+        const approved: ReviewPlan = { ...plan, status: "approved", reviewedAt: new Date().toISOString() };
+        await writeFile(join(plansDir, `${plan.id}.json`), JSON.stringify(approved, null, 2), "utf-8");
+        assert.equal(await waiting, true);
+        const body = await readUntil(reader, (b) => b.includes("event: reviewed"), 2000);
+        assert.ok(body.includes("event: reviewed"), `expected a reviewed SSE event; got: ${JSON.stringify(body)}`);
+        assert.ok(body.includes('"status":"approved"'), "the event payload carries the settled status");
       } finally {
         bridge.close();
       }
