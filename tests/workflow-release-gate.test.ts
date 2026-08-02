@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import packageJson from "../package.json" with { type: "json" };
 import { WORKFLOW_AUTHORING_COVERAGE } from "../src/workflow-authoring-coverage.js";
+import { CAPABILITY_DETAIL_PATH } from "../src/workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
 import { checkWorkflowRelease, parseNpmPackFilePaths, runNpmPack } from "../src/workflow-release-gate.js";
 
@@ -312,6 +313,51 @@ test("release gate reports missing generated artifacts instead of crashing", () 
           severity === "error" &&
           subject === "docs/workflow-context-surfaces.json" &&
           /missing/i.test(message),
+      ),
+    );
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("release gate flags publishable skill resources and installed-skill version when the repository omits them", () => {
+  // Exercises three defensive existsSync guards that the missing-baseline/context
+  // test does not cover: validatePackage's listed-but-absent skill .md loop,
+  // skillVersion's absent SKILL.md path, and checkWorkflowCapabilityPublications'
+  // missing detail file. Each would silently disappear if refactored away.
+  const tmpRoot = mkdtempSync(join(tmpdir(), "workflow-release-missing-skill-"));
+  try {
+    const phantomSkillMd = "skills/workflow-authoring/references/does-not-exist.md";
+    const diagnostics = checkWorkflowRelease({
+      root: tmpRoot,
+      publishableFiles: [phantomSkillMd],
+    });
+
+    assert.ok(
+      diagnostics.some(
+        ({ code, severity, subject, message }) =>
+          code === "MISSING_PACKAGE_RESOURCE" &&
+          severity === "error" &&
+          subject === phantomSkillMd &&
+          /missing from the repository/i.test(message),
+      ),
+    );
+    assert.ok(
+      diagnostics.some(
+        ({ code, severity, subject, message }) =>
+          code === "INCOMPATIBLE_VERSION" &&
+          severity === "error" &&
+          subject === "installed skill" &&
+          /<missing>/.test(message),
+      ),
+    );
+    assert.ok(
+      diagnostics.some(
+        ({ code, severity, subject, message }) =>
+          code === "STALE_GENERATED_SURFACE" &&
+          severity === "error" &&
+          subject === CAPABILITY_DETAIL_PATH &&
+          /stale/i.test(message),
       ),
     );
   } finally {
