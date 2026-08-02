@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { proxiedParameters } from "../../src/agent/mcp-proxy-client.js";
+import { ProxyAbortError, proxiedParameters } from "../../src/agent/mcp-proxy-client.js";
 import {
   createGatewayProxiedTools,
   GATEWAY_NOT_RUNNING_MESSAGE,
@@ -23,7 +23,7 @@ import {
   hostToolsFromDefinitions,
   registerWorkflowGatewayCommand,
 } from "../../src/gateway/host-tool-gateway.js";
-import type { ProxiedToolDef, ToolExecutor } from "../../src/gateway/types.js";
+import type { ProxiedToolDef, ToolCallResult, ToolExecutor } from "../../src/gateway/types.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "../helpers/mock-pi.js";
 
 /** A minimal ToolDefinition whose execute echoes its params as text. */
@@ -154,6 +154,49 @@ test("createGatewayProxiedTools round-trips a call through the running gateway",
     echo as { execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }
   ).execute("call-1", { hello: "world" })) as { content: Array<{ type: string; text: string }> };
   assert.strictEqual(result.content[0].text, JSON.stringify({ hello: "world" }));
+});
+
+test("createGatewayProxiedTools propagates an abort as ProxyAbortError, not an isError result (gateway-ipc:i1)", async () => {
+  // The production gateway consumer must mirror executeToolCall's guard: an
+  // aborted call rejects with ProxyAbortError instead of degrading into a
+  // recoverable tool failure the agent could retry past.
+  const tools = new Map<string, ToolExecutor>();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const hostCancelled = new Promise<ToolCallResult>((resolve) => {
+    tools.set("blocking", async (_args, signal) => {
+      markStarted();
+      signal?.addEventListener("abort", () => resolve({ content: "cancelled-by-abort", isError: false }), {
+        once: true,
+      });
+      return await new Promise<ToolCallResult>(() => {});
+    });
+  });
+
+  const gateway = trackedGateway();
+  await gateway.start({
+    tools,
+    toolDefs: [{ name: "blocking", description: "blocks until aborted", inputSchema: {}, source: "host" }],
+  });
+
+  const defs = createGatewayProxiedTools(gateway);
+  const blocking = defs.find((d) => d.name === "blocking");
+  assert.ok(blocking, "blocking must be proxied");
+
+  const controller = new AbortController();
+  const call = (
+    blocking as {
+      execute: (id: string, p: unknown, signal: AbortSignal) => Promise<unknown>;
+    }
+  ).execute("call-1", {}, controller.signal);
+
+  await started; // the host tool is in flight on the bridge
+  controller.abort();
+
+  await assert.rejects(call, (error: unknown) => error instanceof ProxyAbortError);
+  await hostCancelled;
 });
 
 test("a stale/dead socket surfaces an isError result with no unhandledRejection (gateway-ipc:f1)", async () => {

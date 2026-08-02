@@ -23,7 +23,7 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { MCPProxyClient, proxiedParameters } from "../agent/mcp-proxy-client.js";
+import { MCPProxyClient, ProxyAbortError, proxiedParameters } from "../agent/mcp-proxy-client.js";
 import { MCPBridge } from "./mcp-bridge.js";
 import type { ProxiedToolDef, ToolExecutor } from "./types.js";
 
@@ -190,6 +190,10 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
             isError: result.isError,
           };
         } catch (error) {
+          // The subagent runtime aborted this call — surface the rejection as
+          // an abort, NOT as a recoverable tool failure (mirrors the guard in
+          // MCPProxyClient.executeToolCall itself).
+          if (error instanceof ProxyAbortError) throw error;
           return {
             content: [
               {
