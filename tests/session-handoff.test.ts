@@ -258,9 +258,11 @@ test("planning guidance is handoff-only and pruned once the swap gate opens", as
   try {
     // Non-handoff agents never carry the planning guidance (no behavior change).
     const plain = new WorkflowAgent({ cwd: "/tmp" });
-    const plainPrompt = (
-      plain as unknown as { buildPrompt(p: string, o: unknown, s: boolean): string }
-    ).buildPrompt("task", {}, false);
+    const plainPrompt = (plain as unknown as { buildPrompt(p: string, o: unknown, s: boolean): string }).buildPrompt(
+      "task",
+      {},
+      false,
+    );
     assert.ok(!plainPrompt.includes("PLANNING phase"), "non-handoff agents must not get planning guidance");
 
     await withFakeHomeAsync(cwd, async () => {
