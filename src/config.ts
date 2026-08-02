@@ -2,6 +2,11 @@
  * Configuration constants for pi-dynamic-workflows.
  */
 
+// Type-only to avoid a runtime import cycle: workflow-settings.ts imports value
+// bindings (MAX_AGENT_RETRIES, ...) from this module, so importing its type is
+// erased at compile time and never re-enters it at load.
+import type { WorkflowSettings } from "./workflow-settings.js";
+
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
 
@@ -54,6 +59,117 @@ export const MODEL_TIERS_FILE = ".pi/workflows/model-tiers.json";
 
 /** User-level workflow extension settings file, relative to the home directory. */
 export const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
+
+// ─── Environment-var settings override layer (headless/CI/containerized) ─────
+// Env vars are the only settings channel that works without a writable home
+// directory or settings.json. They override the merged global+project file
+// settings at load time and never write back to disk (save paths are
+// untouched), so a CI job can pin concurrency/budgets without mutating a
+// developer's machine.
+
+/** Prefix for every workflow settings override env var. */
+export const WORKFLOW_ENV_PREFIX = "PI_WORKFLOW_";
+
+/**
+ * Env var name per settings key. `as const satisfies` keeps this exhaustive:
+ * adding a WorkflowSettings key without an env mapping is a compile error.
+ */
+export const WORKFLOW_ENV_VARS = {
+  keywordTriggerEnabled: "PI_WORKFLOW_KEYWORD_TRIGGER_ENABLED",
+  keywordTriggerWord: "PI_WORKFLOW_KEYWORD_TRIGGER_WORD",
+  defaultAgentTimeoutMs: "PI_WORKFLOW_DEFAULT_AGENT_TIMEOUT_MS",
+  defaultTokenBudget: "PI_WORKFLOW_DEFAULT_TOKEN_BUDGET",
+  defaultConcurrency: "PI_WORKFLOW_DEFAULT_CONCURRENCY",
+  defaultAgentRetries: "PI_WORKFLOW_DEFAULT_AGENT_RETRIES",
+  progressPanelMode: "PI_WORKFLOW_PROGRESS_PANEL_MODE",
+  progressPanelMaxAgents: "PI_WORKFLOW_PROGRESS_PANEL_MAX_AGENTS",
+  persistAgentSessions: "PI_WORKFLOW_PERSIST_AGENT_SESSIONS",
+  deliveredResultMaxChars: "PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS",
+  excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
+} as const satisfies Record<keyof WorkflowSettings, string>;
+
+type EnvSource = Record<string, string | undefined>;
+
+/** Parse a strict boolean env value ("true"/"false", case-insensitive). */
+function envBoolean(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  return undefined;
+}
+
+/** Parse an integer env value inside [min, max]; out-of-range/unparseable → undefined. */
+function envInteger(value: string | undefined, min: number, max: number): number | undefined {
+  if (value === undefined) return undefined;
+  const number = Number(value.trim());
+  if (!Number.isFinite(number) || number < min) return undefined;
+  return Math.min(max, Math.floor(number));
+}
+
+/**
+ * Parse an env value that may explicitly mean "null" (empty string or the
+ * literal "null") — mirrors settings.json's `null` semantics, e.g. a project
+ * override that cancels a global token budget.
+ */
+function envNullableInteger(value: string | undefined, min: number, max: number): number | null | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "null") return null;
+  return envInteger(trimmed, min, max);
+}
+
+/**
+ * Parse the PI_WORKFLOW_* env surface into a WorkflowSettings-shaped object.
+ * Only present, parseable values are emitted: garbage, out-of-range numbers,
+ * and unknown values are silently ignored (the same drop-on-violation
+ * leniency the settings.json normalization applies), so a misconfigured CI
+ * env can never crash the extension — it just falls back to the file value.
+ * `excludeSubagentTools` is a comma-separated list.
+ */
+export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowSettings {
+  const settings: WorkflowSettings = {};
+  const keywordTriggerEnabled = envBoolean(env[WORKFLOW_ENV_VARS.keywordTriggerEnabled]);
+  if (keywordTriggerEnabled !== undefined) settings.keywordTriggerEnabled = keywordTriggerEnabled;
+  const keywordTriggerWord = normalizeKeywordTriggerWord(env[WORKFLOW_ENV_VARS.keywordTriggerWord]);
+  if (keywordTriggerWord !== undefined) settings.keywordTriggerWord = keywordTriggerWord;
+  const defaultAgentTimeoutMs = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.defaultAgentTimeoutMs],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (defaultAgentTimeoutMs !== undefined) settings.defaultAgentTimeoutMs = defaultAgentTimeoutMs;
+  const defaultTokenBudget = envNullableInteger(env[WORKFLOW_ENV_VARS.defaultTokenBudget], 1, Number.MAX_SAFE_INTEGER);
+  if (defaultTokenBudget !== undefined) settings.defaultTokenBudget = defaultTokenBudget;
+  const defaultConcurrency = envInteger(env[WORKFLOW_ENV_VARS.defaultConcurrency], 1, MAX_CONCURRENCY);
+  if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
+  const defaultAgentRetries = envInteger(env[WORKFLOW_ENV_VARS.defaultAgentRetries], 0, MAX_AGENT_RETRIES);
+  if (defaultAgentRetries !== undefined) settings.defaultAgentRetries = defaultAgentRetries;
+  const progressPanelMode = env[WORKFLOW_ENV_VARS.progressPanelMode]?.trim();
+  if (progressPanelMode === "compact" || progressPanelMode === "detailed") {
+    settings.progressPanelMode = progressPanelMode;
+  }
+  const progressPanelMaxAgents = envInteger(env[WORKFLOW_ENV_VARS.progressPanelMaxAgents], 1, 1000);
+  if (progressPanelMaxAgents !== undefined) settings.progressPanelMaxAgents = progressPanelMaxAgents;
+  const persistAgentSessions = envBoolean(env[WORKFLOW_ENV_VARS.persistAgentSessions]);
+  if (persistAgentSessions !== undefined) settings.persistAgentSessions = persistAgentSessions;
+  const deliveredResultMaxChars = envInteger(env[WORKFLOW_ENV_VARS.deliveredResultMaxChars], 1, 1_000_000);
+  if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
+  const excludeSubagentTools = env[WORKFLOW_ENV_VARS.excludeSubagentTools]
+    ?.split(",")
+    .map((name) => name.trim())
+    .filter((name): name is string => name.length > 0);
+  if (excludeSubagentTools?.length) settings.excludeSubagentTools = excludeSubagentTools;
+  return settings;
+}
+
+/**
+ * Merge env overrides on top of file-loaded settings. Env wins per key;
+ * keys without an env var are untouched. `env` is injectable for tests.
+ */
+export function applyEnvSettingsOverride(settings: WorkflowSettings, env: EnvSource = process.env): WorkflowSettings {
+  return { ...settings, ...workflowSettingsFromEnv(env) };
+}
 
 /** Default keyword that arms workflows mode from interactive input. */
 export const DEFAULT_KEYWORD_TRIGGER_WORD = "workflow";
