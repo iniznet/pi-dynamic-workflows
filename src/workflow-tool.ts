@@ -1,6 +1,5 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import type { TSchema } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import {
@@ -15,6 +14,8 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
+import type { PersistedRunState } from "./run-persistence.js";
 import { coerceArgs } from "./saved-commands.js";
 import { parseWorkflowScript, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
@@ -25,7 +26,38 @@ import { loadWorkflowSettings } from "./workflow-settings.js";
 export const WORKFLOW_GATE_GUIDELINE =
   "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 
-const workflowToolSchema = Type.Object({
+// ─── Lazy peer loading (H4) ─────────────────────────────────────────────────────
+// typebox and pi-tui load via top-level await at module evaluation instead of a
+// module-scope import, so this module stays importable when a peer is missing or
+// incompatible. The diagnostic — a MissingPeerError naming the peer and its
+// required range — is raised at the point of use: createWorkflowTool() for
+// typebox (the schema cannot exist without it) and the render functions for
+// pi-tui (only ever invoked by a TUI host). Both peers are hard dependencies of
+// pi-coding-agent in any working pi, so the holders are populated in practice;
+// the guards are defense in depth for headless/broken hosts.
+let typeboxNamespace: typeof import("typebox") | undefined;
+try {
+  typeboxNamespace = await lazyPeerImport<typeof import("typebox")>("typebox");
+} catch {
+  // Deferred to createWorkflowTool().
+}
+let tuiNamespace: typeof import("@earendil-works/pi-tui") | undefined;
+try {
+  tuiNamespace = await lazyPeerImport<typeof import("@earendil-works/pi-tui")>("@earendil-works/pi-tui");
+} catch {
+  // Deferred to the render functions.
+}
+
+function requireTuiText(): typeof import("@earendil-works/pi-tui")["Text"] {
+  if (!tuiNamespace) throw new MissingPeerError("@earendil-works/pi-tui", PEER_DEPENDENCIES["@earendil-works/pi-tui"]);
+  return tuiNamespace.Text;
+}
+
+// Optional-chained so the schema is simply `undefined` (with a deferred
+// MissingPeerError at createWorkflowTool) when typebox is missing — never a
+// module-evaluation crash that takes the whole extension down with it.
+const Type = typeboxNamespace?.Type;
+const workflowToolSchema = Type?.Object({
   script: Type.Optional(
     Type.String({
       description: [
@@ -45,9 +77,9 @@ const workflowToolSchema = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        "Run a saved or built-in workflow by name instead of `script`; its args go in `args`. " +
-        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see the workflow-patterns skill for each one's args. ` +
-        "A same-named saved workflow wins. Not combinable with resumeFromRunId.",
+        "Run a saved or built-in workflow by name; args go in `args`. " +
+        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see workflow-patterns skill for their args. ` +
+        "A same-named saved workflow wins. Not with resumeFromRunId.",
     }),
   ),
   args: Type.Optional(
@@ -159,7 +191,10 @@ export interface WorkflowToolOptions {
   defaultAgentRetries?: number;
 }
 
-export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<typeof workflowToolSchema, any> {
+export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<TSchema, unknown> {
+  // typebox is required to even describe the tool; fail with a named diagnostic
+  // (peer + required range) rather than a schema-less tool.
+  if (!workflowToolSchema) throw new MissingPeerError("typebox", PEER_DEPENDENCIES.typebox);
   const storage = options.storage ?? createWorkflowStorage(options.cwd ?? process.cwd());
   const cwd = options.cwd ?? process.cwd();
   const defaults = resolveWorkflowToolDefaults(options, cwd);
@@ -331,7 +366,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           display.complete(snapshot);
           throw new Error("Workflow was aborted");
         }
-        throw error;
+        // A run that settled failed/paused is resumable via resumeFromRunId with
+        // an edited script; completed/aborted runs are not. Offer the resume path
+        // only when the run landed in a resumable state (M18) — never from a
+        // completed run's own text.
+        throw withResumeHint(error, resumableRunId(manager, parsed.meta.name));
       }
 
       if (result.agentCount === 0) {
@@ -345,20 +384,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       snapshot = recomputeWorkflowSnapshot(snapshot);
       display.complete(snapshot);
 
-      // Format token usage (include cost when the provider reports it)
-      const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
-      const tokenInfo = tokenSegment
-        ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
-        : "";
-
-      const formattedResult =
-        result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
-
       return {
         content: [
           {
             type: "text",
-            text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
+            text: formatCompletedResultText(result),
           },
         ],
         details: {
@@ -374,9 +404,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       };
     },
     renderCall(_args, theme) {
+      const Text = requireTuiText();
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
+      const Text = requireTuiText();
       const snapshot = result.details as WorkflowSnapshot | undefined;
       if (snapshot?.name) {
         return new Text(renderWorkflowText(snapshot, !isPartial), 0, 0);
@@ -395,6 +427,25 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       return new Text(clean || theme.fg("muted", "workflow"), 0, 0);
     },
   });
+}
+
+/**
+ * The tool result text for a COMPLETED run. Deliberately carries no resume
+ * hint: a completed run cannot be resumed (its journal is dropped on
+ * completion), so advertising resumeFromRunId here would mislead the model
+ * (M18). Paused/failed runs get the hint from their own paths.
+ */
+export function formatCompletedResultText(result: WorkflowRunResult): string {
+  // Format token usage (include cost when the provider reports it)
+  const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
+  const tokenInfo = tokenSegment
+    ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
+    : "";
+
+  const formattedResult =
+    result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
+
+  return `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}`;
 }
 
 /**
@@ -450,15 +501,19 @@ export function backgroundStartedText(name: string, runId: string): string {
     "resume the conversation by itself), or keep chatting / working on other things",
     "in the meantime; either way the result will come back to this conversation.",
     `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
-    reviseHint(runId),
+    // Deliberately no resume hint here: the run is still "running" at this point,
+    // and resume() only accepts paused/failed runs (M18). The failed/paused
+    // paths carry the hint instead.
   ].join("\n");
 }
 
 /**
- * One-line hint telling the model it can iterate on a finished/running run by
+ * One-line hint telling the model it can iterate on a PAUSED or FAILED run by
  * resuming it with an edited script instead of re-running the whole workflow.
  * Unchanged agent() calls replay from the journal (cache); only edited/new ones
- * re-run. Omitted when there is no runId to reference.
+ * re-run. Deliberately never emitted for completed or running runs: resume()
+ * refuses those (a completed run's journal is dropped on completion). Omitted
+ * when there is no runId to reference.
  */
 export function reviseHint(runId: string | undefined): string {
   if (!runId) return "";
@@ -504,6 +559,45 @@ export function resumeFailureText(manager: WorkflowManager, runId: string): stri
     return `Cannot resume workflow run "${runId}": it has no persisted script to resume. Start a new run instead (omit resumeFromRunId).`;
   }
   return `Cannot resume workflow run "${runId}": it is not currently resumable (it may be busy under another process). Try again shortly, or start a new run.`;
+}
+
+/**
+ * Append the resume hint to an error thrown by a run that settled into a
+ * resumable state. Non-WorkflowError failures (e.g. lease acquisition) are
+ * rethrown untouched when no resumable run could be identified.
+ */
+function withResumeHint(error: unknown, runId: string | undefined): unknown {
+  if (!runId) return error;
+  const hint = reviseHint(runId);
+  if (error instanceof WorkflowError) {
+    return new WorkflowError(`${error.message}\n\n${hint}`, error.code, {
+      recoverable: error.recoverable,
+      agentLabel: error.agentLabel,
+      details: error.details,
+      resetHint: error.resetHint,
+    });
+  }
+  if (error instanceof Error) return new Error(`${error.message}\n\n${hint}`, { cause: error });
+  return error;
+}
+
+/** Minimal manager surface the resumable-run lookup needs (testable via stub). */
+interface ResumableRunLookup {
+  listRuns(): Array<Pick<PersistedRunState, "runId" | "status" | "workflowName" | "startedAt">>;
+}
+
+/**
+ * The most recently settled failed/paused run for `workflowName`, if any.
+ * Only paused/failed runs are resumable — completed/aborted runs drop their
+ * journal on settlement — so the lookup is the gate that keeps the resume hint
+ * off every other run text (M18).
+ */
+function resumableRunId(manager: ResumableRunLookup, workflowName: string): string | undefined {
+  return manager
+    .listRuns()
+    .filter((run) => (run.status === "failed" || run.status === "paused") && run.workflowName === workflowName)
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt))
+    .at(-1)?.runId;
 }
 
 function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {

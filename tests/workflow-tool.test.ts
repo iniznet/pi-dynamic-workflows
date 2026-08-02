@@ -423,9 +423,11 @@ test(
     assert.equal(details.background, true);
     assert.equal(details.resumedFrom, undefined, "a fresh run is not a resume");
     assert.equal(manager.listRuns().length, 1, "exactly one new run created");
-    // The returned text advertises the revise/iterate path.
+    // M18: a just-started background run is not resumable, so the background
+    // text must NOT advertise the resumeFromRunId iterate path — only paused/
+    // failed runs are resumable (their hint comes from the error/result paths).
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
-    assert.match(text, /resumeFromRunId/, "background text tells the model how to iterate");
+    assert.doesNotMatch(text, /resumeFromRunId/, "background text must not advertise resume (M18)");
   }),
 );
 
@@ -494,10 +496,12 @@ const validArgsByBuiltinName: Record<string, unknown> = {
   "code-review": { diff: "some diff" },
   "multi-perspective": { topic: "a topic" },
   "codebase-audit": { scope: "src/", checks: ["security"] },
+  "plan-then-execute": { objective: "do the thing" },
+  "spec-generation": { topic: "a topic" },
 };
 
 test(
-  "workflow tool: `name` resolves each of the 5 built-in patterns and starts a run",
+  "workflow tool: `name` resolves each of the 7 built-in patterns and starts a run",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     manager.on("error", () => {});

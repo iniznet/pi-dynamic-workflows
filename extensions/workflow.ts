@@ -1,4 +1,9 @@
-import { createCodingTools, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  createCodingTools,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
@@ -117,13 +122,33 @@ export default function extension(pi: ExtensionAPI) {
   };
   // Refresh the delivery holder immediately after claiming the manager. On a
   // reload handoff its listener survives, but Pi invalidates the old ExtensionAPI
-  // before loading this generation.
-  installResultDelivery(pi, manager, { loadSettings });
+  // before loading this generation. The TUI surface may be absent in a headless
+  // host (pi-tui missing) — the barrel facade yields undefined there, so skip
+  // rather than crash.
+  if (installResultDelivery) installResultDelivery(pi, manager, { loadSettings });
 
-  const workflowTool = createWorkflowTool({ cwd, manager, storage });
-  const workflowControlTool = createWorkflowControlTool({ manager });
-  pi.registerTool(workflowTool);
-  pi.registerTool(workflowControlTool);
+  // Register the two tools defensively: a missing/incompatible peer (typebox for
+  // the schemas) must disable JUST those tools with a clear diagnostic, not take
+  // the whole extension down — manager, storage, scheduler, and the slash-command
+  // surface keep working headless (H4).
+  const disabledPieces: string[] = [];
+  const registeredToolNames: string[] = [];
+  // Both tool factories return different TDetails instantiations (unknown vs
+  // Record<string, unknown>); the registration helper is the one boundary where
+  // the two must share a type, so it widens to the tool-definition surface type.
+  const registerToolSafely = (create: () => ToolDefinition<any, any, any> | undefined, label: string) => {
+    try {
+      const tool = create();
+      if (tool) {
+        pi.registerTool(tool);
+        registeredToolNames.push(tool.name);
+      }
+    } catch (error) {
+      disabledPieces.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  registerToolSafely(() => createWorkflowTool({ cwd, manager, storage }), "workflow tool");
+  registerToolSafely(() => createWorkflowControlTool({ manager }), "workflow_control tool");
   // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
   // definitions are built at start time so the extension load stays side-effect
   // free and the default (no host tools in subagents) is untouched until a user
@@ -151,8 +176,8 @@ export default function extension(pi: ExtensionAPI) {
   // messages, like CC's ultracode. Shared with the editor's input hook below and
   // with the explicit /workflows run <prompt> manual trigger. It is part of the
   // reload handoff so /reload does not silently turn the selected effort off.
-  registerWorkflowCommands(pi, manager, { storage, cwd, effort });
-  registerWorkflowModelsCommand(pi);
+  registerWorkflowCommands?.(pi, manager, { storage, cwd, effort });
+  registerWorkflowModelsCommand?.(pi);
   registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
@@ -178,7 +203,7 @@ export default function extension(pi: ExtensionAPI) {
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
     const active = pi.getActiveTools();
-    const workflowTools = [workflowTool.name, workflowControlTool.name];
+    const workflowTools = registeredToolNames;
     const missing = workflowTools.filter((name) => !active.includes(name));
     if (missing.length) pi.setActiveTools([...active, ...missing]);
     // Scope the /workflows history to this session: runs persist on disk across
@@ -192,7 +217,18 @@ export default function extension(pi: ExtensionAPI) {
     // Live "workflows running" panel below the input (focus + enter to open).
     // Pass a live settings loader so /workflows-progress (compact|detailed) takes
     // effect without a restart.
-    installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings });
+    if (installTaskPanel && ctx.ui) {
+      installTaskPanel(pi, manager, ctx.ui, { storage, cwd, loadSettings });
+    } else {
+      // Headless host: no task panel, no crash. notify() may itself be absent.
+      ctx.ui?.notify?.(
+        "Workflow task panel unavailable: @earendil-works/pi-tui is missing or incompatible (required: >=0.80.6).",
+        "warning",
+      );
+    }
+    if (disabledPieces.length) {
+      ctx.ui?.notify?.(`Workflow extension partially loaded: ${disabledPieces.join("; ")}`, "warning");
+    }
     if (!armingInstalled) {
       installWorkflowKeywordArming(pi, effort, {
         settingsStore: {

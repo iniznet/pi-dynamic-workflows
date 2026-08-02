@@ -10,7 +10,8 @@ export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
 export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
-export { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
+export type { CodeReviewAngle } from "./code-review.js";
+export { CODE_REVIEW_ANGLES, diffShard, generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
 export * from "./config.js";
 export type { DeepResearchConfig } from "./deep-research.js";
 export { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
@@ -106,6 +107,30 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
+export {
+  isMissingPeerError,
+  lazyPeerImport,
+  MissingPeerError,
+  PEER_DEPENDENCIES,
+  probePeerAvailability,
+} from "./peer-deps.js";
+// The TUI-facing value exports below come from a headless-safe facade: their
+// modules import @earendil-works/pi-tui at module scope, so loading them through
+// the facade (guarded top-level await) keeps this entrypoint importable when
+// pi-tui is absent/incompatible. The values are `undefined` in that case; the
+// extension null-guards and notifies instead of failing the whole load.
+export {
+  deliverText,
+  installResultDelivery,
+  installTaskPanel,
+  keyToAction,
+  NavigatorModel,
+  NavigatorState,
+  openWorkflowNavigator,
+  registerWorkflowCommands,
+  registerWorkflowModelsCommand,
+  renderNavigator,
+} from "./peer-facades.js";
 export type { BlueprintStep, ExecutionBlueprint } from "./phases/prewalk.js";
 export { generateBlueprint, loadBlueprint, saveBlueprint, validateBlueprint } from "./phases/prewalk.js";
 export type { PhaseState } from "./phases/state-machine.js";
@@ -147,6 +172,14 @@ export {
   saveDecisionMap,
   unblockTicket,
 } from "./phases/wayfinder.js";
+export type { PlanStep, PlanThenExecuteConfig, StepsOrderingOutcome } from "./plan-then-execute.js";
+export {
+  generatePlanThenExecuteWorkflow,
+  orderStepsByDependencies,
+  PLAN_THEN_EXECUTE_MAX_PLAN_ATTEMPTS,
+  PLAN_THEN_EXECUTE_MAX_REWORK_ATTEMPTS,
+  PLAN_THEN_EXECUTE_NUMERIC_ARGS,
+} from "./plan-then-execute.js";
 export type {
   PersistedRunState,
   RunCheckpoint,
@@ -170,9 +203,16 @@ export {
   registerSavedWorkflow,
 } from "./saved-commands.js";
 export { SharedStore } from "./shared-store.js";
+export type { SpecArtifact, SpecGenerationConfig, SpecGenerationFormat, SpecRequirement } from "./spec-generation.js";
+export {
+  generateSpecGenerationWorkflow,
+  normalizeSpecArtifact,
+  SPEC_GENERATION_DEFAULT_FORMAT,
+  SPEC_GENERATION_FORMATS,
+} from "./spec-generation.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
-export { deliverText, installResultDelivery, installTaskPanel, type TaskPanelOptions } from "./task-panel.js";
+export type { TaskPanelOptions } from "./task-panel.js";
 export type {
   AutoResumeDelayParams,
   SchedulableWorkflowManager,
@@ -219,12 +259,12 @@ export {
   WORKFLOW_CAPABILITY_DEFINITION,
   WorkflowCapabilityContractError,
 } from "./workflow-capability-contract.js";
-export { registerWorkflowCommands } from "./workflow-commands.js";
 export type {
   WorkflowControlInput,
   WorkflowControlRunDetails,
   WorkflowControlToolOptions,
 } from "./workflow-control-tool.js";
+
 export { createWorkflowControlTool } from "./workflow-control-tool.js";
 export {
   type ArmReason,
@@ -268,16 +308,7 @@ export {
   releaseFileLock,
 } from "./workflow-status.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
-export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
-export {
-  keyToAction,
-  type NavAction,
-  NavigatorModel,
-  NavigatorState,
-  openWorkflowNavigator,
-  renderNavigator,
-  type ViewKind,
-} from "./workflow-ui.js";
-export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
+export { backgroundStartedText, createWorkflowTool, formatCompletedResultText } from "./workflow-tool.js";
+export type { NavAction, ViewKind } from "./workflow-ui.js";
 export type { Worktree } from "./worktree.js";
 export { createWorktree, removeWorktree } from "./worktree.js";

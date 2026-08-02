@@ -1,18 +1,34 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { type Static, Type } from "typebox";
+import type { TSchema } from "typebox";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
-// A tool's top-level parameter schema must be a JSON Schema object (`type:
-// "object"`). A discriminated Type.Union of two objects serializes to a
-// top-level `anyOf` with no `type`, which strict providers (e.g. DeepSeek)
-// reject with "schema must be type object, got type: null". So the schema is a
-// single object: `action` is the full set of verbs and `runId` is optional at
-// the schema level. The per-action requirement (runId is mandatory for every
-// action except `list`, and `list` takes no runId) is enforced at runtime in
-// normalizeInput() and guarded again in execute().
-const workflowControlSchema = Type.Object(
+// Lazy peer loading (H4): typebox loads via top-level await at module evaluation
+// instead of a module-scope import, so this module stays importable when the
+// peer is missing or incompatible; the MissingPeerError diagnostic is raised at
+// createWorkflowControlTool(). typebox is a hard dependency of pi-coding-agent
+// in any working pi, so the holder is populated in practice — defense in depth.
+let typeboxNamespace: typeof import("typebox") | undefined;
+try {
+  typeboxNamespace = await lazyPeerImport<typeof import("typebox")>("typebox");
+} catch {
+  // Deferred to createWorkflowControlTool().
+}
+
+// Optional-chained so the schema is `undefined` (with a deferred MissingPeerError)
+// when typebox is missing — never a module-evaluation crash.
+const Type = typeboxNamespace?.Type;
+const workflowControlSchema = Type?.Object(
+  // A tool's top-level parameter schema must be a JSON Schema object (`type:
+  // "object"`). A discriminated Type.Union of two objects serializes to a
+  // top-level `anyOf` with no `type`, which strict providers (e.g. DeepSeek)
+  // reject with "schema must be type object, got type: null". So the schema is a
+  // single object: `action` is the full set of verbs and `runId` is optional at
+  // the schema level. The per-action requirement (runId is mandatory for every
+  // action except `list`, and `list` takes no runId) is enforced at runtime in
+  // normalizeInput() and guarded again in execute().
   {
     action: Type.Union(
       [
@@ -34,7 +50,10 @@ const workflowControlSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export type WorkflowControlInput = Static<typeof workflowControlSchema>;
+export type WorkflowControlInput = {
+  action: "list" | "status" | "pause" | "resume" | "stop";
+  runId?: string;
+};
 
 export interface WorkflowControlToolOptions {
   manager: WorkflowManager;
@@ -64,7 +83,10 @@ type ControlResult = {
 
 export function createWorkflowControlTool(
   options: WorkflowControlToolOptions,
-): ToolDefinition<typeof workflowControlSchema, Record<string, unknown>> {
+): ToolDefinition<TSchema, Record<string, unknown>> {
+  // typebox is required to even describe the tool; fail with a named diagnostic
+  // (peer + required range) rather than a schema-less tool.
+  if (!workflowControlSchema) throw new MissingPeerError("typebox", PEER_DEPENDENCIES.typebox);
   const manager = options.manager;
   return defineTool({
     name: "workflow_control",

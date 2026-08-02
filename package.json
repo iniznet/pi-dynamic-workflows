@@ -21,6 +21,9 @@
     "src/",
     "docs/",
     "assets/readme/",
+    "tests/",
+    "tsconfig.json",
+    "tsconfig.scripts.json",
     "README.md",
     "LICENSE"
   ],

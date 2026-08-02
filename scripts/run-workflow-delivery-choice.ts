@@ -109,7 +109,10 @@ async function runScenario(
     parameters: workflow.parameters,
     async execute(toolCallId, params) {
       void toolCallId;
-      captured.value = params;
+      // createWorkflowTool's schema is built lazily (H4) so its execute params
+      // surface as the wide TSchema; the invocation shape is exactly the tool
+      // input contract, so a type-only cast keeps the evidence capture typed.
+      captured.value = params as WorkflowToolInput;
       return {
         content: [{ type: "text" as const, text: "Workflow invocation captured for delivery-choice evidence." }],
         details: { captured: true },
