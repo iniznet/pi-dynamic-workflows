@@ -128,25 +128,60 @@ function findExactModelReferenceMatch(modelReference: string, availableModels: M
 }
 
 function tryMatchModel(modelPattern: string, availableModels: Model<Api>[]): Model<Api> | undefined {
+  const normalizedPattern = modelPattern.trim().toLowerCase();
+  // An empty/whitespace-only pattern matches EVERY model via String.includes("") —
+  // reject it up front (M10) instead of silently resolving an arbitrary model.
+  if (!normalizedPattern) return undefined;
+
   const exactMatch = findExactModelReferenceMatch(modelPattern, availableModels);
   if (exactMatch) return exactMatch;
 
-  const normalizedPattern = modelPattern.toLowerCase();
   const matches = availableModels.filter(
     (model) =>
       model.id.toLowerCase().includes(normalizedPattern) || model.name?.toLowerCase().includes(normalizedPattern),
   );
   if (matches.length === 0) return undefined;
 
-  const aliases = matches.filter((model) => isAlias(model.id));
-  if (aliases.length > 0) {
-    aliases.sort((a, b) => b.id.localeCompare(a.id));
-    return aliases[0];
-  }
+  // Version-aware ordering (L5): rank by how closely the id matches the pattern
+  // — exact id first, then prefix matches, then plain substrings — and within a
+  // band prefer stable ids over dated snapshots, the shortest (base) id over
+  // suffixed variants, and the newest date for snapshots. The previous
+  // lexicographic sort picked "gpt-4o-mini" over "gpt-4o" for pattern "gpt-4o"
+  // — the exact opposite of what a user means.
+  const proximity = (model: Model<Api>): number => {
+    const id = model.id.toLowerCase();
+    if (id === normalizedPattern) return 0;
+    if (id.startsWith(normalizedPattern)) return 1;
+    return 2;
+  };
+  matches.sort((a, b) => {
+    const proximityA = proximity(a);
+    const proximityB = proximity(b);
+    if (proximityA !== proximityB) return proximityA - proximityB;
+    const aAlias = isAlias(a.id);
+    const bAlias = isAlias(b.id);
+    if (aAlias !== bAlias) return aAlias ? -1 : 1;
+    if (aAlias) {
+      if (a.id.length !== b.id.length) return a.id.length - b.id.length;
+      return a.id.localeCompare(b.id);
+    }
+    // Dated snapshots carry a fixed-width -YYYYMMDD suffix, so plain
+    // lexicographic order is newest-first.
+    return b.id.localeCompare(a.id);
+  });
+  return matches[0];
+}
 
-  const datedVersions = matches.filter((model) => !isAlias(model.id));
-  datedVersions.sort((a, b) => b.id.localeCompare(a.id));
-  return datedVersions[0];
+/**
+ * True when `pattern` matched `model` only as a substring — neither an exact
+ * id/name nor an id prefix. Used to warn that a fuzzy resolution may not be
+ * what the caller meant (L5).
+ */
+function isSubstringOnlyMatch(pattern: string, model: Model<Api>): boolean {
+  const normalized = pattern.trim().toLowerCase();
+  if (!normalized) return false;
+  const id = model.id.toLowerCase();
+  return id !== normalized && !id.startsWith(normalized) && !(model.name?.toLowerCase() === normalized);
 }
 
 function parseModelPattern(
@@ -269,11 +304,20 @@ export function resolveModelSpecWithThinking(
         return { requestedSpec, model: preferred, resolvedSpec: canonicalModelSpec(preferred) };
       }
     }
+    // Warn when the pattern only matched as a substring — the resolution may
+    // not be what the caller meant (L5). Strip a resolved thinking suffix
+    // first: "gpt-5.6-sol:max" must be judged against "gpt-5.6-sol", which is
+    // an exact id match, not a fuzzy one.
+    const patternWithoutThinking =
+      thinkingLevel && pattern.endsWith(`:${thinkingLevel}`) ? pattern.slice(0, -(thinkingLevel.length + 1)) : pattern;
+    const substringWarning = isSubstringOnlyMatch(patternWithoutThinking, model)
+      ? `Pattern "${patternWithoutThinking}" only partially matches model "${canonicalModelSpec(model)}"; resolved by substring match.`
+      : undefined;
     return {
       requestedSpec,
       model,
       thinkingLevel,
-      warning,
+      warning: warning ?? substringWarning,
       resolvedSpec: formatModelSpecWithThinking(canonicalModelSpec(model), thinkingLevel),
     };
   }
@@ -308,6 +352,16 @@ export function resolveModelSpecWithThinking(
         fallbackPattern = pattern.slice(0, lastColon);
         fallbackThinking = suffix;
       }
+    }
+
+    // An empty/whitespace-only pattern (e.g. "openai/") must not fabricate a
+    // custom model with an empty id — report it as not found instead (M10).
+    if (!fallbackPattern.trim()) {
+      return {
+        requestedSpec,
+        warning,
+        error: `Model "${provider}/${pattern}" not found. Use /workflows-models to choose an available model.`,
+      };
     }
 
     const fallbackModel = buildFallbackModel(provider, fallbackPattern, availableModels);

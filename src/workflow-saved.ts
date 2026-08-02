@@ -2,7 +2,7 @@
  * Save and load reusable workflow commands.
  */
 
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
@@ -12,6 +12,7 @@ import {
   unlinkIfExistsSafe,
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import { parseWorkflowScript } from "./workflow.js";
 import { workflowProjectPaths, workflowUserSavedDir } from "./workflow-paths.js";
 
 /**
@@ -77,7 +78,12 @@ export function assertSafeSavedWorkflowName(name: string): void {
   }
 }
 
-export function createWorkflowStorage(cwd: string, fsOverride?: Partial<PersistenceFsLayer>): WorkflowStorage {
+export function createWorkflowStorage(
+  cwd: string,
+  fsOverride?: Partial<PersistenceFsLayer>,
+  /** Diagnostic sink for load-time reconciliation (e.g. embedded-name mismatches). */
+  onDiagnostic?: (message: string) => void,
+): WorkflowStorage {
   const fs = resolvePersistenceFs(fsOverride);
   const paths = workflowProjectPaths(cwd);
   const projectDir = paths.savedDir;
@@ -102,11 +108,24 @@ export function createWorkflowStorage(cwd: string, fsOverride?: Partial<Persiste
   // or a truncated file as a run's resumable state is.
   const loadFromFile = (path: string, location: "project" | "user"): SavedWorkflow | null => {
     const data = readJsonWithBackupRecovery<Record<string, unknown>>(fs, path);
-    if (!data || typeof data !== "object" || !isSafeSavedWorkflowName((data as { name?: string }).name ?? "")) {
-      return null;
+    if (!data || typeof data !== "object") return null;
+    // The workflow's identity is its SANITIZED FILENAME, never the embedded
+    // `name` field: files are addressed by basename (load/delete/list), so
+    // trusting contents would let a mismatch (rename, copy, hand-edit) register
+    // a command under a different name than the file — or an unsafe one (L7).
+    const fileName = basename(path).replace(/\.json$/, "");
+    if (!isSafeSavedWorkflowName(fileName)) return null;
+    const embeddedName =
+      typeof (data as { name?: unknown }).name === "string" ? (data as { name: string }).name : undefined;
+    if (embeddedName !== undefined && embeddedName !== fileName) {
+      onDiagnostic?.(
+        `[workflow-saved] "${fileName}" at ${path} has an embedded name "${embeddedName}" that differs from its ` +
+          `filename; using the filename. Rename the file to fix the mismatch.`,
+      );
     }
     return {
-      ...(data as Omit<SavedWorkflow, "location" | "path">),
+      ...(data as Omit<SavedWorkflow, "location" | "path" | "name">),
+      name: fileName,
       location,
       path,
     };
@@ -115,6 +134,16 @@ export function createWorkflowStorage(cwd: string, fsOverride?: Partial<Persiste
   return {
     save(workflow, location = "project") {
       assertSafeSavedWorkflowName(workflow.name);
+      // Validate the script BEFORE persisting: a malformed script must fail at
+      // save time with a clear message, not at every future /name invocation
+      // (L21).
+      try {
+        parseWorkflowScript(workflow.script);
+      } catch (error) {
+        throw new Error(
+          `Cannot save workflow "${workflow.name}": ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       const dir = location === "project" ? projectDir : userDir;
       ensureDir(dir);
 

@@ -61,6 +61,11 @@ export interface WorkflowSettings {
    * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
    * other recursive-orchestration tools you have installed (e.g. a pi-subagents
    * tool) so a subagent can't fan out through them.
+   *
+   * Clearing: pass `[]` to saveWorkflowSettings to clear a previously-set list.
+   * In settings.json itself, `null` is accepted as a tombstone meaning "cleared"
+   * (normalized to an empty list on load) — both let a project override wipe a
+   * global exclusion list (M9).
    */
   excludeSubagentTools?: string[];
 }
@@ -91,7 +96,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   progressPanelMaxAgents: ["number"],
   persistAgentSessions: ["boolean"],
   deliveredResultMaxChars: ["number"],
-  excludeSubagentTools: ["array"],
+  // null is a tombstone for "cleared": loading it normalizes to an empty list
+  // (see normalizeSettings) so a project override can wipe a global exclusion
+  // list instead of being schema-rejected.
+  excludeSubagentTools: ["array", "null"],
 };
 
 /**
@@ -197,7 +205,7 @@ export function saveWorkflowSettings(
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const existing = readObject(path);
-  writeFileSync(path, `${JSON.stringify({ ...existing, ...normalizeSettings(settings) }, null, 2)}\n`, "utf-8");
+  writeFileSync(path, `${JSON.stringify({ ...existing, ...normalizeSettingsForSave(settings) }, null, 2)}\n`, "utf-8");
 }
 
 /** Save a global preference and update an existing project override if one is present. */
@@ -265,10 +273,35 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
-  if (Array.isArray(raw.excludeSubagentTools)) {
-    const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
-    if (names.length) settings.excludeSubagentTools = names;
+  if (raw.excludeSubagentTools === null) {
+    // Tombstone: a project override writes null to clear a global exclusion
+    // list. Emitted as an explicit empty list so the spread-merge in
+    // loadWorkflowSettings actually overrides the global value (M9).
+    settings.excludeSubagentTools = [];
+  } else if (Array.isArray(raw.excludeSubagentTools)) {
+    if (raw.excludeSubagentTools.length === 0) {
+      // Explicit empty array: same "cleared" semantics as the null tombstone.
+      settings.excludeSubagentTools = [];
+    } else {
+      const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
+      if (names.length) settings.excludeSubagentTools = names;
+    }
   }
+  return settings;
+}
+
+/**
+ * Save-path normalization: identical to {@link normalizeSettings} except an
+ * explicit `defaultTokenBudget: 0` is kept as the null tombstone ("no budget")
+ * instead of being dropped. The read path drops 0 (there is no budget), but the
+ * save path must EMIT a value — otherwise the spread-merge with the previous
+ * file contents would leave the old budget in place and "0 clears" would be a
+ * no-op, including from a project override that wants to wipe a global budget.
+ */
+function normalizeSettingsForSave(value: unknown): WorkflowSettings {
+  const settings = normalizeSettings(value);
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  if (raw.defaultTokenBudget === 0) settings.defaultTokenBudget = null;
   return settings;
 }
 

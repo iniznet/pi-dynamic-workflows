@@ -39,6 +39,13 @@ export interface UsageLimitSchedulerOptions {
   clearTimer?: (handle: TimerHandle) => void;
   /** Max auto-resume attempts per pause-cycle before giving up. Default 5. */
   maxAttempts?: number;
+  /**
+   * Max consecutive resume() refusals (false returns — lease/state contention)
+   * before giving up on a pause-cycle. Default 3. Structural refusals don't
+   * consume a pause-attempt, but they also must not re-arm forever: this cap
+   * bounds the short-delay retry loop.
+   */
+  maxConsecutiveRefusals?: number;
   /** Delay floor — never arm sooner than this. Default 60_000 (1m). */
   minDelayMs?: number;
   /** Delay used when the provider's resetHint can't be parsed. Default 300_000 (5m). */
@@ -56,9 +63,15 @@ interface RunState {
   timer?: TimerHandle;
   /** Set once the attempt cap is hit, so the give-up diagnostic logs once. */
   gaveUp?: boolean;
+  /**
+   * Consecutive resume() refusals for this pause-cycle (transient lease/state
+   * contention). Reset by a successful arm, and drives the refusal backoff.
+   */
+  refusals?: number;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 5;
+const DEFAULT_MAX_CONSECUTIVE_REFUSALS = 3;
 const DEFAULT_MIN_DELAY_MS = 60_000;
 const DEFAULT_FALLBACK_DELAY_MS = 300_000;
 const DEFAULT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
@@ -86,7 +99,9 @@ export function parseResetHintMs(hint?: string, now: number = Date.now()): numbe
   // there. A negative lookahead for another letter is the correct boundary —
   // it still stops "hours" from partially matching as bare "h" mid-word while
   // allowing a unit to be followed immediately by the next (digit, unit) pair.
-  const re = /(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
+  // Long unit words come first in the alternation so "days"/"weeks" match as
+  // whole words, not as a bare "d"/"w" plus a stray letter (L11).
+  const re = /(\d+(?:\.\d+)?)\s*(weeks?|w|days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])/gi;
   let match: RegExpExecArray | null;
   let totalMs = 0;
   let found = false;
@@ -96,7 +111,9 @@ export function parseResetHintMs(hint?: string, now: number = Date.now()): numbe
     if (!Number.isFinite(value)) continue;
     const unit = match[2].toLowerCase();
     found = true;
-    if (unit.startsWith("h")) totalMs += value * 3_600_000;
+    if (unit.startsWith("w")) totalMs += value * 604_800_000;
+    else if (unit.startsWith("d")) totalMs += value * 86_400_000;
+    else if (unit.startsWith("h")) totalMs += value * 3_600_000;
     else if (unit.startsWith("m")) totalMs += value * 60_000;
     else if (unit.startsWith("s")) totalMs += value * 1_000;
   }
@@ -140,6 +157,19 @@ export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number 
 }
 
 /**
+ * Backoff delay after a refused resume(): minDelayMs * 2^(refusals-1), clamped
+ * to [minDelayMs, maxDelayMs]. Refusals are transient contention (lease held
+ * elsewhere, run mid-transition), so the first retry stays at the floor and
+ * escalates from there — capped so a pathological refusal streak can't grow
+ * the delay without bound.
+ */
+function computeRefusalBackoffDelayMs(refusals: number, minDelayMs: number, maxDelayMs: number): number {
+  const exponent = Math.min(Math.max(refusals - 1, 0), 30);
+  const backoff = minDelayMs * 2 ** exponent;
+  return Math.min(maxDelayMs, Math.max(minDelayMs, backoff));
+}
+
+/**
  * Watches a WorkflowManager for usage-limit pauses and auto-resumes eligible
  * runs once the provider's quota is likely to have refilled.
  *
@@ -147,11 +177,13 @@ export function computeAutoResumeDelayMs(params: AutoResumeDelayParams): number 
  * usage_limit pause (live via the "paused" event, or once at cold start for a
  * run that was already paused), never when a resume is merely fired. When an
  * armed timer fires, resume() is called; if it returns false (lease busy, run
- * already gone, etc.) no attempt is consumed and a short un-backed-off retry is
- * armed instead, unless the run has reached a terminal state on disk. If resume()
- * returns true, this scheduler steps back — the existing "paused" subscription
- * re-arms with backoff if the run hits the wall again, and "complete"/"error"/
- * "stopped" clean up its timer.
+ * already gone, etc.) no attempt is consumed and a short backoff retry is
+ * armed instead — but only up to {@link UsageLimitSchedulerOptions.maxConsecutiveRefusals}
+ * consecutive refusals, after which the scheduler gives up (log once) and
+ * leaves the run paused for manual resume. If resume() returns true, this
+ * scheduler steps back — the existing "paused" subscription re-arms with
+ * backoff if the run hits the wall again, and "complete"/"error"/"stopped"
+ * clean up its timer.
  */
 export class UsageLimitScheduler {
   private readonly manager: SchedulableWorkflowManager;
@@ -159,6 +191,7 @@ export class UsageLimitScheduler {
   private readonly setTimer: (fn: () => void, ms: number) => TimerHandle;
   private readonly clearTimer: (handle: TimerHandle) => void;
   private readonly maxAttempts: number;
+  private readonly maxConsecutiveRefusals: number;
   private readonly minDelayMs: number;
   private readonly fallbackDelayMs: number;
   private readonly maxDelayMs: number;
@@ -189,6 +222,7 @@ export class UsageLimitScheduler {
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
     this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+    this.maxConsecutiveRefusals = options.maxConsecutiveRefusals ?? DEFAULT_MAX_CONSECUTIVE_REFUSALS;
     this.minDelayMs = options.minDelayMs ?? DEFAULT_MIN_DELAY_MS;
     this.fallbackDelayMs = options.fallbackDelayMs ?? DEFAULT_FALLBACK_DELAY_MS;
     this.maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
@@ -386,8 +420,39 @@ export class UsageLimitScheduler {
     }
 
     const current = this.state.get(runId) ?? entry;
-    const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), this.minDelayMs);
-    this.state.set(runId, { attempts: current.attempts, timer });
+    // Consecutive-refusal cap (M8): a run whose resume() keeps refusing (lease
+    // contention, stuck transition) must give up after a bounded number of
+    // retries and leave the decision to a human, instead of polling at the
+    // floor for the process lifetime. Logs once via gaveUp; a manual /workflows
+    // resume resets the whole cycle.
+    const refusals = (current.refusals ?? 0) + 1;
+    if (refusals > this.maxConsecutiveRefusals) {
+      this.giveUpOnRefusals(runId);
+      return;
+    }
+    // Transient contention backs off exponentially so a busy lease isn't
+    // hammered at the floor delay.
+    const delay = computeRefusalBackoffDelayMs(refusals, this.minDelayMs, this.maxDelayMs);
+    const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), delay);
+    this.state.set(runId, { attempts: current.attempts, refusals, timer });
+  }
+
+  /**
+   * Give up on a run whose resume() kept refusing. Freezes the persisted
+   * attempt counter at the maxAttempts+1 sentinel so a later cold start won't
+   * re-arm (and won't grow the counter, #106) — the same freeze arm() uses for
+   * the pause-attempt cap. Logs the give-up exactly once per crossing.
+   */
+  private giveUpOnRefusals(runId: string): void {
+    const existing = this.state.get(runId);
+    if (existing?.gaveUp) return;
+    const frozen = this.maxAttempts + 1;
+    this.state.set(runId, { attempts: frozen, gaveUp: true });
+    this.persistAttempts(runId, frozen);
+    this.diagnostic(
+      `[usage-limit-scheduler] ${runId}: giving up after ${this.maxConsecutiveRefusals} consecutive refused ` +
+        `resume() attempts (lease/state contention); leaving paused for manual resume`,
+    );
   }
 
   // ---- helpers --------------------------------------------------------------

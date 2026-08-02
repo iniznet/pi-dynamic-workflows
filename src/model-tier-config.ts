@@ -125,7 +125,12 @@ export function rankByCapability(models: readonly RankableModel[]): RankableMode
   const hasPriceSignal = knownCosts.length > 0;
   const min = knownCosts[0];
   const max = knownCosts[knownCosts.length - 1];
-  const median = knownCosts[Math.floor(knownCosts.length / 2)];
+  // LOWER median, not upper: with an even number of known costs the upper
+  // middle index (Math.floor(len/2)) projects a neutral unknown-cost model to
+  // the top half of the range — letting a free/self-hosted model tie (and
+  // sometimes outrank) a paid flagship. The lower middle keeps the projection
+  // conservative (L10).
+  const median = knownCosts[Math.floor((knownCosts.length - 1) / 2)];
 
   // Project every model onto the price axis. Undefined only when there is no
   // price signal anywhere (all models unpriced) — then the sort falls through
@@ -138,11 +143,22 @@ export function rankByCapability(models: readonly RankableModel[]): RankableMode
   };
 
   return models
-    .map((m, index) => ({ m, index, cost: costKey(m), hint: hintScore(m.spec), ctx: m.contextWindow ?? 0 }))
+    .map((m, index) => ({
+      m,
+      index,
+      cost: costKey(m),
+      hint: hintScore(m.spec),
+      ctx: m.contextWindow ?? 0,
+      priced: typeof m.costOutput === "number" && m.costOutput > 0,
+    }))
     .sort((a, b) => {
       if (a.cost !== undefined && b.cost !== undefined && a.cost !== b.cost) return a.cost - b.cost;
       if (a.hint !== b.hint) return a.hint - b.hint;
       if (a.ctx !== b.ctx) return a.ctx - b.ctx;
+      // A model with a REAL price wins a tie against a projected (unknown-cost)
+      // model at the same cost: a free/self-hosted entry must never outrank a
+      // paid model it merely projects onto (L10).
+      if (a.priced !== b.priced) return a.priced ? -1 : 1;
       return a.index - b.index;
     })
     .map((entry) => entry.m);

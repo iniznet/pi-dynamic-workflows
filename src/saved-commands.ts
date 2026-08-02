@@ -85,8 +85,13 @@ export function coerceArgs(args: unknown, parameters?: WorkflowParameters): Reco
 /**
  * Parse a command argument string into an `args` object for the script.
  * Supports `key=value` tokens; everything else collects into `_` (and `_raw`).
- * Declared parameter defaults fill missing keys, provided values are coerced
- * to their declared type, and missing required params throw.
+ * Positional tokens are bound to DECLARED parameters in declaration order
+ * (skipping parameters already satisfied by `key=value` tokens) BEFORE
+ * defaults are applied — a declared key passed positionally keeps the user's
+ * value instead of being silently discarded into `_` and replaced by its
+ * default (M11). Remaining positional tokens stay in `_`; still-missing
+ * declared keys are then filled by their defaults and coerced via coerceArgs
+ * (which also throws for missing required params and failed coercions).
  */
 export function parseCommandArgs(raw: string, parameters?: WorkflowParameters): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -96,7 +101,16 @@ export function parseCommandArgs(raw: string, parameters?: WorkflowParameters): 
     if (eq > 0) out[tok.slice(0, eq)] = tok.slice(eq + 1);
     else positional.push(tok);
   }
-  out._ = positional.join(" ");
+
+  // Bind positionals to still-missing declared params, in declaration order.
+  let positionalIndex = 0;
+  for (const key of Object.keys(parameters ?? {})) {
+    if (out[key] !== undefined || positionalIndex >= positional.length) continue;
+    out[key] = positional[positionalIndex];
+    positionalIndex++;
+  }
+
+  out._ = positional.slice(positionalIndex).join(" ");
   out._raw = raw.trim();
   return coerceArgs(out, parameters);
 }
