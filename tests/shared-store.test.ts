@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentDefinition, AgentRegistry } from "../src/agent-registry.js";
-import { SharedStore } from "../src/shared-store.js";
+import { createAgentStoreTools, DEFAULT_STORE_LIMITS, SharedStore } from "../src/shared-store.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // ─── SharedStore unit tests ───────────────────────────────────────────────────
@@ -738,4 +738,93 @@ test("resume replays parallel-agent deltas additively so no writes are lost", as
   // The get agents ran live against a store rebuilt from deltas.
   assert.equal(writeCalls.alpha, "hello", "resume: alpha delta must survive replay");
   assert.equal(writeCalls.beta, "world", "resume: beta delta must survive replay");
+});
+
+// ─── Size/TTL guardrails (infra-utils:i4): store_put can never grow unbounded ─
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Loose executable handle for the store tools (the ToolDefinition type needs 5 args). */
+type StoreToolHandle = {
+  execute: (id: string, params: { key: string; value: unknown }) => Promise<unknown>;
+};
+
+test("default store limits keep the store bounded", () => {
+  assert.equal(DEFAULT_STORE_LIMITS.maxKeys, 10_000);
+  assert.ok(DEFAULT_STORE_LIMITS.maxTotalBytes > 0);
+  assert.ok(DEFAULT_STORE_LIMITS.maxValueBytes > 0);
+});
+
+test("maxKeys evicts the oldest entries FIFO", () => {
+  const store = new SharedStore({ maxKeys: 3 });
+  store.put("a", 1);
+  store.put("b", 2);
+  store.put("c", 3);
+  store.put("d", 4);
+  assert.equal(store.has("a"), false, "the oldest key is evicted first");
+  assert.equal(store.has("b"), true);
+  assert.equal(store.has("c"), true);
+  assert.equal(store.has("d"), true);
+});
+
+test("maxTotalBytes evicts the oldest entries to stay under the cap", () => {
+  const store = new SharedStore({ maxTotalBytes: 200 });
+  store.put("a", "x".repeat(80)); // ~82 B
+  store.put("b", "y".repeat(80)); // ~164 B total — fits
+  store.put("c", "z".repeat(80)); // would exceed 200 B → evicts the oldest (a)
+  assert.equal(store.has("a"), false, "oldest entry evicted to make room");
+  assert.equal(store.has("b"), true);
+  assert.equal(store.has("c"), true);
+});
+
+test("maxValueBytes rejects oversized values with a loud error", () => {
+  const store = new SharedStore({ maxValueBytes: 10 });
+  assert.throws(() => store.put("big", "x".repeat(100)), /exceeds maxValueBytes/);
+  assert.equal(store.has("big"), false, "a rejected value must never land in the store");
+});
+
+test("a value that cannot fit even after evicting every other key throws", () => {
+  const store = new SharedStore({ maxTotalBytes: 50 });
+  store.put("a", "x".repeat(10));
+  assert.throws(() => store.put("b", "y".repeat(60)), /exceeds maxTotalBytes/);
+});
+
+test("ttlMs entries expire lazily", async () => {
+  const store = new SharedStore({ ttlMs: 40 });
+  store.put("k", "v");
+  assert.equal(store.get("k"), "v");
+  await sleep(80);
+  assert.equal(store.has("k"), false, "an expired entry reads as absent");
+  assert.equal(store.get("k"), undefined);
+});
+
+test("trackPut enforces the same guardrails as put", () => {
+  const store = new SharedStore({ maxValueBytes: 10 });
+  assert.throws(() => store.trackPut("k", "x".repeat(100), "run-1:0"), /exceeds maxValueBytes/);
+});
+
+test("applyDelta and restore enforce the same caps", () => {
+  const store = new SharedStore({ maxKeys: 2 });
+  store.applyDelta({ a: 1, b: 2, c: 3 });
+  assert.equal(store.has("a"), false, "applyDelta evicts oldest beyond maxKeys");
+  assert.equal(store.has("c"), true);
+
+  store.restore({ x: 1, y: 2, z: 3 });
+  assert.equal(store.has("x"), false, "restore evicts oldest beyond maxKeys");
+  assert.equal(store.has("z"), true);
+});
+
+test("non-JSON-serializable values are rejected", () => {
+  const store = new SharedStore();
+  assert.throws(() => store.put("bigint", 1n), TypeError);
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  assert.throws(() => store.put("circular", circular), TypeError);
+});
+
+test("store_put via the injected tool enforces guardrails end-to-end", async () => {
+  const store = new SharedStore({ maxValueBytes: 8 });
+  const [storePut] = createAgentStoreTools(store, "run-1:0") as unknown as [StoreToolHandle];
+  await assert.rejects(() => storePut.execute("", { key: "k", value: "x".repeat(100) }), /exceeds maxValueBytes/);
+  assert.equal(store.has("k"), false, "a rejected tool write must never land in the store");
 });

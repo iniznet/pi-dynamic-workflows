@@ -21,10 +21,38 @@
  * `agentDeltas`. Callers compose `deltaKey` as `${runId}:${callIndex}`, and
  * since every run (including each nested run) gets its own distinct `runId`,
  * the composite key is unique across the whole store's lifetime.
+ *
+ * Guardrails: the store is size-bounded so store_put can never grow a run's
+ * memory without limit. Every write path (`put`, `trackPut`, `applyDelta`,
+ * `restore`) enforces the configured caps: values that are not JSON-serializable
+ * or that exceed `maxValueBytes` are rejected with a loud error, and when the
+ * key count or total byte size would exceed its cap, the oldest entries are
+ * evicted (FIFO) to make room. Entries can also expire (`ttlMs`, lazy) so
+ * long-running runs do not accumulate stale intermediate state.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+
+/** Size / TTL guardrails applied to every store write. */
+export interface SharedStoreLimits {
+  /** Max live keys; oldest keys are evicted first beyond this. */
+  maxKeys?: number;
+  /** Approx max total size of all values, in JSON bytes; oldest evicted to stay under. */
+  maxTotalBytes?: number;
+  /** Reject individual values whose JSON size exceeds this. */
+  maxValueBytes?: number;
+  /** Lazy expiry: entries written more than `ttlMs` ago read as absent. */
+  ttlMs?: number;
+}
+
+/** Default guardrails applied when a run constructs a store without explicit limits. */
+export const DEFAULT_STORE_LIMITS: Required<SharedStoreLimits> = {
+  maxKeys: 10_000,
+  maxTotalBytes: 8 * 1024 * 1024,
+  maxValueBytes: 1024 * 1024,
+  ttlMs: 0,
+};
 
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
@@ -41,10 +69,90 @@ export class SharedStore {
   // already covered by that first shadow) and cleared whenever the delta is
   // finalized, either way, via `commitDelta`/`discardDelta`.
   private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
+  private readonly limits: Required<SharedStoreLimits>;
+  // JSON-size (bytes) per key, so eviction accounting never re-serializes a
+  // value just to evict it.
+  private readonly bytesByKey = new Map<string, number>();
+  private totalBytes = 0;
+  // Absolute expiry timestamps (ms epoch) per key when a TTL is configured.
+  private readonly expiresAt = new Map<string, number>();
+
+  constructor(limits: SharedStoreLimits = {}) {
+    this.limits = { ...DEFAULT_STORE_LIMITS, ...limits };
+  }
+
+  /** Serialized size of `value`; throws for non-JSON-serializable values. */
+  private measure(value: unknown): number {
+    return Buffer.byteLength(JSON.stringify(value), "utf8");
+  }
+
+  /**
+   * Guardrail check for writing `key` -> `value`: reject oversized values, and
+   * evict the oldest entries (never `key` itself) until the key-count and
+   * total-byte caps would fit. Throws when the write could never fit even
+   * after evicting every other key. Returns the serialized byte size.
+   */
+  private assertWriteFits(key: string, value: unknown): number {
+    const bytes = this.measure(value);
+    if (bytes > this.limits.maxValueBytes) {
+      throw new RangeError(
+        `store value for "${key}" (${bytes} B) exceeds maxValueBytes (${this.limits.maxValueBytes} B)`,
+      );
+    }
+    const had = this.map.has(key);
+    const extraKeys = had ? 0 : 1;
+    const oldBytes = this.bytesByKey.get(key) ?? 0;
+    const wouldFit = () =>
+      this.map.size + extraKeys <= this.limits.maxKeys &&
+      this.totalBytes - oldBytes + bytes <= this.limits.maxTotalBytes;
+    if (wouldFit()) return bytes;
+    for (const k of [...this.map.keys()]) {
+      if (k === key) continue;
+      this.removeKey(k);
+      if (wouldFit()) return bytes;
+    }
+    if (this.map.size + extraKeys > this.limits.maxKeys) {
+      throw new RangeError(`store key count would exceed maxKeys (${this.limits.maxKeys})`);
+    }
+    throw new RangeError(
+      `store value for "${key}" (${bytes} B) exceeds maxTotalBytes (${this.limits.maxTotalBytes} B)`,
+    );
+  }
+
+  private setExpiry(key: string): void {
+    if (this.limits.ttlMs > 0) this.expiresAt.set(key, Date.now() + this.limits.ttlMs);
+    else this.expiresAt.delete(key);
+  }
+
+  private isExpired(key: string): boolean {
+    const at = this.expiresAt.get(key);
+    return at !== undefined && Date.now() >= at;
+  }
+
+  private removeKey(key: string): void {
+    if (!this.map.has(key)) return;
+    this.map.delete(key);
+    this.totalBytes -= this.bytesByKey.get(key) ?? 0;
+    this.bytesByKey.delete(key);
+    this.expiresAt.delete(key);
+  }
+
+  private purgeExpired(): void {
+    if (this.limits.ttlMs <= 0) return;
+    const now = Date.now();
+    for (const [key, at] of this.expiresAt) {
+      if (now >= at) this.removeKey(key);
+    }
+  }
 
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
+    const bytes = this.assertWriteFits(key, value);
+    const oldBytes = this.bytesByKey.get(key) ?? 0;
     this.map.set(key, value);
+    this.totalBytes += bytes - oldBytes;
+    this.bytesByKey.set(key, bytes);
+    this.setExpiry(key);
   }
 
   /**
@@ -54,6 +162,8 @@ export class SharedStore {
    * writes can be journaled and replayed independently.
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
+    const bytes = this.assertWriteFits(key, value);
+    const oldBytes = this.bytesByKey.get(key) ?? 0;
     let priors = this.priorValues.get(deltaKey);
     if (!priors) {
       priors = new Map();
@@ -69,6 +179,9 @@ export class SharedStore {
       );
     }
     this.map.set(key, value);
+    this.totalBytes += bytes - oldBytes;
+    this.bytesByKey.set(key, bytes);
+    this.setExpiry(key);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
@@ -79,16 +192,19 @@ export class SharedStore {
 
   /** Retrieve the value for `key`, or `undefined` when absent. */
   get(key: string): unknown {
+    if (this.isExpired(key)) this.removeKey(key);
     return this.map.get(key);
   }
 
   /** Whether `key` is present in the store. */
   has(key: string): boolean {
+    if (this.isExpired(key)) this.removeKey(key);
     return this.map.has(key);
   }
 
   /** Return a deep-copied plain-object snapshot of all entries. */
   snapshot(): Record<string, unknown> {
+    this.purgeExpired();
     return structuredClone(Object.fromEntries(this.map));
   }
 
@@ -137,8 +253,11 @@ export class SharedStore {
       // leave their write in place instead of clobbering it with our rollback.
       if (!Object.is(this.map.get(key), delta[key])) continue;
       const prior = priors?.get(key);
-      if (prior?.existed) this.map.set(key, prior.value);
-      else this.map.delete(key);
+      if (prior?.existed) {
+        this.put(key, prior.value);
+      } else {
+        this.removeKey(key);
+      }
     }
     this.agentDeltas.delete(deltaKey);
     this.priorValues.delete(deltaKey);
@@ -148,10 +267,12 @@ export class SharedStore {
    * Apply a write delta additively — sets each key without clearing others.
    * Used during resume replay so parallel-agent deltas applied in callSeq
    * order accumulate correctly regardless of original completion order.
+   * Guardrails apply identically to a live write, so replay reconstructs the
+   * same bounded state the original run produced.
    */
   applyDelta(delta: Record<string, unknown>): void {
     for (const [k, v] of Object.entries(delta)) {
-      this.map.set(k, v);
+      this.put(k, v);
     }
   }
 
@@ -161,8 +282,11 @@ export class SharedStore {
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
+    this.totalBytes = 0;
+    this.bytesByKey.clear();
+    this.expiresAt.clear();
     for (const [k, v] of Object.entries(snap)) {
-      this.map.set(k, v);
+      this.put(k, v);
     }
   }
 
@@ -171,6 +295,9 @@ export class SharedStore {
     this.map.clear();
     this.agentDeltas.clear();
     this.priorValues.clear();
+    this.bytesByKey.clear();
+    this.expiresAt.clear();
+    this.totalBytes = 0;
   }
 }
 
