@@ -19,6 +19,7 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import { safeSetInterval } from "./timing.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -462,10 +463,11 @@ export function installTaskPanel(
       // In detailed mode, force a redraw every 2s while a run is active so the
       // token/s rate keeps updating between sparse token events — and decays to 0
       // when an agent stalls. Gated + unref'd so it costs nothing when idle.
-      const timer = setInterval(() => {
+      // Gated + unref'd so it costs nothing when idle; cleared on dispose.
+      const timer = safeSetInterval(() => {
         if (settings().progressPanelMode === "detailed" && hasActiveRun()) tui.requestRender();
       }, 2000);
-      (timer as { unref?: () => void }).unref?.();
+      timer.unref();
       // Purely informational: it lists running runs and re-renders on events. To
       // open the navigator, the user runs /workflows (the panel takes no input).
       const comp: Component & { dispose?(): void } = {
@@ -478,7 +480,7 @@ export function installTaskPanel(
         },
         invalidate: () => {},
         dispose: () => {
-          clearInterval(timer);
+          timer.clear();
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
           for (const ev of RUN_END_EVENTS) manager.off(ev, onRunEnd);
         },
