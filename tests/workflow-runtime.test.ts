@@ -387,6 +387,145 @@ test("resume re-runs only the changed call (hash mismatch)", async () => {
   assert.equal(second.state.calls, 1, "only the edited call re-runs");
 });
 
+// routing-budgets:f1 / i2 — the resume-replay identity hash must include the
+// resolved tier→model (a signature of the active model-tiers config + mainModel),
+// so editing model-tiers.json invalidates a cached journaled result on the next
+// resume. Without this, `model` is left null for a tiered call (the model is
+// resolved inside the session), so a tier-config change would leave an identical
+// hash and a stale result would replay. The tier config is injected via the
+// `loadTierConfig` run option so the test never touches the real config file.
+const tierScript = `export const meta = { name: 'tier_replay', description: 'tier replay' }
+const a = await agent('small task', { label: 'tier', tier: 'small' })
+return { a }`;
+
+test("resume re-runs a tiered call when the resolved tier→model changes (f1)", async () => {
+  let config: { tiers: Record<string, string> } | null = {
+    tiers: { small: "model-a", medium: "model-m", big: "model-b" },
+  };
+  const loadTierConfig = () => config;
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(tierScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "tier-replay-run",
+    mainModel: "main-model",
+    loadTierConfig,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 1);
+
+  // Same script, same run id, same main model — only the tier→model mapping for
+  // "small" changed. The hash must miss and the call re-runs.
+  config = { tiers: { small: "model-a-changed", medium: "model-m", big: "model-b" } };
+  const second = countingAgent();
+  await runWorkflow(tierScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "tier-replay-run",
+    mainModel: "main-model",
+    loadTierConfig,
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "a tier→model change must invalidate the cached call (not replay stale)");
+});
+
+test("resume replays a tiered call when the tier→model is unchanged (control)", async () => {
+  const loadTierConfig = () => ({ tiers: { small: "model-a", medium: "model-m", big: "model-b" } });
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(tierScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "tier-replay-ctrl",
+    mainModel: "main-model",
+    loadTierConfig,
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const second = countingAgent();
+  await runWorkflow(tierScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "tier-replay-ctrl",
+    mainModel: "main-model",
+    loadTierConfig,
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 0, "unchanged tier config keeps the cached result");
+});
+
+test("resume re-runs a tiered call when the tier config is removed (falls back to main model)", async () => {
+  let config: { tiers: Record<string, string> } | null = {
+    tiers: { small: "model-a", medium: "model-m", big: "model-b" },
+  };
+  const loadTierConfig = () => config;
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(tierScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "tier-replay-nocfg",
+    mainModel: "main-model",
+    loadTierConfig,
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  // Removing the tier config changes the resolved model (now the session main
+  // model), so the hash must miss and the call re-runs.
+  config = null;
+  const second = countingAgent();
+  await runWorkflow(tierScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "tier-replay-nocfg",
+    mainModel: "main-model",
+    loadTierConfig,
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "losing the tier config (→ main model fallback) invalidates the cached call");
+});
+
+test("resume re-runs an untagged agent when its default (medium) tier model changes (i2)", async () => {
+  // An untagged agent (no model/tier/agentType) is routed through the configured
+  // default "medium" tier by resolveAgentModelSpec; changing that tier's model
+  // must invalidate the cached call too (not just explicit tier= calls).
+  const untaggedScript = `export const meta = { name: 'untagged_replay', description: 'untagged replay' }
+const a = await agent('untagged task', { label: 'u' })
+return { a }`;
+  let config: { tiers: Record<string, string> } | null = {
+    tiers: { small: "model-a", medium: "model-m", big: "model-b" },
+  };
+  const loadTierConfig = () => config;
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(untaggedScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "untagged-replay-run",
+    mainModel: "main-model",
+    loadTierConfig,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 1);
+
+  config = { tiers: { small: "model-a", medium: "model-m-changed", big: "model-b" } };
+  const second = countingAgent();
+  await runWorkflow(untaggedScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "untagged-replay-run",
+    mainModel: "main-model",
+    loadTierConfig,
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "a default-tier model change must invalidate the untagged agent's cached result");
+});
+
 const threeCallScript = `export const meta = { name: 'prefix', description: 'prefix resume' }
 const a = await agent('A', { label: 'a' })
 const b = await agent('B', { label: 'b' })

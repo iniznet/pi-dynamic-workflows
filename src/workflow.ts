@@ -25,6 +25,7 @@ import {
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
@@ -191,6 +192,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   agent?: WorkflowAgentRunner;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
+  /**
+   * Injectable source for the model-tiers config used by the resume-replay
+   * identity hash (see hashAgentCall's `tierModel` field). Defaults to the
+   * real disk read (~/.pi/workflows/model-tiers.json), which matches the live
+   * resolution WorkflowAgent performs — so in production the hash captures the
+   * resolved tier→model id and editing model-tiers.json invalidates a cached
+   * replay result on the next resume (routing-budgets:f1/i2). Injected in
+   * tests so a tier-config change can be exercised without touching the real
+   * config file; this only seeds the hash, it never affects the live agent run
+   * (the resolution there re-reads from disk via WorkflowAgent.loadTierConfig).
+   */
+  loadTierConfig?: () => ModelTierConfig | null;
   /**
    * Named subagent definitions for `agent({ agentType })`. Snapshotted once per
    * run for determinism. Defaults to scanning `.pi/agents` (project) +
@@ -892,7 +905,21 @@ export async function runWorkflow<T = unknown>(
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(prompt, modelSpec, assignedPhase, agentOptions, agentDefinitionKey(agentDef));
+    const tierModel = resolveRoutingModelSignature(
+      agentOptions,
+      agentDef,
+      modelSpec,
+      options.mainModel,
+      options.loadTierConfig ?? loadModelTierConfig,
+    );
+    const callHash = hashAgentCall(
+      prompt,
+      modelSpec,
+      tierModel,
+      assignedPhase,
+      agentOptions,
+      agentDefinitionKey(agentDef),
+    );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
     // restarts its own callSeq at 0, so a parent agent and a concurrently
@@ -2038,6 +2065,7 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
 function hashAgentCall(
   prompt: string,
   model: string | undefined,
+  tierModel: string | undefined,
   phase: string | undefined,
   options: AgentOptions,
   agentDefKey: string | null,
@@ -2045,6 +2073,16 @@ function hashAgentCall(
   const identity = JSON.stringify({
     prompt,
     model: model ?? null,
+    // Resolved tier→model (or default-tier model) the session WILL run this
+    // agent on, computed from the model-tiers config + mainModel at call time
+    // (resolveRoutingModelSignature). `model` above is left null precisely
+    // when a tier is set (the model is resolved inside the session), so
+    // WITHOUT this field the hash would stay identical across a tier-config
+    // change and a stale journaled result would replay on resume
+    // (routing-budgets:f1/i2). It mirrors only the file-driven resolution —
+    // explicit model/agentType model/default tier — so it does not vary across
+    // calls within one run for a fixed config.
+    tierModel: tierModel ?? null,
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
@@ -2054,6 +2092,42 @@ function hashAgentCall(
     schema: options.schema ?? null,
   });
   return createHash("sha256").update(identity).digest("hex");
+}
+
+/**
+ * Resolve the model spec a tier/routing-config-dependent agent() call will run
+ * on, for the resume-replay identity hash. Mirrors the file-driven parts of
+ * WorkflowAgent.run's `resolveAgentModelSpec`: explicit per-agent/agentType
+ * model > configured tier model > configured default (medium) tier model > the
+ * phase/`model` spec already computed by the call site (which itself encodes
+ * the phase-routing config). The mainModel fallback matches the session's.
+ *
+ * Side-effect-free and deterministic over a fixed config: it reads only the
+ * tier config and mainModel, never the live model registry, so it cannot vary
+ * across calls within a single run — exactly the property the replay hash needs
+ * (a miss must reflect a genuine config change, not registry drift).
+ */
+function resolveRoutingModelSignature(
+  options: AgentOptions,
+  agentDef: AgentDefinition | undefined,
+  modelSpec: string | undefined,
+  mainModel: string | undefined,
+  loadConfig: () => ModelTierConfig | null,
+): string | undefined {
+  const explicitModel = options.model ?? agentDef?.model;
+  if (explicitModel) return explicitModel;
+  const config = loadConfig();
+  if (options.tier) {
+    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+  }
+  // Untagged agent with a tier config present: the session routes it through
+  // the configured default ("medium") tier, so include that resolved model so
+  // editing model-tiers.json invalidates untagged agents too.
+  if (config) {
+    const medium = resolveTierModel("medium", config);
+    if (medium) return medium;
+  }
+  return modelSpec;
 }
 
 function buildAgentInstructions(
