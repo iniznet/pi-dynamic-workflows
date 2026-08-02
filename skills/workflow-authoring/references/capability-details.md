@@ -299,6 +299,16 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
 - Constraint: always runs in the background
 
+<a id="tool-input-dryrun"></a>
+## dryRun
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `dryRun?: boolean = false`
+- Constraint: validates the script or named workflow without launching a run
+- Constraint: parses and checks the script, then returns its meta with no subagents launched
+- Constraint: mutually exclusive with resumeFromRunId
+
 <a id="metadata"></a>
 ## export const meta
 

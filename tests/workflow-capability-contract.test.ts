@@ -39,6 +39,7 @@ const EXPECTED_TOOL_INPUTS = [
   "args",
   "background",
   "concurrency",
+  "dryRun",
   "maxAgents",
   "name",
   "resumeFromRunId",

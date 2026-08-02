@@ -478,6 +478,11 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "unchanged positional agent calls replay from cache until the first changed or inserted call",
     "always runs in the background",
   ]),
+  toolInput("dryRun", "dryRun?: boolean = false", [
+    "validates the script or named workflow without launching a run",
+    "parses and checks the script, then returns its meta with no subagents launched",
+    "mutually exclusive with resumeFromRunId",
+  ]),
   {
     id: "workflow.script.metadata",
     label: "export const meta",
