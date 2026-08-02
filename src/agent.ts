@@ -960,6 +960,12 @@ export class WorkflowAgent {
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
       prompt,
+      // Rank the prompt-aware tier fallback against the SAME registry the
+      // warning above uses — otherwise an injected options.modelRegistry
+      // (tests, multi-registry setups) would be ranked against the
+      // module-level disk fallback and could pick a model absent from the
+      // injected registry (routing-budgets:i3).
+      () => listAvailableModels(modelRegistry),
     );
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
