@@ -14,13 +14,25 @@ import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
 import {
+  capJournalBudget,
+  cleanupRun,
   createRunPersistence,
+  DEFAULT_JOURNAL_BYTE_BUDGET,
+  DEFAULT_RUN_LEASE_TTL_MS,
   generateRunId,
-  loadRunState,
   listActiveRuns,
-  saveCheckpoint,
+  loadRunState,
+  MAX_JOURNAL_ENTRIES,
+  migrateRunState,
   type PersistedRunState,
+  RUN_STATE_SCHEMA_VERSION,
   type RunCheckpoint,
+  redactText,
+  renewRunLease,
+  resumeRun,
+  saveCheckpoint,
+  updateRunState,
+  upsertJournalEntry,
 } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
@@ -1228,5 +1240,514 @@ test(
       "only checkpoint-shaped journal entries are treated as checkpoints, real agent-call entries are not",
     );
     assert.equal(state?.checkpoints[0].taskId, "approve-plan");
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CAS single-writer persistence (core-orchestration:f3 / i2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "updateRunState applies a mutation to the freshest snapshot and persists atomically (no leftover .tmp)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-basic";
+    rp.save({
+      ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "paused"),
+      journal: [{ index: 0, runId, hash: "h0", result: "cached" }],
+    });
+    const final = await updateRunState(
+      runId,
+      (s) => {
+        s.status = "running";
+      },
+      cwd,
+    );
+    assert.equal(final?.status, "running");
+    const loaded = rp.load(runId);
+    assert.equal(loaded?.status, "running");
+    assert.deepEqual(
+      loaded?.journal,
+      [{ index: 0, runId, hash: "h0", result: "cached" }],
+      "the mutation must not clobber the journal",
+    );
+    assert.equal(
+      existsSync(join(workflowProjectPaths(cwd).runsDir, `${runId}.json.tmp`)),
+      false,
+      "the CAS write is atomic — no leftover .tmp",
+    );
+  }),
+);
+
+test(
+  "updateRunState returns null for a missing run and creates no file",
+  withTempCwd(async (cwd) => {
+    const result = await updateRunState(
+      "ghost",
+      (s) => {
+        s.status = "running";
+      },
+      cwd,
+    );
+    assert.equal(result, null);
+    assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "ghost.json")), false);
+  }),
+);
+
+test(
+  "concurrent writers (journaling + checkpointing) never lose each other's data: a stale checkpoint save preserves the journal",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-race-journal";
+    rp.save({ ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "running") });
+
+    // Writer B (checkpoint saver) captures a stale snapshot BEFORE A journals.
+    const staleB = rp.load(runId);
+    assert.ok(staleB, "B's snapshot exists");
+    assert.equal(staleB.journal?.length, undefined, "B's snapshot predates A's journal entry");
+    const checkpoint: RunCheckpoint = {
+      runId,
+      taskId: "approve-plan",
+      status: "completed",
+      timestamp: "2024-01-01T00:02:00.000Z",
+    };
+
+    // Writer A (the manager) journals an entry — this is the freshest state.
+    await updateRunState(
+      runId,
+      (s) => {
+        s.journal = upsertJournalEntry(s.journal ?? [], { index: 0, runId, hash: "h-journaled", result: "journaled" });
+      },
+      cwd,
+    );
+
+    await saveCheckpoint(runId, checkpoint, cwd);
+
+    // B now persists its stale snapshot: the CAS merge must re-read the
+    // freshest file and keep A's journal entry instead of erasing it.
+    rp.save({ ...staleB, checkpoints: [checkpoint] });
+
+    const final = rp.load(runId);
+    assert.equal(final?.journal?.[0]?.result, "journaled", "the journaling writer's entry survives B's stale save");
+    assert.deepEqual(final?.checkpoints, [checkpoint], "B's checkpoint is present");
+  }),
+);
+
+test(
+  "concurrent writers never lose each other's data: a stale journaling save preserves the checkpoint",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-race-checkpoint";
+    rp.save({ ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "running") });
+
+    // Writer A (the manager) captures a stale snapshot BEFORE B's checkpoint.
+    const staleA = rp.load(runId);
+    assert.ok(staleA, "A's snapshot exists");
+    assert.equal(staleA.checkpoints, undefined, "A's snapshot predates B's checkpoint");
+
+    // Writer B saves a checkpoint first (fresh CAS read).
+    const checkpoint: RunCheckpoint = {
+      runId,
+      taskId: "approve-plan",
+      status: "completed",
+      timestamp: "2024-01-01T00:01:00.000Z",
+    };
+    await saveCheckpoint(runId, checkpoint, cwd);
+
+    // A journals an entry (fresh CAS read), then persists its stale snapshot.
+    await updateRunState(
+      runId,
+      (s) => {
+        s.journal = upsertJournalEntry(s.journal ?? [], { index: 0, runId, hash: "h-journaled", result: "journaled" });
+      },
+      cwd,
+    );
+    rp.save({ ...staleA, journal: [{ index: 0, runId, hash: "h-stale", result: "stale" }] });
+
+    const final = rp.load(runId);
+    assert.deepEqual(final?.checkpoints, [checkpoint], "the checkpoint writer's data survives A's stale save");
+    assert.equal(final?.journal?.length, 1, "A's journal entry survives");
+    assert.equal(final?.journal?.[0]?.result, "stale", "the journaling writer's own entry wins its key");
+  }),
+);
+
+test(
+  "a manager-style full snapshot save never erases disk checkpoints (save() carries them into the write)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-checkpoints-survive";
+    rp.save({ ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "running") });
+
+    const checkpoint: RunCheckpoint = {
+      runId,
+      taskId: "approve-plan",
+      status: "completed",
+      timestamp: "2024-01-01T00:01:00.000Z",
+    };
+    await saveCheckpoint(runId, checkpoint, cwd);
+
+    // The manager's writeRunToDisk save object carries NO checkpoints field —
+    // save() must merge the disk list instead of dropping it.
+    rp.save({
+      ...baseRunState(runId, "2024-01-01T00:02:00.000Z", "paused"),
+      journal: [{ index: 0, runId, hash: "h0", result: "cached" }],
+    });
+    const final = rp.load(runId);
+    assert.deepEqual(final?.checkpoints, [checkpoint], "manager persists keep the checkpoint");
+    assert.equal(final?.journal?.[0]?.result, "cached");
+  }),
+);
+
+test(
+  "concurrent updateRunState appends all land (no lost updates under real fs)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-stress";
+    rp.save({ ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "running") });
+
+    await Promise.all(
+      Array.from({ length: 25 }, (_, i) =>
+        updateRunState(
+          runId,
+          (s) => {
+            s.journal = upsertJournalEntry(s.journal ?? [], { index: i, runId, hash: `h${i}`, result: `r${i}` });
+          },
+          cwd,
+        ),
+      ),
+    );
+    await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        saveCheckpoint(
+          runId,
+          { runId, taskId: `t${i}`, status: "completed", timestamp: `2024-01-01T00:0${i}:00.000Z` },
+          cwd,
+        ),
+      ),
+    );
+
+    const final = rp.load(runId);
+    assert.equal(final?.journal?.length, 25, "all 25 concurrent journal appends must land");
+    assert.equal(final?.checkpoints?.length, 5, "all 5 checkpoints must land");
+  }),
+);
+
+test(
+  "cleanupRun and resumeRun go through CAS: neither clobbers concurrent journal/checkpoint data",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "cas-lifecycle";
+    rp.save({
+      ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "paused"),
+      journal: [{ index: 0, runId, hash: "h0", result: "cached" }],
+    });
+    const checkpoint: RunCheckpoint = {
+      runId,
+      taskId: "approve",
+      status: "completed",
+      timestamp: "2024-01-01T00:01:00.000Z",
+    };
+    await saveCheckpoint(runId, checkpoint, cwd);
+
+    const resumed = await resumeRun(runId, cwd);
+    assert.equal(resumed.status, "active");
+    assert.deepEqual((await loadRunState(runId, cwd))?.checkpoints, [checkpoint]);
+    assert.deepEqual(rp.load(runId)?.journal, [{ index: 0, runId, hash: "h0", result: "cached" }]);
+
+    await cleanupRun(runId, cwd);
+    const finished = rp.load(runId);
+    assert.equal(finished?.status, "completed");
+    assert.ok(finished?.completedAt, "cleanup stamps completedAt");
+    assert.deepEqual(finished?.checkpoints, [checkpoint], "cleanup keeps the checkpoint");
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RunState schema versioning + migration (migrateRunState)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("migrateRunState stamps the schema version and preserves every known field", () => {
+  const raw = {
+    runId: "legacy",
+    workflowName: "wf",
+    script: "export const meta = {}",
+    status: "paused",
+    phases: ["Scan"],
+    agents: [{ id: 1, label: "a", prompt: "p", status: "done" }],
+    logs: ["started"],
+    journal: [{ index: 0, hash: "h", result: "r" }],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:01:00.000Z",
+  };
+  const migrated = migrateRunState(raw);
+  assert.equal(migrated.schemaVersion, RUN_STATE_SCHEMA_VERSION);
+  assert.equal(migrated.runId, "legacy");
+  assert.equal(migrated.status, "paused");
+  assert.deepEqual(migrated.phases, ["Scan"]);
+  assert.deepEqual(migrated.agents, [{ id: 1, label: "a", prompt: "p", status: "done" }]);
+  assert.deepEqual(migrated.journal, [{ index: 0, hash: "h", result: "r" }]);
+});
+
+test("migrateRunState fills defaults for missing fields and never throws", () => {
+  const migrated = migrateRunState({ runId: "partial" });
+  assert.equal(migrated.status, "paused", "missing status defaults to the resumable paused");
+  assert.deepEqual(migrated.phases, []);
+  assert.deepEqual(migrated.agents, []);
+  assert.deepEqual(migrated.logs, []);
+  assert.equal(migrated.schemaVersion, RUN_STATE_SCHEMA_VERSION);
+  assert.equal(typeof migrated.startedAt, "string");
+  // Garbage inputs never throw; missing/invalid fields get defaults.
+  assert.equal(migrateRunState(null).schemaVersion, RUN_STATE_SCHEMA_VERSION);
+  assert.equal(migrateRunState(42).status, "paused");
+  assert.equal(migrateRunState("junk").status, "paused");
+  assert.equal(migrateRunState({ status: "bogus" }).status, "paused");
+  assert.equal(migrateRunState({ journal: "not-an-array" }).journal, undefined);
+  assert.equal(migrateRunState({ journalCompacted: { kind: "nope" } }).journalCompacted, undefined);
+});
+
+test("migrateRunState preserves unknown/forward fields and clamps unknown schema versions", () => {
+  const migrated = migrateRunState({ runId: "fwd", schemaVersion: 999, futureField: { a: 1 }, status: "failed" });
+  assert.equal(migrated.status, "failed", "a valid status is never overridden");
+  assert.deepEqual((migrated as unknown as { futureField: unknown }).futureField, { a: 1 }, "forward fields survive");
+  assert.equal(migrated.schemaVersion, RUN_STATE_SCHEMA_VERSION, "unknown version numbers are clamped, not thrown on");
+});
+
+test(
+  "load() migrates a legacy (v0) fixture so resume preserves its data",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "legacy-v0.json"),
+      JSON.stringify({
+        runId: "legacy-v0",
+        workflowName: "wf",
+        script: "export const meta = { name: 'w', description: 'w' }",
+        status: "paused",
+        phases: ["Scan"],
+        agents: [{ id: 1, label: "a", prompt: "p", status: "done", result: { ok: true } }],
+        logs: ["started"],
+        journal: [{ index: 0, hash: "h0", result: "cached" }],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+        // No schemaVersion → treated as prior version 0.
+      }),
+      "utf-8",
+    );
+
+    const rp = createRunPersistence(cwd);
+    const state = rp.load("legacy-v0");
+    assert.equal(state?.schemaVersion, RUN_STATE_SCHEMA_VERSION, "legacy fixture is migrated to the current version");
+    assert.equal(state?.status, "paused");
+    assert.deepEqual(state?.phases, ["Scan"]);
+    assert.deepEqual(state?.journal, [{ index: 0, hash: "h0", result: "cached" }]);
+    assert.equal(state?.agents[0]?.result?.ok, true);
+
+    // Resume from the migrated fixture: the CAS status flip must not lose the
+    // legacy journal or the persisted data.
+    const resumed = await resumeRun("legacy-v0", cwd);
+    assert.equal(resumed.status, "active");
+    const after = rp.load("legacy-v0");
+    assert.equal(after?.status, "running");
+    assert.deepEqual(
+      after?.journal,
+      [{ index: 0, hash: "h0", result: "cached" }],
+      "resume preserves the legacy journal",
+    );
+    assert.equal(after?.schemaVersion, RUN_STATE_SCHEMA_VERSION);
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Secret redaction (provider keys never reach disk)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("redactText masks provider keys, env-var assignments, bearer tokens, JWTs and PEM blocks", () => {
+  assert.equal(redactText("sk-abcDEF1234567890"), "[REDACTED]");
+  assert.equal(redactText("OPENAI_API_KEY=sk-abcDEF1234567890"), "OPENAI_API_KEY=[REDACTED]");
+  assert.equal(redactText('"OPENAI_API_KEY": "sk-abcDEF1234567890"'), '"OPENAI_API_KEY=[REDACTED]"');
+  assert.equal(redactText("Authorization: Bearer abcdefghijklmnop1234567890"), "Authorization: Bearer [REDACTED]");
+  assert.equal(
+    redactText("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+    "[REDACTED]",
+  );
+  assert.equal(redactText("-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"), "[REDACTED]");
+  assert.equal(redactText("ghp_abcdefghijklmnopqrstuvwxyz1234567890"), "[REDACTED]");
+  assert.equal(redactText("AIzaSyA1234567890abcdefghijklmnopqrstuvwxyz"), "[REDACTED]");
+  assert.equal(redactText("AKIAIOSFODNN7EXAMPLE"), "[REDACTED]");
+  // Benign content is untouched.
+  assert.equal(redactText("the quick brown fox"), "the quick brown fox");
+  assert.equal(redactText('{"hash":"a1b2c3d4","result":"ok"}'), '{"hash":"a1b2c3d4","result":"ok"}');
+  assert.equal(redactText("2024-01-01T00:00:00.000Z"), "2024-01-01T00:00:00.000Z");
+});
+
+test(
+  "a provider API key in agent output never lands in the persisted journal or compacted state",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runId = "secret-leak";
+    const key = "sk-abcDEFghijklmnopqrstuvwxyz1234567890";
+
+    // Save 1: plain-journal form (the manager's default write).
+    const journalState: PersistedRunState = {
+      ...baseRunState(runId, "2024-01-01T00:00:00.000Z", "paused"),
+      journal: [{ index: 0, runId, hash: "h0", result: { text: `use ${key} for the API` } }],
+      logs: [`OPENAI_API_KEY=${key}`],
+      agents: [{ id: 1, label: "a", prompt: "p", status: "done", result: { key } }],
+    };
+    rp.save(journalState);
+
+    const rawJournal = readFileSync(join(workflowProjectPaths(cwd).runsDir, `${runId}.json`), "utf-8");
+    assert.ok(!rawJournal.includes(key), "the raw key must never be written to disk");
+    assert.ok(!rawJournal.includes("sk-abcDEFghijklmnopqrstuvwxyz"), "the key prefix must not leak either");
+    assert.ok(rawJournal.includes("use [REDACTED] for the API"), "the redacted form IS what lands on disk");
+
+    const loadedJournal = rp.load(runId);
+    assert.ok(!JSON.stringify(loadedJournal).includes(key), "the key is scrubbed from every loaded surface");
+    assert.equal(loadedJournal?.journal?.[0]?.result?.text, "use [REDACTED] for the API");
+    assert.equal(loadedJournal?.logs?.[0], "OPENAI_API_KEY=[REDACTED]");
+    assert.equal(loadedJournal?.agents[0]?.result?.key, "[REDACTED]");
+    // The in-memory state passed to save() is NOT mutated — only the
+    // persisted form is scrubbed.
+    assert.ok(
+      JSON.stringify(journalState).includes(key),
+      "the in-memory state keeps its value until the persistence boundary",
+    );
+
+    // Save 2: compacted-summary form (the manager's opt-in compaction write).
+    const compactedState: PersistedRunState = {
+      ...baseRunState(runId, "2024-01-01T00:02:00.000Z", "paused"),
+      journalCompacted: {
+        kind: "compact",
+        version: 1,
+        hashes: ["h0"],
+        opTraces: [],
+        results: [{ key }],
+        storeDeltas: [],
+        records: [{ fold: "resolved", index: 0, runId, hashRef: 0, resultRef: 0 }],
+      },
+    };
+    rp.save(compactedState);
+
+    const rawCompacted = readFileSync(join(workflowProjectPaths(cwd).runsDir, `${runId}.json`), "utf-8");
+    assert.ok(!rawCompacted.includes(key), "the key never lands in the compacted state either");
+    const loadedCompacted = rp.load(runId);
+    assert.equal(loadedCompacted?.journalCompacted?.results[0]?.key, "[REDACTED]");
+    assert.equal(loadedCompacted?.journalCompacted?.records.length, 1);
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Journal size / stringify budget
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("upsertJournalEntry caps growth at MAX_JOURNAL_ENTRIES keeping the newest entries", () => {
+  const base = Array.from({ length: MAX_JOURNAL_ENTRIES }, (_, i) => ({
+    index: i,
+    runId: "r",
+    hash: `h${i}`,
+    result: i,
+  }));
+  const next = upsertJournalEntry(base, { index: MAX_JOURNAL_ENTRIES, runId: "r", hash: "new", result: "new" });
+  assert.equal(next.length, MAX_JOURNAL_ENTRIES, "the journal never grows past the cap");
+  assert.equal(next[0]?.index, 1, "the oldest entry is evicted");
+  assert.equal(next[next.length - 1]?.index, MAX_JOURNAL_ENTRIES, "the newest entry is kept");
+});
+
+test("capJournalBudget drops the oldest entries first when over the byte budget", () => {
+  const journal = Array.from({ length: 100 }, (_, i) => ({
+    index: i,
+    runId: "r",
+    hash: `h${i}`,
+    result: `result-${i}-${"x".repeat(100)}`,
+  }));
+  const capped = capJournalBudget(journal, 2000);
+  assert.ok(capped.length < journal.length, "the journal was trimmed");
+  assert.ok(JSON.stringify(capped).length <= 2000, "the capped journal fits the budget");
+  assert.equal(capped[0]?.index, journal.length - capped.length, "the OLDEST entries were dropped, newest kept");
+  assert.equal(capJournalBudget(journal, DEFAULT_JOURNAL_BYTE_BUDGET), journal, "under budget → unchanged (no copy)");
+});
+
+test(
+  "persisting a 20k-entry journal stays within a generous wall-clock bound",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const journal = Array.from({ length: 20_000 }, (_, i) => ({
+      index: i,
+      runId: "big",
+      hash: `h${i}`,
+      result: { i },
+    }));
+    const started = Date.now();
+    rp.save({ ...baseRunState("big-run", "2024-01-01T00:00:00.000Z", "paused"), journal });
+    const saveMs = Date.now() - started;
+    const loaded = rp.load("big-run");
+    assert.equal(loaded?.journal?.length, 20_000, "the full journal round-trips");
+    assert.ok(saveMs < 5000, `saving 20k entries took ${saveMs}ms — expected well under the generous 5s bound`);
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Lease lifecycle: bounded-delay reclaim + renewal heartbeat
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "new leases carry an expiry and renewRunLease pushes it forward (owner token only)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const lease = rp.acquireRunLease("heartbeat");
+    assert.ok(lease, "first acquire succeeds");
+    const lockPath = join(workflowProjectPaths(cwd).runsDir, "heartbeat.lock");
+    const lockBefore = JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string };
+    assert.ok(lockBefore.expiresAt, "new leases carry an expiry for bounded-delay reclaim");
+
+    assert.equal(rp.renewRunLease({ ...lease, token: "wrong-token" }), false, "a non-owner cannot renew");
+    assert.equal(renewRunLease(lease, cwd), true, "the owner's heartbeat renews the lease (standalone export)");
+
+    const lockAfter = JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string };
+    assert.ok(Date.parse(lockAfter.expiresAt) > Date.parse(lockBefore.expiresAt), "renewal pushes the expiry forward");
+    rp.releaseRunLease(lease);
+  }),
+);
+
+test(
+  "a still-alive owner that renews its lease is never evicted by a concurrent acquire",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const lease = rp.acquireRunLease("live-renewer");
+    assert.ok(lease);
+    for (let i = 0; i < 5; i++) {
+      assert.equal(rp.acquireRunLease("live-renewer"), null, "a live, renewed lease must never be evicted");
+      assert.equal(rp.renewRunLease(lease), true, "the owner keeps its heartbeat");
+    }
+    assert.equal(rp.acquireRunLease("live-renewer"), null, "still refused after the final renewal");
+    rp.releaseRunLease(lease);
+  }),
+);
+
+test(
+  "an expired lease is reclaimable even when the owner pid is alive (bounded-delay reclaim)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    rp.save({ ...baseRunState("expired-lease", "2024-01-01T00:00:00.000Z", "paused") });
+    // Simulate an owner that stopped renewing: pid is STILL alive (this process),
+    // but the lease expired long ago.
+    writeFileSync(
+      join(runsDir, "expired-lease.lock"),
+      JSON.stringify({
+        runId: "expired-lease",
+        runPath: join(runsDir, "expired-lease.json"),
+        pid: process.pid,
+        startedAt: "2024-01-01T00:00:00.000Z",
+        token: "ghost-owner",
+        expiresAt: "2024-01-01T00:10:00.000Z",
+      }),
+      "utf-8",
+    );
+    const stolen = rp.acquireRunLease("expired-lease");
+    assert.ok(stolen, "an expired lease must be reclaimable even with a live pid");
+    assert.equal(DEFAULT_RUN_LEASE_TTL_MS > 0, true, "the TTL constant is positive (the bounded delay)");
+    rp.releaseRunLease(stolen);
   }),
 );
