@@ -744,7 +744,7 @@ function rightAgentRow(
   const statsStyled = theme.fg("dim", stats);
 
   // Assemble with explicit cell padding (visibleWidth-driven gaps).
-  let out = marker + dot + " " + nameStyled;
+  let out = `${marker}${dot} ${nameStyled}`;
   const afterName = nameStart + visibleWidth(nameOut);
   if (modelOut) {
     out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;

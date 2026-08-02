@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -125,7 +125,7 @@ async function waitForPlanFile(dir: string): Promise<string> {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const files = await readdir(dir).catch(() => [] as string[]);
-    if (files.length > 0) return join(dir, files[0]!);
+    if (files.length > 0) return join(dir, files[0]);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error("no plan file appeared in time");
