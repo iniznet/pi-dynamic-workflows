@@ -188,6 +188,11 @@ export interface JournalCompactionVerification {
  * (a throwing or byte-divergent reconstruct, an entry-count mismatch) is a
  * rejection with a reason. Callers must never persist a summary this gate
  * rejects — keep the original journal instead.
+ *
+ * Perf: the diff serializes each side ONCE (full-array stringify), not once
+ * per entry — a 500k-entry fan-out journal pays two stringifies, not a
+ * million. The per-entry scan that produces the rejection reason only runs
+ * after a mismatch is already known.
  */
 export function verifyJournalCompaction(
   summary: CompactJournalSummary,
@@ -201,12 +206,17 @@ export function verifyJournalCompaction(
         reason: `reconstructed ${reconstructed.length} entries, expected ${original.length}`,
       };
     }
+    if (JSON.stringify(reconstructed) === JSON.stringify(original)) {
+      return { ok: true };
+    }
     for (let i = 0; i < original.length; i++) {
       if (JSON.stringify(reconstructed[i]) !== JSON.stringify(original[i])) {
         return { ok: false, reason: `entry ${i} does not reconstruct byte-identically` };
       }
     }
-    return { ok: true };
+    // Unreachable: the full-stringify diff above already failed. Kept so the
+    // gate's contract stays "ok only when byte-identical".
+    return { ok: false, reason: "reconstructed bytes diverge from the original" };
   } catch (err) {
     return { ok: false, reason: `reconstruction threw: ${(err as Error).message}` };
   }

@@ -334,3 +334,27 @@ test("a resolved multi-call runWorkflow run compacts then reconstructs byte-iden
     }),
   );
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5 — perf guard: compaction + QA stay off quadratic behavior (single-stringify diff)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("compacting and QA-verifying a 20k-entry journal stays within a generous wall-clock bound", () => {
+  const journal = Array.from({ length: 20_000 }, (_, i) =>
+    entry(i, {
+      result: { i },
+      storeDelta: { step: i % 7 },
+      operations: [{ line: 1, op: "read", outcome: "ok" }],
+    }),
+  );
+  const started = Date.now();
+  const summary = compactJournal(journal);
+  const qa = verifyJournalCompaction(summary, journal);
+  const elapsed = Date.now() - started;
+  assert.equal(qa.ok, true, "the 20k-entry journal must still compact + reconstruct byte-identically");
+  assert.equal(summary.records.length, journal.length, "no entry is dropped");
+  assert.ok(
+    elapsed < 8000,
+    `compact+verify of 20k entries took ${elapsed}ms — expected well under the generous 8s bound`,
+  );
+});
