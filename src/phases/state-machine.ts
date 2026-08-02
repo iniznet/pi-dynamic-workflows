@@ -73,6 +73,13 @@ export interface PhaseState {
   plannotatorSubmitted: boolean;
   /** ISO-8601 timestamp of the last state mutation. */
   updatedAt: string;
+  /**
+   * Monotonic write generation used as the optimistic-lock token for
+   * compare-and-swap in `setState`. Each successful write advances it by one,
+   * so a writer can detect that a concurrent writer landed between its read
+   * and its rename and retry without losing either update.
+   */
+  version: number;
 }
 
 /** Factory for a fresh default state (new timestamp on every call). */
@@ -84,6 +91,7 @@ function createDefaultState(): PhaseState {
     prewalkComplete: false,
     plannotatorSubmitted: false,
     updatedAt: new Date().toISOString(),
+    version: 0,
   };
 }
 
@@ -112,6 +120,14 @@ function normalizePhaseState(parsed: unknown): PhaseState {
   const updatedAt =
     typeof raw.updatedAt === "string" && !Number.isNaN(Date.parse(raw.updatedAt)) ? raw.updatedAt : defaults.updatedAt;
 
+  const version =
+    typeof raw.version === "number" &&
+    Number.isInteger(raw.version) &&
+    raw.version >= 0 &&
+    raw.version <= Number.MAX_SAFE_INTEGER
+      ? raw.version
+      : defaults.version;
+
   return {
     activePhase,
     humanApproved: asBoolean("humanApproved"),
@@ -119,12 +135,8 @@ function normalizePhaseState(parsed: unknown): PhaseState {
     prewalkComplete: asBoolean("prewalkComplete"),
     plannotatorSubmitted: asBoolean("plannotatorSubmitted"),
     updatedAt,
+    version,
   };
-}
-
-/** Compare two normalized states structurally (field order is stable). */
-function sameState(a: PhaseState, b: PhaseState): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +165,15 @@ export class WorkflowStateManager {
   private readonly statePath: string;
   private readonly enforcePrerequisites: boolean;
   private cachedState: PhaseState | null = null;
+  /**
+   * Serialize writes originating from this manager instance. Concurrent
+   * `setState`/`transitionTo`/`approvePlan` calls on the same state machine
+   * are applied one after another instead of racing on the read-merge-write
+   * sequence, so no caller's partial update is silently overwritten by a peer
+   * that read the same pre-write snapshot. Each write still verifies the
+   * on-disk generation to guard against writers from other processes.
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(workflowDir: string = ".pi/workflows", options: WorkflowStateManagerOptions = {}) {
     this.workflowDir = workflowDir;
@@ -192,22 +213,45 @@ export class WorkflowStateManager {
   /**
    * Merge partial state into the current snapshot and persist atomically.
    *
-   * Concurrency: compare-and-swap. Every attempt re-reads the disk snapshot,
-   * merges the caller's patch on top, writes to a UNIQUE temp file (a shared
-   * fixed `.tmp` name would let concurrent writers clobber each other's buffer),
-   * renames it into place, then verifies the on-disk state matches what was
-   * written. If a concurrent writer slipped in between the read and the rename,
-   * the verification fails and the merge is retried against the newer snapshot,
-   * so no update is lost.
+   * Concurrency: each write is serialized within this manager instance, so
+   * concurrent calls on the same state machine apply one after another instead
+   * of racing on the read-merge-write sequence. Within a write, compare-and-swap
+   * is enforced via the persisted `version` generation: the on-disk generation
+   * captured BEFORE merging is the value our write must advance. After the
+   * atomic rename, the on-disk generation is re-read; if it no longer equals the
+   * generation we just wrote, a concurrent writer (from another process) landed
+   * between our read and our rename, and the merge is retried on top of the
+   * newer snapshot — so no update is lost. The generation check replaces the
+   * earlier post-write field-equality self-check, which passed whenever a
+   * writer read back its own value even as a peer was about to clobber it.
    */
   async setState(state: Partial<PhaseState>): Promise<void> {
+    const run = this.writeChain.then(() => this.applyStateUpdate(state));
+    // Detach the chain from this run's outcome so a rejected write does not
+    // permanently poison subsequent writes on the same instance.
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    await run;
+  }
+
+  /**
+   * Single compare-and-swap attempt loop for {@link setState}, expected to run
+   * serialized against other writes from this instance by {@link setState}.
+   */
+  private async applyStateUpdate(state: Partial<PhaseState>): Promise<void> {
     await mkdir(this.workflowDir, { recursive: true });
 
     for (let attempt = 0; attempt < MAX_SET_STATE_ATTEMPTS; attempt++) {
+      // Snapshot the on-disk generation BEFORE merging. This is the
+      // optimistic-lock token our write must advance.
       const current = await this.readStateFromDisk();
+      const baseVersion = current.version;
       const merged: PhaseState = {
         ...current,
         ...state,
+        version: baseVersion + 1,
         updatedAt: new Date().toISOString(),
       };
 
@@ -230,9 +274,12 @@ export class WorkflowStateManager {
         continue;
       }
 
-      // Compare-and-swap verification: our write must be what's on disk.
+      // Optimistic-lock verification: the on-disk generation must equal the one
+      // we just wrote. A different value means a concurrent writer (from
+      // another process) renamed over our commit either before or after our
+      // rename, so re-merge on top of the newer snapshot and retry.
       const onDisk = await this.readStateFromDisk();
-      if (sameState(onDisk, merged)) {
+      if (onDisk.version === merged.version) {
         this.cachedState = merged;
         return;
       }
