@@ -12,14 +12,15 @@ import {
   buildResumeJournal,
   createRunPersistence,
   generateRunId,
+  journalEntryKey,
   keepsResumeJournal,
   loadPersistedJournal,
   type PersistedRunState,
+  type RunCheckpoint,
   type RunLease,
   type RunLeaseState,
   type RunPersistence,
   type RunStatus,
-  upsertJournalEntry,
 } from "./run-persistence.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
@@ -35,6 +36,15 @@ export interface ManagedRunBase {
   args?: unknown;
   /** Accumulated agent results for resume (deterministic call index -> result). */
   journal: JournalEntry[];
+  /**
+   * O(1) side-index for journal upserts: key (journalSideKey — the entry's own
+   * `${runId}:${index}` pair) -> position in `journal`. Maintained alongside
+   * the array by onAgentJournal (in-place replace) and rebuilt at resume()
+   * seed time; onAgentJournal is the manager's ONLY writer of the pair, so
+   * they can never drift. The persistence-layer upsertJournalEntry (O(n)
+   * filter) is not used by the manager (see core-orchestration:i3).
+   */
+  journalIndex: Map<string, number>;
   /**
    * True when the run was started in the background (or resumed) and the caller is
    * not awaiting its result inline. Only background runs deliver their result back
@@ -120,6 +130,16 @@ export interface ManagedRunBase {
    * tokenBudget.
    */
   agentRetries?: number;
+  /**
+   * Human-approval checkpoints for this run (see RunCheckpoint in
+   * run-persistence.ts). The manager carries them in memory and writeRunToDisk
+   * persists them with every write — before this field existed, a manager
+   * persist landing after a persistence-layer saveCheckpoint() erased the
+   * just-written checkpoints from the shared JSON file (core-orchestration:f3;
+   * the persistence slice's compare-and-swap keeps the two writers in sync).
+   * Seeded from persisted.checkpoints on resume().
+   */
+  checkpoints: RunCheckpoint[];
 }
 
 /** Statuses a run can rest in while it is NOT executing (lease released). */
@@ -159,6 +179,18 @@ export type ManagedRun = ExecutingRun | IdleRun;
  * immutable union, which is what refuses to express an illegal state.
  */
 type ManagedRunRuntime = ManagedRunBase & { status: RunStatus; lease?: RunLease };
+
+/** Options for resume() — run-level overrides (script/args) plus a passthrough
+ * of ExecOptions so a UI-bearing resume (TUI) keeps live checkpoints/progress
+ * while the headless scheduler path stays unchanged (core-orchestration:i4).
+ * Additive: opts remains optional and backward-compatible with the former
+ * `{ script?: string; args?: unknown }` shape. */
+export interface ResumeOptions extends ExecOptions {
+  /** Resume with an EDITED script (cached-prefix reuse / iteration); omitted = persisted script. */
+  script?: string;
+  /** Override the persisted args; omitted = persisted args. */
+  args?: unknown;
+}
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
@@ -282,6 +314,15 @@ export interface WorkflowManagerOptions {
    * to observe eviction without creating dozens of runs.
    */
   maxTerminalRunsInMemory?: number;
+  /**
+   * How long an aborted execution may take to settle before the settle
+   * watchdog force-releases its run from the in-memory registry (see
+   * armSettleWatchdog / forceReleaseUnsettledRun). Generous default: a
+   * cooperative abort (pause/stop/Esc) winds down in seconds, so the deadline
+   * only fires for genuinely hung executions that would otherwise pin their
+   * run in `runs` forever. Exposed for tests (core-orchestration:i5).
+   */
+  settleWatchdogMs?: number;
 }
 
 /** Options that a fresh extension generation may safely refresh on a live
@@ -322,6 +363,41 @@ const IN_MEMORY_TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed"
  * memory-retention mitigation in agent.ts).
  */
 const DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY = 20;
+
+/**
+ * Generous deadline for an aborted execution to settle before the settle
+ * watchdog force-releases its run from `runs` (see armSettleWatchdog).
+ * Cooperative aborts (pause/stop/Esc) are expected to wind down in seconds;
+ * only a genuinely hung execution exceeds this — the watchdog's job is to
+ * stop that hung execution from pinning its run in memory forever (its disk
+ * state stays authoritative: listRuns()/resume() never depend on the
+ * in-memory copy). The deadline, not a poll, bounds the wait (deterministic).
+ */
+const DEFAULT_SETTLE_WATCHDOG_MS = 30_000;
+
+/**
+ * Side-index key for journal upserts: the entry's OWN (runId, index) pair —
+ * deliberately NOT the resume-time fallback (`runId ?? frameRunId`) that
+ * buildResumeJournal uses. The manager's upsert must mirror the
+ * persistence-layer upsertJournalEntry semantics (raw runId equality), where
+ * a legacy entry (no runId) and a fresh entry for this run are DISTINCT keys
+ * — a legacy entry must never be evicted by a fresh same-index entry.
+ */
+function journalSideKey(entry: JournalEntry): string {
+  return journalEntryKey(entry.runId ?? "", entry.index);
+}
+
+/**
+ * Build the journalIndex side-index from a journal array (resume() seed time).
+ * Iterating with set() keeps the LAST entry per key, matching buildResumeJournal's
+ * Map semantics and the persistence layer's dedup: duplicates in a legacy
+ * persisted journal collapse to the newest.
+ */
+function buildJournalSideIndex(journal: JournalEntry[]): Map<string, number> {
+  const index = new Map<string, number>();
+  for (let i = 0; i < journal.length; i++) index.set(journalSideKey(journal[i]), i);
+  return index;
+}
 
 export class WorkflowManager extends EventEmitter {
   /**
@@ -374,6 +450,10 @@ export class WorkflowManager extends EventEmitter {
    */
   private terminalRunQueue: string[] = [];
   private maxTerminalRunsInMemory: number;
+  /** How long an aborted execution may take to settle (see armSettleWatchdog). */
+  private settleWatchdogMs: number;
+  /** Pending settle watchdogs keyed by runId — see armSettleWatchdog. */
+  private settleWatchdogs = new Map<string, { timer: ReturnType<typeof setTimeout>; managed: ManagedRun }>();
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -408,6 +488,7 @@ export class WorkflowManager extends EventEmitter {
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+    this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -518,6 +599,8 @@ export class WorkflowManager extends EventEmitter {
       script,
       args,
       journal: [],
+      journalIndex: new Map(),
+      checkpoints: [],
       background: true,
       lease,
       autoResume: exec.autoResume,
@@ -646,6 +729,8 @@ export class WorkflowManager extends EventEmitter {
       script,
       args,
       journal: [],
+      journalIndex: new Map(),
+      checkpoints: [],
       background: false,
       agentTimestamps: new Map(),
       agentsById: new Map(),
@@ -707,8 +792,19 @@ export class WorkflowManager extends EventEmitter {
     };
     // Let a host abort (e.g. Esc during a blocking tool call) cancel this run.
     if (externalSignal) {
-      if (externalSignal.aborted) managed.controller.abort();
-      else externalSignal.addEventListener("abort", () => managed.controller.abort(), { once: true });
+      if (externalSignal.aborted) {
+        managed.controller.abort();
+        this.armSettleWatchdog(managed);
+      } else {
+        externalSignal.addEventListener(
+          "abort",
+          () => {
+            managed.controller.abort();
+            this.armSettleWatchdog(managed);
+          },
+          { once: true },
+        );
+      }
     }
     try {
       const result = await runWorkflow(script, {
@@ -753,16 +849,28 @@ export class WorkflowManager extends EventEmitter {
           this.accumulateTokenUsage(managed, tokens);
         },
         onAgentJournal: (entry) => {
-          // Append (crash-safe-ish): keep the latest entry per (runId, index)
-          // pair, then persist — see upsertJournalEntry in run-persistence.ts
-          // (matching on index ALONE would let a nested workflow()'s
-          // callIndex-0 entry evict the parent's own callIndex-0 entry, and
-          // vice versa — they're only distinguished by runId). This is the
-          // high-frequency progress persist (fires once per completed agent,
-          // can burst under concurrency) — throttled (trailing edge). Every
-          // lifecycle-critical persist below (status transitions, run end,
-          // pause/resume/stop) still calls persistRun() directly and flushes this.
-          managed.journal = upsertJournalEntry(managed.journal, entry);
+          // O(1) upsert via the journalIndex side-index (see its doc comment):
+          // keep the LATEST entry per (runId, index) pair exactly like the
+          // persistence-layer upsertJournalEntry, without the O(n) array
+          // filter on the high-frequency progress persist (once per completed
+          // agent, can burst under concurrency). Matching on index ALONE would
+          // let a nested workflow()'s callIndex-0 entry evict the parent's own
+          // callIndex-0 entry (and vice versa) — they're only distinguished by
+          // runId (JournalEntry.runId). Legacy entries (no runId) are distinct
+          // keys from fresh ones (see journalSideKey).
+          const key = journalSideKey(entry);
+          const at = managed.journalIndex.get(key);
+          if (
+            at !== undefined &&
+            managed.journal[at]?.runId === entry.runId &&
+            managed.journal[at]?.index === entry.index
+          ) {
+            // Same (runId, index) pair already journaled: replace in place.
+            managed.journal[at] = entry;
+          } else {
+            managed.journalIndex.set(key, managed.journal.length);
+            managed.journal.push(entry);
+          }
           this.schedulePersist(managed);
         },
         onLog: (message) => {
@@ -878,6 +986,10 @@ export class WorkflowManager extends EventEmitter {
         // `runs` field doc comment.
         this.recordTerminalRun(managed.runId);
       }
+      // The execution settled on its own — cancel the abort watchdog (see
+      // armSettleWatchdog) so it can't later fire against a newer execution
+      // of this runId.
+      this.disarmSettleWatchdog(managed);
 
       return result;
     } catch (error) {
@@ -922,10 +1034,18 @@ export class WorkflowManager extends EventEmitter {
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
-      } else if (this.listenerCount("error") > 0) {
+      } else if (!managed.controller.signal.aborted && this.listenerCount("error") > 0) {
         // Guarded: EventEmitter throws on an unlistened "error" emit, which
         // would abort this catch block mid-way — skipping the final persist,
         // the lease release, and the real error rethrow below.
+        // `!managed.controller.signal.aborted` (core-orchestration:f1):
+        // intentional aborts (pause()/stop()/deleteRun()/external signal) all
+        // set managed.controller.signal.aborted, and the usageLimitPaused
+        // branch above already excludes them from "paused" — without this
+        // gate they'd fall through to the failure branch and fire a spurious
+        // 'error' event for a deliberate user action. Run-fatal aborts use the
+        // SharedRuntime.runFatalController (NOT managed.controller), so a
+        // genuine run failure still reaches this branch and emits 'error'.
         // Surface the failing operation (Fabric-style line-numbered failure
         // repair) from the failed agent that carries one, when present.
         const failedAgent = [...managed.agentsById.values()]
@@ -951,6 +1071,8 @@ export class WorkflowManager extends EventEmitter {
         // the eviction queue.
         if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.recordTerminalRun(managed.runId);
       }
+      // The execution settled (failure path) — cancel the abort watchdog.
+      this.disarmSettleWatchdog(managed);
 
       throw workflowError;
     }
@@ -1094,6 +1216,79 @@ export class WorkflowManager extends EventEmitter {
   private releaseHeldLease(run: ExecutingRun): void {
     this.persistence.releaseRunLease(run.lease);
     (run as unknown as ManagedRunRuntime).lease = undefined;
+  }
+
+  /**
+   * Settle watchdog (core-orchestration:i5): bound how long an aborted
+   * execution may take to settle after pause()/stop()/an external signal fired
+   * its abort. A cooperative abort winds down in seconds; a genuinely hung
+   * execution (a subagent session that never observes the signal, a stuck
+   * store write, ...) would otherwise pin its run in `this.runs` forever —
+   * pause()/stop() already flipped its status and released its lease
+   * synchronously, but the pending executeRun() promise never settles, so
+   * recordTerminalRun() (which only runs after the real settle) never evicts
+   * it. The watchdog fires after settleWatchdogMs and force-releases the run:
+   * settle-and-persist where the execution never got there itself, then drop
+   * the entry from `runs`. The hung execution's eventual settle is a harmless
+   * no-op via isCurrent() — the entry is gone (or superseded) by then.
+   * Disarmed in executeRun's settle tails when the execution settles on its
+   * own. The deadline, not a poll, bounds the wait; every callback path is
+   * identity-checked against the ManagedRun it was armed for, so a superseded
+   * execution's watchdog can never release a newer execution of the same
+   * runId.
+   */
+  private armSettleWatchdog(managed: ManagedRun): void {
+    const existing = this.settleWatchdogs.get(managed.runId);
+    if (existing?.managed === managed) return; // already armed for this execution
+    if (existing) clearTimeout(existing.timer); // superseded execution's watchdog — replace it
+    const timer = setTimeout(() => {
+      this.settleWatchdogs.delete(managed.runId);
+      this.forceReleaseUnsettledRun(managed);
+    }, this.settleWatchdogMs);
+    // A pending watchdog must never keep the process alive on its own.
+    timer.unref?.();
+    this.settleWatchdogs.set(managed.runId, { timer, managed });
+  }
+
+  /** Cancel a pending watchdog — called only by the exact execution it was armed for. */
+  private disarmSettleWatchdog(managed: ManagedRun): void {
+    const existing = this.settleWatchdogs.get(managed.runId);
+    if (existing?.managed !== managed) return;
+    clearTimeout(existing.timer);
+    this.settleWatchdogs.delete(managed.runId);
+  }
+
+  /**
+   * Watchdog callback: the aborted execution never settled within
+   * settleWatchdogMs — force-release its run from the in-memory registry (see
+   * armSettleWatchdog). Safe for every resting status the run can have at this
+   * point ("running" from an external-signal abort whose subagent ignored the
+   * signal; "paused"/"aborted" from pause()/stop()): disk state is and stays
+   * authoritative, and resume()/listRuns() never depend on the in-memory copy.
+   */
+  private forceReleaseUnsettledRun(managed: ManagedRun): void {
+    // Only release the exact execution the watchdog was armed for — a resume()
+    // may have replaced this runId's entry with a newer execution since.
+    if (this.runs.get(managed.runId) !== managed) return;
+    const runtime = managed as unknown as ManagedRunRuntime;
+    if (runtime.status === "running") {
+      // The abort fired but the execution never settled it. Settle + persist
+      // here so the lease is released and "aborted" lands on disk (persistRun
+      // also flushes any pending throttled write for this runId); the hung
+      // execution's later settle is a no-op via isCurrent().
+      this.settleExecuting(managed as unknown as ExecutingRun, "aborted");
+      this.persistRun(managed);
+    } else {
+      // Idle status (paused/aborted/...): pause()/stop() already released the
+      // lease and persisted the status. Cancel any pending throttled write so
+      // a deferred persist can't fire after the entry is gone.
+      const timer = this.persistTimers.get(managed.runId);
+      if (timer) {
+        clearTimeout(timer);
+        this.persistTimers.delete(managed.runId);
+      }
+    }
+    this.runs.delete(managed.runId);
   }
 
   /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
@@ -1256,6 +1451,15 @@ export class WorkflowManager extends EventEmitter {
           };
         }),
         logs: managed.snapshot.logs,
+        // Checkpoints live in their own array on disk (see RunCheckpoint); the
+        // manager carries its in-memory copy so a resume-seeded list round-trips
+        // through every persist (core-orchestration:f3). Omitted (JSON-dropped)
+        // when empty: the persistence layer's CAS merge treats an EXPLICIT empty
+        // array as a clear, so a fresh run (which has no checkpoints in memory)
+        // must send undefined to keep externally CAS-written checkpoints — that
+        // is the whole point of the single-writer fix. A non-empty list merges
+        // by taskId, newest timestamp wins.
+        checkpoints: managed.checkpoints.length > 0 ? managed.checkpoints : undefined,
         result: managed.result?.result,
         tokenUsage: managed.snapshot.tokenUsage
           ? {
@@ -1288,6 +1492,7 @@ export class WorkflowManager extends EventEmitter {
     if (managed?.status !== "running") return false;
 
     managed.controller.abort();
+    this.armSettleWatchdog(managed);
     this.settleExecuting(managed, "paused");
     this.emit("paused", { runId });
     this.persistRun(managed);
@@ -1306,9 +1511,13 @@ export class WorkflowManager extends EventEmitter {
    * exactly as before and uses the persisted script (auto-resume, TUI resume);
    * this keeps the existing single-arg `resume(runId)` callers (e.g. the
    * UsageLimitScheduler) unchanged. `opts.args` overrides the persisted args
-   * only when provided; otherwise the persisted args are kept.
+   * only when provided; otherwise the persisted args are kept. Any remaining
+   * ResumeOptions (an ExecOptions passthrough, core-orchestration:i4) are
+   * forwarded to the resumed execution — e.g. a TUI resume passes onProgress/
+   * confirm to keep live checkpoints and progress, while the headless
+   * scheduler path stays as-is by simply omitting them.
    */
-  async resume(runId: string, opts?: { script?: string; args?: unknown }): Promise<boolean> {
+  async resume(runId: string, opts?: ResumeOptions): Promise<boolean> {
     // Guard: refuse to resume a run that is already running, or one that was
     // intentionally aborted (pause/stop/Esc). Paused and failed runs can restart.
     const active = this.runs.get(runId);
@@ -1321,8 +1530,9 @@ export class WorkflowManager extends EventEmitter {
     if (!lease) return false;
 
     // Use the edited script when supplied, else the persisted one (backward-compat).
-    const script = opts?.script ?? persisted.script;
-    const args = opts?.args !== undefined ? opts.args : persisted.args;
+    const { script: editedScript, args: overrideArgs, ...exec } = opts ?? {};
+    const script = editedScript ?? persisted.script;
+    const args = overrideArgs !== undefined ? overrideArgs : persisted.args;
 
     // Normalize the persisted total-at-pause once: PersistedRunState.tokenUsage
     // has optional cost/cacheRead/cacheWrite (legacy runs may lack them), but
@@ -1337,6 +1547,11 @@ export class WorkflowManager extends EventEmitter {
           cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
         }
       : undefined;
+
+    // The run's resume journal in normalized (de-compacted) form, computed
+    // ONCE and reused for the in-memory seed, the upsert side-index, and the
+    // resume-replay map below (see loadPersistedJournal).
+    const persistedJournal = loadPersistedJournal(persisted);
 
     const controller = new AbortController();
     const managed: ManagedRun = {
@@ -1363,7 +1578,12 @@ export class WorkflowManager extends EventEmitter {
       // writes them below, so a later resume of this run sees the edited script.
       script,
       args,
-      journal: loadPersistedJournal(persisted),
+      journal: persistedJournal,
+      // Rebuild the O(1) upsert side-index from the seeded journal (see
+      // ManagedRunBase.journalIndex) so onAgentJournal can replace seeded
+      // entries in place when a resume re-runs a call.
+      journalIndex: buildJournalSideIndex(persistedJournal),
+      checkpoints: persisted.checkpoints ?? [],
       background: true,
       lease,
       // Carry the original opt-out forward across resumes; it's fixed at
@@ -1421,7 +1641,7 @@ export class WorkflowManager extends EventEmitter {
     // nested workflow() journaling was namespaced), so it still resume-hits
     // for a top-level call and safely cache-misses (re-runs live, does not
     // misapply) for what was actually a nested-run entry.
-    const resumeJournal = buildResumeJournal(runId, loadPersistedJournal(persisted));
+    const resumeJournal = buildResumeJournal(runId, persistedJournal);
     this.emit("resumed", { runId });
     // Run in the background; executeRun records status/errors on the managed run.
     // initialTokenUsage seeds the resumed execution's fresh SharedRuntime.spent
@@ -1436,7 +1656,12 @@ export class WorkflowManager extends EventEmitter {
     // correct cumulative count inside this fresh SharedRuntime by the time any
     // new live agent runs — so maxAgents (via A1) is already a genuine
     // cumulative cap across resume with no extra seeding required.
-    void this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage }).catch(() => {});
+    // ExecOptions passthrough: `...exec` is spread FIRST so the manager's own
+    // resumeJournal/initialTokenUsage (computed above) always win over any
+    // caller-supplied values.
+    void this.executeRun(managed, script, args, { ...exec, resumeJournal, initialTokenUsage: priorTokenUsage }).catch(
+      () => {},
+    );
     return true;
   }
 
@@ -1480,6 +1705,7 @@ export class WorkflowManager extends EventEmitter {
       // small leak in exactly the class this manager otherwise bounds.
       const hadNoPendingSettle = managed.status === "paused";
       managed.controller.abort();
+      this.armSettleWatchdog(managed);
       if (managed.status === "running") {
         this.settleExecuting(managed, "aborted");
       } else {

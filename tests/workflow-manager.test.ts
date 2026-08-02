@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { saveCheckpoint } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -1027,7 +1028,16 @@ test(
       assert.ok((err as WorkflowError).recoverable, "abort error should be recoverable");
     }
 
-    assert.equal(errorEmitted, true, "manager should emit 'error' event on abort");
+    assert.equal(
+      errorEmitted,
+      false,
+      "manager must NOT emit 'error' for an intentional external abort (core-orchestration:f1)",
+    );
+    assert.equal(
+      manager.listRuns()[0]?.status,
+      "aborted",
+      "an intentional abort settles the run to 'aborted', not 'failed'",
+    );
   }),
 );
 
@@ -2559,7 +2569,7 @@ test(
 );
 
 test(
-  "manager emits 'error' event on abort with WorkflowError",
+  "manager does NOT emit 'error' for an intentional externalSignal abort (f1 gate)",
   withTempCwd(async (cwd) => {
     const ac = new AbortController();
     const da = deferredAgent();
@@ -2583,9 +2593,358 @@ test(
       /* expected */
     }
 
-    assert.ok(capturedError, "error event should fire on abort");
+    // externalSignal aborts managed.controller (see executeRun's wiring), so the
+    // intent-gated 'error' branch must skip the emit — a deliberate user abort
+    // (Esc during a blocking tool call) is not a run failure.
+    assert.equal(capturedError, null, "intentional external abort must NOT emit 'error'");
+    assert.equal(manager.listRuns()[0]?.status, "aborted");
+  }),
+);
+
+test(
+  "manager emits 'error' event for a genuine run failure (f1 gate preserves real failures)",
+  withTempCwd(async (cwd) => {
+    // Each agent reports 100 tokens against a default budget of 50: the second
+    // agent throws TOKEN_BUDGET_EXHAUSTED — a genuine, non-recoverable run
+    // failure that must still emit 'error' even with the intent gate.
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent({ total: 100 }), defaultTokenBudget: 50 });
+
+    let capturedError: { runId: string; error: WorkflowError } | null = null;
+    manager.on("error", (ev: { runId: string; error: WorkflowError }) => {
+      capturedError = ev;
+    });
+
+    await assert.rejects(manager.runSync(twoAgentScript));
+
+    assert.ok(capturedError, "a genuine run failure must emit 'error'");
     assert.ok(capturedError?.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(capturedError?.error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(capturedError?.error.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+    assert.equal(manager.listRuns()[0]?.status, "failed");
+  }),
+);
+
+test(
+  "pause() and stop() do not emit 'error' (intentional aborts, not failures)",
+  withTempCwd(async (cwd) => {
+    // The subagent's in-flight run() rejects when the run's abort signal fires
+    // — the cooperative-abort path a real session follows on pause/stop. This
+    // rejection reaches executeRun's catch tail, which must NOT emit 'error'
+    // for a deliberate user action (core-orchestration:f1).
+    const abortRejectingAgent = {
+      async run(_prompt: string, options?: { signal?: AbortSignal }) {
+        return new Promise((_resolve, reject) => {
+          const signal = options?.signal;
+          if (signal?.aborted) {
+            reject(new Error("aborted"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+
+    for (const action of ["pause", "stop"] as const) {
+      let sawAbort = false;
+      const agentWithFlag = {
+        async run(prompt: string, options?: { signal?: AbortSignal }) {
+          // Set the in-flight flag when the subagent session is actually created.
+          sawAbort = true;
+          return abortRejectingAgent.run(prompt, options);
+        },
+      };
+      const manager = new WorkflowManager({ cwd, agent: agentWithFlag });
+      let errorEvents = 0;
+      manager.on("error", () => {
+        errorEvents++;
+      });
+      const { runId, promise } = manager.startInBackground(oneAgentScript);
+      // Wait until the agent is genuinely in flight (run() invoked).
+      for (let i = 0; i < 200 && !sawAbort; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (action === "pause") assert.equal(manager.pause(runId), true);
+      else assert.equal(manager.stop(runId), true);
+      // Let the abort propagate through the agent rejection into the catch tail.
+      await promise.catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      assert.equal(errorEvents, 0, `${action}() must not emit 'error'`);
+      assert.equal(manager.getRun(runId)?.status, action === "pause" ? "paused" : "aborted");
+    }
+  }),
+);
+
+test(
+  "deleteRun() does not emit 'error' for the run it intentionally aborts",
+  withTempCwd(async (cwd) => {
+    let sawAbort = false;
+    const abortRejectingAgent = {
+      async run(_prompt: string, options?: { signal?: AbortSignal }) {
+        // In-flight marker: the subagent session is live the moment run() runs.
+        sawAbort = true;
+        return new Promise((_resolve, reject) => {
+          const signal = options?.signal;
+          if (signal?.aborted) {
+            reject(new Error("aborted"));
+            return;
+          }
+          signal?.addEventListener(
+            "abort",
+            () => {
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: abortRejectingAgent });
+    let errorEvents = 0;
+    manager.on("error", () => {
+      errorEvents++;
+    });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    for (let i = 0; i < 200 && !sawAbort; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.deleteRun(runId), true);
+    await promise.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(errorEvents, 0, "deleteRun() must not emit 'error'");
+  }),
+);
+
+test(
+  "checkpoints persist through writeRunToDisk and seed resume() (f3 manager side)",
+  withTempCwd(async (cwd) => {
+    // 'first' resolves, 'second' hangs — so the run can be paused after the
+    // first agent journals.
+    const agent = {
+      async run(prompt: string) {
+        if (prompt === "first") return "a-done";
+        return new Promise(() => {});
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    promise.catch(() => {}); // pause aborts the in-flight execution — expected
+    // Wait until the second agent is in flight, then pause.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // A checkpoint written through the persistence layer (the CAS side lives
+    // in the persistence slice; the manager must not erase it on its next
+    // write — see writeRunToDisk's save object).
+    await saveCheckpoint(
+      runId,
+      {
+        runId,
+        taskId: "task-1",
+        status: "active",
+        output: "stage 1 complete",
+        timestamp: new Date().toISOString(),
+      },
+      cwd,
+    );
+
+    // A manager persist lands AFTER the saveCheckpoint (e.g. the final pause
+    // persist, or resume's initial persist) — with ManagedRunBase.checkpoints
+    // carried through, the checkpoint survives.
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.checkpoints?.length, 1, "manager persist must keep the CAS-written checkpoint");
+    assert.equal(persisted?.checkpoints?.[0]?.taskId, "task-1");
+
+    // Resume: the new ManagedRun seeds its in-memory checkpoints from the
+    // persisted array (persisted.checkpoints ?? []), so a later manager persist
+    // keeps carrying them.
+    assert.equal(await manager.resume(runId), true);
+    assert.deepEqual(manager.getRun(runId)?.checkpoints, persisted?.checkpoints);
+    const resumedPersisted = manager.getPersistence().load(runId);
+    assert.equal(resumedPersisted?.checkpoints?.length, 1, "resume's initial persist keeps the checkpoint");
+  }),
+);
+
+test(
+  "resume(runId, opts) passes ExecOptions through (onProgress fires for the resumed execution)",
+  withTempCwd(async (cwd) => {
+    // First run: 'first' resolves, 'second' hangs — pause mid-'second'.
+    let hangSecond = true;
+    const agent = {
+      async run(prompt: string) {
+        if (prompt === "second" && hangSecond) return new Promise(() => {});
+        return `done:${prompt}`;
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.pause(runId), true);
+
+    // Resume with an ExecOptions passthrough: onProgress must fire for the
+    // resumed execution (core-orchestration:i4) while the headless scheduler
+    // path (no opts) stays unchanged.
+    hangSecond = false;
+    let progressCalls = 0;
+    const resumed = await manager.resume(runId, {
+      onProgress: () => {
+        progressCalls++;
+      },
+    });
+    assert.equal(resumed, true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(progressCalls > 0, "onProgress must fire during the resumed execution");
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+  }),
+);
+
+test(
+  "resume stays headless when opts carries no confirm; threaded confirm is honored (i4)",
+  withTempCwd(async (cwd) => {
+    // A checkpoint() script: a headless resume (no confirm threaded in) applies
+    // the declared default / replays the journaled reply instead of blocking.
+    const script = `export const meta = { name: 'ckpt_headless', description: 'checkpoint headless' }
+const ok = await checkpoint('proceed?', { kind: 'confirm', default: true })
+const a = await agent('work', { label: 'a' })
+return { ok, a }`;
+    let hang = true;
+    const agent = {
+      async run(prompt: string) {
+        if (hang && prompt === "work") return new Promise(() => {});
+        return `done:${prompt}`;
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    const { runId, promise } = manager.startInBackground(script);
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.pause(runId), true);
+    hang = false;
+
+    // Headless scheduler path: resume() with no opts must not hang on the
+    // checkpoint (it replays the journaled reply).
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.status, "completed");
+
+    // Same script run fresh with a confirm threaded via ExecOptions: the
+    // callback is used (proves the opts passthrough surface is the same
+    // ExecOptions runSync/startInBackground already accept).
+    const manager2 = new WorkflowManager({ cwd, agent });
+    let confirmCalls = 0;
+    await manager2.runSync(script, undefined, {
+      confirm: async () => {
+        confirmCalls++;
+        return true;
+      },
+    });
+    assert.ok(confirmCalls > 0, "confirm from ExecOptions is honored");
+  }),
+);
+
+test(
+  "journal upsert is O(1): a resume re-run replaces its seeded (runId, index) entry in place",
+  withTempCwd(async (cwd) => {
+    const hangSecond = true;
+    const agent = {
+      async run(prompt: string) {
+        if (prompt === "second" && hangSecond) return new Promise(() => {});
+        return `done:${prompt}`;
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    const { runId, promise } = manager.startInBackground(twoAgentScript);
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.pause(runId), true);
+    // The first run journaled exactly one entry: 'first' (call index 0).
+    assert.equal(manager.getPersistence().load(runId)?.journal?.length, 1);
+
+    // Resume with an EDITED script (call 0's prompt changes -> cache miss ->
+    // re-runs live and journals a FRESH (runId, 0) entry). 'second' STILL
+    // hangs, so the resumed run's in-memory journal — the side-index's own
+    // bookkeeping (core-orchestration:i3) — is observable mid-run.
+    const edited = twoAgentScript.replace("'first'", "'first-edited'");
+    assert.equal(await manager.resume(runId, { script: edited }), true);
+    // Wait until the resumed run has re-journaled call 0 and reached the
+    // hanging 'second' (agents rebuilt from scratch: length 1 -> 2).
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const liveJournal = manager.getRun(runId)?.journal;
+    assert.equal(liveJournal?.length, 1, "the fresh (runId, 0) entry replaced the seeded one in place — no duplicate");
+    assert.equal(liveJournal?.[0]?.result, "done:first-edited", "latest-wins: the resumed call's result is journaled");
+
+    // Cleanup: stop the resumed run (its 'second' hangs forever).
+    assert.equal(manager.stop(runId), true);
+  }),
+);
+
+test(
+  "settle watchdog releases a stopped run whose execution never settles (i5)",
+  withTempCwd(async (cwd) => {
+    // The subagent NEVER settles — it ignores the abort signal entirely, so the
+    // execution promise would otherwise pin the run in `runs` forever.
+    const neverSettlingAgent = {
+      async run(_prompt: string, _options?: { signal?: AbortSignal }) {
+        return new Promise(() => {});
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: neverSettlingAgent, settleWatchdogMs: 80 });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {}); // the hung execution never settles — swallow
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents.length < 1; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.stop(runId), true);
+    assert.ok(manager.getRun(runId), "the stopped run is still in memory until the watchdog fires");
+
+    // After settleWatchdogMs the watchdog force-releases the run from the
+    // in-memory registry (disk state remains authoritative and listable).
+    for (let i = 0; i < 100 && manager.getRun(runId) !== undefined; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.getRun(runId), undefined, "watchdog must release the never-settling run");
+    assert.equal(manager.listRuns()[0]?.status, "aborted", "disk state stays authoritative");
+  }),
+);
+
+test(
+  "settle watchdog never releases a run that settles on its own (disarmed on settle)",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner, settleWatchdogMs: 60 });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(manager.pause(runId), true);
+    // The cooperative abort DOES settle (agent resolves, throwIfAborted fires).
+    da.resolve("done");
+    await promise.catch(() => {});
+
+    // Give the watchdog ample time to have fired had it not been disarmed.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const managed = manager.getRun(runId);
+    assert.ok(managed, "a settled run must not be force-released");
+    assert.equal(managed.status, "paused");
   }),
 );
 
