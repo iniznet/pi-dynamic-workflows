@@ -106,6 +106,17 @@ export class SharedStore {
       this.map.size + extraKeys <= this.limits.maxKeys &&
       this.totalBytes - oldBytes + bytes <= this.limits.maxTotalBytes;
     if (wouldFit()) return bytes;
+    // A write that can never succeed even in an empty store must be rejected
+    // BEFORE evicting anything, so a rejected put has no side effects: it
+    // never destroys existing entries as a side effect of inevitably failing.
+    if (!had && this.limits.maxKeys < 1) {
+      throw new RangeError(`store key count would exceed maxKeys (${this.limits.maxKeys})`);
+    }
+    if (bytes > this.limits.maxTotalBytes) {
+      throw new RangeError(
+        `store value for "${key}" (${bytes} B) exceeds maxTotalBytes (${this.limits.maxTotalBytes} B)`,
+      );
+    }
     for (const k of [...this.map.keys()]) {
       if (k === key) continue;
       this.removeKey(k);

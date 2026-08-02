@@ -787,6 +787,10 @@ test("a value that cannot fit even after evicting every other key throws", () =>
   const store = new SharedStore({ maxTotalBytes: 50 });
   store.put("a", "x".repeat(10));
   assert.throws(() => store.put("b", "y".repeat(60)), /exceeds maxTotalBytes/);
+  // A rejected write must have no side effects: the previously-stored entry
+  // survives even when the new value could never fit in an empty store.
+  assert.equal(store.has("a"), true, "rejected write must not evict unrelated entries");
+  assert.deepEqual(store.get("a"), "x".repeat(10));
 });
 
 test("ttlMs entries expire lazily", async () => {
@@ -801,6 +805,28 @@ test("ttlMs entries expire lazily", async () => {
 test("trackPut enforces the same guardrails as put", () => {
   const store = new SharedStore({ maxValueBytes: 10 });
   assert.throws(() => store.trackPut("k", "x".repeat(100), "run-1:0"), /exceeds maxValueBytes/);
+});
+
+test("a rejected write never destroys other entries as a side effect", () => {
+  // maxTotalBytes tuned below maxValueBytes so a single value can pass the
+  // maxValueBytes check yet never fit even in an empty store.
+  const store = new SharedStore({ maxTotalBytes: 50, maxValueBytes: 200 });
+  store.put("a", "x".repeat(10));
+  store.put("b", "y".repeat(10));
+  const beforeA = store.get("a");
+  const beforeB = store.get("b");
+  assert.throws(() => store.put("c", "z".repeat(60)), /exceeds maxTotalBytes/);
+  assert.equal(store.get("a"), beforeA, "rejected put must not evict unrelated entries");
+  assert.equal(store.get("b"), beforeB, "rejected put must not evict unrelated entries");
+  assert.equal(store.has("c"), false, "rejected put must never land in the store");
+});
+
+test("applyDelta rejects a never-fitting entry without destroying others", () => {
+  const store = new SharedStore({ maxTotalBytes: 50, maxValueBytes: 200 });
+  store.put("a", "x".repeat(10));
+  assert.throws(() => store.applyDelta({ b: "y".repeat(60) }), /exceeds maxTotalBytes/);
+  assert.equal(store.has("a"), true);
+  assert.deepEqual(store.get("a"), "x".repeat(10));
 });
 
 test("applyDelta and restore enforce the same caps", () => {
