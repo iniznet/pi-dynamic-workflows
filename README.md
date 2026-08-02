@@ -269,6 +269,8 @@ Completed background runs persist their full result in the project run JSON. The
 
 Pi's `/reload` keeps the live workflow manager in-process when the installed extension version has not changed. Active background runs therefore continue streaming progress, remain controllable, and deliver their result through the freshly loaded extension; session-local `/effort` also survives the reload. If the package version changes, active runs are paused and a fresh manager loads, leaving them safely resumable through the journal instead of mixing extension versions. This handoff applies only to `/reload`. A process restart still uses the same durable journal path, recovering an interrupted running workflow as paused so it can be resumed safely.
 
+On any shutdown the extension deterministically disposes the resources it owns: the usage-limit scheduler's timers, the host-tool gateway (ending its MCP bridge socket), and any on-demand review bridge (its `close()` ends open SSE responses and closes the server). The handoff is idempotent — a double-fired shutdown cannot double-close or re-stage the same generation.
+
 Finished runs (completed, failed, or aborted) are retained in full on disk, capped at the 300 most recent per project — older ones are evicted first, and a running or paused run is never touched. Only a smaller number (20 by default) also stay fully loaded in memory for instant access right after they finish; older finished runs still show up in `/workflows` and `workflow_control list`, just read back from disk instead of memory. Library embedders can tune both caps — `maxTerminalRunsInMemory` on `WorkflowManager` and `maxTerminalRunsOnDisk` on the run-persistence layer.
 
 </details>
@@ -285,6 +287,33 @@ Set a literal, case-insensitive custom trigger in `~/.pi/workflows/settings.json
 ```
 
 The default `workflow` also matches `workflows`; a custom word matches exactly. Trigger words are case-insensitive and Unicode identifier-bounded, and do not activate inside paths, slash commands, or identifier-like text. Detection is purely textual, applied at submit time to the message you send — it does not depend on, or own, Pi's editor component, so it works the same regardless of what else is installed.
+
+</details>
+
+<details>
+<summary><strong>Environment-variable overrides (headless / CI / containers)</strong></summary>
+
+Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environment variable — the settings channel that works without a writable home directory or `settings.json`. Env overrides are merged on top of the global and project settings files (env wins per key), are applied to every settings reader in the extension, and never write back to disk, so a CI job can pin concurrency or budgets without mutating a developer's machine.
+
+| Setting | Env var | Value shape |
+| --- | --- | --- |
+| `keywordTriggerEnabled` | `PI_WORKFLOW_KEYWORD_TRIGGER_ENABLED` | `true` / `false` |
+| `keywordTriggerWord` | `PI_WORKFLOW_KEYWORD_TRIGGER_WORD` | plain word (no `/`, no whitespace) |
+| `defaultAgentTimeoutMs` | `PI_WORKFLOW_DEFAULT_AGENT_TIMEOUT_MS` | positive integer; `null` or empty disables |
+| `defaultTokenBudget` | `PI_WORKFLOW_DEFAULT_TOKEN_BUDGET` | positive integer; `null` or empty cancels a global budget |
+| `defaultConcurrency` | `PI_WORKFLOW_DEFAULT_CONCURRENCY` | integer 1–16 |
+| `defaultAgentRetries` | `PI_WORKFLOW_DEFAULT_AGENT_RETRIES` | integer 0–3 |
+| `progressPanelMode` | `PI_WORKFLOW_PROGRESS_PANEL_MODE` | `compact` / `detailed` |
+| `progressPanelMaxAgents` | `PI_WORKFLOW_PROGRESS_PANEL_MAX_AGENTS` | integer 1–1000 |
+| `persistAgentSessions` | `PI_WORKFLOW_PERSIST_AGENT_SESSIONS` | `true` / `false` |
+| `deliveredResultMaxChars` | `PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS` | integer 1–1000000 |
+| `excludeSubagentTools` | `PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS` | comma-separated tool names |
+
+Unparseable, out-of-range, or unknown values are silently ignored (the same leniency the settings-file normalization applies), so a misconfigured CI env can never crash the extension — it just falls back to the file value. Example:
+
+```bash
+PI_WORKFLOW_DEFAULT_CONCURRENCY=8 PI_WORKFLOW_PERSIST_AGENT_SESSIONS=false pi
+```
 
 </details>
 
@@ -333,8 +362,10 @@ Two behavior changes to know about:
 
 ```bash
 npm install
-npm test     # Biome, TypeScript, unit tests, and release checks
+npm test     # Biome, TypeScript (incl. the extension entry), unit tests, release checks, entry contract
 ```
+
+The check pipeline type-checks the extension entry (`extensions/workflow.ts`) together with the scripts via `tsconfig.scripts.json`, and `scripts/check-entry-contract.ts` verifies that `src/index.ts` still exports the documented public API (every name the extension entry, README, and tests depend on). Run the contract gate alone with `npm run check:entry-contract`.
 
 ### Optional model-comprehension evidence
 
