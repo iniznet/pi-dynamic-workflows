@@ -3,6 +3,8 @@
  * Agents cross-check each other's findings for higher quality results.
  */
 
+import { ADVERSARIAL_REVIEW_NUMERIC_ARGS, numericArgCoercionSource } from "./builtin-args.js";
+
 export interface AdversarialReviewConfig {
   /** Number of independent reviewers per finding. */
   reviewerCount: number;
@@ -31,16 +33,34 @@ export function generateAdversarialReviewWorkflow(): string {
   ],
 }
 
+// reviewers/threshold/maxFindings come from the shared builtin-args coercion
+// (baked into the script below) — never the || default pattern, which silently mangles a
+// present falsy value (e.g. threshold: 0) and accepts out-of-range fan-out.
+${numericArgCoercionSource(ADVERSARIAL_REVIEW_NUMERIC_ARGS)}
+
 const task = (args && args.task) || ''
-const reviewers = (args && args.reviewers) || 2
-const threshold = (args && args.threshold) || 0.5
 
 phase('Investigate')
 const investigation = await agent(
   'Investigate the following and list concrete, individually-checkable findings:\\n' + task,
   { label: 'investigate', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }
 )
-const findings = investigation.findings || []
+// agent() returns null on a recoverable failure (parallel() swallows failures
+// as null too), and a non-array findings would crash .map below — guard exactly
+// like deep-research.ts's planner. Refute/Consensus still produce a degraded
+// report on an empty pool instead of a TypeError killing the whole run.
+const rawFindings = (investigation && Array.isArray(investigation.findings))
+  ? investigation.findings.filter((f) => typeof f === 'string' && f.trim().length > 0)
+  : []
+// i5: fan-out is findings x reviewers agents — cap the pool at maxFindings and
+// log the degradation instead of silently truncating or fanning out unbounded.
+const findings = rawFindings.slice(0, maxFindings)
+if (rawFindings.length > maxFindings) {
+  log(
+    'Adversarial review: ' + rawFindings.length + ' findings surfaced; capping the refute phase at ' + maxFindings +
+    ' findings to bound fan-out (' + (rawFindings.length - maxFindings) + ' findings are not cross-checked).'
+  )
+}
 
 phase('Refute')
 const judged = await parallel(findings.map((f, i) => () =>

@@ -234,7 +234,8 @@ export function registerBuiltinWorkflows(
         // here lets us tell the user clearly rather than have it happen silently deep
         // inside the generated script.
         const originalLength = diff.length;
-        if (originalLength > MAX_DIFF_CHARS) {
+        const diffTruncated = originalLength > MAX_DIFF_CHARS;
+        if (diffTruncated) {
           diff = diff.slice(0, MAX_DIFF_CHARS);
           ctx.ui.notify(
             `Diff is ${originalLength.toLocaleString()} characters — truncated to the first ` +
@@ -243,9 +244,14 @@ export function registerBuiltinWorkflows(
           );
         }
 
-        const resolved = resolveBuiltinOrNotify("code-review", cwd, { diff, diffSource }, ctx);
+        // i4: pass truncation provenance through to the run. The generated script
+        // derives diffTruncated from args (see code-review.ts); without this flag a
+        // diff already truncated here would report itself as not truncated, and the
+        // original length is needed for accurate "characters omitted" accounting.
+        const reviewArgs = { diff, diffSource, diffTruncated, diffLength: originalLength };
+        const resolved = resolveBuiltinOrNotify("code-review", cwd, reviewArgs, ctx);
         if (!resolved) return;
-        startBackground(manager, ctx, "code-review", resolved.script, { diff, diffSource });
+        startBackground(manager, ctx, "code-review", resolved.script, reviewArgs);
       },
     });
   }

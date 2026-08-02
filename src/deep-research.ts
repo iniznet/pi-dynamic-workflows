@@ -3,6 +3,8 @@
  * Built-in workflow for comprehensive research across multiple sources.
  */
 
+import { DEEP_RESEARCH_NUMERIC_ARGS, numericArgCoercionSource } from "./builtin-args.js";
+
 export interface DeepResearchConfig {
   /** Number of distinct search angles/queries to explore. */
   angles: number;
@@ -29,9 +31,12 @@ export function generateDeepResearchWorkflow(): string {
   ],
 }
 
+// angles/minSupport come from the shared builtin-args coercion (baked into
+// the script below) — never the || default pattern, which silently mangles a present
+// falsy value (e.g. angles: 0) and accepts out-of-range fan-out.
+${numericArgCoercionSource(DEEP_RESEARCH_NUMERIC_ARGS)}
+
 const question = (args && args.question) || ''
-const angles = (args && args.angles) || 4
-const minSupport = (args && args.minSupport) || 2
 
 phase('Queries')
 const plan = await agent(
@@ -44,7 +49,15 @@ const plan = await agent(
 // Gather phase uses below and fall back to the original question as a single
 // query so research still proceeds (degraded) instead of crashing on plan.queries.
 const planned = plan && Array.isArray(plan.queries) ? plan.queries.filter((q) => typeof q === 'string' && q.trim().length > 0) : []
+// i5: the planner can emit far more queries than we can afford to fan out —
+// cap at angles and log the degradation instead of silently dropping them.
 const queries = (planned.length > 0 ? planned : [question]).slice(0, angles)
+if (planned.length > angles) {
+  log(
+    'Deep research: planner produced ' + planned.length + ' queries; using the first ' + angles +
+    ' to bound Gather fan-out (' + (planned.length - angles) + ' queries are not researched).'
+  )
+}
 
 phase('Gather')
 const gathered = await parallel(queries.map((q, i) => () =>

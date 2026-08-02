@@ -3,6 +3,8 @@
  * 7 specialized finder agents → verify pass → ranked report.
  */
 
+import { CODE_REVIEW_NUMERIC_ARGS, numericArgCoercionSource } from "./builtin-args.js";
+
 /**
  * Hard cap on diff characters fed into the review. This bounds worst-case
  * prompt size across 7 parallel finders + a per-candidate verify pass, even
@@ -17,7 +19,14 @@ export const MAX_DIFF_CHARS = 200_000;
  * Generate a code-review workflow script.
  *
  * The workflow expects `args` to be passed with shape:
- *   { diff: string, diffSource: string }
+ *   { diff: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number,
+ *     maxCandidates?: number, verifyBatchSize?: number }
+ *
+ * `diffTruncated`/`diffLength` carry truncation provenance (builtins:i4): the
+ * /code-review slash command truncates the diff before passing it in and flags
+ * both; every other launch path passes the raw diff and the script computes
+ * truncation itself. `maxCandidates`/`verifyBatchSize` bound the verify
+ * fan-out (builtins:i2/i5) and are coerced by the shared builtin-args rules.
  *
  * Model tier routing follows the spec:
  *   Finders A/B/C → medium (correctness)
@@ -37,14 +46,25 @@ export function generateCodeReviewWorkflow(): string {
 }
 
 const MAX_DIFF_CHARS = ${MAX_DIFF_CHARS}
+// maxCandidates/verifyBatchSize come from the shared builtin-args coercion
+// (baked into the script below) — never the old || default pattern, which
+// silently mangles a present falsy value and accepts out-of-range fan-out.
+${numericArgCoercionSource(CODE_REVIEW_NUMERIC_ARGS)}
+// Truncation provenance (builtins:i4): the /code-review slash command already
+// truncated the diff and flags args.diffTruncated + args.diffLength; the
+// workflow tool's name path passes the raw diff and the script computes
+// truncation itself. Honour both so diffTruncated is accurate on every launch
+// path — a truncated diff must never report itself as not truncated.
 const rawDiff = (args && args.diff) || ''
 const diffSource = (args && args.diffSource) || 'git diff HEAD'
-const diffTruncated = rawDiff.length > MAX_DIFF_CHARS
+const diffTruncated = (args && args.diffTruncated) === true || rawDiff.length > MAX_DIFF_CHARS
+const diffOriginalLength = typeof (args && args.diffLength) === 'number' ? args.diffLength : rawDiff.length
 const diff = diffTruncated ? rawDiff.slice(0, MAX_DIFF_CHARS) : rawDiff
 if (diffTruncated) {
+  const omitted = Math.max(0, diffOriginalLength - MAX_DIFF_CHARS)
   log(
-    'Diff truncated for review: showing the first ' + MAX_DIFF_CHARS + ' of ' + rawDiff.length +
-    ' characters (' + (rawDiff.length - MAX_DIFF_CHARS) + ' omitted). Findings past the cut are not covered.'
+    'Diff truncated for review: showing the first ' + MAX_DIFF_CHARS + ' of ' + diffOriginalLength +
+    ' characters (' + omitted + ' omitted). Findings past the cut are not covered.'
   )
 }
 const candidateSchema = {
@@ -68,7 +88,7 @@ const candidateSchema = {
 }
 
 const diffBlock = '\\n\\n<diff source=\\"' + diffSource + '\\"' + (diffTruncated ? ' truncated=\\"true\\"' : '') + '>\\n' +
-  diff + (diffTruncated ? '\\n\\n[... diff truncated: ' + (rawDiff.length - MAX_DIFF_CHARS) + ' more characters omitted ...]' : '') +
+  diff + (diffTruncated ? '\\n\\n[... diff truncated: ' + Math.max(0, diffOriginalLength - MAX_DIFF_CHARS) + ' more characters omitted ...]' : '') +
   '\\n</diff>\\n'
 const base = 'Use the read/grep tools to pull in any additional file context you need.' + diffBlock
 
@@ -132,6 +152,22 @@ const allCandidates = allRaw.filter((c) => {
   return true
 })
 
+// i2: pre-cap the deduped candidate pool BEFORE any verify agent runs — a
+// finder burst of hundreds must not translate into hundreds of verifier calls
+// (the report only shows ~10 anyway). i5: the cap is logged, never silent.
+const pool = allCandidates.slice(0, maxCandidates)
+if (allCandidates.length > maxCandidates) {
+  log(
+    'Code review: ' + allCandidates.length + ' candidate findings after dedupe; capping the verify pass at ' +
+    maxCandidates + ' (' + (allCandidates.length - maxCandidates) + ' candidates are not verified).'
+  )
+}
+// Batch the verify calls: ceil(pool / verifyBatchSize) verifier agents each
+// judge its whole batch in one call, instead of one agent per candidate.
+const batches = Array.from({ length: Math.ceil(pool.length / verifyBatchSize) }, (_, b) =>
+  pool.slice(b * verifyBatchSize, (b + 1) * verifyBatchSize)
+)
+
 phase('Verify')
 // NOTE: deliberately NOT using the verify() stdlib helper here. verify() only
 // returns a boolean real/not-real vote; this phase needs the 3-way
@@ -140,27 +176,41 @@ phase('Verify')
 // below, verify()'s boolean would collapse CONFIRMED and PLAUSIBLE into one
 // bucket and lose that signal for no behavioral gain — verify({reviewers: 1})
 // is already a single agent() call under the hood, same as this.
-const verdicts = allCandidates.length > 0
-  ? await parallel(allCandidates.map((c, i) => () =>
+const batchVerdicts = batches.length > 0
+  ? await parallel(batches.map((batch, b) => () =>
       agent(
-        'You are a verifier. Determine whether this code review finding is CONFIRMED, PLAUSIBLE, or REFUTED. ' +
+        'You are a verifier. For EACH finding below, determine whether it is CONFIRMED, PLAUSIBLE, or REFUTED. ' +
         'CONFIRMED = you can trace the exact failure in the diff. PLAUSIBLE = concern is valid but not certain. ' +
-        'REFUTED = finding is wrong or already handled.\\n\\n' +
-        'FINDING:\\nFile: ' + c.file + '\\nLine: ' + c.line + '\\nSummary: ' + c.summary + '\\n' +
-        'Failure scenario: ' + c.failure_scenario + diffBlock,
+        'REFUTED = finding is wrong or already handled. Return one verdict object per finding, in the same order as listed.\\n\\n' +
+        batch.map((c, i) =>
+          'FINDING ' + (b * verifyBatchSize + i + 1) + ':\\nFile: ' + c.file + '\\nLine: ' + c.line +
+          '\\nSummary: ' + c.summary + '\\nFailure scenario: ' + c.failure_scenario
+        ).join('\\n\\n') + diffBlock,
         {
-          label: 'verify-' + (i + 1),
+          label: 'verify-batch-' + (b + 1),
           schema: {
             type: 'object',
-            properties: { verdict: { type: 'string', enum: ['CONFIRMED', 'PLAUSIBLE', 'REFUTED'] }, reason: { type: 'string' } },
-            required: ['verdict'],
+            properties: {
+              verdicts: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: { verdict: { type: 'string', enum: ['CONFIRMED', 'PLAUSIBLE', 'REFUTED'] }, reason: { type: 'string' } },
+                  required: ['verdict'],
+                },
+              },
+            },
+            required: ['verdicts'],
           },
         }
       )
     ))
   : []
+// Flatten batch verdicts back into pool order; a null batch (recoverable
+// agent failure) degrades to PLAUSIBLE per candidate, same as a null verdict.
+const verdicts = batchVerdicts.flatMap((b) => (b && Array.isArray(b.verdicts) ? b.verdicts : []))
 
-const surviving = allCandidates
+const surviving = pool
   .map((c, i) => ({ ...c, verdict: (verdicts[i] && verdicts[i].verdict) || 'PLAUSIBLE', verifyReason: (verdicts[i] && verdicts[i].reason) || '' }))
   .filter((c) => c.verdict !== 'REFUTED')
 
@@ -179,5 +229,5 @@ const synthesis = await agent(
   { label: 'synthesis', tier: 'big' }
 )
 
-return { total: allCandidates.length, surviving: surviving.length, findings: top, report: synthesis, diffTruncated }`;
+return { total: allCandidates.length, verified: pool.length, surviving: surviving.length, findings: top, report: synthesis, diffTruncated }`;
 }

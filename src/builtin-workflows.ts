@@ -14,6 +14,12 @@
 
 import { createCodingTools, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
+import {
+  ADVERSARIAL_REVIEW_NUMERIC_ARGS,
+  CODE_REVIEW_NUMERIC_ARGS,
+  DEEP_RESEARCH_NUMERIC_ARGS,
+  validateNumericArgs,
+} from "./builtin-args.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { createWebTools } from "./web-tools.js";
@@ -67,9 +73,15 @@ function requireStringArray(value: unknown, argName: string, patternName: string
 export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "deep-research",
-    description: "Research a question across the web with cross-checked sources. args: { question: string }.",
+    description:
+      "Research a question across the web with cross-checked sources. args: { question: string, angles?: number, minSupport?: number }.",
     resolve(cwd, args) {
-      requireNonEmptyString(asRecord(args).question, "question", "deep-research");
+      const record = asRecord(args);
+      requireNonEmptyString(record.question, "question", "deep-research");
+      // Numeric args (angles/minSupport) are bounds-checked here so an invalid
+      // value (0, negative, absurd fan-out) fails loudly before a run starts;
+      // the generated script enforces the same rules at runtime (builtins:i1).
+      validateNumericArgs(record, DEEP_RESEARCH_NUMERIC_ARGS, "deep-research");
       return {
         script: generateDeepResearchWorkflow(),
         // Research agents need real web access on top of the coding tools; the
@@ -83,22 +95,26 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "adversarial-review",
     description:
-      "Investigate a task, then cross-check each finding with skeptical reviewers. args: { task: string, reviewers?: number, threshold?: number }.",
+      "Investigate a task, then cross-check each finding with skeptical reviewers. args: { task: string, reviewers?: number, threshold?: number, maxFindings?: number }.",
     resolve(_cwd, args) {
-      requireNonEmptyString(asRecord(args).task, "task", "adversarial-review");
+      const record = asRecord(args);
+      requireNonEmptyString(record.task, "task", "adversarial-review");
+      validateNumericArgs(record, ADVERSARIAL_REVIEW_NUMERIC_ARGS, "adversarial-review");
       return { script: generateAdversarialReviewWorkflow() };
     },
   },
   {
     name: "code-review",
     description:
-      "Multi-angle parallel code review: 7 specialized finders (correctness, reuse, simplification, efficiency, altitude) + verify pass → ranked findings. args: { diff: string, diffSource?: string }.",
+      "Multi-angle parallel code review: 7 specialized finders (correctness, reuse, simplification, efficiency, altitude) + verify pass → ranked findings. args: { diff: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number }.",
     resolve(_cwd, args) {
+      const record = asRecord(args);
       // Truncation past MAX_DIFF_CHARS already happens inside the generated
       // script at runtime (see code-review.ts); a caller invoking by name is
       // responsible for supplying `diff` (e.g. by running `git diff` itself),
       // unlike the /code-review slash command, which fetches it automatically.
-      requireNonEmptyString(asRecord(args).diff, "diff", "code-review");
+      requireNonEmptyString(record.diff, "diff", "code-review");
+      validateNumericArgs(record, CODE_REVIEW_NUMERIC_ARGS, "code-review");
       return { script: generateCodeReviewWorkflow() };
     },
   },
