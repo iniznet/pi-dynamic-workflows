@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { proxiedParameters } from "../../src/agent/mcp-proxy-client.js";
 import {
   createGatewayProxiedTools,
   GATEWAY_NOT_RUNNING_MESSAGE,
@@ -155,6 +156,79 @@ test("createGatewayProxiedTools round-trips a call through the running gateway",
   assert.strictEqual(result.content[0].text, JSON.stringify({ hello: "world" }));
 });
 
+test("a stale/dead socket surfaces an isError result with no unhandledRejection (gateway-ipc:f1)", async () => {
+  // The background connect() fired by createGatewayProxiedTools must carry a
+  // detached catch: when the bridge dies under it, the rejected connect
+  // promise must never become an unhandledRejection (which with Node's
+  // default --unhandled-rejections=throw would crash the host process).
+  const unhandled: Error[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason instanceof Error ? reason : new Error(String(reason)));
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const gateway = trackedGateway();
+    await gateway.start(hostToolsFromDefinitions([echoTool()]));
+
+    const defs = createGatewayProxiedTools(gateway);
+    // Tear the bridge down immediately — the client's connect() is still in
+    // flight, so its promise rejects against the dying socket. The detached
+    // .catch(() => {}) must absorb that rejection.
+    await gateway.stop();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const echo = defs.find((d) => d.name === "echo") as {
+      execute: (
+        id: string,
+        p: unknown,
+      ) => Promise<{ isError?: boolean; content: Array<{ type: string; text: string }> }>;
+    };
+    // Per-call `await connecting` still surfaces the failure as an isError
+    // result instead of throwing out of the proxied execute.
+    const result = await echo.execute("call-1", { hello: "world" });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /error/i);
+
+    // Drain any late rejection before asserting.
+    await new Promise((r) => setTimeout(r, 30));
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, [], "the stale-socket connect rejection must be caught, never unhandled");
+});
+
+test("proxied tool definitions carry the host tool's real argument schema (gateway-ipc:f6/i2)", async () => {
+  const withSchema: ToolDefinition = {
+    name: "search",
+    label: "search",
+    description: "search tool",
+    parameters: Type.Object({
+      query: Type.String(),
+      limit: Type.Optional(Type.Number()),
+    }),
+    async execute(_toolCallId, params) {
+      return { content: [{ type: "text", text: JSON.stringify(params) }], details: undefined };
+    },
+  } as ToolDefinition;
+
+  // Bridge metadata preserves the host tool's real schema, not Type.Object({}).
+  const bundle = hostToolsFromDefinitions([withSchema]);
+  assert.strictEqual(bundle.toolDefs[0].inputSchema, withSchema.parameters);
+
+  // The subagent-facing definition exposes the actual argument shape.
+  const gateway = trackedGateway();
+  await gateway.start(bundle);
+  const defs = createGatewayProxiedTools(gateway);
+  const search = defs.find((d) => d.name === "search");
+  assert.ok(search, "search must be proxied once the gateway is running");
+  const parameters = (search as { parameters: { type?: string; properties?: Record<string, { type?: string }> } })
+    .parameters;
+  assert.equal(parameters.type, "object");
+  assert.deepEqual(Object.keys(parameters.properties ?? {}).sort(), ["limit", "query"]);
+  assert.equal(parameters.properties?.query.type, "string");
+  assert.equal(parameters.properties?.limit.type, "number");
+});
+
 test("/workflows-gateway command: start → status → stop lifecycle", async () => {
   const gateway = trackedGateway();
   const { pi, commands, sent } = makeCommandRegistryPi();
@@ -213,4 +287,87 @@ test("host-tools toolset does not start the gateway on resolution", async () => 
 test("exported gateway types are usable (ProxiedToolDef round-trip)", () => {
   const def: ProxiedToolDef = { name: "x", description: "d", inputSchema: {}, source: "host" };
   assert.equal(def.source, "host");
+});
+
+test("connecting to a dead/stale socket must NOT produce an unhandledRejection (gateway-ipc:f1)", async () => {
+  const gateway = trackedGateway();
+  const bundle = hostToolsFromDefinitions([echoTool()]);
+  await gateway.start(bundle);
+
+  // Kill the bridge behind the gateway's back: the gateway still believes it
+  // is running, but the socket file/pipe no longer accepts connections — the
+  // exact "stale/dead socket" scenario where client.connect() rejects long
+  // before any proxied tool executes.
+  await (gateway as unknown as { bridge: { stop(): Promise<void> } }).bridge.stop();
+  assert.equal(gateway.isRunning(), true, "gateway must still report running over a dead socket");
+
+  // Install a process-level unhandledRejection probe BEFORE the background
+  // connect fires so a regression is measured instead of crashing the runner.
+  const unhandled: unknown[] = [];
+  const probe = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", probe);
+  try {
+    const defs = createGatewayProxiedTools(gateway);
+    assert.equal(defs.length, 1, "the dead-socket gateway must still advertise its known tool list");
+
+    // Give the background connect() time to reject against the dead socket.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(unhandled, [], "background connect rejection must be detached, not unhandled");
+
+    // The per-call await still surfaces the failure — as an isError result,
+    // never as a thrown exception escaping the proxied execute.
+    const result = (await (
+      defs[0] as {
+        execute: (
+          id: string,
+          p: unknown,
+        ) => Promise<{ content: Array<{ type: string; text: string }>; isError: boolean }>;
+      }
+    ).execute("call-1", {})) as {
+      content: Array<{ type: string; text: string }>;
+      isError: boolean;
+    };
+    assert.equal(result.isError, true, "dead-socket call must surface as an isError result");
+    assert.match(result.content[0].text, /Host tool gateway error/);
+  } finally {
+    process.removeListener("unhandledRejection", probe);
+    await gateway.stop();
+  }
+});
+
+test("proxied tool definitions carry the real input schema through to defineTool (gateway-ipc:f6/i2)", async () => {
+  const gateway = trackedGateway();
+  const schema = Type.Object({ who: Type.String(), count: Type.Integer() });
+  const tool: ToolDefinition = {
+    name: "greet",
+    label: "greet",
+    description: "Greets someone",
+    parameters: schema,
+    async execute(_toolCallId, params) {
+      return { content: [{ type: "text", text: JSON.stringify(params) }], details: undefined };
+    },
+  } as ToolDefinition;
+
+  const bundle = hostToolsFromDefinitions([tool]);
+  await gateway.start(bundle);
+
+  // The bridge-side metadata must not degrade the schema to Type.Object({}).
+  const defs = gateway.getProxiedToolDefinitions();
+  assert.equal(defs.length, 1);
+  assert.deepEqual(defs[0].inputSchema, schema, "inputSchema must be the host tool's real parameter shape");
+
+  // The proxied ToolDefinition (what subagent models see) must expose the same
+  // shape via proxiedParameters inside defineTool.
+  const proxied = createGatewayProxiedTools(gateway);
+  assert.deepEqual((proxied[0] as unknown as { parameters: unknown }).parameters, schema);
+});
+
+test("proxiedParameters preserves a real JSON schema and falls back to an empty object (gateway-ipc:f6/i2)", () => {
+  const schema = Type.Object({ who: Type.String() });
+  assert.deepEqual(proxiedParameters(schema), schema, "real schemas must pass through unchanged");
+  assert.deepEqual(proxiedParameters(null), Type.Object({}));
+  assert.deepEqual(proxiedParameters("not-a-schema"), Type.Object({}));
+  assert.deepEqual(proxiedParameters(undefined), Type.Object({}));
 });

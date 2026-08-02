@@ -1,14 +1,23 @@
 /**
  * Unit tests for MCPBridge.
+ *
+ * The bridge now requires a socket auth handshake (auth.handshake with the
+ * bridge token) before any method is accepted, so every request-bearing test
+ * first authenticates via connectToBridge. Raw unauthenticated sockets are
+ * used deliberately by the auth-negative tests (AUTH_REQUIRED / AUTH_FAILED).
  */
 
 import assert from "node:assert";
-import { Socket } from "node:net";
+import { randomUUID } from "node:crypto";
+import { unlinkSync } from "node:fs";
+import { createServer, Socket } from "node:net";
+import { platform, tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { MCPProxyClient } from "../../src/agent/mcp-proxy-client.js";
+import { MCPProxyClient, ProxyAbortError, proxiedParameters } from "../../src/agent/mcp-proxy-client.js";
 import { MCPBridge } from "../../src/gateway/mcp-bridge.js";
 import type { ToolCallResult, ToolExecutor } from "../../src/gateway/types.js";
-import { TOOL_TIMEOUT } from "../../src/gateway/types.js";
+import { AUTH_REQUIRED, FRAME_TOO_LARGE, TOOL_TIMEOUT } from "../../src/gateway/types.js";
 
 // Each test instantiates a fresh bridge, and every bridge registers process
 // lifecycle listeners; lift the default cap so the accumulated instances in
@@ -17,14 +26,20 @@ process.setMaxListeners(64);
 
 const LENGTH_PREFIX_SIZE = 4;
 
-/** Helper to send a JSON-RPC request and receive the response. */
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Length-prefix a JSON value into one IPC frame. */
+function framed(obj: unknown): Buffer {
+  const messageBuffer = Buffer.from(JSON.stringify(obj), "utf-8");
+  const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
+  lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
+  return Buffer.concat([lengthPrefix, messageBuffer]);
+}
+
+/** Send a JSON-RPC request and receive the response. */
 function sendRequest(socket: Socket, request: unknown): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const json = JSON.stringify(request);
-    const messageBuffer = Buffer.from(json, "utf-8");
-    const lengthPrefix = Buffer.alloc(LENGTH_PREFIX_SIZE);
-    lengthPrefix.writeUInt32BE(messageBuffer.length, 0);
-    socket.write(Buffer.concat([lengthPrefix, messageBuffer]));
+    socket.write(framed(request));
 
     let buffer = Buffer.alloc(0);
 
@@ -63,6 +78,36 @@ function sendRequest(socket: Socket, request: unknown): Promise<unknown> {
     socket.on("data", onData);
     socket.on("error", onError);
   });
+}
+
+/** Connect a raw socket and complete the auth handshake with the bridge token. */
+async function connectToBridge(bridge: MCPBridge): Promise<Socket> {
+  const socket = new Socket();
+  await new Promise<void>((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    socket.on("error", onError);
+    socket.connect(bridge.getSocketPath(), () => {
+      socket.removeListener("error", onError);
+      resolve();
+    });
+  });
+  const handshake = (await sendRequest(socket, {
+    jsonrpc: "2.0",
+    method: "auth.handshake",
+    params: { token: bridge.getAuthToken() },
+    id: "auth-handshake",
+  })) as { result?: { ok?: boolean }; error?: { code?: number } };
+  assert.ok(
+    handshake.error === undefined && handshake.result?.ok === true,
+    `handshake must succeed (got: ${JSON.stringify(handshake)})`,
+  );
+  return socket;
+}
+
+/** A unique IPC path for throwaway servers (named pipe on Windows, socket file elsewhere). */
+function tempIpcPath(label: string): string {
+  const id = `${label}-${process.pid}-${randomUUID().slice(0, 6)}`;
+  return platform() === "win32" ? join("\\\\.\\pipe", id) : join(tmpdir(), `${id}.sock`);
 }
 
 describe("MCPBridge", () => {
@@ -110,8 +155,7 @@ describe("MCPBridge", () => {
     });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -133,8 +177,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -156,8 +199,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -179,8 +221,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -202,8 +243,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -212,9 +252,9 @@ describe("MCPBridge", () => {
       id: "test-5",
     });
 
-    const result = (response as any).result;
-    assert.ok(result.pong === true, "Should respond with pong");
-    assert.ok(typeof result.timestamp === "number", "Should include timestamp");
+    const result = (response as { result?: { pong?: boolean; timestamp?: number } }).result;
+    assert.ok(result?.pong === true, "Should respond with pong");
+    assert.ok(typeof result?.timestamp === "number", "Should include timestamp");
 
     socket.destroy();
   });
@@ -230,6 +270,13 @@ describe("MCPBridge", () => {
       Array.from({ length: 3 }, async () => {
         const socket = new Socket();
         await new Promise<void>((resolve) => socket.connect(socketPath, resolve));
+        const handshake = (await sendRequest(socket, {
+          jsonrpc: "2.0",
+          method: "auth.handshake",
+          params: { token: bridge.getAuthToken() },
+          id: "auth-concurrent",
+        })) as { result?: { ok?: boolean } };
+        assert.strictEqual(handshake.result?.ok, true);
         return socket;
       }),
     );
@@ -264,8 +311,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -287,8 +333,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     // Send malformed JSON
     const malformed = Buffer.from("not valid json");
@@ -336,7 +381,13 @@ describe("MCPBridge", () => {
     await bridge.start();
 
     // Success path: the timer is armed while the call is in flight…
-    const pending = (bridge as any).handleToolCall({ toolName: "slow", args: {} });
+    const bridgeHandle = bridge as unknown as {
+      handleToolCall: (p: unknown, c: unknown) => Promise<unknown>;
+    };
+    const pending = bridgeHandle.handleToolCall(
+      { toolName: "slow", args: {} },
+      { requestId: "direct-1", socket: {} as Socket },
+    );
     assert.strictEqual(bridge.pendingTimeoutCount, 1, "timeout timer should be armed while the call is in flight");
 
     // …and cleared once the call completes.
@@ -349,7 +400,10 @@ describe("MCPBridge", () => {
     tools.set("thrower", async () => {
       throw new Error("boom");
     });
-    const failed = (await (bridge as any).handleToolCall({ toolName: "thrower", args: {} })) as ToolCallResult;
+    const failed = (await bridgeHandle.handleToolCall(
+      { toolName: "thrower", args: {} },
+      { requestId: "direct-2", socket: {} as Socket },
+    )) as ToolCallResult;
     assert.strictEqual(failed.isError, true);
     assert.strictEqual(bridge.pendingTimeoutCount, 0, "timeout timer must be cleared after an executor failure");
   });
@@ -364,8 +418,7 @@ describe("MCPBridge", () => {
     bridge = new MCPBridge({ tools, timeout: 50 });
     await bridge.start();
 
-    const socket = new Socket();
-    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+    const socket = await connectToBridge(bridge);
 
     const response = await sendRequest(socket, {
       jsonrpc: "2.0",
@@ -388,19 +441,405 @@ describe("MCPBridge", () => {
     socket.destroy();
   });
 
+  // ─── gateway-ipc:i4 — socket auth handshake ───────────────────────────────
+
+  it("rejects tool.list before auth.handshake with AUTH_REQUIRED (gateway-ipc:i4)", async () => {
+    bridge = new MCPBridge({ tools });
+    await bridge.start();
+
+    // Deliberately NO handshake: the connection is unauthenticated.
+    const socket = new Socket();
+    await new Promise<void>((resolve) => socket.connect(bridge.getSocketPath(), resolve));
+
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.list",
+      params: {},
+      id: "unauth-1",
+    });
+
+    assert.deepStrictEqual(response, {
+      jsonrpc: "2.0",
+      error: {
+        code: AUTH_REQUIRED,
+        message: "Socket not authenticated: send auth.handshake with the bridge token first",
+      },
+      id: "unauth-1",
+    });
+
+    // A tool call is equally refused.
+    const call = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "echo", args: { sneaky: true } },
+      id: "unauth-2",
+    });
+    assert.deepStrictEqual((call as { error?: { code: number } }).error?.code, AUTH_REQUIRED);
+
+    socket.destroy();
+  });
+
+  it("closes the connection on an invalid handshake token; a good token still works (gateway-ipc:i4)", async () => {
+    bridge = new MCPBridge({ tools, authToken: "secret-token" });
+    await bridge.start();
+
+    // Wrong token: the bridge must terminate the connection so the attacker
+    // cannot retry with a different token on the same socket.
+    const bad = new Socket();
+    // A data listener keeps the pipe in flowing mode: on Windows named pipes a
+    // paused socket never observes the peer's close, and we want both the
+    // AUTH_FAILED frame and the termination itself.
+    const frames: Buffer[] = [];
+    bad.on("error", () => {});
+    bad.on("data", (chunk: Buffer) => frames.push(chunk));
+    const closed = new Promise<void>((resolve) => bad.once("close", () => resolve()));
+    await new Promise<void>((resolve) => bad.connect(bridge.getSocketPath(), resolve));
+    bad.write(
+      framed({
+        jsonrpc: "2.0",
+        method: "auth.handshake",
+        params: { token: "wrong-token" },
+        id: "bad-token",
+      }),
+    );
+    await Promise.race([
+      closed,
+      sleep(1000).then(() => {
+        throw new Error("bridge kept a connection alive after a wrong token");
+      }),
+    ]);
+    assert.match(
+      Buffer.concat(frames).toString("utf-8"),
+      /Invalid auth token/,
+      "a wrong token must be refused with an AUTH_FAILED error frame",
+    );
+
+    // The gate is selective: a correct token authenticates normally.
+    const good = await connectToBridge(bridge);
+    const response = await sendRequest(good, {
+      jsonrpc: "2.0",
+      method: "tool.list",
+      params: {},
+      id: "good-1",
+    });
+    assert.ok(Array.isArray((response as { result?: unknown }).result));
+    good.destroy();
+  });
+
+  // ─── gateway-ipc:i3 — idempotency keys ────────────────────────────────────
+
+  it("dedupes replayed tool executions by idempotency key (gateway-ipc:i3)", async () => {
+    let executions = 0;
+    tools.set("side-effect", async () => {
+      executions++;
+      await sleep(20);
+      return { content: `execution-${executions}`, isError: false };
+    });
+    bridge = new MCPBridge({ tools });
+    await bridge.start();
+
+    const s1 = await connectToBridge(bridge);
+    const s2 = await connectToBridge(bridge);
+
+    // Two callers race the same idempotency key (client timeout + retry shape).
+    const [r1, r2] = await Promise.all([
+      sendRequest(s1, {
+        jsonrpc: "2.0",
+        method: "tool.call",
+        params: { toolName: "side-effect", args: {}, idempotencyKey: "key-1" },
+        id: "replay-a",
+      }),
+      sendRequest(s2, {
+        jsonrpc: "2.0",
+        method: "tool.call",
+        params: { toolName: "side-effect", args: {}, idempotencyKey: "key-1" },
+        id: "replay-b",
+      }),
+    ]);
+
+    assert.strictEqual(executions, 1, "a replayed call with the same key must join the original execution");
+    assert.deepStrictEqual((r1 as { result?: ToolCallResult }).result, { content: "execution-1", isError: false });
+    assert.deepStrictEqual((r2 as { result?: ToolCallResult }).result, { content: "execution-1", isError: false });
+
+    // A different key starts a fresh execution.
+    const r3 = await sendRequest(s1, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "side-effect", args: {}, idempotencyKey: "key-2" },
+      id: "fresh-c",
+    });
+    assert.strictEqual(executions, 2);
+    assert.deepStrictEqual((r3 as { result?: ToolCallResult }).result, { content: "execution-2", isError: false });
+
+    s1.destroy();
+    s2.destroy();
+  });
+
+  // ─── gateway-ipc:f8 — hard frame-size cap ─────────────────────────────────
+
+  it("rejects an oversized frame with FRAME_TOO_LARGE and drops only that connection (gateway-ipc:f8)", async () => {
+    bridge = new MCPBridge({ tools, maxFrameSize: 1024 });
+    await bridge.start();
+
+    const lying = new Socket();
+    await new Promise<void>((resolve) => lying.connect(bridge.getSocketPath(), resolve));
+    const closed = new Promise<void>((resolve) => lying.once("close", () => resolve()));
+
+    // The length prefix alone lies about the frame size; the bridge must not
+    // buffer 9999 bytes (OOM defense) — it responds once and drops the socket.
+    const lie = Buffer.alloc(LENGTH_PREFIX_SIZE);
+    lie.writeUInt32BE(9999, 0);
+    lying.write(lie);
+
+    const response = await new Promise<unknown>((resolve, reject) => {
+      let buffer = Buffer.alloc(0);
+      const timer = setTimeout(() => {
+        lying.removeListener("data", onData);
+        reject(new Error("no response to oversized frame"));
+      }, 1000);
+      function onData(chunk: Buffer) {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (buffer.length >= LENGTH_PREFIX_SIZE) {
+          const messageLength = buffer.readUInt32BE(0);
+          if (buffer.length >= LENGTH_PREFIX_SIZE + messageLength) {
+            clearTimeout(timer);
+            lying.removeListener("data", onData);
+            resolve(
+              JSON.parse(buffer.subarray(LENGTH_PREFIX_SIZE, LENGTH_PREFIX_SIZE + messageLength).toString("utf-8")),
+            );
+          }
+        }
+      }
+      lying.on("data", onData);
+    });
+    assert.deepStrictEqual(response, {
+      jsonrpc: "2.0",
+      error: { code: FRAME_TOO_LARGE, message: "Frame of 9999 bytes exceeds the 1024-byte cap" },
+      id: 0,
+    });
+    await Promise.race([
+      closed,
+      sleep(1000).then(() => {
+        throw new Error("socket not closed after an oversized frame");
+      }),
+    ]);
+
+    // The bridge itself survives: an authenticated client still works.
+    const good = await connectToBridge(bridge);
+    const call = await sendRequest(good, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "echo", args: { ok: 1 } },
+      id: "after-cap",
+    });
+    assert.deepStrictEqual((call as { result?: ToolCallResult }).result, {
+      content: JSON.stringify({ ok: 1 }),
+      isError: false,
+    });
+    good.destroy();
+  });
+
+  // ─── gateway-ipc:i1 — abort/cancellation over IPC ─────────────────────────
+
+  it("tool.abort cancels an in-flight host tool execution (bridge side, gateway-ipc:i1)", async () => {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let resolveDone!: (r: ToolCallResult) => void;
+    const done = new Promise<ToolCallResult>((resolve) => {
+      resolveDone = resolve;
+    });
+    tools.set("blocking", async (_args, signal) => {
+      markStarted();
+      signal?.addEventListener("abort", () => resolveDone({ content: "cancelled-by-abort", isError: false }), {
+        once: true,
+      });
+      return await done;
+    });
+    bridge = new MCPBridge({ tools, timeout: 10_000 });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+
+    // Fire the call without awaiting it — the bridge suppresses the response
+    // for a cancelled request, so only the executor's outcome proves the abort.
+    socket.write(
+      framed({
+        jsonrpc: "2.0",
+        method: "tool.call",
+        params: { toolName: "blocking", args: {} },
+        id: "abort-target",
+      }),
+    );
+    await started;
+
+    socket.write(
+      framed({
+        jsonrpc: "2.0",
+        method: "tool.abort",
+        params: { requestId: "abort-target" },
+        id: "abort-ack",
+      }),
+    );
+
+    const result = await done;
+    assert.deepStrictEqual(result, { content: "cancelled-by-abort", isError: false });
+    socket.destroy();
+  });
+
+  // ─── gateway-ipc:f8/i5 — flush-based shutdown ─────────────────────────────
+
+  it("delivers the shutdown ack before the bridge stops (flush-based shutdown)", async () => {
+    bridge = new MCPBridge({ tools });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "shutdown",
+      params: {},
+      id: "shutdown-1",
+    });
+
+    // The ack round-trips even though the very next step tears the socket
+    // down — sendResponse flushes before stop() destroys the connection.
+    assert.deepStrictEqual(response, { jsonrpc: "2.0", result: { shuttingDown: true }, id: "shutdown-1" });
+    // The ack can reach the client a tick before the bridge finishes stop(),
+    // so wait for the server teardown to complete before asserting it.
+    const deadline = Date.now() + 1000;
+    while ((bridge as unknown as { started: boolean }).started && Date.now() < deadline) {
+      await sleep(5);
+    }
+    assert.strictEqual((bridge as unknown as { started: boolean }).started, false);
+    assert.strictEqual((bridge as unknown as { server: unknown }).server, null);
+    // afterEach's stop() is a safe no-op for an already-stopped bridge.
+  });
+
+  // ─── gateway-ipc:f2 — bounded connect ─────────────────────────────────────
+
+  it("bounded connect(): a silent bridge surfaces an error instead of wedging (gateway-ipc:f2)", async () => {
+    const path = tempIpcPath("gateway-silent");
+    // Accepts the socket but never answers the auth handshake — the exact
+    // "peer accepted but is dead" shape that used to hang connect() forever.
+    const silent = createServer(() => {});
+    await new Promise<void>((resolve) => silent.listen(path, resolve));
+    try {
+      const client = new MCPProxyClient(path, { authToken: "any", connectTimeout: 80 });
+      await assert.rejects(client.connect(), /Connect timed out after 80ms/);
+      assert.strictEqual(client.getState(), "disconnected");
+    } finally {
+      silent.close();
+      if (platform() !== "win32") {
+        try {
+          unlinkSync(path);
+        } catch {
+          // never created a file
+        }
+      }
+    }
+  });
+
+  it("client rejects an oversized frame from the bridge (gateway-ipc:f8)", async () => {
+    const path = tempIpcPath("gateway-lie");
+    const server = createServer((socket) => {
+      // Answer the client's auth handshake with a lying length prefix.
+      socket.once("data", () => {
+        const lie = Buffer.alloc(LENGTH_PREFIX_SIZE);
+        lie.writeUInt32BE(9999, 0);
+        socket.write(Buffer.concat([lie, Buffer.from("garbage")]));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(path, resolve));
+    try {
+      const client = new MCPProxyClient(path, { authToken: "any", maxFrameSize: 64, connectTimeout: 1000 });
+      await assert.rejects(client.connect(), /Frame of 9999 bytes exceeds the 64-byte cap/);
+    } finally {
+      server.close();
+      if (platform() !== "win32") {
+        try {
+          unlinkSync(path);
+        } catch {
+          // never created a file
+        }
+      }
+    }
+  });
+
+  // ─── gateway-ipc:f6/i2 — real JSON schemas through the proxy ──────────────
+
+  it("proxiedParameters carries the real JSON schema into subagent definitions (gateway-ipc:f6/i2)", () => {
+    const schema = {
+      type: "object",
+      properties: { query: { type: "string" }, limit: { type: "number" } },
+      required: ["query"],
+    };
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(proxiedParameters(schema))), schema);
+    // Non-schema input degrades to the previous empty-object schema.
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(proxiedParameters(null))), { type: "object", properties: {} });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(proxiedParameters(undefined))), {
+      type: "object",
+      properties: {},
+    });
+  });
+
+  it("propagates an external abort to the bridge and rejects the local call (client side, gateway-ipc:i1)", async () => {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let resolveDone!: (r: ToolCallResult) => void;
+    const hostCancelled = new Promise<ToolCallResult>((resolve) => {
+      resolveDone = resolve;
+    });
+    tools.set("blocking", async (_args, signal) => {
+      markStarted();
+      signal?.addEventListener("abort", () => resolveDone({ content: "cancelled-by-abort", isError: false }), {
+        once: true,
+      });
+      return await hostCancelled;
+    });
+    bridge = new MCPBridge({ tools, timeout: 5000 });
+    await bridge.start();
+
+    const client = new MCPProxyClient(bridge.getSocketPath(), { authToken: bridge.getAuthToken() });
+    await client.connect();
+    try {
+      const controller = new AbortController();
+      const call = client.executeToolCall("blocking", {}, { signal: controller.signal });
+      await started; // the host tool is now in flight on the bridge
+
+      controller.abort();
+
+      // The local request must fail as an abort (not an isError tool result),
+      // and the bridge-side host tool must have observed the cancellation.
+      await assert.rejects(call, ProxyAbortError);
+      const hostOutcome = await hostCancelled;
+      assert.deepStrictEqual(hostOutcome, { content: "cancelled-by-abort", isError: false });
+    } finally {
+      await client.disconnect();
+    }
+  });
+
   it("round-trips a tool call through a real MCPProxyClient socket (E2E proxied path)", async () => {
     bridge = new MCPBridge({
       tools,
       toolDefs: [
-        { name: "echo", description: "Echo tool", inputSchema: {}, source: "host" },
+        {
+          name: "echo",
+          description: "Echo tool",
+          inputSchema: { type: "object", properties: { hello: { type: "string" } } },
+          source: "host",
+        },
         { name: "error-tool", description: "Error tool", inputSchema: {}, source: "host" },
       ],
     });
     await bridge.start();
 
     // Client side of the proxied path: a real MCPProxyClient connects to the
-    // bridge socket exactly like a subagent session would.
-    const client = new MCPProxyClient(bridge.getSocketPath());
+    // bridge socket exactly like a subagent session would — and must present
+    // the auth token to get past the handshake gate.
+    const client = new MCPProxyClient(bridge.getSocketPath(), { authToken: bridge.getAuthToken() });
     await client.connect();
     try {
       const proxiedDefs = client.getProxiedToolDefs();
@@ -418,11 +857,19 @@ describe("MCPBridge", () => {
       });
 
       // The proxied ToolDefinition path (what a subagent session actually
-      // executes) forwards through the same client.
+      // executes) forwards through the same client and carries the host
+      // tool's REAL argument schema (gateway-ipc:f6/i2), not Type.Object({}).
       const echoDef = client.getToolDefinitions().find((d) => d.name === "echo");
       assert.ok(echoDef, "echo tool definition must be exposed to the subagent");
+      const paramsJson = JSON.parse(JSON.stringify((echoDef as unknown as { parameters: unknown }).parameters));
+      assert.deepStrictEqual(paramsJson, {
+        type: "object",
+        properties: { hello: { type: "string" } },
+      });
       const defResult = (await (
-        echoDef as { execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }
+        echoDef as {
+          execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+        }
       ).execute("call-1", { nested: [1, 2] })) as { content: Array<{ type: string; text: string }> };
       assert.strictEqual(defResult.content[0].text, JSON.stringify({ nested: [1, 2] }));
     } finally {
