@@ -106,7 +106,16 @@ test(
       assert.ok((err as WorkflowError).recoverable, "abort error should be recoverable");
     }
 
-    assert.equal(errorEmitted, true, "manager should emit 'error' event on abort");
+    assert.equal(
+      errorEmitted,
+      false,
+      "manager must NOT emit 'error' for an intentional external abort (core-orchestration:f1)",
+    );
+    assert.equal(
+      manager.listRuns()[0]?.status,
+      "aborted",
+      "an intentional abort settles the run to 'aborted', not 'failed'",
+    );
   }),
 );
 
@@ -658,7 +667,7 @@ test(
 );
 
 test(
-  "manager emits 'resumed' and 'error' events",
+  "manager emits 'resumed' event and suppresses 'error' on external abort",
   withTempCwd(async (cwd) => {
     const _ac = new AbortController();
     const da = deferredAgent();
@@ -682,7 +691,9 @@ test(
     da.resolve("done");
     await origPromise.catch(() => {});
 
-    // Now test error event on abort
+    // Now verify an intentional external abort does NOT emit 'error'
+    // (core-orchestration:f1): external abort settles the run to 'aborted'
+    // without firing a spurious 'error' event.
     let capturedError: { runId: string; error: WorkflowError } | null = null;
     const da2 = deferredAgent();
     const manager2 = new WorkflowManager({ cwd, agent: da2.runner });
@@ -704,8 +715,15 @@ test(
       /* expected */
     }
 
-    assert.ok(capturedError, "error event should fire on abort");
-    assert.ok(capturedError?.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(capturedError?.error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(
+      capturedError,
+      null,
+      "manager must NOT emit 'error' for an intentional external abort (core-orchestration:f1)",
+    );
+    assert.equal(
+      manager2.listRuns()[0]?.status,
+      "aborted",
+      "an intentional abort settles the run to 'aborted', not 'failed'",
+    );
   }),
 );
