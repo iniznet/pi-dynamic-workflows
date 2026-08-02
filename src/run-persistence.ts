@@ -637,8 +637,9 @@ export function createRunPersistence(
    * to the snapshot that is CURRENT at write time. Cross-process writers
    * converge the same way: the writer whose rename lands second re-reads the
    * first writer's content, merges, and rewrites. Bounded retries — under
-   * sustained contention the last produced snapshot is persisted without
-   * verification (last-writer-wins beats failing a run forever).
+   * sustained contention the loop falls back to one final converged write
+   * (re-read + re-merge against the freshest snapshot) rather than verifying
+   * it landed, so a run is never failed forever while still preserving merges.
    */
   const casWrite = (
     runId: string,
@@ -682,17 +683,27 @@ export function createRunPersistence(
       }
       // Our rename lost a race against another writer → retry on the fresh base.
     }
-    // Sustained contention: last-writer-wins rather than failing the run. The
-    // loop above always assigns `last` on its first iteration
+    // Sustained contention: rather than failing the run, fall back to a single
+    // last write — but STILL re-read the freshest on-disk snapshot and re-apply
+    // `produce` to it so a concurrent writer's journal/checkpoints are merged
+    // in rather than clobbered (preserving the convergence guarantee above).
+    // The loop above always assigns `last` on its first iteration
     // (CAS_MAX_ATTEMPTS > 0); this guard only satisfies the type system.
     if (last === undefined) {
       throw new Error(`unreachable: casWrite loop did not execute for ${runId}`);
     }
-    const json = serializeRedacted(last);
-    writeJsonAtomicWithBackup(fs, path, JSON.parse(json) as PersistedRunState);
+    const finalCurrent = parseFreshest(runId);
+    if (requireExisting && finalCurrent === null) return null;
+    const finalNext = produce(finalCurrent);
+    finalNext.updatedAt = new Date().toISOString();
+    finalNext.schemaVersion = RUN_STATE_SCHEMA_VERSION;
+    if (finalNext.journal && finalNext.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
+      finalNext.journal = capJournalBudget(finalNext.journal, DEFAULT_JOURNAL_BYTE_BUDGET);
+    }
+    writeJsonAtomicWithBackup(fs, path, finalNext);
     invalidateListCache();
-    if (TERMINAL_RUN_STATUSES.has(last.status)) enforceRetention();
-    return last;
+    if (TERMINAL_RUN_STATUSES.has(finalNext.status)) enforceRetention();
+    return finalNext;
   };
 
   return {
