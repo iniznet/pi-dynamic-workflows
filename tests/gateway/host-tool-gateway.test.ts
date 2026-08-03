@@ -290,7 +290,14 @@ test("/workflows-gateway command: start → status → stop lifecycle", async ()
   const started = sent.at(-1)?.content ?? "";
   assert.match(started, /Host tool gateway started on/);
   assert.match(started, /1 host tool\(s\) proxied/);
-  assert.match(started, /toolset "host-tools"/, "start must state the explicit opt-in requirement");
+  assert.match(started, /toolset "host-tools"/, "start must state the explicit opt-in surface");
+  // The default "auto" mode is stated in the copy: untagged runs include host
+  // tools automatically, so the message must no longer claim opt-in-only.
+  assert.match(
+    started,
+    /include host tools automatically/,
+    "start must state the automatic default (subagentHostTools=auto)",
+  );
 
   // status (running)
   await handler("status", ctx);
@@ -301,9 +308,46 @@ test("/workflows-gateway command: start → status → stop lifecycle", async ()
   assert.equal(gateway.isRunning(), false);
   assert.match(sent.at(-1)?.content ?? "", /stopped/);
 
-  // status (stopped) states the README default
+  // status (stopped) states the automatic default in "auto" mode
   await handler("status", ctx);
   assert.match(sent.at(-1)?.content ?? "", /STOPPED/);
+  assert.match(
+    sent.at(-1)?.content ?? "",
+    /auto-start it when they need host tools/,
+    "stopped status must state that untagged runs auto-start the gateway",
+  );
+});
+
+test("/workflows-gateway command keeps the legacy opt-in-only copy when hostToolsAutomatic is false", async () => {
+  // The "off" escape hatch restores the exact pre-change copy: opt-in via
+  // toolset "host-tools" after a manual start, README default for STOPPED.
+  const gateway = trackedGateway();
+  const { pi, commands, sent } = makeCommandRegistryPi();
+  const { ctx } = makeNotifyCtx();
+
+  registerWorkflowGatewayCommand(pi as ExtensionAPI, gateway, {
+    buildHostTools: () => hostToolsFromDefinitions([echoTool()]),
+    hostToolsAutomatic: false,
+  });
+  const handler = commands[0].handler as (args: string, c: ExtensionCommandContext) => Promise<void>;
+
+  await handler("start", ctx);
+  const started = sent.at(-1)?.content ?? "";
+  assert.match(
+    started,
+    /Subagents still get no host tools by default/,
+    "off-mode start must keep the opt-in-only requirement",
+  );
+
+  await handler("stop", ctx);
+  await handler("status", ctx);
+  const stopped = sent.at(-1)?.content ?? "";
+  assert.match(stopped, /STOPPED/);
+  assert.match(
+    stopped,
+    /README default — subagents get no host tools/,
+    "off-mode STOPPED must keep the legacy README-default copy",
+  );
 });
 
 test("/workflows-gateway command registration is idempotent", async () => {

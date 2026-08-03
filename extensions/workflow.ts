@@ -12,10 +12,10 @@ import {
   WORKFLOW_EXTENSION_VERSION,
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
+import { SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
 import {
   applyEnvSettingsOverride,
   createEffortState,
-  createGatewayProxiedTools,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
@@ -71,16 +71,31 @@ export default function extension(pi: ExtensionAPI) {
     persistAgentSessions: settings.persistAgentSessions,
   };
   // P2-1 WIRE: lazily-started host tool gateway. Constructing it opens nothing;
-  // the bridge only comes up when a user runs /workflows-gateway start. The
-  // host-tools toolset below is the explicit opt-in: a run that names
-  // toolset "host-tools" receives proxied host tools, everything else keeps the
-  // README-documented default of no host tools in subagents.
+  // the bridge only comes up when a run needs host tools (design C: automatic
+  // default) or a user runs /workflows-gateway start. The policy below is the
+  // single owner of that decision: in "auto" (default) untagged runs get
+  // merged coding + proxied host tools and the gateway starts on first need;
+  // "on" also starts it eagerly at load; "off" restores the legacy opt-in
+  // behavior (manual start + toolset "host-tools" only).
   const hostToolGateway = new HostToolGateway();
+  const hostToolsPolicy = new SubagentHostToolsPolicy({
+    gateway: hostToolGateway,
+    mode: settings.subagentHostTools ?? "auto",
+    buildHostTools: () => hostToolsFromDefinitions([...createCodingTools(cwd), ...createWebTools()]),
+    buildCodingTools: () => createCodingTools(cwd),
+  });
   const gatewayManagerOptions = {
     ...managerOptions,
+    // Untagged runs resolve the merged host-tools default only when the
+    // policy is enabled; "off" keeps the exact legacy fallback (agent coding
+    // tools) and never auto-starts the gateway.
+    defaultTools: hostToolsPolicy.isEnabled() ? () => hostToolsPolicy.defaultTools() : undefined,
     toolsets: {
       ...managerOptions.toolsets,
-      "host-tools": () => createGatewayProxiedTools(hostToolGateway),
+      // The explicit opt-in toolset now auto-starts first (fixing the
+      // silent-empty result a never-started gateway used to produce); in
+      // "off" mode ensureStarted is a no-op so manual start remains required.
+      "host-tools": () => hostToolsPolicy.hostToolsToolset(),
     },
   };
   // The gateway is created per extension generation; a /reload hands the old
@@ -152,11 +167,16 @@ export default function extension(pi: ExtensionAPI) {
   registerToolSafely(() => createWorkflowControlTool({ manager }), "workflow_control tool");
   // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
   // definitions are built at start time so the extension load stays side-effect
-  // free and the default (no host tools in subagents) is untouched until a user
-  // explicitly enables the bridge.
+  // free and the automatic default (host tools in untagged runs, design C) is
+  // stated in the command copy; the "off" escape hatch gets the legacy
+  // opt-in-only phrasing.
   registerWorkflowGatewayCommand(pi, hostToolGateway, {
     buildHostTools: () => hostToolsFromDefinitions([...createCodingTools(cwd), ...createWebTools()]),
+    hostToolsAutomatic: hostToolsPolicy.isEnabled(),
   });
+  // "on" (opt-in): eager start at load for latency-sensitive users. The
+  // default "auto" stays lazy — nothing opens until a run needs host tools.
+  if (hostToolsPolicy.mode === "on") void hostToolsPolicy.ensureStarted();
   // Auto-resume runs that paused on a provider usage limit once the quota is
   // likely refilled. Standalone: only consumes the manager's public surface, so
   // it stays decoupled from manager/persistence internals. Its constructor also

@@ -2,7 +2,7 @@
 
 This document preserves the decision-by-decision record behind the workflow tool's compact model guidance. It records each reviewed insertion, removal, and compaction with its reasoning, evidence, and confidence.
 
-## Current placement (3.5.0)
+## Current placement (3.6.0)
 
 The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to authorization and established one always-on workflow gate. The current implementation preserves that gate and its background-delivery behavior while applying the concision decisions recorded below.
 

@@ -4,7 +4,7 @@ This report records review evidence for the compact workflow tool contract and t
 
 ## Context surfaces
 
-Measurements use UTF-8 bytes. The historical baseline is `818fdd8` (release 3.0.0), captured when concision work began. The candidate is the current package tree (3.5.0), LF-normalized per the release-gate re-baseline.
+Measurements use UTF-8 bytes. The historical baseline is `818fdd8` (release 3.0.0), captured when concision work began. The candidate is the current package tree (3.6.0), LF-normalized per the release-gate re-baseline.
 
 | Surface | Baseline (`818fdd8`) | Candidate | Change |
 | --- | ---: | ---: | ---: |

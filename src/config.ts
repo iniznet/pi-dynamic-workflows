@@ -86,6 +86,7 @@ export const WORKFLOW_ENV_VARS = {
   persistAgentSessions: "PI_WORKFLOW_PERSIST_AGENT_SESSIONS",
   deliveredResultMaxChars: "PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS",
   excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
+  subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -160,6 +161,10 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
     .map((name) => name.trim())
     .filter((name): name is string => name.length > 0);
   if (excludeSubagentTools?.length) settings.excludeSubagentTools = excludeSubagentTools;
+  const subagentHostTools = env[WORKFLOW_ENV_VARS.subagentHostTools]?.trim();
+  if (subagentHostTools === "auto" || subagentHostTools === "on" || subagentHostTools === "off") {
+    settings.subagentHostTools = subagentHostTools;
+  }
   return settings;
 }
 

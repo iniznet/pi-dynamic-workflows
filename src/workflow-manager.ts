@@ -317,10 +317,18 @@ export interface WorkflowManagerOptions {
   /**
    * Named toolsets resolvable by ExecOptions.toolset — e.g.
    * `{ "web-research": () => [...createCodingTools(cwd), ...createWebTools()] }`.
-   * Called lazily per execution (including on resume). An unknown tag resolves
-   * to the default coding tools.
+   * Called lazily per execution (including on resume); factories may be async.
+   * An unknown tag resolves to the default coding tools.
    */
-  toolsets?: Record<string, () => ToolDefinition[]>;
+  toolsets?: Record<string, () => ToolDefinition[] | Promise<ToolDefinition[]>>;
+  /**
+   * Default toolset factory resolved only when a run passes neither `tools`
+   * nor a `toolset` tag — e.g. the extension's merged coding + proxied host
+   * tools. May be async. An unknown toolset tag still falls through to the
+   * agent's default coding tools (unchanged): defaultTools only fires for
+   * untagged runs.
+   */
+  defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   /**
    * Extra tool NAMES to deny in every subagent session, on top of the always-on
    * `workflow`/`workflow_control` defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
@@ -363,6 +371,7 @@ export type WorkflowManagerReloadOptions = Pick<
   | "defaultAgentRetries"
   | "defaultTokenBudget"
   | "toolsets"
+  | "defaultTools"
   | "excludeSubagentTools"
   | "persistAgentSessions"
 >;
@@ -495,7 +504,8 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
-  private toolsets?: Record<string, () => ToolDefinition[]>;
+  private toolsets?: Record<string, () => ToolDefinition[] | Promise<ToolDefinition[]>>;
+  private defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private excludeSubagentTools?: string[];
   private persistAgentSessions: boolean;
 
@@ -512,6 +522,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.toolsets = options.toolsets;
+    this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
@@ -586,6 +597,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.toolsets = options.toolsets;
+    this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
   }
@@ -838,9 +850,13 @@ export class WorkflowManager extends EventEmitter {
     // direct executeRun callers that skipped the start paths.
     const resolvedTokenBudget = managed.tokenBudget !== undefined ? managed.tokenBudget : (tokenBudget ?? null);
     // Explicit tools win for this execution; else re-resolve the run's persisted
-    // toolset tag (how a resumed /deep-research keeps its web tools); else the
-    // agent layer's default coding tools.
-    const resolvedTools = tools ?? (managed.toolset ? this.toolsets?.[managed.toolset]?.() : undefined);
+    // toolset tag (how a resumed /deep-research keeps its web tools); else, for
+    // a run with NO tag, resolve the manager's defaultTools (e.g. host tools);
+    // else the agent layer's default coding tools.
+    let resolvedTools = tools ?? (managed.toolset ? await this.toolsets?.[managed.toolset]?.() : undefined);
+    if (resolvedTools === undefined && managed.toolset === undefined) {
+      resolvedTools = await this.defaultTools?.();
+    }
     // Gated the same way as this.emitLive() below (see isCurrent()) — a stale
     // execution's progress callback would otherwise keep driving live UI
     // (task panel, etc.) for a run that's been superseded or deleted.

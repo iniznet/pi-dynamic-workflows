@@ -120,6 +120,29 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads subagentHostTools, dropping values outside auto|on|off", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      // All three mode literals round-trip.
+      for (const mode of ["auto", "on", "off"]) {
+        saveWorkflowSettings({ subagentHostTools: mode }, settingsPath);
+        assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentHostTools: mode });
+      }
+
+      // A wrong-typed value violates the declared schema and fails loudly.
+      writeFileSync(settingsPath, JSON.stringify({ subagentHostTools: 42 }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+
+      // A string outside the three literals passes the schema but is dropped
+      // by value normalization (lenient drop-on-violation, like the enums).
+      for (const mode of ["", "  ", "AUTO", "eager", "banana"]) {
+        writeFileSync(settingsPath, JSON.stringify({ subagentHostTools: mode }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+    });
+  });
+
   it("normalizes default concurrency and agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

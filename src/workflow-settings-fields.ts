@@ -52,7 +52,7 @@ export interface WorkflowSettingsField {
 }
 
 /**
- * The 11 settings rows, in UI render order. Bounds/options/defaults are the
+ * The 12 settings rows, in UI render order. Bounds/options/defaults are the
  * verified load-path semantics: normalizeSettings (ws:233-298), the cfg env
  * clamps (cfg:130-166), and the documented runtime fallbacks.
  */
@@ -172,6 +172,16 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     group: "Advanced",
     defaultDisplay: "[] (none)",
     envVar: WORKFLOW_ENV_VARS.excludeSubagentTools,
+  },
+  {
+    key: "subagentHostTools",
+    type: "enum",
+    label: "Subagent host tools",
+    help: 'Subagent access to host coding/web tools: auto (default, lazy auto-start + merged tools), on (eager start at load), off (legacy opt-in via toolset "host-tools" + manual gateway start).',
+    options: ["auto", "on", "off"],
+    group: "Advanced",
+    defaultDisplay: "auto",
+    envVar: WORKFLOW_ENV_VARS.subagentHostTools,
   },
 ];
 

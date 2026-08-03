@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { saveCheckpoint } from "../src/run-persistence.js";
@@ -316,6 +317,152 @@ test(
     assert.equal(resumed?.status, "completed", "resume completes without TOKEN_BUDGET_EXHAUSTED");
     assert.equal(resumed?.tokenBudget, null, "resume keeps the start-time budget, not the current default");
     assert.equal(resumed?.toolset, "webby");
+  }),
+);
+
+test(
+  "defaultTools resolves only for untagged runs (explicit tools and toolset tags win)",
+  withTempCwd(async (cwd) => {
+    // The extension wires defaultTools as the automatic host-tools default for
+    // untagged runs (design C); the precedence invariants are: explicit `tools`
+    // wins, a named toolset tag wins, and defaultTools fires only for runs with
+    // neither.
+    let defaultResolutions = 0;
+    let tagResolutions = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: fakeAgent(),
+      defaultTools: () => {
+        defaultResolutions++;
+        return [];
+      },
+      toolsets: {
+        webby: () => {
+          tagResolutions++;
+          return [];
+        },
+      },
+    });
+
+    await manager.runSync(oneAgentScript);
+    assert.equal(defaultResolutions, 1, "an untagged run must resolve defaultTools");
+
+    // A named toolset tag resolves the tag factory, never defaultTools.
+    await manager.runSync(oneAgentScript, undefined, { toolset: "webby" });
+    assert.equal(defaultResolutions, 1, "a tagged run must NOT resolve defaultTools");
+    assert.equal(tagResolutions, 1, "the named toolset factory must resolve instead");
+
+    // Explicit tools win outright.
+    const explicit = [
+      {
+        name: "explicit",
+        label: "explicit",
+        description: "explicit tools",
+        parameters: {},
+        execute: async () => ({ content: [] }),
+      },
+    ] as unknown as ToolDefinition[];
+    await manager.runSync(oneAgentScript, undefined, { tools: explicit });
+    assert.equal(defaultResolutions, 1, "explicit tools must NOT resolve defaultTools");
+    assert.equal(tagResolutions, 1, "explicit tools must not touch the toolset either");
+
+    // An unknown tag falls through to the agent's default coding tools
+    // (documented manager behavior) — defaultTools is for untagged runs only.
+    await manager.runSync(oneAgentScript, undefined, { toolset: "no-such-toolset" });
+    assert.equal(defaultResolutions, 1, "an unknown toolset tag must NOT resolve defaultTools");
+  }),
+);
+
+test(
+  "defaultTools may be async and resolves per run",
+  withTempCwd(async (cwd) => {
+    let defaultResolutions = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: fakeAgent(),
+      defaultTools: async () => {
+        defaultResolutions++;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return [];
+      },
+    });
+
+    await manager.runSync(oneAgentScript);
+    assert.equal(defaultResolutions, 1, "an async defaultTools factory must be awaited");
+    await manager.runSync(oneAgentScript);
+    assert.equal(defaultResolutions, 2, "each untagged run re-resolves defaultTools");
+  }),
+);
+
+test(
+  "resume re-resolves defaultTools for an untagged run",
+  withTempCwd(async (cwd) => {
+    // 'second' hangs on its first attempt (pause point), then resolves on its
+    // second attempt — so the run can be paused mid-flight and resumed.
+    let secondAttempts = 0;
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+        if (prompt === "second" && ++secondAttempts === 1) return new Promise(() => {});
+        return "ok";
+      },
+    };
+    let defaultResolutions = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent,
+      defaultTools: () => {
+        defaultResolutions++;
+        return [];
+      },
+    });
+
+    const { runId, promise } = manager.startInBackground(twoAgentScript, undefined, {});
+    promise.catch(() => {}); // pause aborts the in-flight execution — expected
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+    assert.equal(defaultResolutions, 1, "defaultTools resolves for the initial execution");
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(defaultResolutions, 2, "resume must re-resolve defaultTools for the untagged run");
+    assert.equal(manager.getRun(runId)?.status, "completed");
+  }),
+);
+
+test(
+  "reconfigureAfterReload carries defaultTools into the surviving manager",
+  withTempCwd(async (cwd) => {
+    let firstDefault = 0;
+    let secondDefault = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: fakeAgent(),
+      defaultTools: () => {
+        firstDefault++;
+        return [];
+      },
+    });
+
+    await manager.runSync(oneAgentScript);
+    assert.equal(firstDefault, 1, "the original defaultTools factory must be live");
+
+    // /reload hands the surviving manager the new generation's options; the
+    // defaultTools factory must be replaced, not appended.
+    manager.reconfigureAfterReload({
+      defaultTools: () => {
+        secondDefault++;
+        return [];
+      },
+    });
+    await manager.runSync(oneAgentScript);
+    assert.equal(firstDefault, 1, "the reloaded defaultTools must replace the old factory");
+    assert.equal(secondDefault, 1, "the reload-provided defaultTools factory must be used");
   }),
 );
 

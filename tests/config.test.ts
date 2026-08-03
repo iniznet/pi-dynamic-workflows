@@ -31,6 +31,7 @@ test("workflowSettingsFromEnv parses every PI_WORKFLOW_* key", () => {
     [WORKFLOW_ENV_VARS.persistAgentSessions]: "false",
     [WORKFLOW_ENV_VARS.deliveredResultMaxChars]: "1000",
     [WORKFLOW_ENV_VARS.excludeSubagentTools]: " pi-subagents,  my-tool ,",
+    [WORKFLOW_ENV_VARS.subagentHostTools]: "off",
   };
   assert.deepEqual(workflowSettingsFromEnv(env), {
     keywordTriggerEnabled: true,
@@ -44,6 +45,7 @@ test("workflowSettingsFromEnv parses every PI_WORKFLOW_* key", () => {
     persistAgentSessions: false,
     deliveredResultMaxChars: 1000,
     excludeSubagentTools: ["pi-subagents", "my-tool"],
+    subagentHostTools: "off",
   });
 });
 
@@ -70,8 +72,25 @@ test("invalid values are dropped, never coerced or crashing", () => {
     [WORKFLOW_ENV_VARS.persistAgentSessions]: "1", // not true/false
     [WORKFLOW_ENV_VARS.deliveredResultMaxChars]: "-5",
     [WORKFLOW_ENV_VARS.excludeSubagentTools]: "  , ,",
+    [WORKFLOW_ENV_VARS.subagentHostTools]: "garbage", // not a mode literal
   };
   assert.deepEqual(workflowSettingsFromEnv(env), {});
+});
+
+test("subagentHostTools env accepts only auto|on|off and ignores anything else", () => {
+  for (const mode of ["auto", "on", "off"]) {
+    assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentHostTools]: mode }), {
+      subagentHostTools: mode,
+    });
+    assert.deepEqual(
+      workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentHostTools]: `  ${mode}  ` }),
+      { subagentHostTools: mode },
+      "whitespace around the mode literal is trimmed",
+    );
+  }
+  for (const garbage of ["", "AUTO", "yes", "1", "eager", "disabled"]) {
+    assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentHostTools]: garbage }), {});
+  }
 });
 
 test("integer bounds are clamped to the config ceilings", () => {
@@ -153,6 +172,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "persistAgentSessions",
     "deliveredResultMaxChars",
     "excludeSubagentTools",
+    "subagentHostTools",
   ];
   for (const key of settingsKeys) {
     assert.ok(

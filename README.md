@@ -185,17 +185,26 @@ Saved workflows can declare typed parameters (string/number/integer/boolean/arra
 
 In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit.
 
-### Host tool gateway (opt-in proxying)
+### Host tool gateway (automatic host tools for subagents)
 
-Subagents never load host extensions by default (see “Upgrading past 3.2”); that default is preserved. If you explicitly want a run's subagents to call host-side tools, start the gateway on demand and opt the run into its toolset:
+Subagents never load host extensions by default (see “Upgrading past 3.2”); that memory-leak mitigation is preserved. Instead, host **coding and web tools** reach subagents through a local IPC gateway: `read`, `bash`, `edit`, `write`, `web_search`, and `web_fetch` are proxied from the host session, so subagents get them **automatically with zero configuration**.
+
+The default mode (`subagentHostTools: "auto"`) lazily starts the gateway on the first run that needs host tools. Untagged runs receive the host coding + web tools merged with the agent coding tools; a run that names `toolset: "host-tools"` gets the proxied host tools on top (and now auto-starts the gateway, instead of silently resolving to an empty list). The gateway stays stopped until a run actually needs it:
 
 ```bash
-/workflows-gateway start   # lazily starts MCPBridge over a local IPC socket
-/workflows-gateway status
+/workflows-gateway status   # STOPPED until a run auto-starts it
+/workflows-gateway start    # still works for manual control
 /workflows-gateway stop
 ```
 
-Nothing starts on extension load; `status` reports `STOPPED` until you run `start`. Once running, a run opts in explicitly by naming the `host-tools` toolset at run level — `executeRun({ toolset: "host-tools" })`, the `workflow` tool with a saved/built-in workflow that carries a toolset tag, or direct `runWorkflow({ tools })`. Those subagents receive proxied definitions that forward each tool call back to the host. A run that opts in while the gateway is stopped fails loudly at call time instead of silently dropping the tools.
+Two escape hatches restore the exact pre-change behavior (no auto-start; untagged runs get coding tools only; `toolset: "host-tools"` is the only proxy path and needs a manual `start`):
+
+- `PI_WORKFLOW_SUBAGENT_HOST_TOOLS=off` (env, CI/headless), or
+- `"subagentHostTools": "off"` in `settings.json` (global or project override).
+
+A third value, `"on"`, eagerly starts the gateway at extension load for latency-sensitive users. If the automatic start fails (e.g. the socket is taken), the affected run degrades to coding tools with a logged diagnostic and the next run retries — host tools are never silently advertised-and-dead.
+
+MCP-server and other extension-registered tools are **not** proxied yet (public SDK limitation); they remain available only in the main session.
 
 The gateway authenticates every IPC connection with a per-bridge token; subagent processes connecting via `MCPProxyClient` must present `gateway.getAuthToken()` in their `auth.handshake` (missing → `AUTH_REQUIRED`, wrong → `AUTH_FAILED`).
 
@@ -346,6 +355,7 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `persistAgentSessions` | `PI_WORKFLOW_PERSIST_AGENT_SESSIONS` | `true` / `false` |
 | `deliveredResultMaxChars` | `PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS` | integer 1–1000000 |
 | `excludeSubagentTools` | `PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS` | comma-separated tool names |
+| `subagentHostTools` | `PI_WORKFLOW_SUBAGENT_HOST_TOOLS` | `auto` (default) / `on` / `off` |
 
 Unparseable, out-of-range, or unknown values are silently ignored (the same leniency the settings-file normalization applies), so a misconfigured CI env can never crash the extension — it just falls back to the file value. Example:
 
@@ -395,6 +405,12 @@ Only a call that finishes with a real result is journaled — a call whose every
 Everything else is additive or a fix: the `workflow_control` tool (list/status/pause/resume/stop), edited-script resume, auto-resume on provider usage limits, and persistence/perf hardening. Requires pi ≥ 0.80.8.
 
 Library API note: the unused `createSharedStoreTools` export was removed — use `createAgentStoreTools`.
+
+## Upgrading past 3.5
+
+One behavior change to know about:
+
+- **Subagents now get host coding + web tools automatically.** In the default `subagentHostTools: "auto"` mode, the first run that needs host tools lazily starts the host tool gateway and untagged runs receive `read`, `bash`, `edit`, `write`, `web_search`, and `web_fetch` proxied from the host session — no `/workflows-gateway start`, no `toolset: "host-tools"` tag required. If you relied on “subagents have no host tools”, set `"subagentHostTools": "off"` in `settings.json` (global or project override) or `PI_WORKFLOW_SUBAGENT_HOST_TOOLS=off` to restore the exact previous behavior (manual `start` + explicit toolset only). MCP-server and other extension-registered tools are not included (public SDK limitation). An `agentType` allowlist naming one of the six host tools now matches the proxied definitions — allowlisted/denylisted names still win over the merge.
 
 ## Upgrading past 3.2
 

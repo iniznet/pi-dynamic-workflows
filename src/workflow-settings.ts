@@ -68,6 +68,16 @@ export interface WorkflowSettings {
    * global exclusion list (M9).
    */
   excludeSubagentTools?: string[];
+  /**
+   * Subagent host-tool access: "auto" (default) | "on" | "off". "auto"
+   * lazily starts the host tool gateway on the first run that needs host
+   * tools and gives untagged runs merged coding + proxied host tools; "on"
+   * also starts the gateway eagerly at extension load (latency-sensitive
+   * opt-in); "off" restores the exact pre-change behavior (no auto-start,
+   * toolset "host-tools" is the only proxy path and needs a manual
+   * /workflows-gateway start).
+   */
+  subagentHostTools?: "auto" | "on" | "off";
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -100,6 +110,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // (see normalizeSettings) so a project override can wipe a global exclusion
   // list instead of being schema-rejected.
   excludeSubagentTools: ["array", "null"],
+  // Any string passes the type schema; normalizeSettings accepts only the three
+  // mode literals and drops anything else (lenient drop-on-violation, matching
+  // the file's style for enum-valued keys like progressPanelMode).
+  subagentHostTools: ["string"],
 };
 
 /**
@@ -286,6 +300,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
       const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
       if (names.length) settings.excludeSubagentTools = names;
     }
+  }
+  if (raw.subagentHostTools === "auto" || raw.subagentHostTools === "on" || raw.subagentHostTools === "off") {
+    settings.subagentHostTools = raw.subagentHostTools;
   }
   return settings;
 }

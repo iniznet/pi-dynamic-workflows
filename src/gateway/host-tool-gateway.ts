@@ -213,6 +213,13 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
 export interface WorkflowGatewayCommandOptions {
   /** Build the host tool bundle lazily at `start` time (not at load). */
   buildHostTools: () => HostToolsBundle;
+  /**
+   * When true (the extension's default "auto"/"on" modes), the start/status
+   * copy states that untagged runs include host tools automatically; false
+   * (the "off" escape hatch) keeps the legacy opt-in-only phrasing. Defaults
+   * to true — the extension's default mode is "auto".
+   */
+  hostToolsAutomatic?: boolean;
 }
 
 /**
@@ -236,10 +243,11 @@ export function registerWorkflowGatewayCommand(
 
   pi.registerCommand("workflows-gateway", {
     description:
-      'Host tool IPC gateway (MCPBridge) — start | stop | status. Starts the bridge lazily so subagents can proxy host tools only when a run explicitly opts into toolset "host-tools".',
+      'Host tool IPC gateway (MCPBridge) — start | stop | status. Starts the bridge lazily; in the default "auto" mode untagged runs include host tools automatically, and the explicit toolset "host-tools" also works.',
     async handler(args: string, ctx: ExtensionCommandContext) {
       const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "status";
       const say = (content: string) => pi.sendMessage({ customType: "workflows-gateway", content, display: true });
+      const automatic = options.hostToolsAutomatic !== false;
 
       if (sub === "start") {
         if (gateway.isRunning()) {
@@ -249,10 +257,10 @@ export function registerWorkflowGatewayCommand(
         try {
           const socketPath = await gateway.start(options.buildHostTools());
           const count = gateway.getProxiedToolDefinitions().length;
-          await say(
-            `Host tool gateway started on ${socketPath} — ${count} host tool(s) proxied. ` +
-              `Subagents still get no host tools by default; a workflow must opt in via toolset "host-tools".`,
-          );
+          const defaultNote = automatic
+            ? 'Untagged runs include host tools automatically (setting subagentHostTools=auto); the explicit toolset "host-tools" also works.'
+            : 'Subagents still get no host tools by default; a workflow must opt in via toolset "host-tools".';
+          await say(`Host tool gateway started on ${socketPath} — ${count} host tool(s) proxied. ${defaultNote}`);
         } catch (error) {
           ctx.ui.notify(
             `Failed to start host tool gateway: ${error instanceof Error ? error.message : "Unknown error"}`,
@@ -268,7 +276,13 @@ export function registerWorkflowGatewayCommand(
           return;
         }
         await gateway.stop();
-        await say("Host tool gateway stopped — runs can no longer proxy host tools.");
+        // In auto/on modes an untagged run re-starts the gateway, so "stopped"
+        // is a temporary state — only the off escape hatch makes it permanent.
+        await say(
+          automatic
+            ? "Host tool gateway stopped — untagged runs will auto-start it again when they need host tools (subagentHostTools=off makes this permanent)."
+            : "Host tool gateway stopped — runs can no longer proxy host tools.",
+        );
         return;
       }
 
@@ -278,10 +292,10 @@ export function registerWorkflowGatewayCommand(
             `Usage: /workflows-gateway stop`,
         );
       } else {
-        await say(
-          "Host tool gateway STOPPED (README default — subagents get no host tools). " +
-            `Usage: /workflows-gateway start | stop | status`,
-        );
+        const stoppedNote = automatic
+          ? "Host tool gateway STOPPED (untagged runs auto-start it when they need host tools)."
+          : "Host tool gateway STOPPED (README default — subagents get no host tools).";
+        await say(`${stoppedNote} Usage: /workflows-gateway start | stop | status`);
       }
     },
   });
