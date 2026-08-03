@@ -15,3 +15,6 @@ __pycache__/
 
 # Local-only task working notes (research/design/handoff docs; never shared)
 tasks/
+
+# CodeGraph local index (regenerable; not part of the package)
+.codegraph/
