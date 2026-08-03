@@ -12,6 +12,7 @@ import {
   WORKFLOW_EXTENSION_VERSION,
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
+import type { SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
 import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
 import {
   applyEnvSettingsOverride,
@@ -77,6 +78,12 @@ export default function extension(pi: ExtensionAPI) {
   // "on" also starts it eagerly at load; "off" restores the legacy opt-in
   // behavior (manual start + toolset "host-tools" only).
   const hostToolGateway = new HostToolGateway();
+  // The real host session manager, captured at session_start and re-resolved
+  // by the bridge per tool call (provider form). Host-side bash calls (0.83.0
+  // reads ctx.sessionManager.getSessionId()) get the genuine session identity
+  // the moment it exists; before that, hostToolsFromDefinitions' stable shim
+  // keeps them working (eager "on" mode starts the gateway at load).
+  let hostSessionManager: SessionManagerProvider = () => undefined;
   const hostToolsPolicy = new SubagentHostToolsPolicy({
     gateway: hostToolGateway,
     mode: settings.subagentHostTools ?? "auto",
@@ -87,7 +94,12 @@ export default function extension(pi: ExtensionAPI) {
     // + settings.excludeSubagentTools). A future SDK's getAllToolDefinitions()
     // would merge extension-registered tools automatically; on 0.83.0 it is
     // absent, so MCP tools are metadata-only and never advertised (logged).
-    buildHostTools: () => buildMergedHostTools(pi, { cwd, excludeSubagentTools: settings.excludeSubagentTools }),
+    buildHostTools: () =>
+      buildMergedHostTools(pi, {
+        cwd,
+        sessionManager: () => hostSessionManager(),
+        excludeSubagentTools: settings.excludeSubagentTools,
+      }),
     buildCodingTools: () => createCodingTools(cwd),
   });
   const gatewayManagerOptions = {
@@ -177,7 +189,12 @@ export default function extension(pi: ExtensionAPI) {
   // stated in the command copy; the "off" escape hatch gets the legacy
   // opt-in-only phrasing.
   registerWorkflowGatewayCommand(pi, hostToolGateway, {
-    buildHostTools: () => buildMergedHostTools(pi, { cwd, excludeSubagentTools: settings.excludeSubagentTools }),
+    buildHostTools: () =>
+      buildMergedHostTools(pi, {
+        cwd,
+        sessionManager: () => hostSessionManager(),
+        excludeSubagentTools: settings.excludeSubagentTools,
+      }),
     hostToolsAutomatic: hostToolsPolicy.isEnabled(),
   });
   // "on" (opt-in): eager start at load for latency-sensitive users. The
@@ -230,6 +247,11 @@ export default function extension(pi: ExtensionAPI) {
     // manager's registry lazily, so tool-registry refreshes from here on
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
+    // Capture the real session manager for the host-tool bridge context (bash's
+    // PI_SESSION_ID/PI_SESSION_FILE env). The provider is re-resolved per call,
+    // so both already-built and future bundles adopt it immediately;
+    // session_start always fires before any workflow run starts.
+    if (ctx.sessionManager) hostSessionManager = () => ctx.sessionManager;
     const active = pi.getActiveTools();
     const workflowTools = registeredToolNames;
     const missing = workflowTools.filter((name) => !active.includes(name));

@@ -34,22 +34,69 @@ export interface HostToolsBundle {
 }
 
 /**
+ * The session-manager surface host-side coding tools read from the execution
+ * context. The host aliases @earendil-works/pi-coding-agent to its own runtime
+ * dist (0.83.0), whose bash tool reads `ctx.sessionManager.getSessionId()` and
+ * `getSessionFile()` to set PI_SESSION_ID/PI_SESSION_FILE env — an undefined
+ * sessionManager crashes every proxied bash call. ReadonlySessionManager in
+ * the SDK structurally satisfies this shape, so the extension can pass the
+ * real session manager captured at session_start.
+ */
+export interface SessionManagerLike {
+  getSessionId(): string;
+  getSessionFile(): string | undefined;
+}
+
+/**
+ * A session-manager provider, evaluated per tool call. A bundle built before
+ * the first session_start (eager "on" mode starts the gateway at load) picks
+ * up the real manager the moment session_start delivers it, instead of
+ * freezing the fallback identity for the gateway's whole lifetime.
+ */
+export type SessionManagerProvider = () => SessionManagerLike | undefined;
+
+/**
+ * Honest stand-in until a real session manager exists: subagent bash calls
+ * still work, but clearly belong to the gateway rather than a real session.
+ */
+const FALLBACK_SESSION_MANAGER: SessionManagerLike = {
+  getSessionId: () => "host-tool-gateway",
+  getSessionFile: () => undefined,
+};
+
+/**
  * Build a HostToolsBundle from ToolDefinitions the host can execute.
  *
  * Each ToolDefinition.execute returns pi agent-core's AgentToolResult (content
  * array); the adapter flattens text parts into the bridge's ToolCallResult
- * content string. Coding/web tools read at most `ctx?.model` (verified in
- * @earendil-works/pi-coding-agent/dist/core/tools/*), so a minimal context is a
- * truthful stand-in for host-side execution.
+ * content string. Most coding tools read at most `ctx?.model` (verified in
+ * @earendil-works/pi-coding-agent/dist/core/tools/*), but 0.83.0's bash also
+ * reads `ctx.sessionManager`, so the bridge context carries the session
+ * manager the extension captured at session_start (or a provider that resolves
+ * it per call, falling back to {@link FALLBACK_SESSION_MANAGER} until the real
+ * one exists).
  */
-export function hostToolsFromDefinitions(definitions: ToolDefinition[]): HostToolsBundle {
+export function hostToolsFromDefinitions(
+  definitions: ToolDefinition[],
+  sessionManager?: SessionManagerLike | SessionManagerProvider,
+): HostToolsBundle {
   const tools = new Map<string, ToolExecutor>();
   const toolDefs: ProxiedToolDef[] = [];
-  const minimalCtx = { model: undefined } as unknown as ExtensionContext;
+  // Resolved per call: a provider form lets a load-time-built bundle (eager
+  // "on" mode) adopt the real session manager once session_start has fired;
+  // an object form is stable for the bundle's lifetime.
+  const resolveSessionManager = (): SessionManagerLike => {
+    const candidate = typeof sessionManager === "function" ? sessionManager() : sessionManager;
+    return candidate ?? FALLBACK_SESSION_MANAGER;
+  };
 
   for (const def of definitions) {
     if (tools.has(def.name)) continue;
     tools.set(def.name, async (args, signal) => {
+      const minimalCtx = {
+        model: undefined,
+        sessionManager: resolveSessionManager(),
+      } as unknown as ExtensionContext;
       try {
         const result = await def.execute(randomUUID(), (args ?? {}) as never, signal, undefined, minimalCtx);
         const text = result.content

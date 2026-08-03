@@ -36,6 +36,8 @@ import {
   type HostToolGateway,
   type HostToolsBundle,
   hostToolsFromDefinitions,
+  type SessionManagerLike,
+  type SessionManagerProvider,
 } from "./host-tool-gateway.js";
 
 /** Subagent host-tool access mode: "auto" (default) | "on" (eager) | "off" (legacy). */
@@ -47,6 +49,15 @@ export type HostToolsMode = "auto" | "on" | "off";
 export interface MergedHostToolsOptions {
   /** Workspace the coding tools operate on. */
   cwd: string;
+  /**
+   * The host session manager captured at session_start (see
+   * {@link SessionManagerLike}). Passed into the bridge execution context so
+   * host-side bash calls (0.83.0 reads ctx.sessionManager.getSessionId()) work;
+   * a provider form is resolved per tool call, so a bundle built before the
+   * first session_start (eager "on" mode) adopts the real manager once it
+   * exists — until then a stable fallback shim keeps bash working.
+   */
+  sessionManager?: SessionManagerLike | SessionManagerProvider;
   /**
    * Extra tool names to deny (wired from `settings.excludeSubagentTools`), on
    * top of the always-on `workflow`/`workflow_control` denial.
@@ -148,7 +159,7 @@ export function buildMergedHostTools(pi: ExtensionAPI, options: MergedHostToolsO
     );
   }
 
-  return hostToolsFromDefinitions([...builtins, ...createWebTools(), ...extensionTools]);
+  return hostToolsFromDefinitions([...builtins, ...createWebTools(), ...extensionTools], options.sessionManager);
 }
 
 export interface SubagentHostToolsPolicyOptions {

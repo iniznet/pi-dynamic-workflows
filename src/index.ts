@@ -47,7 +47,12 @@ export {
   WorkflowErrorCode,
   wrapError,
 } from "./errors.js";
-export type { HostToolsBundle, WorkflowGatewayCommandOptions } from "./gateway/host-tool-gateway.js";
+export type {
+  HostToolsBundle,
+  SessionManagerLike,
+  SessionManagerProvider,
+  WorkflowGatewayCommandOptions,
+} from "./gateway/host-tool-gateway.js";
 export {
   createGatewayProxiedTools,
   GATEWAY_NOT_RUNNING_MESSAGE,

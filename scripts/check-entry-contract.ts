@@ -333,6 +333,8 @@ const ENTRY_CONTRACT: Record<string, string> = {
   StructuredOutputCapture: "structured output type",
   StructuredOutputToolOptions: "structured output type",
   HostToolsBundle: "gateway type",
+  SessionManagerLike: "gateway type",
+  SessionManagerProvider: "gateway type",
   WorkflowGatewayCommandOptions: "gateway type",
   MCPBridgeOptions: "gateway type",
   MCPProxyClientOptions: "gateway type",

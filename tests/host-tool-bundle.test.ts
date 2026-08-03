@@ -189,6 +189,78 @@ describe("buildMergedHostTools", () => {
     assert.ok(names.includes("bash"), "core tools are unaffected by the extra exclusions");
   });
 
+  test("sessionManager option is threaded into the bridge execution context", async () => {
+    // A registered def that reads ctx.sessionManager like 0.83.0's bash tool;
+    // the option must reach hostToolsFromDefinitions so subagent bash calls
+    // carry the real session identity instead of crashing on undefined.
+    const sessionReader: ToolDefinition = {
+      name: "session_reader",
+      label: "session_reader",
+      description: "reads the session-manager surface",
+      parameters: Type.Object({}),
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const session = (
+          ctx as unknown as { sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined } }
+        ).sessionManager;
+        if (!session) throw new Error("ctx.sessionManager is undefined");
+        return {
+          content: [
+            { type: "text" as const, text: `${session.getSessionId()}|${session.getSessionFile() ?? "<none>"}` },
+          ],
+          details: undefined,
+        };
+      },
+    } as ToolDefinition;
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [sessionReader],
+      }),
+      {
+        cwd: process.cwd(),
+        sessionManager: { getSessionId: () => "session-xyz", getSessionFile: () => "/tmp/session-xyz.jsonl" },
+      },
+    );
+    const executor = bundle.tools.get("session_reader");
+    assert.ok(executor, "session_reader must be proxied");
+    assert.deepEqual(await executor({}), {
+      content: "session-xyz|/tmp/session-xyz.jsonl",
+      isError: false,
+      details: undefined,
+    });
+  });
+
+  test("without a sessionManager option the fallback shim keeps ctx-reading defs working", async () => {
+    const sessionReader: ToolDefinition = {
+      name: "session_reader",
+      label: "session_reader",
+      description: "reads the session-manager surface",
+      parameters: Type.Object({}),
+      async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+        const session = (
+          ctx as unknown as { sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined } }
+        ).sessionManager;
+        if (!session) throw new Error("ctx.sessionManager is undefined");
+        return {
+          content: [
+            { type: "text" as const, text: `${session.getSessionId()}|${session.getSessionFile() ?? "<none>"}` },
+          ],
+          details: undefined,
+        };
+      },
+    } as ToolDefinition;
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [sessionReader],
+      }),
+      { cwd: process.cwd() },
+    );
+    const executor = bundle.tools.get("session_reader");
+    assert.ok(executor, "session_reader must be proxied");
+    assert.deepEqual(await executor({}), { content: "host-tool-gateway|<none>", isError: false, details: undefined });
+  });
+
   test("dedupe: a same-named def loses to the earlier core def (first occurrence wins)", () => {
     const bundle = buildMergedHostTools(
       makePi({

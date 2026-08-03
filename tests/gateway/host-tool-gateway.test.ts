@@ -118,6 +118,116 @@ test("hostToolsFromDefinitions surfaces host tool execution failures as isError 
   assert.match(result.content, /host exploded/);
 });
 
+test("hostToolsFromDefinitions passes the injected session manager to the execution context (0.83.0 bash contract)", async () => {
+  // Mirrors the 0.83.0 bash tool's ctx reads: PI_SESSION_ID / PI_SESSION_FILE
+  // come from ctx.sessionManager. An undefined sessionManager crashes every
+  // proxied bash call (TypeError on getSessionId), so the bridge must forward
+  // the manager the extension captured at session_start.
+  const readsSessionCtx: ToolDefinition = {
+    name: "bash_like",
+    label: "bash_like",
+    description: "reads the session-manager surface like 0.83.0 bash",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const session = (
+        ctx as unknown as { sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined } }
+      ).sessionManager;
+      if (!session) throw new Error("ctx.sessionManager is undefined");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${session.getSessionId()}|${session.getSessionFile() ?? "<none>"}`,
+          },
+        ],
+        details: undefined,
+      };
+    },
+  } as ToolDefinition;
+
+  const injected = hostToolsFromDefinitions([readsSessionCtx], {
+    getSessionId: () => "session-abc",
+    getSessionFile: () => "/tmp/session-abc.jsonl",
+  });
+  const injectedResult = await (injected.tools.get("bash_like") as ToolExecutor)({});
+  assert.deepEqual(injectedResult, {
+    content: "session-abc|/tmp/session-abc.jsonl",
+    isError: false,
+    details: undefined,
+  });
+});
+
+test("hostToolsFromDefinitions falls back to a stable session-manager shim when none is injected", async () => {
+  const readsSessionCtx: ToolDefinition = {
+    name: "bash_like",
+    label: "bash_like",
+    description: "reads the session-manager surface like 0.83.0 bash",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const session = (
+        ctx as unknown as { sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined } }
+      ).sessionManager;
+      if (!session) throw new Error("ctx.sessionManager is undefined");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${session.getSessionId()}|${session.getSessionFile() ?? "<none>"}`,
+          },
+        ],
+        details: undefined,
+      };
+    },
+  } as ToolDefinition;
+
+  // A bundle built before the first session_start (eager "on" mode) must not
+  // crash bash — the shim is honest (gateway identity, no fake session file).
+  const fallback = hostToolsFromDefinitions([readsSessionCtx]);
+  const first = await (fallback.tools.get("bash_like") as ToolExecutor)({});
+  const second = await (fallback.tools.get("bash_like") as ToolExecutor)({});
+  assert.deepEqual(first, { content: "host-tool-gateway|<none>", isError: false, details: undefined });
+  assert.deepEqual(second, first, "the fallback identity is stable across calls");
+});
+
+test("hostToolsFromDefinitions resolves a provider per call so a load-time bundle adopts the real session manager later", async () => {
+  const readsSessionCtx: ToolDefinition = {
+    name: "bash_like",
+    label: "bash_like",
+    description: "reads the session-manager surface like 0.83.0 bash",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const session = (
+        ctx as unknown as { sessionManager?: { getSessionId(): string; getSessionFile(): string | undefined } }
+      ).sessionManager;
+      if (!session) throw new Error("ctx.sessionManager is undefined");
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${session.getSessionId()}|${session.getSessionFile() ?? "<none>"}`,
+          },
+        ],
+        details: undefined,
+      };
+    },
+  } as ToolDefinition;
+
+  // Simulates eager "on" mode: the bundle is built at load, BEFORE the
+  // session_start handler assigns the real manager to the provider.
+  let real: { getSessionId(): string; getSessionFile(): string | undefined } | undefined;
+  const bundle = hostToolsFromDefinitions([readsSessionCtx], () => real);
+  const executor = bundle.tools.get("bash_like") as ToolExecutor;
+
+  const before = await executor({});
+  assert.deepEqual(before, { content: "host-tool-gateway|<none>", isError: false, details: undefined });
+
+  // session_start fires; the provider now returns the real manager.
+  real = { getSessionId: () => "session-live-9", getSessionFile: () => "/tmp/session-live-9.jsonl" };
+  const after = await executor({});
+  assert.deepEqual(after, { content: "session-live-9|/tmp/session-live-9.jsonl", isError: false, details: undefined });
+  assert.notDeepEqual(after, before, "the same bundle must adopt the real manager without a rebuild");
+});
+
 test("createGatewayProxiedTools with a stopped gateway resolves to definitions that fail at call time", async () => {
   const gateway = trackedGateway();
   const defs = createGatewayProxiedTools(gateway);
