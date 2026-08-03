@@ -8,6 +8,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
+import { EXTENSION_TOOL_SOURCES } from "./subagent/extension-tools-capture.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 /**
@@ -100,6 +102,18 @@ export interface WorkflowSettings {
    * subagentTools.
    */
   subagentChromeTools?: "on" | "off";
+  /**
+   * Host-captured extension tools for subagents (design: tasks/
+   * subagent-extension-tools/DESIGN.md): third-party extension tools
+   * (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*) captured
+   * in-process from the installed packages and executed in the host via the
+   * gateway. "on" (opt-in) exposes every installed source; a string[] is an
+   * allowlist of exact source ids ("supi-web", "pi-codegraph"); [] explicitly
+   * disables all sources; "off" (default) keeps subagents on the standard
+   * toolset. Unknown ids are dropped leniently. Orthogonal to subagentHostTools
+   * and subagentChromeTools.
+   */
+  subagentExtensionTools?: "off" | "on" | ExtensionToolSourceId[];
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -143,6 +157,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // Same lenient drop-on-violation style as subagentHostTools: any string
   // passes the type schema; normalizeSettings accepts only "on"/"off".
   subagentChromeTools: ["string"],
+  // "on" (string) or a source-id allowlist (array); lenient drop-on-violation,
+  // same style as subagentTools. normalizeSettings accepts only the exact
+  // literal "on"/"off" and drops other strings.
+  subagentExtensionTools: ["string", "array"],
 };
 
 /**
@@ -354,6 +372,28 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (raw.subagentChromeTools === "on" || raw.subagentChromeTools === "off") {
     settings.subagentChromeTools = raw.subagentChromeTools;
+  }
+  if (raw.subagentExtensionTools === "on" || raw.subagentExtensionTools === "off") {
+    settings.subagentExtensionTools = raw.subagentExtensionTools;
+  } else if (Array.isArray(raw.subagentExtensionTools)) {
+    if (raw.subagentExtensionTools.length === 0) {
+      // Explicit empty allowlist: no extension source is enabled (the "off"
+      // side of the on | allowlist setting).
+      settings.subagentExtensionTools = [];
+    } else {
+      // Allowlist: keep known source ids only, dedupe while preserving order.
+      const ids = [
+        ...new Set(
+          raw.subagentExtensionTools.filter(
+            (id): id is ExtensionToolSourceId =>
+              typeof id === "string" &&
+              id.trim().length > 0 &&
+              EXTENSION_TOOL_SOURCES.some((source) => source.id === id.trim()),
+          ),
+        ),
+      ];
+      if (ids.length) settings.subagentExtensionTools = ids;
+    }
   }
   return settings;
 }

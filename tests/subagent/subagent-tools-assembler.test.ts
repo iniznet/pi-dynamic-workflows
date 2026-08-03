@@ -49,12 +49,14 @@ function makeAssembler(
   mode: "all" | string[],
   excludeTools: string[] = [],
   chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>,
+  extensionTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>,
 ): SubagentToolsAssembler {
   return new SubagentToolsAssembler({
     mode,
     hostTools: () => [...HOST_TOOLS],
     mcpTools: manager,
     chromeTools,
+    extensionTools,
     excludeTools,
   });
 }
@@ -189,5 +191,64 @@ describe("SubagentToolsAssembler", () => {
     const tools = await assembler.assemble();
     assert.ok(tools.some((tool) => tool.name === "chrome_snapshot"));
     assert.ok(!tools.some((tool) => tool.name === "chrome_click"));
+  });
+
+  test("an extension supplier appends captured extension tools after chrome tools", async () => {
+    const assembler = makeAssembler(
+      makeManager(await mcpServerTools()),
+      "all",
+      [],
+      () => [fakeTool("chrome_snapshot")],
+      () => [fakeTool("web_fetch_md"), fakeTool("codegraph_search")],
+    );
+    const tools = await assembler.assemble();
+    assert.deepEqual(
+      tools.map((tool) => tool.name),
+      [
+        ...HOST_TOOLS.map((tool) => tool.name),
+        "mcp_svelte_get-docs",
+        "mcp_svelte_read-resource",
+        "chrome_snapshot",
+        "web_fetch_md",
+        "codegraph_search",
+      ],
+    );
+  });
+
+  test("an absent/empty extension supplier contributes no extension tools", async () => {
+    const none = makeAssembler(makeManager(await mcpServerTools()), "all");
+    const tools = await none.assemble();
+    assert.ok(!tools.some((tool) => tool.name === "web_fetch_md" || tool.name === "codegraph_search"));
+    const empty = makeAssembler(makeManager(await mcpServerTools()), "all", [], undefined, () => []);
+    assert.deepEqual(
+      (await empty.assemble()).filter((tool) => tool.name === "web_fetch_md" || tool.name === "codegraph_search"),
+      [],
+    );
+  });
+
+  test("extensionToolsOnly yields the supplier's defs without the host/MCP/chrome bundle", async () => {
+    const assembler = makeAssembler(
+      makeManager(await mcpServerTools()),
+      "all",
+      [],
+      () => [fakeTool("chrome_snapshot")],
+      () => [fakeTool("web_fetch_md"), fakeTool("web_docs_search")],
+    );
+    assert.deepEqual(
+      (await assembler.extensionToolsOnly()).map((tool) => tool.name),
+      ["web_fetch_md", "web_docs_search"],
+    );
+    const without = makeAssembler(makeManager(await mcpServerTools()), "all");
+    assert.deepEqual(await without.extensionToolsOnly(), []);
+  });
+
+  test("excluded names are stripped from the extension set too", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", ["web_docs_search"], undefined, () => [
+      fakeTool("web_fetch_md"),
+      fakeTool("web_docs_search"),
+    ]);
+    const tools = await assembler.assemble();
+    assert.ok(tools.some((tool) => tool.name === "web_fetch_md"));
+    assert.ok(!tools.some((tool) => tool.name === "web_docs_search"));
   });
 });

@@ -49,6 +49,12 @@ export interface SubagentToolsAssemblerOptions {
    * assemble() so the supplier can re-check the shared chrome auth grant.
    */
   chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  /**
+   * Host-captured extension tool defs (subagent-extension-tools). Resolved
+   * lazily per assemble(); the supplier is undefined when the setting is off
+   * (no defs anywhere, mirroring the chrome gate).
+   */
+  extensionTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   /** Extra tool names to deny (wired from settings.excludeSubagentTools). */
   excludeTools?: string[];
 }
@@ -73,11 +79,17 @@ function filterChromeTools(defs: ToolDefinition[], excludeTools: string[]): Tool
   return defs.filter((def) => !isExcludedHostTool(def.name, excludeTools));
 }
 
+/** Captured extension defs minus the always-denied/excluded names. */
+function filterExtensionTools(defs: ToolDefinition[], excludeTools: string[]): ToolDefinition[] {
+  return defs.filter((def) => !isExcludedHostTool(def.name, excludeTools));
+}
+
 export class SubagentToolsAssembler {
   private readonly mode: SubagentToolsMode;
   private readonly hostTools: () => Promise<ToolDefinition[]> | ToolDefinition[];
   private readonly mcpTools: McpToolsManager;
   private readonly chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  private readonly extensionTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private readonly excludeTools: string[];
 
   constructor(options: SubagentToolsAssemblerOptions) {
@@ -85,25 +97,40 @@ export class SubagentToolsAssembler {
     this.hostTools = options.hostTools;
     this.mcpTools = options.mcpTools;
     this.chromeTools = options.chromeTools;
+    this.extensionTools = options.extensionTools;
     this.excludeTools = options.excludeTools ?? [];
   }
 
   /**
    * The merged default toolset for untagged runs: host bundle + MCP tools
-   * (mode-filtered) + vendored chrome tools (auth-gated by the supplier).
-   * Never throws — MCP failures degrade to host-only tools.
+   * (mode-filtered) + vendored chrome tools (auth-gated by the supplier) +
+   * captured extension tools (setting-gated by the supplier). Never throws —
+   * MCP failures degrade to host-only tools.
    */
   async assemble(): Promise<ToolDefinition[]> {
-    const [host, mcp, chrome] = await Promise.all([
+    const [host, mcp, chrome, extension] = await Promise.all([
       this.hostTools(),
       this.mcpTools.listSubagentTools(),
       this.chromeTools?.() ?? [],
+      this.extensionTools?.() ?? [],
     ]);
-    return [
+    const merged = [
       ...host,
       ...filterMcpTools(mcp, this.mode, this.excludeTools),
       ...filterChromeTools(chrome, this.excludeTools),
+      ...filterExtensionTools(extension, this.excludeTools),
     ];
+    // First-wins dedupe by name across every source (defensive: no collision
+    // among current sources, but a future supplier could overlap).
+    const seen = new Set<string>();
+    const unique: ToolDefinition[] = [];
+    for (const def of merged) {
+      if (!seen.has(def.name)) {
+        seen.add(def.name);
+        unique.push(def);
+      }
+    }
+    return unique;
   }
 
   /**
@@ -125,5 +152,16 @@ export class SubagentToolsAssembler {
   async chromeToolsOnly(): Promise<ToolDefinition[]> {
     const chrome = (await this.chromeTools?.()) ?? [];
     return filterChromeTools(chrome, this.excludeTools);
+  }
+
+  /**
+   * Captured extension tools only (the "extension-tools" named toolset).
+   * Resolved per call so it reflects the CURRENT setting gate — with the
+   * supplier undefined (setting off) this resolves to [] (script intent
+   * recorded, no tools).
+   */
+  async extensionToolsOnly(): Promise<ToolDefinition[]> {
+    const extension = (await this.extensionTools?.()) ?? [];
+    return filterExtensionTools(extension, this.excludeTools);
   }
 }

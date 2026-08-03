@@ -23,6 +23,8 @@
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_EXCLUDED_SUBAGENT_TOOLS } from "./agent.js";
 import type { HostToolsMode } from "./gateway/subagent-host-tools.js";
+import type { CapturedSourceResult, ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
+import { EXPECTED_EXTENSION_TOOL_NAMES, extensionSourceIdForTool } from "./subagent/extension-tools-capture.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 
 /** "all" | exact mcp_* allowlist ([] = no MCP tools for subagents). */
@@ -64,8 +66,12 @@ export interface SubagentToolsListingInput {
   mcpServerNames: string[];
   /** Effective subagentChromeTools mode ("on" | "off"). */
   chromeToolsMode: "on" | "off";
-  /** Whether the host currently holds the shared /chrome authorize grant. */
+  /** Whether the shared /chrome authorize grant is currently held. */
   chromeGranted: boolean;
+  /** Effective subagentExtensionTools mode ("off" | "on" | source allowlist). */
+  extensionToolsMode: "off" | "on" | ExtensionToolSourceId[];
+  /** Per-source capture results (disabled sources report "not-enabled"). */
+  extensionToolSources: CapturedSourceResult[];
 }
 
 /** The executable coding builtins (createCodingTools) — host-bundle sources. */
@@ -176,6 +182,39 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
             ? "subagentChromeTools is off — set settings.subagentChromeTools=on to expose vendored chrome tools"
             : "no active /chrome authorize grant — chrome tools attach once the host session authorizes",
       });
+    } else if (EXPECTED_EXTENSION_TOOL_NAMES.has(info.name)) {
+      // A host-registered extension tool (supi-web / pi-codegraph) not in the
+      // assembled set: the setting is off, the source is allowlisted out, or
+      // capture failed/not installed — all reported truthfully, no SDK gap.
+      const sourceId = extensionSourceIdForTool(info.name);
+      const result = sourceId ? input.extensionToolSources.find((row) => row.sourceId === sourceId) : undefined;
+      if (result?.status === "captured") {
+        rows.push({
+          name: info.name,
+          source: "extension",
+          status: "available-if-enabled",
+          note: `captured by ${sourceId} but filtered from this run's toolset (exclusion or dedupe)`,
+        });
+      } else if (result?.status === "not-enabled" || input.extensionToolsMode === "off") {
+        rows.push({
+          name: info.name,
+          source: "extension",
+          status: "available-if-enabled",
+          note:
+            input.extensionToolsMode === "off"
+              ? "subagentExtensionTools is off — set settings.subagentExtensionTools=on to capture extension tools"
+              : `source ${sourceId} is not in the subagentExtensionTools allowlist — add "${sourceId}" to enable it`,
+        });
+      } else {
+        rows.push({
+          name: info.name,
+          source: "extension",
+          status: "unavailable",
+          note: result
+            ? `${sourceId} source: ${result.status}${result.error ? ` — ${result.error}` : ""}`
+            : `${sourceId} source not captured`,
+        });
+      }
     } else {
       rows.push({
         name: info.name,
@@ -196,6 +235,13 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
     "available-if-enabled": 5,
   };
   return rows.sort((a, b) => statusOrder[a.status] - statusOrder[b.status] || a.name.localeCompare(b.name));
+}
+
+/** Render the extension-tools mode for the listing header. */
+function renderExtensionToolsMode(mode: "off" | "on" | ExtensionToolSourceId[]): string {
+  if (mode === "off") return "off";
+  if (mode === "on") return "on";
+  return mode.length === 0 ? "none" : `allowlist (${mode.length})`;
 }
 
 /** Render the listing as markdown for pi.sendMessage. */
@@ -222,6 +268,9 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
   );
   lines.push(
     `- Chrome tools: **${input.chromeToolsMode}** (${input.chromeToolsMode === "off" ? "vendored chrome defs hidden — set settings.subagentChromeTools=on to expose them" : input.chromeGranted ? "shared /chrome authorize grant active — chrome defs attach to runs" : "setting on but no /chrome authorize grant — chrome defs stay empty until the host authorizes"})`,
+  );
+  lines.push(
+    `- Extension tools: **${renderExtensionToolsMode(input.extensionToolsMode)}** (${input.extensionToolsMode === "off" ? "captured defs hidden — set settings.subagentExtensionTools=on to capture supi-web + pi-codegraph tools" : "captured in-process from installed sources; per-source status below"})`,
   );
   const alwaysDenied = DEFAULT_EXCLUDED_SUBAGENT_TOOLS.join(", ");
   const deniedSettings =
@@ -264,6 +313,8 @@ export interface WorkflowSubagentToolsCommandOptions {
   listMcpServers: () => string[];
   /** Shared-grant check — extension passes isChromeAuthorized. */
   getChromeGranted: () => boolean;
+  /** Per-source extension-tool capture results — extension passes the capture module. */
+  getExtensionToolSources: () => Promise<CapturedSourceResult[]>;
 }
 
 /**
@@ -284,9 +335,10 @@ export function registerWorkflowSubagentToolsCommand(
     description: COMMAND_DESCRIPTION,
     async handler(_args: string, ctx: ExtensionCommandContext) {
       const settings = options.loadSettings();
-      const [assembled, infos] = await Promise.all([
+      const [assembled, infos, extensionToolSources] = await Promise.all([
         options.assembleDefaultTools().catch(() => [] as ToolDefinition[]),
         Promise.resolve(options.getHostToolInfos()),
+        options.getExtensionToolSources().catch(() => [] as CapturedSourceResult[]),
       ]);
       const listing = renderSubagentToolsListing({
         mode: settings.subagentTools ?? "all",
@@ -297,6 +349,8 @@ export function registerWorkflowSubagentToolsCommand(
         mcpServerNames: options.listMcpServers(),
         chromeToolsMode: settings.subagentChromeTools ?? "off",
         chromeGranted: options.getChromeGranted(),
+        extensionToolsMode: settings.subagentExtensionTools ?? "off",
+        extensionToolSources,
       });
       // fallback: a host without sendMessage still surfaces the rows via the
       // notify channel; ctx.cwd keeps the listing project-scoped.

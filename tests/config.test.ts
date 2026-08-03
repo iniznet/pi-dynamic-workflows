@@ -195,6 +195,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "subagentHostTools",
     "subagentTools",
     "subagentChromeTools",
+    "subagentExtensionTools",
   ];
   for (const key of settingsKeys) {
     assert.ok(

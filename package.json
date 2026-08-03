@@ -93,7 +93,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "acorn": "^8.16.0"
+    "acorn": "^8.16.0",
+    "jiti": "^2.7.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=0.80.8",

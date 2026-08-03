@@ -39,6 +39,10 @@ import {
   WorkflowManager,
 } from "../src/index.js";
 import { isChromeAuthorized } from "../src/subagent/chrome-bridge-client.js";
+import {
+  createExtensionToolsSupplier,
+  getExtensionToolSourceResults,
+} from "../src/subagent/extension-tools-capture.js";
 import { McpToolsManager } from "../src/subagent/mcp-tools.js";
 import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
 import { createVendoredChromeTools } from "../src/subagent/vendored-chrome-tools.js";
@@ -142,6 +146,14 @@ export default function extension(pi: ExtensionAPI) {
     });
   const chromeToolsSupplier =
     settings.subagentChromeTools === "on" ? () => (isChromeAuthorized() ? vendoredChromeTools() : []) : undefined;
+  // SUBAGENT EXTENSION TOOLS: host-captured third-party extension tools
+  // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*) captured
+  // in-process from the installed packages and executed in the host via the
+  // gateway (design: tasks/subagent-extension-tools/DESIGN.md). Gated by
+  // `subagentExtensionTools` exactly like chrome: off → undefined → no defs
+  // anywhere, including the "extension-tools" toolset.
+  const extensionToolsMode = settings.subagentExtensionTools ?? "off";
+  const extensionToolsSupplier = createExtensionToolsSupplier(extensionToolsMode);
   const subagentToolsAssembler = new SubagentToolsAssembler({
     mode: settings.subagentTools ?? "all",
     // The host bundle baseline (coding + proxied host + web tools) is owned by
@@ -149,6 +161,7 @@ export default function extension(pi: ExtensionAPI) {
     hostTools: () => hostToolsPolicy.defaultTools(),
     mcpTools: mcpToolsManager,
     chromeTools: chromeToolsSupplier,
+    extensionTools: extensionToolsSupplier,
     excludeTools: settings.excludeSubagentTools,
   });
   const gatewayManagerOptions = {
@@ -174,6 +187,10 @@ export default function extension(pi: ExtensionAPI) {
       // host-tools mode. With subagentChromeTools "off" the supplier is
       // undefined, so this resolves to [] (script intent recorded, no tools).
       "chrome-tools": () => subagentToolsAssembler.chromeToolsOnly(),
+      // Captured-extension-tools-only toolset: works in every host-tools
+      // mode, including "off". With subagentExtensionTools off the supplier
+      // is undefined → [] (script intent recorded, no tools).
+      "extension-tools": () => subagentToolsAssembler.extensionToolsOnly(),
     },
   };
   // The gateway is created per extension generation; a /reload hands the old
@@ -296,6 +313,7 @@ export default function extension(pi: ExtensionAPI) {
     assembleDefaultTools: () => subagentToolsAssembler.assemble(),
     listMcpServers: () => mcpToolsManager.serverNames(),
     getChromeGranted: () => isChromeAuthorized(),
+    getExtensionToolSources: () => getExtensionToolSourceResults(settings.subagentExtensionTools ?? "off"),
   });
   registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);

@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { CapturedSourceResult } from "../src/subagent/extension-tools-capture.js";
 import {
   buildSubagentToolRows,
   classifyToolSource,
@@ -44,6 +45,12 @@ const HOST_INFOS: ToolInfo[] = [
   fakeInfo("todo"),
   fakeInfo("vcc_recall"),
   fakeInfo("mcp"),
+  // Host-registered extension tools (supi-web + pi-codegraph): the listing
+  // reports their capture state truthfully instead of the metadata-only row.
+  fakeInfo("web_fetch_md"),
+  fakeInfo("web_docs_search"),
+  fakeInfo("codegraph_search"),
+  fakeInfo("codegraph_files"),
 ];
 
 function listing(overrides: Partial<SubagentToolsListingInput> = {}): SubagentToolsListingInput {
@@ -56,6 +63,8 @@ function listing(overrides: Partial<SubagentToolsListingInput> = {}): SubagentTo
     mcpServerNames: ["svelte"],
     chromeToolsMode: "off",
     chromeGranted: false,
+    extensionToolsMode: "off",
+    extensionToolSources: [],
     ...overrides,
   };
 }
@@ -153,6 +162,85 @@ describe("buildSubagentToolRows", () => {
     assert.equal(grep?.status, "available-if-enabled");
     assert.match(grep?.note ?? "", /host tools off/);
   });
+
+  test("extension tools hidden when the setting is off get an actionable note", () => {
+    const rows = buildSubagentToolRows(listing());
+    for (const name of ["web_fetch_md", "web_docs_search", "codegraph_search", "codegraph_files"]) {
+      const row = rowByName(rows, name);
+      assert.equal(row?.status, "available-if-enabled", `${name} must be available-if-enabled`);
+      assert.equal(row?.source, "extension");
+      assert.match(row?.note ?? "", /subagentExtensionTools is off/);
+    }
+  });
+
+  test("extension tools of a source allowlisted out report the missing source", () => {
+    const rows = buildSubagentToolRows(
+      listing({
+        extensionToolsMode: ["pi-codegraph"],
+        extensionToolSources: [
+          {
+            sourceId: "supi-web",
+            label: "supi-web",
+            defs: [],
+            status: "not-enabled",
+          } as CapturedSourceResult,
+          {
+            sourceId: "pi-codegraph",
+            label: "pi-codegraph",
+            defs: [],
+            status: "captured",
+          } as CapturedSourceResult,
+        ],
+      }),
+    );
+    const web = rowByName(rows, "web_fetch_md");
+    assert.equal(web?.status, "available-if-enabled");
+    assert.match(web?.note ?? "", /supi-web is not in the subagentExtensionTools allowlist/);
+    const cg = rowByName(rows, "codegraph_search");
+    assert.equal(cg?.status, "available-if-enabled");
+    assert.match(cg?.note ?? "", /captured by pi-codegraph but filtered/);
+  });
+
+  test("a captured source whose tools are assembled is allowed with an extension source", () => {
+    const rows = buildSubagentToolRows(
+      listing({
+        extensionToolsMode: "on",
+        extensionToolSources: [
+          {
+            sourceId: "supi-web",
+            label: "supi-web",
+            defs: [],
+            status: "captured",
+          } as CapturedSourceResult,
+        ],
+        assembledToolNames: ["read", "bash", "web_fetch_md"],
+      }),
+    );
+    const web = rowByName(rows, "web_fetch_md");
+    assert.equal(web?.status, "allowed");
+    assert.equal(web?.source, "extension");
+  });
+
+  test("a failing source reports unavailable with its one-line error", () => {
+    const rows = buildSubagentToolRows(
+      listing({
+        extensionToolsMode: "on",
+        extensionToolSources: [
+          {
+            sourceId: "pi-codegraph",
+            label: "pi-codegraph",
+            defs: [],
+            status: "capture-failed",
+            error: "capturing pi-codegraph threw: boom",
+          } as CapturedSourceResult,
+        ],
+      }),
+    );
+    const cg = rowByName(rows, "codegraph_search");
+    assert.equal(cg?.status, "unavailable");
+    assert.match(cg?.note ?? "", /capture-failed/);
+    assert.match(cg?.note ?? "", /boom/);
+  });
 });
 
 describe("renderSubagentToolsListing", () => {
@@ -184,5 +272,35 @@ describe("renderSubagentToolsListing", () => {
     assert.match(md, /#### Not in subagent sessions/);
     assert.match(md, /chrome_snapshot/);
     assert.match(md, /subagentChromeTools is off/);
+  });
+
+  test("the header renders the extension-tools mode with an actionable hint when off", () => {
+    const md = renderSubagentToolsListing(listing());
+    assert.match(md, /Extension tools: \*\*off\*\*/);
+    assert.match(md, /set settings\.subagentExtensionTools=on/);
+  });
+
+  test("the header shows the allowlist and per-source status when enabled", () => {
+    const md = renderSubagentToolsListing(
+      listing({
+        extensionToolsMode: "on",
+        extensionToolSources: [
+          {
+            sourceId: "supi-web",
+            label: "supi-web",
+            defs: [],
+            status: "captured",
+          } as CapturedSourceResult,
+          {
+            sourceId: "pi-codegraph",
+            label: "pi-codegraph",
+            defs: [],
+            status: "not-installed",
+          } as CapturedSourceResult,
+        ],
+      }),
+    );
+    assert.match(md, /Extension tools: \*\*on\*\*/);
+    assert.match(md, /captured in-process from installed sources/);
   });
 });

@@ -2,6 +2,8 @@
  * Configuration constants for pi-dynamic-workflows.
  */
 
+import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
+import { isKnownExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 // Type-only to avoid a runtime import cycle: workflow-settings.ts imports value
 // bindings (MAX_AGENT_RETRIES, ...) from this module, so importing its type is
 // erased at compile time and never re-enters it at load.
@@ -89,6 +91,7 @@ export const WORKFLOW_ENV_VARS = {
   subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
   subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
+  subagentExtensionTools: "PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS",
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -186,6 +189,23 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   const subagentChromeTools = env[WORKFLOW_ENV_VARS.subagentChromeTools]?.trim();
   if (subagentChromeTools === "on" || subagentChromeTools === "off") {
     settings.subagentChromeTools = subagentChromeTools;
+  }
+  const subagentExtensionTools = env[WORKFLOW_ENV_VARS.subagentExtensionTools]?.trim();
+  if (subagentExtensionTools === "on" || subagentExtensionTools === "off") {
+    settings.subagentExtensionTools = subagentExtensionTools;
+  } else if (subagentExtensionTools) {
+    // Allowlist: comma-separated exact source ids ("supi-web",
+    // "pi-codegraph"). "on"/"off" are the only magic values; anything else
+    // is a source-id list. Unknown ids are dropped leniently.
+    const ids = [
+      ...new Set(
+        subagentExtensionTools
+          .split(",")
+          .map((id) => id.trim())
+          .filter((id): id is ExtensionToolSourceId => isKnownExtensionToolSourceId(id)),
+      ),
+    ];
+    if (ids.length) settings.subagentExtensionTools = ids;
   }
   return settings;
 }

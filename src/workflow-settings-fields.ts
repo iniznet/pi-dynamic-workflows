@@ -202,6 +202,15 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     defaultDisplay: "off",
     envVar: WORKFLOW_ENV_VARS.subagentChromeTools,
   },
+  {
+    key: "subagentExtensionTools",
+    type: "string[]",
+    label: "Subagent extension tools",
+    help: "Host-captured third-party extension tools for subagents: on (opt-in, captures tools from every installed source — supi-web, pi-codegraph), a comma-separated allowlist of exact source ids, or off (default). Empty clears. See /workflows-subagent-tools for the live toolset.",
+    group: "Advanced",
+    defaultDisplay: "off",
+    envVar: WORKFLOW_ENV_VARS.subagentExtensionTools,
+  },
 ];
 
 /** The four groups in render order, derived from the registry so they can never drift. */
@@ -298,6 +307,13 @@ export function parseFieldInput(
       // "none" side of the all | allowlist setting.
       if (field.key === "subagentTools" && raw.trim() === "all") return { ok: true, value: "all" };
       if (field.key === "subagentTools" && raw.trim() === "") return { ok: true, value: [] };
+      // The subagentExtensionTools row accepts the special literals "on" and
+      // "off" (its capture modes) before the comma-split source-id allowlist
+      // path; empty input means "no sources" ([]), the "off" side.
+      if (field.key === "subagentExtensionTools" && (raw.trim() === "on" || raw.trim() === "off")) {
+        return { ok: true, value: raw.trim() };
+      }
+      if (field.key === "subagentExtensionTools" && raw.trim() === "") return { ok: true, value: [] };
       const names = raw
         .split(",")
         .map((name) => name.trim())
