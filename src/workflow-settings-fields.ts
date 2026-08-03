@@ -192,6 +192,16 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     defaultDisplay: "all",
     envVar: WORKFLOW_ENV_VARS.subagentTools,
   },
+  {
+    key: "subagentChromeTools",
+    type: "enum",
+    label: "Subagent chrome tools",
+    help: 'Vendored pi-chrome chrome_* tools for subagents: on (expose in the default toolset and the "chrome-tools" named toolset while the host holds a /chrome authorize grant) or off (default, subagents stay browser-free). Reuses the host session\'s bridge and grant — no separate setup.',
+    options: ["off", "on"],
+    group: "Advanced",
+    defaultDisplay: "off",
+    envVar: WORKFLOW_ENV_VARS.subagentChromeTools,
+  },
 ];
 
 /** The four groups in render order, derived from the registry so they can never drift. */

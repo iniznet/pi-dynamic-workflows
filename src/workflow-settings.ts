@@ -90,6 +90,16 @@ export interface WorkflowSettings {
    * regardless of mode.
    */
   subagentTools?: "all" | string[];
+  /**
+   * Vendored chrome tools for subagents (design: tasks/subagent-chrome-tools/
+   * DESIGN.md): pi-chrome's `chrome_*` set re-created in-process, executed
+   * against the host session's shared bridge and gated by its `/chrome
+   * authorize` grant. "on" exposes them in the default subagent toolset and
+   * the "chrome-tools" named toolset when a grant is active; "off" (default)
+   * keeps subagents browser-free. Orthogonal to subagentHostTools and
+   * subagentTools.
+   */
+  subagentChromeTools?: "on" | "off";
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -130,6 +140,9 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // normalizeSettings accepts only the exact literal "all" and drops other
   // strings (lenient drop-on-violation, same style as subagentHostTools).
   subagentTools: ["string", "array"],
+  // Same lenient drop-on-violation style as subagentHostTools: any string
+  // passes the type schema; normalizeSettings accepts only "on"/"off".
+  subagentChromeTools: ["string"],
 };
 
 /**
@@ -338,6 +351,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
       ];
       if (names.length) settings.subagentTools = names;
     }
+  }
+  if (raw.subagentChromeTools === "on" || raw.subagentChromeTools === "off") {
+    settings.subagentChromeTools = raw.subagentChromeTools;
   }
   return settings;
 }

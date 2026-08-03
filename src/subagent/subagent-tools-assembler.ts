@@ -11,6 +11,10 @@
  *    defs by {@link McpToolsManager}) are the new addition, controlled here:
  *    "all" appends every reachable server's tools; a string[] appends only the
  *    exact `mcp_*` names listed; [] appends nothing.
+ *  - Vendored chrome tools (pi-chrome's `chrome_*` set re-created for
+ *    subagents, design: tasks/subagent-chrome-tools/DESIGN.md) are appended
+ *    after MCP tools when a supplier is provided; they respect the host's
+ *    shared `/chrome authorize` grant (the supplier decides at call time).
  *
  * Safety invariants (mirror the host policy): construction is side-effect free;
  * nothing touches the network until the first assemble()/mcpToolsOnly(); MCP
@@ -40,6 +44,11 @@ export interface SubagentToolsAssemblerOptions {
   hostTools: () => Promise<ToolDefinition[]> | ToolDefinition[];
   /** The extension-owned MCP tools manager (shared, so its TTL cache is reused). */
   mcpTools: McpToolsManager;
+  /**
+   * Vendored chrome tool defs (subagent-chrome-tools). Resolved lazily per
+   * assemble() so the supplier can re-check the shared chrome auth grant.
+   */
+  chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   /** Extra tool names to deny (wired from settings.excludeSubagentTools). */
   excludeTools?: string[];
 }
@@ -56,26 +65,45 @@ function filterMcpTools(defs: ToolDefinition[], mode: SubagentToolsMode, exclude
   );
 }
 
+/**
+ * Vendored chrome defs minus the always-denied/excluded names. The auth gate
+ * is the supplier's job; this only strips user-denied tool names.
+ */
+function filterChromeTools(defs: ToolDefinition[], excludeTools: string[]): ToolDefinition[] {
+  return defs.filter((def) => !isExcludedHostTool(def.name, excludeTools));
+}
+
 export class SubagentToolsAssembler {
   private readonly mode: SubagentToolsMode;
   private readonly hostTools: () => Promise<ToolDefinition[]> | ToolDefinition[];
   private readonly mcpTools: McpToolsManager;
+  private readonly chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private readonly excludeTools: string[];
 
   constructor(options: SubagentToolsAssemblerOptions) {
     this.mode = options.mode;
     this.hostTools = options.hostTools;
     this.mcpTools = options.mcpTools;
+    this.chromeTools = options.chromeTools;
     this.excludeTools = options.excludeTools ?? [];
   }
 
   /**
    * The merged default toolset for untagged runs: host bundle + MCP tools
-   * (mode-filtered). Never throws — MCP failures degrade to host-only tools.
+   * (mode-filtered) + vendored chrome tools (auth-gated by the supplier).
+   * Never throws — MCP failures degrade to host-only tools.
    */
   async assemble(): Promise<ToolDefinition[]> {
-    const [host, mcp] = await Promise.all([this.hostTools(), this.mcpTools.listSubagentTools()]);
-    return [...host, ...filterMcpTools(mcp, this.mode, this.excludeTools)];
+    const [host, mcp, chrome] = await Promise.all([
+      this.hostTools(),
+      this.mcpTools.listSubagentTools(),
+      this.chromeTools?.() ?? [],
+    ]);
+    return [
+      ...host,
+      ...filterMcpTools(mcp, this.mode, this.excludeTools),
+      ...filterChromeTools(chrome, this.excludeTools),
+    ];
   }
 
   /**
@@ -86,5 +114,16 @@ export class SubagentToolsAssembler {
   async mcpToolsOnly(): Promise<ToolDefinition[]> {
     const mcp = await this.mcpTools.listSubagentTools();
     return filterMcpTools(mcp, this.mode, this.excludeTools);
+  }
+
+  /**
+   * Vendored chrome tools only (the "chrome-tools" named toolset). Resolved
+   * per call so it reflects the CURRENT grant — a revoked grant yields an
+   * empty list (mirrors pi-chrome only registering chrome tools when
+   * authorized).
+   */
+  async chromeToolsOnly(): Promise<ToolDefinition[]> {
+    const chrome = (await this.chromeTools?.()) ?? [];
+    return filterChromeTools(chrome, this.excludeTools);
   }
 }

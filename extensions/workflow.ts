@@ -12,7 +12,7 @@ import {
   WORKFLOW_EXTENSION_VERSION,
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
-import type { SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
+import type { SessionManagerLike, SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
 import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
 import {
   applyEnvSettingsOverride,
@@ -38,8 +38,10 @@ import {
   UsageLimitScheduler,
   WorkflowManager,
 } from "../src/index.js";
+import { isChromeAuthorized } from "../src/subagent/chrome-bridge-client.js";
 import { McpToolsManager } from "../src/subagent/mcp-tools.js";
 import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
+import { createVendoredChromeTools } from "../src/subagent/vendored-chrome-tools.js";
 
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and /workflows command. Pi loads
@@ -115,12 +117,38 @@ export default function extension(pi: ExtensionAPI) {
   // assemble()/mcpToolsOnly() and cached (5 min TTL), unreachable servers warn
   // once and contribute nothing (self-healing on the next run).
   const mcpToolsManager = new McpToolsManager();
+  // SUBAGENT CHROME WIRE: vendored pi-chrome chrome_* defs executed against the
+  // host session's shared bridge + /chrome authorize grant (design:
+  // tasks/subagent-chrome-tools/DESIGN.md). The supplier is gated twice: the
+  // `subagentChromeTools` setting decides whether chrome tools exist at all
+  // (off → no defs anywhere, including the "chrome-tools" toolset), and the
+  // shared grant decides whether they are attached to a given assemble (no
+  // grant → empty set, degrading gracefully). Every wire action is tagged with
+  // the HOST session key + group title so subagent automation joins the main
+  // session's tab group.
+  const vendoredChromeTools = () =>
+    createVendoredChromeTools({
+      sessionKey: () => {
+        const manager = hostSessionManager();
+        const id = manager?.getSessionId();
+        return id ? `session:${id}` : undefined;
+      },
+      sessionGroupTitle: () => {
+        const manager = hostSessionManager() as
+          | (SessionManagerLike & { getSessionName?: () => string | undefined })
+          | undefined;
+        return `Pi Session: ${manager?.getSessionName?.() ?? manager?.getSessionId?.() ?? "unknown"}`;
+      },
+    });
+  const chromeToolsSupplier =
+    settings.subagentChromeTools === "on" ? () => (isChromeAuthorized() ? vendoredChromeTools() : []) : undefined;
   const subagentToolsAssembler = new SubagentToolsAssembler({
     mode: settings.subagentTools ?? "all",
     // The host bundle baseline (coding + proxied host + web tools) is owned by
     // the policy above; MCP tools ride on top of it.
     hostTools: () => hostToolsPolicy.defaultTools(),
     mcpTools: mcpToolsManager,
+    chromeTools: chromeToolsSupplier,
     excludeTools: settings.excludeSubagentTools,
   });
   const gatewayManagerOptions = {
@@ -141,6 +169,11 @@ export default function extension(pi: ExtensionAPI) {
       // a script can explicitly opt in to MCP-backed tools without the host
       // bundle (toolset: "mcp-tools").
       "mcp-tools": () => subagentToolsAssembler.mcpToolsOnly(),
+      // Chrome-only toolset: vendored chrome defs (auth-gated by the shared
+      // /chrome authorize grant; empty until one is held). Works in every
+      // host-tools mode. With subagentChromeTools "off" the supplier is
+      // undefined, so this resolves to [] (script intent recorded, no tools).
+      "chrome-tools": () => subagentToolsAssembler.chromeToolsOnly(),
     },
   };
   // The gateway is created per extension generation; a /reload hands the old
@@ -262,6 +295,7 @@ export default function extension(pi: ExtensionAPI) {
     getHostToolInfos: () => pi.getAllTools(),
     assembleDefaultTools: () => subagentToolsAssembler.assemble(),
     listMcpServers: () => mcpToolsManager.serverNames(),
+    getChromeGranted: () => isChromeAuthorized(),
   });
   registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);

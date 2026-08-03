@@ -48,11 +48,13 @@ function makeAssembler(
   manager: McpToolsManager,
   mode: "all" | string[],
   excludeTools: string[] = [],
+  chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>,
 ): SubagentToolsAssembler {
   return new SubagentToolsAssembler({
     mode,
     hostTools: () => [...HOST_TOOLS],
     mcpTools: manager,
+    chromeTools,
     excludeTools,
   });
 }
@@ -136,5 +138,56 @@ describe("SubagentToolsAssembler", () => {
       tools.map((tool) => tool.name),
       HOST_TOOLS.map((tool) => tool.name),
     );
+  });
+
+  test("a chrome supplier appends vendored chrome tools after the MCP tools", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => [
+      fakeTool("chrome_snapshot"),
+      fakeTool("chrome_click"),
+    ]);
+    const tools = await assembler.assemble();
+    assert.deepEqual(
+      tools.map((tool) => tool.name),
+      [
+        ...HOST_TOOLS.map((tool) => tool.name),
+        "mcp_svelte_get-docs",
+        "mcp_svelte_read-resource",
+        "chrome_snapshot",
+        "chrome_click",
+      ],
+    );
+  });
+
+  test("an empty/absent chrome supplier contributes no chrome tools", async () => {
+    const none = makeAssembler(makeManager(await mcpServerTools()), "all");
+    const tools = await none.assemble();
+    assert.ok(!tools.some((tool) => tool.name.startsWith("chrome_")));
+    const empty = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => []);
+    assert.deepEqual(
+      (await empty.assemble()).filter((tool) => tool.name.startsWith("chrome_")),
+      [],
+    );
+  });
+
+  test("chromeToolsOnly yields the supplier's defs without the host/MCP bundle", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => [
+      fakeTool("chrome_snapshot"),
+    ]);
+    assert.deepEqual(
+      (await assembler.chromeToolsOnly()).map((tool) => tool.name),
+      ["chrome_snapshot"],
+    );
+    const without = makeAssembler(makeManager(await mcpServerTools()), "all");
+    assert.deepEqual(await without.chromeToolsOnly(), []);
+  });
+
+  test("excluded names are stripped from the chrome set too", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", ["chrome_click"], () => [
+      fakeTool("chrome_snapshot"),
+      fakeTool("chrome_click"),
+    ]);
+    const tools = await assembler.assemble();
+    assert.ok(tools.some((tool) => tool.name === "chrome_snapshot"));
+    assert.ok(!tools.some((tool) => tool.name === "chrome_click"));
   });
 });

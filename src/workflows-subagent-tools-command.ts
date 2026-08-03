@@ -29,7 +29,7 @@ import type { WorkflowSettings } from "./workflow-settings.js";
 export type SubagentToolsMode = "all" | string[];
 
 /** Tool source classification shown in the listing. */
-export type SubagentToolSource = "builtin" | "proxied-host" | "web" | "mcp" | "extension";
+export type SubagentToolSource = "builtin" | "proxied-host" | "web" | "mcp" | "chrome" | "extension";
 
 /** Tool allow status shown in the listing. */
 export type SubagentToolStatus =
@@ -62,6 +62,10 @@ export interface SubagentToolsListingInput {
   hostToolInfos: ToolInfo[];
   /** Configured MCP server names (for the header's server list). */
   mcpServerNames: string[];
+  /** Effective subagentChromeTools mode ("on" | "off"). */
+  chromeToolsMode: "on" | "off";
+  /** Whether the host currently holds the shared /chrome authorize grant. */
+  chromeGranted: boolean;
 }
 
 /** The executable coding builtins (createCodingTools) — host-bundle sources. */
@@ -70,12 +74,37 @@ const BUILTIN_HOST_TOOLS = new Set(["read", "bash", "edit", "write"]);
 const BUILTIN_READONLY_TOOLS = new Set(["grep", "find", "ls"]);
 /** Extension-defined web tools (createWebTools). */
 const WEB_TOOLS = new Set(["web_search", "web_fetch"]);
+/** Vendored chrome tools (createVendoredChromeTools) — pi-chrome's names. */
+const CHROME_TOOLS = new Set([
+  "chrome_launch",
+  "chrome_tab",
+  "chrome_snapshot",
+  "chrome_find",
+  "chrome_inspect",
+  "chrome_navigate",
+  "chrome_evaluate",
+  "chrome_click",
+  "chrome_type",
+  "chrome_fill",
+  "chrome_key",
+  "chrome_wait_for",
+  "chrome_list_console_messages",
+  "chrome_list_network_requests",
+  "chrome_get_network_request",
+  "chrome_screenshot",
+  "chrome_hover",
+  "chrome_drag",
+  "chrome_tap",
+  "chrome_scroll",
+  "chrome_upload_file",
+]);
 /** Names a builtin/sdk host tool can take (metadata source check). */
 const HOST_SOURCE_NAMES = new Set([...BUILTIN_HOST_TOOLS, ...BUILTIN_READONLY_TOOLS, ...WEB_TOOLS]);
 
 /** Classify an assembled tool's source by its name. */
 export function classifyToolSource(name: string): SubagentToolSource {
   if (name.startsWith("mcp_")) return "mcp";
+  if (CHROME_TOOLS.has(name)) return "chrome";
   if (WEB_TOOLS.has(name)) return "web";
   if (BUILTIN_HOST_TOOLS.has(name) || BUILTIN_READONLY_TOOLS.has(name)) return "builtin";
   return "extension";
@@ -93,12 +122,19 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
   const rows: SubagentToolRow[] = [];
   for (const name of input.assembledToolNames) {
     const isMcp = name.startsWith("mcp_");
+    const isChrome = CHROME_TOOLS.has(name);
     rows.push({
       name,
       source: classifyToolSource(name),
       status: allowlist && isMcp ? "allowlisted" : "allowed",
       note:
-        allowlist && isMcp ? "in the subagentTools allowlist" : isMcp ? "from mcp.json (subagentTools=all)" : undefined,
+        allowlist && isMcp
+          ? "in the subagentTools allowlist"
+          : isMcp
+            ? "from mcp.json (subagentTools=all)"
+            : isChrome
+              ? "vendored chrome defs (subagentChromeTools=on)"
+              : undefined,
     });
   }
 
@@ -127,6 +163,18 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
         source: classifyToolSource(info.name),
         status: "available-if-enabled",
         note: 'host tools off — reachable via /workflows-gateway start + toolset "host-tools"',
+      });
+    } else if (CHROME_TOOLS.has(info.name)) {
+      // A pi-chrome host tool not in the assembled set: either the setting is
+      // off or the shared grant is not held — both recoverable, no SDK gap.
+      rows.push({
+        name: info.name,
+        source: "chrome",
+        status: "available-if-enabled",
+        note:
+          input.chromeToolsMode === "off"
+            ? "subagentChromeTools is off — set settings.subagentChromeTools=on to expose vendored chrome tools"
+            : "no active /chrome authorize grant — chrome tools attach once the host session authorizes",
       });
     } else {
       rows.push({
@@ -172,6 +220,9 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
   lines.push(
     `- MCP servers configured: ${input.mcpServerNames.length > 0 ? input.mcpServerNames.join(", ") : "(none — add HTTP servers to ~/.pi/agent/mcp.json)"}`,
   );
+  lines.push(
+    `- Chrome tools: **${input.chromeToolsMode}** (${input.chromeToolsMode === "off" ? "vendored chrome defs hidden — set settings.subagentChromeTools=on to expose them" : input.chromeGranted ? "shared /chrome authorize grant active — chrome defs attach to runs" : "setting on but no /chrome authorize grant — chrome defs stay empty until the host authorizes"})`,
+  );
   const alwaysDenied = DEFAULT_EXCLUDED_SUBAGENT_TOOLS.join(", ");
   const deniedSettings =
     input.excludeTools.length > 0 ? `; settings.excludeSubagentTools: ${input.excludeTools.join(", ")}` : "";
@@ -211,6 +262,8 @@ export interface WorkflowSubagentToolsCommandOptions {
   assembleDefaultTools: () => Promise<ToolDefinition[]>;
   /** Configured MCP server names — extension passes mcpToolsManager.serverNames(). */
   listMcpServers: () => string[];
+  /** Shared-grant check — extension passes isChromeAuthorized. */
+  getChromeGranted: () => boolean;
 }
 
 /**
@@ -242,6 +295,8 @@ export function registerWorkflowSubagentToolsCommand(
         assembledToolNames: assembled.map((tool) => tool.name),
         hostToolInfos: infos,
         mcpServerNames: options.listMcpServers(),
+        chromeToolsMode: settings.subagentChromeTools ?? "off",
+        chromeGranted: options.getChromeGranted(),
       });
       // fallback: a host without sendMessage still surfaces the rows via the
       // notify channel; ctx.cwd keeps the listing project-scoped.

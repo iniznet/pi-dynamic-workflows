@@ -54,6 +54,8 @@ function listing(overrides: Partial<SubagentToolsListingInput> = {}): SubagentTo
     assembledToolNames: ["read", "bash", "edit", "write", "grep", "web_search", "mcp_svelte_get-docs"],
     hostToolInfos: HOST_INFOS,
     mcpServerNames: ["svelte"],
+    chromeToolsMode: "off",
+    chromeGranted: false,
     ...overrides,
   };
 }
@@ -65,6 +67,7 @@ function rowByName(rows: ReturnType<typeof buildSubagentToolRows>, name: string)
 describe("classifyToolSource", () => {
   test("classifies by name namespace", () => {
     assert.equal(classifyToolSource("mcp_svelte_get-docs"), "mcp");
+    assert.equal(classifyToolSource("chrome_snapshot"), "chrome");
     assert.equal(classifyToolSource("web_search"), "web");
     assert.equal(classifyToolSource("read"), "builtin");
     assert.equal(classifyToolSource("grep"), "builtin");
@@ -104,13 +107,38 @@ describe("buildSubagentToolRows", () => {
     assert.equal(rowByName(rows, "todo")?.status, "denied-settings");
   });
 
-  test("host chrome/UI/vcc/mcp tools are unavailable: metadata-only on the 0.83.0 API", () => {
+  test("host UI/vcc/mcp tools are unavailable: metadata-only on the 0.83.0 API", () => {
     const rows = buildSubagentToolRows(listing());
-    for (const name of ["chrome_snapshot", "observe_ui", "vcc_recall", "mcp"]) {
+    for (const name of ["observe_ui", "vcc_recall", "mcp"]) {
       const row = rowByName(rows, name);
       assert.equal(row?.status, "unavailable", `${name} must be listed as unavailable`);
       assert.match(row?.note ?? "", /metadata-only/);
     }
+  });
+
+  test("chrome tools are available-if-enabled when the setting is off", () => {
+    const rows = buildSubagentToolRows(listing({ chromeToolsMode: "off" }));
+    const chrome = rowByName(rows, "chrome_snapshot");
+    assert.equal(chrome?.status, "available-if-enabled");
+    assert.equal(chrome?.source, "chrome");
+    assert.match(chrome?.note ?? "", /subagentChromeTools is off/);
+  });
+
+  test("chrome tools are available-if-enabled when the grant is missing, setting on", () => {
+    const rows = buildSubagentToolRows(listing({ chromeToolsMode: "on", chromeGranted: false }));
+    const chrome = rowByName(rows, "chrome_snapshot");
+    assert.equal(chrome?.status, "available-if-enabled");
+    assert.match(chrome?.note ?? "", /no active \/chrome authorize grant/);
+  });
+
+  test("assembled chrome tools are allowed with a chrome source note", () => {
+    const rows = buildSubagentToolRows(
+      listing({ chromeToolsMode: "on", chromeGranted: true, assembledToolNames: ["chrome_snapshot"] }),
+    );
+    const chrome = rowByName(rows, "chrome_snapshot");
+    assert.equal(chrome?.status, "allowed");
+    assert.equal(chrome?.source, "chrome");
+    assert.match(chrome?.note ?? "", /subagentChromeTools=on/);
   });
 
   test("host builtins absent from the toolset are available-if-enabled when host tools are off", () => {
@@ -128,10 +156,11 @@ describe("buildSubagentToolRows", () => {
 });
 
 describe("renderSubagentToolsListing", () => {
-  test("the header shows the mode, host mode, and configured MCP servers", () => {
+  test("the header shows the mode, host mode, chrome mode, and configured MCP servers", () => {
     const md = renderSubagentToolsListing(listing());
     assert.match(md, /MCP tools: \*\*all\*\*/);
     assert.match(md, /Host tools: \*\*auto\*\*/);
+    assert.match(md, /Chrome tools: \*\*off\*\*/);
     assert.match(md, /MCP servers configured: svelte/);
     assert.match(md, /Always denied: workflow, workflow_control/);
   });
@@ -150,10 +179,10 @@ describe("renderSubagentToolsListing", () => {
     assert.match(md, /No tools\. Untagged runs fall back/);
   });
 
-  test("unavailable host tools stay visible in the not-in-session table", () => {
+  test("chrome host tools stay visible in the not-in-session table (not metadata-only)", () => {
     const md = renderSubagentToolsListing(listing());
     assert.match(md, /#### Not in subagent sessions/);
     assert.match(md, /chrome_snapshot/);
-    assert.match(md, /metadata-only/);
+    assert.match(md, /subagentChromeTools is off/);
   });
 });

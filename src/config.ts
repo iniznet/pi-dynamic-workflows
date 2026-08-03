@@ -88,6 +88,7 @@ export const WORKFLOW_ENV_VARS = {
   excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
   subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
+  subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -181,6 +182,10 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
       ),
     ];
     if (names.length) settings.subagentTools = names;
+  }
+  const subagentChromeTools = env[WORKFLOW_ENV_VARS.subagentChromeTools]?.trim();
+  if (subagentChromeTools === "on" || subagentChromeTools === "off") {
+    settings.subagentChromeTools = subagentChromeTools;
   }
   return settings;
 }

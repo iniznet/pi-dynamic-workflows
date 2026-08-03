@@ -209,6 +209,12 @@ Beyond the executable builtin suite, the proxied bundle is **metadata-synced aga
 
 The gateway authenticates every IPC connection with a per-bridge token; subagent processes connecting via `MCPProxyClient` must present `gateway.getAuthToken()` in their `auth.handshake` (missing → `AUTH_REQUIRED`, wrong → `AUTH_FAILED`).
 
+### Subagent chrome tools (vendored pi-chrome)
+
+The `chrome_*` tools pi-chrome registers on the host are **metadata-only** on the 0.83.0 `ExtensionAPI` — the extension cannot proxy their executors. Instead it vendors its own definitions of the full v0.15.46 chrome set and executes them through the host session's shared Chrome bridge (`127.0.0.1:17318`), so subagents can drive the same browser the main agent controls — and every action is tagged with the host session key + `Pi Session: <name>` group title, so subagent automation lands in the **same tab group** as the main session's tabs.
+
+Opt in with `"subagentChromeTools": "on"` in `settings.json` (or `PI_WORKFLOW_SUBAGENT_CHROME_TOOLS=on`); the default is `off` (no chrome defs anywhere). Two gates apply on top of the setting: the host session must hold the shared `/chrome authorize` grant (the same authorization the main agent's own chrome tools require), and `excludeSubagentTools` names are filtered out. No grant → the assemble resolves to an empty chrome set and individual `execute` calls throw the standard `Chrome control locked` message — never a silent hang. A script can also request the chrome set alone with `toolset: "chrome-tools"` (auth-gated like the default merge). `/workflows-subagent-tools` now lists each chrome tool's true status: `allowed` when assembled, or `available-if-enabled` with the exact recovery step (setting off, or grant missing) instead of the old misleading `metadata-only` row.
+
 Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
 
 The detailed panel adds a live per-run `~$/s` estimate (output price × token rate), a spend-vs-budget bar when `tokenBudget` is set, and a session-aggregate 'estimated spend across N active runs' line. The `/workflows status` final snapshot reports the truthful state — 'Workflow failed' / 'Workflow stopped' / 'Workflow paused (resumable)' — never a generic 'completed'. Navigator delete/stop/overwrite actions confirm via `ui.confirm`.
@@ -358,6 +364,7 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `excludeSubagentTools` | `PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS` | comma-separated tool names |
 | `subagentHostTools` | `PI_WORKFLOW_SUBAGENT_HOST_TOOLS` | `auto` (default) / `on` / `off` |
 | `subagentTools` | `PI_WORKFLOW_SUBAGENT_TOOLS` | `all` (default) / comma-separated `mcp_*` allowlist / empty = none |
+| `subagentChromeTools` | `PI_WORKFLOW_SUBAGENT_CHROME_TOOLS` | `off` (default) / `on` |
 
 Unparseable, out-of-range, or unknown values are silently ignored (the same leniency the settings-file normalization applies), so a misconfigured CI env can never crash the extension — it just falls back to the file value. Example:
 

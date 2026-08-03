@@ -1,0 +1,160 @@
+/**
+ * ChromeBridgeClient — thin client-only bridge for pi-chrome's local bridge
+ * (design: tasks/subagent-chrome-tools/DESIGN.md).
+ *
+ * pi-chrome (the extension package that registers the host's `chrome_*` tools)
+ * runs a localhost HTTP server (`127.0.0.1:17318`, env-overridable via
+ * `PI_CHROME_BRIDGE_HOST` / `PI_CHROME_BRIDGE_PORT`) that a companion Chrome
+ * extension polls for commands. This module lets workflow subagents reach the
+ * SAME bridge as plain HTTP clients, exactly like pi-chrome's own multi-session
+ * client mode (`sendViaOwner` in pi-chrome's chrome-profile-bridge/index.ts).
+ *
+ * Deliberate boundaries:
+ *  - CLIENT ONLY: this class never binds a port and never tries to promote to
+ *    bridge owner. pi-chrome owns the bridge; stealing the port would break the
+ *    host session's own chrome tools. When the owner is unreachable, the error
+ *    names pi-chrome as the missing dependency.
+ *  - AUTH IS SHARED, NOT MINTED: `/chrome authorize` stores its grant on
+ *    `globalThis["__piChromeProfileBridgeAuth__"]` (pi-chrome keeps it there,
+ *    not in per-extension storage, so a /reload does not drop it). Workflow
+ *    subagents run in the same process as the host extension, so reading that
+ *    key makes the host's grant authoritative for subagent chrome calls — no
+ *    separate authorization UX.
+ */
+
+/** Wire-level shape of a bridge `/command` response. */
+export interface BridgeCommandResponse {
+  ok?: boolean;
+  result?: unknown;
+  error?: string;
+}
+
+/** Options for {@link ChromeBridgeClient}. */
+export interface ChromeBridgeClientOptions {
+  /** Bridge base URL; defaults to the env-overridable 127.0.0.1:17318. */
+  url?: string;
+  /** Injectable fetch (test seam); defaults to the global fetch. */
+  fetchImpl?: typeof fetch;
+}
+
+/** Default bridge host/port, mirroring pi-chrome's DEFAULT_HOST/DEFAULT_PORT. */
+const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
+const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
+
+/** The exact globalThis key pi-chrome persists its `/chrome authorize` grant under. */
+export const PI_CHROME_AUTH_GLOBAL_KEY = "__piChromeProfileBridgeAuth__";
+
+/** Shape of the persisted auth grant on globalThis. */
+export interface ChromeAuthGrant {
+  until: number | "indefinite";
+}
+
+/** globalThis extended with pi-chrome's shared keys (read-only on our side). */
+interface ChromeGlobalState {
+  [PI_CHROME_AUTH_GLOBAL_KEY]?: ChromeAuthGrant;
+}
+
+/**
+ * Read pi-chrome's shared auth grant. Undefined when pi-chrome has not
+ * persisted one (never authorized, or revoked). Expired grants are dropped
+ * here — the caller does not need to distinguish "never" from "expired".
+ */
+export function readChromeAuthGrant(): ChromeAuthGrant | undefined {
+  const grant = (globalThis as ChromeGlobalState)[PI_CHROME_AUTH_GLOBAL_KEY];
+  if (!grant) return undefined;
+  if (grant.until === "indefinite" || grant.until > Date.now()) return grant;
+  // Mirror pi-chrome: an expired grant is removed so a later read stays clean.
+  delete (globalThis as ChromeGlobalState)[PI_CHROME_AUTH_GLOBAL_KEY];
+  return undefined;
+}
+
+/** Whether the host session currently holds a valid chrome-control grant. */
+export function isChromeAuthorized(): boolean {
+  return readChromeAuthGrant() !== undefined;
+}
+
+/** The standard lock message pi-chrome throws when the grant is missing. */
+export const CHROME_CONTROL_LOCKED_MESSAGE =
+  "Chrome control locked. Ask the user to run /chrome authorize before using chrome_* tools.";
+
+/** Throw the standard lock error when the host session is not authorized. */
+export function requireChromeAuthorized(): void {
+  if (!isChromeAuthorized()) throw new Error(CHROME_CONTROL_LOCKED_MESSAGE);
+}
+
+/**
+ * Thin POST-only client for pi-chrome's bridge `/command` endpoint.
+ * Construction is side-effect free; nothing touches the network until send().
+ */
+export class ChromeBridgeClient {
+  readonly url: string;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(options: ChromeBridgeClientOptions = {}) {
+    this.url = options.url ?? `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  }
+
+  /**
+   * POST one bridge action and await its result. Honors the AbortSignal the
+   * pi runtime passes per tool call (abort propagates to the HTTP request).
+   * Error mapping keeps messages actionable:
+   *  - bridge responds !ok  → the bridge's own error text;
+   *  - 404                  → owner pi-chrome is too old (multi-session missing);
+   *  - aborted by signal    → "Chrome command aborted";
+   *  - connection refused   → pi-chrome not running / bridge owner absent.
+   */
+  async send(
+    action: string,
+    params: Record<string, unknown>,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    if (signal?.aborted) throw new Error("Chrome command aborted");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs + 2_000);
+    const forwardAbort = () => controller.abort();
+    if (signal) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", forwardAbort, { once: true });
+    }
+    try {
+      const response = await this.fetchImpl(`${this.url}/command`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action, params, timeoutMs }),
+        signal: controller.signal,
+      });
+      const payload = (await response.json().catch(() => ({}))) as BridgeCommandResponse;
+      if (response.status === 404) {
+        throw new Error(
+          "A running Pi session owns the Chrome bridge but is using an older pi-chrome without multi-session support. Restart that Pi session after `pi update`, then retry.",
+        );
+      }
+      if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Chrome bridge owner HTTP ${response.status}`);
+      return payload.result;
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        if (signal?.aborted) throw new Error("Chrome command aborted");
+        throw new Error(`Timed out waiting for the Chrome bridge owner after ${timeoutMs}ms`);
+      }
+      const message = (error as Error)?.message ?? "";
+      const code = (error as NodeJS.ErrnoException)?.code ?? "";
+      const causeCode = (error as { cause?: NodeJS.ErrnoException })?.cause?.code ?? "";
+      if (
+        /fetch failed|ECONNREFUSED|ECONNRESET|other side closed|socket hang up/i.test(message) ||
+        code === "ECONNREFUSED" ||
+        causeCode === "ECONNREFUSED" ||
+        causeCode === "ECONNRESET"
+      ) {
+        throw new Error(
+          `Chrome bridge at ${this.url} is not reachable. Subagent chrome_* tools require the host pi-chrome extension (install "pi-chrome" in your pi packages) and its companion Chrome extension, with an active /chrome authorize grant.`,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", forwardAbort);
+    }
+  }
+}
