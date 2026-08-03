@@ -79,10 +79,17 @@ export function isExcludedHostTool(name: string, extraExcluded: string[] = []): 
  * exactly the pre-upgrade bundle (the six core host tools), because
  * `hostToolsFromDefinitions` also dedupes by name — coding/web defs win on any
  * collision with same-named extension defs.
+ *
+ * The `execute` shape check guards against signature drift: feature detection
+ * only proves the method EXISTS, so a future SDK that keeps the name but
+ * returns metadata-only defs (no executable `execute`) is filtered out here
+ * instead of proxying broken tool calls.
  */
 export function buildMergedHostTools(pi: ExtensionAPI, options: MergedHostToolsOptions): HostToolsBundle {
   const registered = (pi as HostToolDefinitionApi).getAllToolDefinitions?.() ?? [];
-  const extensionTools = registered.filter((def) => !isExcludedHostTool(def.name, options.excludeSubagentTools));
+  const extensionTools = registered.filter(
+    (def) => typeof def.execute === "function" && !isExcludedHostTool(def.name, options.excludeSubagentTools),
+  );
   return hostToolsFromDefinitions([...createCodingTools(options.cwd), ...createWebTools(), ...extensionTools]);
 }
 

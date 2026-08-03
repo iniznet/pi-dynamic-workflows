@@ -89,6 +89,16 @@ describe("buildMergedHostTools", () => {
     assert.ok(names.includes("mcp_github"), "non-excluded extension tools must still be proxied");
   });
 
+  test("shape guard: definitions without an executable execute are never proxied", () => {
+    const metadataOnly = { name: "mcp_broken", description: "no execute", parameters: Type.Object({}) } as ToolDefinition;
+    const bundle = buildMergedHostTools(makePi([metadataOnly, fakeTool("mcp_ok")]), {
+      cwd: process.cwd(),
+    });
+    const names = toolNames(bundle);
+    assert.ok(!names.includes("mcp_broken"), "execute-less defs must be filtered out (signature-drift guard)");
+    assert.ok(names.includes("mcp_ok"), "executable defs still merge in");
+  });
+
   test("settings.excludeSubagentTools names are filtered from the proxied bundle", () => {
     const bundle = buildMergedHostTools(makePi([fakeTool("mcp_github"), fakeTool("recursive_bridge")]), {
       cwd: process.cwd(),
