@@ -52,7 +52,7 @@ export interface WorkflowSettingsField {
 }
 
 /**
- * The 12 settings rows, in UI render order. Bounds/options/defaults are the
+ * The 13 settings rows, in UI render order. Bounds/options/defaults are the
  * verified load-path semantics: normalizeSettings (ws:233-298), the cfg env
  * clamps (cfg:130-166), and the documented runtime fallbacks.
  */
@@ -183,6 +183,15 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     defaultDisplay: "auto",
     envVar: WORKFLOW_ENV_VARS.subagentHostTools,
   },
+  {
+    key: "subagentTools",
+    type: "string[]",
+    label: "Subagent MCP tools",
+    help: 'MCP tools for subagents: "all" (default, every HTTP MCP server in mcp.json as mcp_<server>_<tool> tools) or a comma-separated allowlist of exact mcp_* tool names. An empty list disables MCP tools for subagents. See /workflows-subagent-tools for the live toolset.',
+    group: "Advanced",
+    defaultDisplay: "all",
+    envVar: WORKFLOW_ENV_VARS.subagentTools,
+  },
 ];
 
 /** The four groups in render order, derived from the registry so they can never drift. */
@@ -272,6 +281,13 @@ export function parseFieldInput(
       return { ok: true, value: word };
     }
     case "string[]": {
+      // The subagentTools row accepts the special literal "all" (its "expose
+      // every MCP tool" mode) before the comma-split allowlist path; the saved
+      // value is the string "all", which is what normalizeSettings accepts
+      // (workflow-settings.ts). Empty input means "no MCP tools" ([]), the
+      // "none" side of the all | allowlist setting.
+      if (field.key === "subagentTools" && raw.trim() === "all") return { ok: true, value: "all" };
+      if (field.key === "subagentTools" && raw.trim() === "") return { ok: true, value: [] };
       const names = raw
         .split(",")
         .map((name) => name.trim())

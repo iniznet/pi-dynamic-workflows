@@ -87,6 +87,7 @@ export const WORKFLOW_ENV_VARS = {
   deliveredResultMaxChars: "PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS",
   excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
   subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
+  subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -164,6 +165,22 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   const subagentHostTools = env[WORKFLOW_ENV_VARS.subagentHostTools]?.trim();
   if (subagentHostTools === "auto" || subagentHostTools === "on" || subagentHostTools === "off") {
     settings.subagentHostTools = subagentHostTools;
+  }
+  const subagentTools = env[WORKFLOW_ENV_VARS.subagentTools]?.trim();
+  if (subagentTools === "all") {
+    settings.subagentTools = "all";
+  } else if (subagentTools) {
+    // Allowlist: comma-separated exact mcp_* tool names (matching the file
+    // form). "all" is the only magic value; anything else is a name list.
+    const names = [
+      ...new Set(
+        subagentTools
+          .split(",")
+          .map((name) => name.trim())
+          .filter((name): name is string => name.length > 0),
+      ),
+    ];
+    if (names.length) settings.subagentTools = names;
   }
   return settings;
 }

@@ -32,6 +32,7 @@ test("workflowSettingsFromEnv parses every PI_WORKFLOW_* key", () => {
     [WORKFLOW_ENV_VARS.deliveredResultMaxChars]: "1000",
     [WORKFLOW_ENV_VARS.excludeSubagentTools]: " pi-subagents,  my-tool ,",
     [WORKFLOW_ENV_VARS.subagentHostTools]: "off",
+    [WORKFLOW_ENV_VARS.subagentTools]: "mcp_svelte_read_resource, mcp_other_tool",
   };
   assert.deepEqual(workflowSettingsFromEnv(env), {
     keywordTriggerEnabled: true,
@@ -46,6 +47,7 @@ test("workflowSettingsFromEnv parses every PI_WORKFLOW_* key", () => {
     deliveredResultMaxChars: 1000,
     excludeSubagentTools: ["pi-subagents", "my-tool"],
     subagentHostTools: "off",
+    subagentTools: ["mcp_svelte_read_resource", "mcp_other_tool"],
   });
 });
 
@@ -90,6 +92,24 @@ test("subagentHostTools env accepts only auto|on|off and ignores anything else",
   }
   for (const garbage of ["", "AUTO", "yes", "1", "eager", "disabled"]) {
     assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentHostTools]: garbage }), {});
+  }
+});
+
+test("subagentTools env accepts the all literal or a comma-separated allowlist", () => {
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentTools]: "all" }), { subagentTools: "all" });
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentTools]: "  all  " }), {
+    subagentTools: "all",
+  });
+  assert.deepEqual(
+    workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentTools]: "mcp_a_x, mcp_b_y , mcp_a_x" }),
+    { subagentTools: ["mcp_a_x", "mcp_b_y"] },
+    "allowlist names are trimmed and deduped",
+  );
+  // Anything else (empty or whitespace-only) is dropped — the file value
+  // still applies. (Any non-empty non-"all" string is a valid allowlist,
+  // including a single name, so there is no other garbage input.)
+  for (const garbage of ["", "  "]) {
+    assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentTools]: garbage }), {});
   }
 });
 
@@ -173,6 +193,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "deliveredResultMaxChars",
     "excludeSubagentTools",
     "subagentHostTools",
+    "subagentTools",
   ];
   for (const key of settingsKeys) {
     assert.ok(

@@ -154,8 +154,8 @@ describe("form interactions (buildFormComponent)", () => {
     const trusted = makeModel();
     const untrustedForm = buildForm(untrusted);
     const trustedForm = buildForm(trusted, { trustedProject: true });
-    navigateTo(untrustedForm.root, 12); // scope row (12 fields, then scope, then save)
-    navigateTo(trustedForm.root, 12);
+    navigateTo(untrustedForm.root, 13); // scope row (13 fields, then scope, then save)
+    navigateTo(trustedForm.root, 13);
     untrustedForm.root.handleInput?.(KEY_CONFIRM);
     trustedForm.root.handleInput?.(KEY_CONFIRM);
     assert.equal(untrusted.scope, "global");
@@ -232,7 +232,7 @@ describe("form interactions (buildFormComponent)", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
     root.handleInput?.(KEY_CONFIRM); // stage keywordTriggerEnabled=false
-    navigateTo(root, 13); // save row (12 fields, scope, then save)
+    navigateTo(root, 14); // save row (13 fields, scope, then save)
     root.handleInput?.(KEY_CONFIRM); // open save confirm
     root.handleInput?.(KEY_CONFIRM); // confirm
     assert.deepEqual(done.mock.calls[0]?.arguments[0], {
@@ -245,7 +245,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("save row with no changes resolves an empty payload", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
-    navigateTo(root, 13);
+    navigateTo(root, 14);
     root.handleInput?.(KEY_CONFIRM);
     root.handleInput?.(KEY_CONFIRM);
     assert.deepEqual(done.mock.calls[0]?.arguments[0], { cancelled: false, settings: {}, scope: "global" });

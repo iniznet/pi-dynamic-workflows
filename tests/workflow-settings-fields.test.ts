@@ -48,7 +48,7 @@ function expectError(key: keyof WorkflowSettings, raw: string): string {
 describe("FIELD_REGISTRY completeness", () => {
   it("has exactly one entry per WorkflowSettings key, mirroring WORKFLOW_ENV_VARS", () => {
     const registryKeys = FIELD_REGISTRY.map((field) => field.key);
-    assert.equal(registryKeys.length, 12, "registry must hold one row per settings key");
+    assert.equal(registryKeys.length, 13, "registry must hold one row per settings key");
     assert.deepEqual(
       new Set(registryKeys),
       new Set(Object.keys(WORKFLOW_ENV_VARS)),
@@ -187,6 +187,19 @@ describe("parseFieldInput", () => {
     assert.deepEqual(expectOk("excludeSubagentTools", "  a  , b"), ["a", "b"]);
     assert.deepEqual(expectOk("excludeSubagentTools", ""), []);
     assert.deepEqual(expectOk("excludeSubagentTools", ",,,"), []);
+  });
+
+  it("parses subagentTools: the all literal, an allowlist, or the empty none mode", () => {
+    // "all" is the special literal — saved as the string mode, not a name.
+    assert.deepEqual(expectOk("subagentTools", "all"), "all");
+    assert.deepEqual(expectOk("subagentTools", "  all  "), "all");
+    // Comma-separated allowlist.
+    assert.deepEqual(expectOk("subagentTools", "mcp_svelte_read_resource, mcp_other_x"), [
+      "mcp_svelte_read_resource",
+      "mcp_other_x",
+    ]);
+    // Empty input is the "none" side (MCP tools disabled for subagents).
+    assert.deepEqual(expectOk("subagentTools", ""), []);
   });
 
   it("returns actionable error strings", () => {

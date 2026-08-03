@@ -143,6 +143,39 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads subagentTools: the all literal, allowlists, and the empty-allowlist none mode", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      // The "all" literal round-trips.
+      saveWorkflowSettings({ subagentTools: "all" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentTools: "all" });
+
+      // An allowlist round-trips; blank/non-string entries are dropped and
+      // duplicates are collapsed while preserving order.
+      saveWorkflowSettings(
+        { subagentTools: ["mcp_svelte_read_resource", "  ", 42, "mcp_svelte_read_resource"] },
+        settingsPath,
+      );
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentTools: ["mcp_svelte_read_resource"] });
+
+      // The empty allowlist is the "none" side of the setting: MCP tools are
+      // disabled for subagents (emitted as an explicit [] so the spread-merge
+      // in loadWorkflowSettings actually overrides a global "all").
+      saveWorkflowSettings({ subagentTools: [] }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentTools: [] });
+
+      // A wrong-typed value violates the declared schema and fails loudly.
+      writeFileSync(settingsPath, JSON.stringify({ subagentTools: 42 }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+
+      // A string outside the "all" literal passes the schema but is dropped by
+      // value normalization (lenient drop-on-violation, like subagentHostTools).
+      writeFileSync(settingsPath, JSON.stringify({ subagentTools: "everything" }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
   it("normalizes default concurrency and agent retries", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

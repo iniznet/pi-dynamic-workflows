@@ -332,5 +332,19 @@ export {
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool, formatCompletedResultText } from "./workflow-tool.js";
 export type { NavAction, ViewKind } from "./workflow-ui.js";
+export type {
+  SubagentToolRow,
+  SubagentToolSource,
+  SubagentToolStatus,
+  SubagentToolsListingInput,
+  SubagentToolsMode,
+  WorkflowSubagentToolsCommandOptions,
+} from "./workflows-subagent-tools-command.js";
+export {
+  buildSubagentToolRows,
+  classifyToolSource,
+  registerWorkflowSubagentToolsCommand,
+  renderSubagentToolsListing,
+} from "./workflows-subagent-tools-command.js";
 export type { Worktree } from "./worktree.js";
 export { createWorktree, removeWorktree } from "./worktree.js";

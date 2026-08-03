@@ -177,6 +177,7 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
 | `/workflows-models` | Map model tiers and thinking levels (with a per-tier cost preview) |
 | `/workflows-settings` | Interactive settings editor (TUI) — `status`/`paths` print effective config |
+| `/workflows-subagent-tools` | Print which tools each subagent session receives (source, allow status, always-denied, metadata-only host tools) |
 | `/workflows-gateway start\|stop\|status` | Lazily start/stop the host tool IPC gateway (MCPBridge) — see below |
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
@@ -356,6 +357,7 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `deliveredResultMaxChars` | `PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS` | integer 1–1000000 |
 | `excludeSubagentTools` | `PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS` | comma-separated tool names |
 | `subagentHostTools` | `PI_WORKFLOW_SUBAGENT_HOST_TOOLS` | `auto` (default) / `on` / `off` |
+| `subagentTools` | `PI_WORKFLOW_SUBAGENT_TOOLS` | `all` (default) / comma-separated `mcp_*` allowlist / empty = none |
 
 Unparseable, out-of-range, or unknown values are silently ignored (the same leniency the settings-file normalization applies), so a misconfigured CI env can never crash the extension — it just falls back to the file value. Example:
 

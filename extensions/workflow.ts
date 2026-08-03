@@ -33,10 +33,13 @@ import {
   registerWorkflowGatewayCommand,
   registerWorkflowModelsCommand,
   registerWorkflowSettingsCommand,
+  registerWorkflowSubagentToolsCommand,
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
   WorkflowManager,
 } from "../src/index.js";
+import { McpToolsManager } from "../src/subagent/mcp-tools.js";
+import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
 
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and /workflows command. Pi loads
@@ -102,18 +105,42 @@ export default function extension(pi: ExtensionAPI) {
       }),
     buildCodingTools: () => createCodingTools(cwd),
   });
+  // SUBAGENT MCP WIRE: the extension-owned MCP client reads the user's
+  // ~/.pi/agent/mcp.json (the same file the pi host consumes) and exposes every
+  // reachable HTTP server's tools as mcp_<server>_<tool> defs. The assembler
+  // merges them into the default subagent toolset per settings.subagentTools
+  // ("all" | allowlist | []); on 0.83.0 this is the ONLY channel that gets MCP
+  // tools into subagent sessions — the host's own mcp_* tool stays metadata-only.
+  // Construction opens nothing; servers are contacted lazily on the first
+  // assemble()/mcpToolsOnly() and cached (5 min TTL), unreachable servers warn
+  // once and contribute nothing (self-healing on the next run).
+  const mcpToolsManager = new McpToolsManager();
+  const subagentToolsAssembler = new SubagentToolsAssembler({
+    mode: settings.subagentTools ?? "all",
+    // The host bundle baseline (coding + proxied host + web tools) is owned by
+    // the policy above; MCP tools ride on top of it.
+    hostTools: () => hostToolsPolicy.defaultTools(),
+    mcpTools: mcpToolsManager,
+    excludeTools: settings.excludeSubagentTools,
+  });
   const gatewayManagerOptions = {
     ...managerOptions,
-    // Untagged runs resolve the merged host-tools default only when the
-    // policy is enabled; "off" keeps the exact legacy fallback (agent coding
-    // tools) and never auto-starts the gateway.
-    defaultTools: hostToolsPolicy.isEnabled() ? () => hostToolsPolicy.defaultTools() : undefined,
+    // Untagged runs resolve the merged default toolset (host bundle + MCP
+    // tools per settings.subagentTools) only when the host-tools policy is
+    // enabled; "off" keeps the exact legacy fallback (agent coding tools) and
+    // never auto-starts the gateway — MCP tools stay reachable there via the
+    // explicit "mcp-tools" toolset below.
+    defaultTools: hostToolsPolicy.isEnabled() ? () => subagentToolsAssembler.assemble() : undefined,
     toolsets: {
       ...managerOptions.toolsets,
       // The explicit opt-in toolset now auto-starts first (fixing the
       // silent-empty result a never-started gateway used to produce); in
       // "off" mode ensureStarted is a no-op so manual start remains required.
       "host-tools": () => hostToolsPolicy.hostToolsToolset(),
+      // MCP-only toolset: works in every host-tools mode, including "off", so
+      // a script can explicitly opt in to MCP-backed tools without the host
+      // bundle (toolset: "mcp-tools").
+      "mcp-tools": () => subagentToolsAssembler.mcpToolsOnly(),
     },
   };
   // The gateway is created per extension generation; a /reload hands the old
@@ -147,6 +174,9 @@ export default function extension(pi: ExtensionAPI) {
       // End the MCP bridge socket and null the gateway client (stop() is
       // idempotent and drops its bridge reference).
       stopHostToolGateway();
+      // Drop the MCP client's cached sessions (no sockets to close — stateless
+      // HTTP transport, only cached session ids and tool lists are forgotten).
+      mcpToolsManager.disconnectAll();
       // Cross-slice handoff: an on-demand plannotator review bridge (if this
       // generation ever creates one) is closed here via its close() — it ends
       // the tracked SSE responses, settles pending waits, and closes the
@@ -223,6 +253,16 @@ export default function extension(pi: ExtensionAPI) {
   registerWorkflowCommands?.(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand?.(pi);
   registerWorkflowSettingsCommand?.(pi);
+  // Effective-subagent-toolset listing: per-tool source + allow status, MCP
+  // servers, and the host tools that cannot reach subagents on 0.83.0
+  // (metadata-only ExtensionAPI). Reads the live settings + the assembler the
+  // runs actually use, so the listing can never drift from the wiring.
+  registerWorkflowSubagentToolsCommand(pi, {
+    loadSettings,
+    getHostToolInfos: () => pi.getAllTools(),
+    assembleDefaultTools: () => subagentToolsAssembler.assemble(),
+    listMcpServers: () => mcpToolsManager.serverNames(),
+  });
   registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);

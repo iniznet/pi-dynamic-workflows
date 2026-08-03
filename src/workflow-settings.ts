@@ -78,6 +78,18 @@ export interface WorkflowSettings {
    * /workflows-gateway start).
    */
   subagentHostTools?: "auto" | "on" | "off";
+  /**
+   * MCP tools for subagents (design: tasks/subagent-tools-all/DESIGN.md).
+   * "all" (default) exposes every reachable HTTP MCP server's tools from the
+   * user's mcp.json as `mcp_<server>_<tool>` defs in the default subagent
+   * toolset; a string[] is an allowlist of exact `mcp_*` tool names to expose
+   * (other MCP tools are withheld); [] explicitly disables MCP tools for
+   * subagents. Orthogonal to subagentHostTools: the host coding/web bundle is
+   * governed by that setting, MCP exposure by this one. Always-denied tools
+   * (workflow/workflow_control + settings.excludeSubagentTools) are filtered
+   * regardless of mode.
+   */
+  subagentTools?: "all" | string[];
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -114,6 +126,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // mode literals and drops anything else (lenient drop-on-violation, matching
   // the file's style for enum-valued keys like progressPanelMode).
   subagentHostTools: ["string"],
+  // "all" (string) or an allowlist (array). Any string passes the type schema;
+  // normalizeSettings accepts only the exact literal "all" and drops other
+  // strings (lenient drop-on-violation, same style as subagentHostTools).
+  subagentTools: ["string", "array"],
 };
 
 /**
@@ -303,6 +319,25 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (raw.subagentHostTools === "auto" || raw.subagentHostTools === "on" || raw.subagentHostTools === "off") {
     settings.subagentHostTools = raw.subagentHostTools;
+  }
+  if (raw.subagentTools === "all") {
+    settings.subagentTools = "all";
+  } else if (Array.isArray(raw.subagentTools)) {
+    if (raw.subagentTools.length === 0) {
+      // Explicit empty allowlist: MCP tools are disabled for subagents (the
+      // "none" side of the "all" | allowlist setting).
+      settings.subagentTools = [];
+    } else {
+      // Allowlist: trim, drop empties, dedupe while preserving order.
+      const names = [
+        ...new Set(
+          raw.subagentTools
+            .filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+            .map((t) => t.trim()),
+        ),
+      ];
+      if (names.length) settings.subagentTools = names;
+    }
   }
   return settings;
 }
