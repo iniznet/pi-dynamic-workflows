@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { WorkflowSettings } from "../src/workflow-settings.js";
+import { loadWorkflowSettings, type WorkflowSettings } from "../src/workflow-settings.js";
 import { FIELD_REGISTRY } from "../src/workflow-settings-fields.js";
 import {
   buildSettingsStatusMarkdown,
@@ -229,6 +229,31 @@ describe("ConfigError gate", () => {
       assert.match(notified[0]?.message ?? "", /not valid JSON/);
     });
   });
+
+  it("rejects a wrong-typed value as ConfigError without prompting", async () => {
+    await withTempDirAsync(async (dir) => {
+      const settingsPath = join(dir, "bad.json");
+      writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: "abc" }), "utf-8");
+
+      const notified: Array<{ message: string; type?: string }> = [];
+      const { pi, sent } = makeSendingPi();
+      const ctx = {
+        cwd: dir,
+        ui: {
+          ...noPromptsUi(),
+          notify: (message: string, type?: string) => notified.push({ message, type }),
+        },
+      } as unknown as ExtensionCommandContext;
+
+      await runWorkflowSettingsCommand(pi, ctx, "", { settingsPath });
+
+      assert.equal(notified.length, 1);
+      assert.match(notified[0]?.message ?? "", /Key "defaultConcurrency".*must be number, got string/);
+      assert.equal(notified[0]?.type, "error");
+      assert.equal(sent.length, 1, "the paths message must still print");
+      assert.match(sent[0]?.content ?? "", /must be number, got string/);
+    });
+  });
 });
 
 describe("TUI form tier save", () => {
@@ -311,6 +336,67 @@ describe("TUI form tier save", () => {
 
       assert.equal(existsSync(settingsPath), false);
       assert.equal(notified.length, 0, "cancelling a clean form must stay silent");
+    });
+  });
+});
+
+describe("save round-trip", () => {
+  it("save then load returns the same values for every field type", async () => {
+    await withTempDirAsync(async (dir) => {
+      const settingsPath = join(dir, "settings.json");
+      const payload: WorkflowSettings = {
+        keywordTriggerEnabled: false,
+        keywordTriggerWord: "probe",
+        defaultAgentTimeoutMs: 90_000,
+        defaultConcurrency: 4,
+        defaultAgentRetries: 2,
+        progressPanelMode: "detailed",
+        progressPanelMaxAgents: 20,
+        persistAgentSessions: true,
+        deliveredResultMaxChars: 5_000,
+        excludeSubagentTools: ["tool-a", " tool-b "],
+      };
+      const ui = {
+        custom: async <T>() => ({ cancelled: false, settings: payload, scope: "global" }) as T,
+        notify: () => {},
+      };
+      const ctx = {
+        cwd: dir,
+        mode: "tui",
+        hasUI: true,
+        isProjectTrusted: () => false,
+        ui,
+      } as unknown as ExtensionCommandContext;
+      const { pi } = makeSendingPi();
+
+      await runWorkflowSettingsCommand(pi, ctx, "", { settingsPath });
+
+      const loaded = loadWorkflowSettings({ settingsPath, cwd: dir });
+      // Lossless round-trip: the save path persists values verbatim; trimming
+      // happens at edit time in parseFieldInput, not on disk.
+      assert.deepEqual(loaded, payload);
+    });
+  });
+
+  it("round-trips the token-budget 0 tombstone as null", async () => {
+    await withTempDirAsync(async (dir) => {
+      const settingsPath = join(dir, "settings.json");
+      const ui = {
+        custom: async <T>() => ({ cancelled: false, settings: { defaultTokenBudget: 0 }, scope: "global" }) as T,
+        notify: () => {},
+      };
+      const ctx = {
+        cwd: dir,
+        mode: "tui",
+        hasUI: true,
+        isProjectTrusted: () => false,
+        ui,
+      } as unknown as ExtensionCommandContext;
+      const { pi } = makeSendingPi();
+
+      await runWorkflowSettingsCommand(pi, ctx, "", { settingsPath });
+
+      assert.deepEqual(loadWorkflowSettings({ settingsPath, cwd: dir }), { defaultTokenBudget: null });
     });
   });
 });

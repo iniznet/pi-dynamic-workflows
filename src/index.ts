@@ -129,6 +129,7 @@ export {
   openWorkflowNavigator,
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
+  registerWorkflowSettingsCommand,
   renderNavigator,
 } from "./peer-facades.js";
 export type { BlueprintStep, ExecutionBlueprint } from "./phases/prewalk.js";
@@ -299,6 +300,22 @@ export {
   saveWorkflowSettings,
   saveWorkflowSettingsForCwd,
 } from "./workflow-settings.js";
+export type {
+  FormResult,
+  SettingsScope,
+  WorkflowSettingsField,
+  WorkflowSettingsFieldGroup,
+  WorkflowSettingsFieldType,
+} from "./workflow-settings-fields.js";
+export {
+  FIELD_GROUPS,
+  FIELD_REGISTRY,
+  fieldDisplayValue,
+  getEnvLockedKeys,
+  getField,
+  parseFieldInput,
+  SettingsFormModel,
+} from "./workflow-settings-fields.js";
 export type { FileLock, WorkflowStatus } from "./workflow-status.js";
 export {
   acquireFileLock,

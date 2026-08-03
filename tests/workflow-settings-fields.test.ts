@@ -174,6 +174,10 @@ describe("parseFieldInput", () => {
     assert.equal(expectOk("defaultTokenBudget", "0"), 0);
   });
 
+  it("rejects 0 on other nullable fields (no save-path tombstone → a silent no-op edit)", () => {
+    expectError("defaultAgentTimeoutMs", "0");
+  });
+
   it("splits comma-separated tool names, trimming and dropping empties", () => {
     assert.deepEqual(expectOk("excludeSubagentTools", "web-search, editor, , mcp-bridge"), [
       "web-search",

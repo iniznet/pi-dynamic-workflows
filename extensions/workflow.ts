@@ -32,6 +32,7 @@ import {
   registerWorkflowCommands,
   registerWorkflowGatewayCommand,
   registerWorkflowModelsCommand,
+  registerWorkflowSettingsCommand,
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
   WorkflowManager,
@@ -178,6 +179,7 @@ export default function extension(pi: ExtensionAPI) {
   // reload handoff so /reload does not silently turn the selected effort off.
   registerWorkflowCommands?.(pi, manager, { storage, cwd, effort });
   registerWorkflowModelsCommand?.(pi);
+  registerWorkflowSettingsCommand?.(pi);
   registerBuiltinWorkflows(pi, { cwd, manager, storage });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
