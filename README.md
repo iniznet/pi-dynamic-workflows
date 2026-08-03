@@ -176,6 +176,7 @@ Pi can manage background runs directly with the `workflow_control` tool instead 
 | `/workflows-trigger set <word>\|reset` | Set or reset the trigger word |
 | `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
 | `/workflows-models` | Map model tiers and thinking levels (with a per-tier cost preview) |
+| `/workflows-settings` | Interactive settings editor (TUI) — `status`/`paths` print effective config |
 | `/workflows-gateway start\|stop\|status` | Lazily start/stop the host tool IPC gateway (MCPBridge) — see below |
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
@@ -274,6 +275,8 @@ Newer run options: `drainTimeoutMs` (default 60 s) waits for un-awaited `agent()
 Workflow tool inputs are range-validated at the boundary: `maxAgents` 1–1000, `concurrency` 1–16, `agentRetries` 0–3, `agentTimeoutMs`/`tokenBudget` ≥ 1; combining `name` + `script` throws. `settings.json` is schema-validated — malformed JSON, unknown keys, or wrong-typed values throw a named `ConfigError` naming the file instead of silently degrading.
 
 Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
+
+`/workflows-settings` inspects and edits every settings key interactively: `↑/↓` navigate, `Enter` cycles booleans/enums or opens a value submenu, `/` searches, and the save row writes only your staged changes to the chosen file (`Esc` cancels with a discard confirmation when you have unsaved changes). `status` (alias `print`) prints the effective merged config — env overrides included and marked `🔒 env` — and `paths` prints the two file locations. The global file is `~/.pi/workflows/settings.json`; the per-project override lives under `~/.pi/workflows/projects/<project>/settings.json` and is offered as a save target only when the current project is trusted. Keys pinned by a `PI_WORKFLOW_*` environment variable are shown read-only from the env value and are never written back to disk — edit the env var, not the file.
 
 A schema-less agent call that comes back as whitespace-only text is a recoverable `AGENT_EMPTY_OUTPUT` failure and retries like any other. Some models occasionally hit this on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run.
 
