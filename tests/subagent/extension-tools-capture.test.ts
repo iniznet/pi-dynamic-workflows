@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
@@ -22,7 +22,9 @@ import {
   getExtensionToolSourceResults,
   isKnownExtensionToolSourceId,
   loadCapturedTools,
+  readHostPackageJson,
   resolveEnabledSourceIds,
+  resolveHostExportsEntry,
 } from "../../src/subagent/extension-tools-capture.js";
 
 /** A ToolDefinition whose execute echoes its params (shape parity with the assembler test). */
@@ -134,6 +136,53 @@ describe("source id helpers", () => {
     assert.equal(extensionSourceIdForTool("codegraph_search"), "pi-codegraph");
     assert.equal(extensionSourceIdForTool("codegraph_files"), "pi-codegraph");
     assert.equal(extensionSourceIdForTool("todo"), undefined);
+  });
+});
+
+describe("readHostPackageJson", () => {
+  test("parses a valid package.json from disk", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-pkg-json-"));
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ main: "./dist/index.js", exports: { ".": "./dist/index.js" } }),
+    );
+    const pkg = readHostPackageJson(dir);
+    assert.equal(pkg?.main, "./dist/index.js");
+    assert.deepEqual(pkg?.exports, { ".": "./dist/index.js" });
+  });
+
+  test("returns undefined for a missing or unparseable package.json", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-pkg-json-"));
+    assert.equal(readHostPackageJson(join(dir, "nope")), undefined);
+    writeFileSync(join(dir, "package.json"), "{ not json");
+    assert.equal(readHostPackageJson(dir), undefined);
+  });
+});
+
+describe("resolveHostExportsEntry", () => {
+  test("resolves a plain string target", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-exports-"));
+    const pkg = { exports: { "./compat": "./dist/compat.js" } };
+    assert.equal(resolveHostExportsEntry(dir, "./compat", pkg), join(dir, "dist", "compat.js"));
+  });
+
+  test("prefers the import condition over default, and handles the root entry", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-exports-"));
+    const pkg = { exports: { ".": { types: "./dist/index.d.ts", import: "./dist/index.js" } } };
+    assert.equal(resolveHostExportsEntry(dir, ".", pkg), join(dir, "dist", "index.js"));
+  });
+
+  test("maps a pattern target's star to the literal subpath tail", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-exports-"));
+    const pkg = { exports: { "./providers/*": { import: "./dist/providers/*.js" } } };
+    assert.equal(resolveHostExportsEntry(dir, "./providers/all", pkg), join(dir, "dist", "providers", "all.js"));
+  });
+
+  test("returns undefined for a missing subpath or a non-relative target", () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-exports-"));
+    assert.equal(resolveHostExportsEntry(dir, "./oauth", { exports: {} }), undefined);
+    assert.equal(resolveHostExportsEntry(dir, "./compat", { exports: { "./compat": "node:path" } }), undefined);
+    assert.equal(resolveHostExportsEntry(dir, "./compat", {}), undefined);
   });
 });
 

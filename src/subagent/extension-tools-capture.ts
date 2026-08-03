@@ -27,10 +27,10 @@
  * loading is useless (subagents run with in-memory session managers).
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createJiti } from "jiti/static";
@@ -104,10 +104,121 @@ function resolvePackageEntry(
   return pathToFileURL(entryPath).href;
 }
 
+// pi's own extension loader aliases its bundled packages (pi-ai compat,
+// pi-coding-agent, pi-tui, pi-agent-core, typebox) into every extension's
+// import graph via jiti's `alias` option (loader.ts getAliases()). Without the
+// same aliases, a captured entry that imports e.g. `@earendil-works/pi-ai` for
+// runtime values (supi-web's StringEnum) is unresolvable from the agent npm
+// root where the package is installed — that package only lives bundled inside
+// the pi host runtime. Mirror the alias map by reading the bundled packages'
+// exports maps directly from disk. The pi host sits in the global node_modules
+// next to process.execPath (e.g. <node-dir>/node_modules/@earendil-works/
+// pi-coding-agent with pi-ai nested in its own node_modules). Graceful: any
+// discovery failure returns undefined (no aliases) and the affected source
+// reports unimportable instead of breaking capture.
+interface HostPackageJson {
+  main?: string;
+  exports?: Record<string, string | Record<string, string>>;
+}
+
+/** Parse a package.json as the host-bundle reader needs it (undefined on any failure). */
+export function readHostPackageJson(pkgDir: string): HostPackageJson | undefined {
+  try {
+    return JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as HostPackageJson;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve one exports-map entry (string, or the import/default condition).
+ * Pattern targets ("./providers/*") map the literal subpath's tail into the
+ * star position. Returns undefined for missing/unresolvable entries.
+ */
+export function resolveHostExportsEntry(pkgDir: string, subpath: string, pkg: HostPackageJson): string | undefined {
+  const exports = pkg.exports;
+  if (!exports) return undefined;
+  let raw: string | Record<string, string> | undefined = exports[subpath];
+  let patternTail = "";
+  if (raw === undefined) {
+    // Pattern match: a key with a star that prefixes the literal subpath, e.g.
+    // "./providers/*" matched by "./providers/all" -> tail "all".
+    for (const [key, value] of Object.entries(exports)) {
+      const star = key.indexOf("*");
+      if (star === -1) continue;
+      const prefix = key.slice(0, star);
+      if (!subpath.startsWith(prefix)) continue;
+      raw = value;
+      patternTail = subpath.slice(prefix.length);
+      break;
+    }
+  }
+  const target =
+    typeof raw === "string" ? raw : raw && typeof raw === "object" ? (raw.import ?? raw.default) : undefined;
+  if (typeof target !== "string" || !target.startsWith("./")) return undefined;
+  const star = target.indexOf("*");
+  if (star === -1) return join(pkgDir, target);
+  return join(pkgDir, target.slice(0, star) + patternTail + target.slice(star + 1));
+}
+
+function buildPiHostAliases(): Record<string, string> | undefined {
+  try {
+    const globalModules = join(dirname(process.execPath), "node_modules");
+    const hostPkgDir = join(globalModules, "@earendil-works", "pi-coding-agent");
+    const hostPkg = readHostPackageJson(hostPkgDir);
+    if (!hostPkg) return undefined;
+    const aliases: Record<string, string> = {};
+    const addBundle = (name: string, pkgDir: string): void => {
+      const pkg = readHostPackageJson(pkgDir);
+      if (!pkg) return;
+      // Mirror loader.ts: the pi-ai ROOT maps to the compat entry (a strict
+      // superset of the core entrypoint); subpaths map to their own entries.
+      const compat = resolveHostExportsEntry(pkgDir, "./compat", pkg) ?? resolveHostExportsEntry(pkgDir, ".", pkg);
+      const oauth = resolveHostExportsEntry(pkgDir, "./oauth", pkg);
+      const providersAll = resolveHostExportsEntry(pkgDir, "./providers/all", pkg);
+      if (compat) {
+        aliases[name] = compat;
+        aliases[`${name}/compat`] = compat;
+      }
+      if (oauth) aliases[`${name}/oauth`] = oauth;
+      if (providersAll) aliases[`${name}/providers/all`] = providersAll;
+    };
+    const hostPiAiDir = join(hostPkgDir, "node_modules", "@earendil-works", "pi-ai");
+    addBundle("@earendil-works/pi-ai", hostPiAiDir);
+    // pi-ai's compat surface imports the sibling bundles (pi-tui, pi-agent-core)
+    // — alias their roots too, via exports entry or main field.
+    for (const sibling of ["pi-tui", "pi-agent-core"] as const) {
+      const dir = join(hostPkgDir, "node_modules", "@earendil-works", sibling);
+      const pkg = readHostPackageJson(dir);
+      if (!pkg) continue;
+      const root = resolveHostExportsEntry(dir, ".", pkg) ?? (pkg.main ? join(dir, pkg.main) : join(dir, "index.js"));
+      aliases[`@earendil-works/${sibling}`] = root;
+      aliases[`@mariozechner/${sibling}`] = root;
+    }
+    // Legacy @mariozechner/* spellings: pi's loader maps them to the identical
+    // bundles, and no separate package exists on disk — reuse the resolved
+    // earendil-works entries so old-style sources capture too.
+    if (aliases["@earendil-works/pi-ai"]) {
+      for (const suffix of ["", "/compat", "/oauth", "/providers/all"]) {
+        aliases[`@mariozechner/pi-ai${suffix}`] = aliases[`@earendil-works/pi-ai${suffix}`];
+      }
+    }
+    if (hostPkg.main) {
+      aliases["@earendil-works/pi-coding-agent"] = join(hostPkgDir, hostPkg.main);
+    }
+    return Object.keys(aliases).length > 0 ? aliases : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // Lazily-created jiti instance (transpiles the TS entries at capture time).
 let jitiTranspiler: ReturnType<typeof createJiti> | null = null;
 function jiti(): ReturnType<typeof createJiti> {
-  if (!jitiTranspiler) jitiTranspiler = createJiti(import.meta.url);
+  if (!jitiTranspiler) {
+    const aliases = buildPiHostAliases();
+    jitiTranspiler = createJiti(import.meta.url, { ...(aliases ? { alias: aliases } : {}) });
+  }
   return jitiTranspiler;
 }
 
