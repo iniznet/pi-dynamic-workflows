@@ -80,11 +80,13 @@ export default function extension(pi: ExtensionAPI) {
   const hostToolsPolicy = new SubagentHostToolsPolicy({
     gateway: hostToolGateway,
     mode: settings.subagentHostTools ?? "auto",
-    // Merged bundle: the six core host tools, plus — when the host SDK exposes
-    // it — every extension-registered tool (MCP servers, third-party
-    // extensions) minus the subagent-hostile exclusions (workflow/
-    // workflow_control + settings.excludeSubagentTools). Older SDKs fall back
-    // to exactly the six tools; hostToolsFromDefinitions dedupes by name.
+    // Merged bundle (extension-only, no pi source changes): the executable
+    // builtin suite (read/bash/edit/write + grep/find/ls via public SDK
+    // factories) metadata-synced against the host's public getAllTools(), plus
+    // web tools, minus the subagent-hostile exclusions (workflow/workflow_control
+    // + settings.excludeSubagentTools). A future SDK's getAllToolDefinitions()
+    // would merge extension-registered tools automatically; on 0.83.0 it is
+    // absent, so MCP tools are metadata-only and never advertised (logged).
     buildHostTools: () => buildMergedHostTools(pi, { cwd, excludeSubagentTools: settings.excludeSubagentTools }),
     buildCodingTools: () => createCodingTools(cwd),
   });

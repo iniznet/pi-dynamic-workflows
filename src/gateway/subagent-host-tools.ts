@@ -23,7 +23,12 @@
  * from src/index.ts, so the public entry contract is untouched.
  */
 
-import { createCodingTools, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import {
+  createCodingTools,
+  createReadOnlyTools,
+  type ExtensionAPI,
+  type ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { DEFAULT_EXCLUDED_SUBAGENT_TOOLS } from "../agent.js";
 import { createWebTools } from "../web-tools.js";
 import {
@@ -52,12 +57,25 @@ export interface MergedHostToolsOptions {
 /**
  * The newer host SDK surface that exposes every registered tool definition.
  * Intersection-cast only — never referenced statically, because it does NOT
- * exist in SDK 0.80.10's types (verified against its .d.ts); `tsc` against
- * 0.80.10 must still compile. On an SDK that has it, this returns the union of
- * core built-ins and every extension-registered tool (MCP servers, third-party
- * extensions); on older SDKs the optional method is simply absent.
+ * exist in SDK 0.83.0's public types (verified against the published dist);
+ * `tsc` against the pinned SDK must still compile. On a future SDK that has
+ * it, this returns the union of core built-ins and every extension-registered
+ * tool (MCP servers, third-party extensions); on 0.83.0 the optional method is
+ * simply absent and the primary path below (public getAllTools metadata + SDK
+ * tool factories) is what actually runs.
  */
 type HostToolDefinitionApi = ExtensionAPI & { getAllToolDefinitions?: () => ToolDefinition[] };
+
+/**
+ * Extension-only builtin suite: the executable coding tools (read/bash/edit/
+ * write) merged with the read-only builtins (grep/find/ls) via the PUBLIC SDK
+ * factories. These execute in-process in the gateway with a minimal context,
+ * exactly like createCodingTools already did — no SDK modification involved.
+ * hostToolsFromDefinitions dedupes by name, so `read` keeps its coding def.
+ */
+function createExecutableBuiltins(cwd: string): ToolDefinition[] {
+  return [...createCodingTools(cwd), ...createReadOnlyTools(cwd)];
+}
 
 /**
  * Whether a host tool name may be proxied to subagents. Always denies the
@@ -72,25 +90,65 @@ export function isExcludedHostTool(name: string, extraExcluded: string[] = []): 
 }
 
 /**
- * Build the host bundle subagents can reach through the gateway: the host
- * coding + web tools (unchanged baseline) merged with EVERY tool the host SDK
- * exposes via `getAllToolDefinitions()` (feature-detected), minus the
- * subagent-hostile exclusions. On an SDK without that method this degrades to
- * exactly the pre-upgrade bundle (the six core host tools), because
- * `hostToolsFromDefinitions` also dedupes by name — coding/web defs win on any
- * collision with same-named extension defs.
+ * Build the host bundle subagents can reach through the gateway, entirely from
+ * the PUBLIC ExtensionAPI surface (extension-only — pi source is off-limits):
  *
- * The `execute` shape check guards against signature drift: feature detection
- * only proves the method EXISTS, so a future SDK that keeps the name but
- * returns metadata-only defs (no executable `execute`) is filtered out here
- * instead of proxying broken tool calls.
+ * 1. Executable builtin suite from public SDK factories (coding + read-only
+ *    builtins), metadata-synced against the running host via the public
+ *    `pi.getAllTools()` API (present on every SDK the extension compiles
+ *    against): descriptions/promptGuidelines follow the live host, and a
+ *    builtin is only advertised if the host actually registers it.
+ * 2. Web tools (extension-defined, unchanged).
+ * 3. Future path: full extension/MCP tool definitions via the feature-detected
+ *    `getAllToolDefinitions()` — absent on 0.83.0, so it contributes nothing
+ *    today; on a future SDK it merges extension-registered tools automatically.
+ *
+ * Extension-registered tools that are ONLY visible as metadata (sourceInfo
+ * source ≠ builtin/sdk) cannot be executed by the gateway without their full
+ * definitions, so they are never advertised — the gap is logged once per build
+ * (documented capability limit of the public API, see AGENTS.md).
  */
 export function buildMergedHostTools(pi: ExtensionAPI, options: MergedHostToolsOptions): HostToolsBundle {
+  // Live host tool metadata (name/description/parameters/promptGuidelines/sourceInfo).
+  // Feature-detected: an SDK without the public getAllTools() degrades to the
+  // full executable builtin suite with no metadata sync.
+  const live = typeof pi.getAllTools === "function" ? pi.getAllTools() : [];
+  const liveByName = new Map(live.map((info) => [info.name, info]));
+
+  const builtins = createExecutableBuiltins(options.cwd)
+    .filter((def) => !isExcludedHostTool(def.name, options.excludeSubagentTools))
+    // Advertise a builtin only when the host registers it (empty live list =
+    // no metadata API — keep the whole suite rather than hiding everything).
+    .filter((def) => liveByName.size === 0 || liveByName.has(def.name))
+    .map((def) => {
+      const info = liveByName.get(def.name);
+      // Description sync only: hostToolsFromDefinitions advertises exactly
+      // name/description/parameters, so promptGuidelines would be stripped
+      // downstream anyway. Execution stays on our own SDK-factory def.
+      return info ? { ...def, description: info.description } : def;
+    });
+
   const registered = (pi as HostToolDefinitionApi).getAllToolDefinitions?.() ?? [];
   const extensionTools = registered.filter(
     (def) => typeof def.execute === "function" && !isExcludedHostTool(def.name, options.excludeSubagentTools),
   );
-  return hostToolsFromDefinitions([...createCodingTools(options.cwd), ...createWebTools(), ...extensionTools]);
+
+  const unproxyable = live.filter(
+    (info) =>
+      info.sourceInfo.source !== "builtin" &&
+      info.sourceInfo.source !== "sdk" &&
+      !isExcludedHostTool(info.name, options.excludeSubagentTools) &&
+      !extensionTools.some((def) => def.name === info.name),
+  );
+  if (unproxyable.length > 0) {
+    console.error(
+      `[workflows] ${unproxyable.length} extension/MCP host tool(s) are not proxied to subagents ` +
+        `(${unproxyable.map((info) => info.name).join(", ")}): the public ExtensionAPI exposes them as metadata ` +
+        "only. Full-definition proxying needs the SDK's getAllToolDefinitions, which pi 0.83.0 does not provide.",
+    );
+  }
+
+  return hostToolsFromDefinitions([...builtins, ...createWebTools(), ...extensionTools]);
 }
 
 export interface SubagentHostToolsPolicyOptions {

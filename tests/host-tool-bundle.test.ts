@@ -1,27 +1,35 @@
 /**
- * buildMergedHostTools + isExcludedHostTool unit tests (host-tool gateway
- * upgrade: proxy every extension-registered tool with feature-detect fallback).
+ * buildMergedHostTools + isExcludedHostTool unit tests (extension-only host-tool
+ * upgrade: no pi source modification — proxied bundle is built entirely from the
+ * public ExtensionAPI surface and public SDK tool factories).
  *
  * Coverage:
- *  - Fallback path: an SDK surface without getAllToolDefinitions (e.g. the
- *    installed 0.80.10) yields exactly the six core host tools — nothing more.
- *  - Feature-detected path: extension-registered tools (MCP, third-party) are
- *    merged into the proxied bundle.
- *  - Exclusions: workflow/workflow_control are NEVER proxied even when the
- *    definitions list contains them; settings.excludeSubagentTools names are
- *    filtered too.
- *  - Dedupe: a same-named extension def loses to the core coding/web def
- *    (hostToolsFromDefinitions keeps the first occurrence).
+ *  - Baseline: the executable builtin suite (read/bash/edit/write + grep/find/ls
+ *    via public createCodingTools/createReadOnlyTools factories) + web tools,
+ *    even when the host exposes no metadata API at all.
+ *  - Live metadata path: pi.getAllTools() (public) syncs descriptions /
+ *    promptGuidelines and narrows the suite to builtins the host registers.
+ *  - Extension/MCP tools visible ONLY as metadata (no full definitions) are
+ *    never advertised — the public API cannot execute them (documented gap).
+ *  - Future path: the feature-detected getAllToolDefinitions() still merges
+ *    full extension defs when a future SDK provides it.
+ *  - Exclusions: workflow/workflow_control are NEVER proxied even when present;
+ *    settings.excludeSubagentTools names are filtered too.
+ *  - Dedupe: a same-named def loses to the earlier core def (first wins).
  */
 
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { buildMergedHostTools, isExcludedHostTool } from "../src/gateway/subagent-host-tools.js";
 
-/** The six core host tools (createCodingTools + createWebTools), verified live. */
-const CORE_TOOL_NAMES = ["read", "bash", "edit", "write", "web_search", "web_fetch"];
+/**
+ * The executable host bundle baseline: createCodingTools (read/bash/edit/write)
+ * + createReadOnlyTools (read/grep/find/ls) + createWebTools, deduped by name.
+ */
+const BUILTIN_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const CORE_TOOL_NAMES = [...BUILTIN_TOOL_NAMES, "web_search", "web_fetch"];
 
 /** A minimal ToolDefinition whose execute echoes its params as text. */
 function fakeTool(name: string): ToolDefinition {
@@ -36,10 +44,32 @@ function fakeTool(name: string): ToolDefinition {
   } as ToolDefinition;
 }
 
-/** An ExtensionAPI mock exposing getAllToolDefinitions, or a bare API without it. */
-function makePi(registeredTools?: ToolDefinition[]): ExtensionAPI {
-  if (registeredTools === undefined) return {} as ExtensionAPI;
-  return { getAllToolDefinitions: () => registeredTools } as unknown as ExtensionAPI;
+/** ToolInfo metadata for a host-registered tool (the getAllTools() shape). */
+function fakeInfo(name: string, source: string = "builtin"): ToolInfo {
+  return {
+    name,
+    description: `Live ${name} description`,
+    parameters: Type.Object({}),
+    promptGuidelines: [`Guideline for ${name}`],
+    sourceInfo: { path: `<builtin:${name}>`, source, scope: "temporary", origin: "top-level" },
+  };
+}
+
+interface MockPiOptions {
+  /** Values for the public getAllTools() (live host metadata). */
+  toolInfos?: ToolInfo[];
+  /** Full definitions for the feature-detected getAllToolDefinitions() path. */
+  registeredTools?: ToolDefinition[];
+  /** Whether to omit getAllTools entirely (ancient-SDK fallback). */
+  noMetadataApi?: boolean;
+}
+
+/** An ExtensionAPI mock whose surface mirrors 0.83.0's public API. */
+function makePi({ toolInfos, registeredTools, noMetadataApi }: MockPiOptions = {}): ExtensionAPI {
+  const api: Record<string, unknown> = {};
+  if (!noMetadataApi) api.getAllTools = () => toolInfos ?? [];
+  if (registeredTools !== undefined) api.getAllToolDefinitions = () => registeredTools;
+  return api as ExtensionAPI;
 }
 
 function toolNames(bundle: ReturnType<typeof buildMergedHostTools>): string[] {
@@ -62,25 +92,63 @@ describe("isExcludedHostTool", () => {
 });
 
 describe("buildMergedHostTools", () => {
-  test("fallback path: no getAllToolDefinitions on the API surface → exactly the six core tools", () => {
-    const bundle = buildMergedHostTools(makePi(), { cwd: process.cwd() });
+  test("no metadata API at all → full executable builtin suite + web tools (extension-only baseline)", () => {
+    const bundle = buildMergedHostTools(makePi({ noMetadataApi: true }), { cwd: process.cwd() });
     assert.deepEqual(
       toolNames(bundle),
       CORE_TOOL_NAMES,
-      "an SDK without getAllToolDefinitions must preserve exactly today's bundle",
+      "the extension-only baseline is the executable builtin suite plus the web tools",
     );
   });
 
-  test("feature-detected path: extension-registered tools are merged in", () => {
-    const bundle = buildMergedHostTools(makePi([fakeTool("mcp_github"), fakeTool("mcp_fs")]), {
-      cwd: process.cwd(),
-    });
+  test("getAllTools() present: builtins the host does not register are dropped from the suite", () => {
+    // The live host registers only the 4 coding tools — grep/find/ls are absent.
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: ["read", "bash", "edit", "write"].map((name) => fakeInfo(name)),
+      }),
+      { cwd: process.cwd() },
+    );
+    assert.deepEqual(toolNames(bundle), ["read", "bash", "edit", "write", "web_search", "web_fetch"]);
+  });
+
+  test("getAllTools() present: descriptions sync from live host metadata", () => {
+    const live = BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name));
+    const bundle = buildMergedHostTools(makePi({ toolInfos: live }), { cwd: process.cwd() });
+    const read = bundle.toolDefs.find((def) => def.name === "read");
+    assert.equal(read?.description, "Live read description", "description follows the running host");
+  });
+
+  test("extension/MCP tools visible only as metadata are never advertised (public API cannot execute them)", () => {
+    const live = [
+      ...BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+      fakeInfo("mcp_github", "extension"),
+      fakeInfo("mcp_fs", "extension"),
+    ];
+    const bundle = buildMergedHostTools(makePi({ toolInfos: live }), { cwd: process.cwd() });
+    const names = toolNames(bundle);
+    assert.ok(!names.includes("mcp_github"), "metadata-only MCP tools must not be proxied");
+    assert.ok(!names.includes("mcp_fs"), "metadata-only MCP tools must not be proxied");
+    assert.ok(names.includes("read"), "executable builtins are unaffected");
+  });
+
+  test("future path: full extension defs from getAllToolDefinitions() are merged in", () => {
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [fakeTool("mcp_github"), fakeTool("mcp_fs")],
+      }),
+      { cwd: process.cwd() },
+    );
     assert.deepEqual(toolNames(bundle), [...CORE_TOOL_NAMES, "mcp_github", "mcp_fs"]);
   });
 
   test("workflow/workflow_control are never proxied even when present in the definitions list", () => {
     const bundle = buildMergedHostTools(
-      makePi([fakeTool("workflow"), fakeTool("workflow_control"), fakeTool("mcp_github")]),
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [fakeTool("workflow"), fakeTool("workflow_control"), fakeTool("mcp_github")],
+      }),
       { cwd: process.cwd() },
     );
     const names = toolNames(bundle);
@@ -90,30 +158,45 @@ describe("buildMergedHostTools", () => {
   });
 
   test("shape guard: definitions without an executable execute are never proxied", () => {
-    const metadataOnly = { name: "mcp_broken", description: "no execute", parameters: Type.Object({}) } as ToolDefinition;
-    const bundle = buildMergedHostTools(makePi([metadataOnly, fakeTool("mcp_ok")]), {
-      cwd: process.cwd(),
-    });
+    const metadataOnly = {
+      name: "mcp_broken",
+      description: "no execute",
+      parameters: Type.Object({}),
+    } as ToolDefinition;
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [metadataOnly, fakeTool("mcp_ok")],
+      }),
+      { cwd: process.cwd() },
+    );
     const names = toolNames(bundle);
     assert.ok(!names.includes("mcp_broken"), "execute-less defs must be filtered out (signature-drift guard)");
     assert.ok(names.includes("mcp_ok"), "executable defs still merge in");
   });
 
   test("settings.excludeSubagentTools names are filtered from the proxied bundle", () => {
-    const bundle = buildMergedHostTools(makePi([fakeTool("mcp_github"), fakeTool("recursive_bridge")]), {
-      cwd: process.cwd(),
-      excludeSubagentTools: ["recursive_bridge"],
-    });
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [fakeTool("mcp_github"), fakeTool("recursive_bridge")],
+      }),
+      { cwd: process.cwd(), excludeSubagentTools: ["recursive_bridge"] },
+    );
     const names = toolNames(bundle);
     assert.ok(!names.includes("recursive_bridge"), "user-excluded tool names must be dropped");
     assert.ok(names.includes("mcp_github"), "other extension tools stay");
     assert.ok(names.includes("bash"), "core tools are unaffected by the extra exclusions");
   });
 
-  test("dedupe: a same-named extension def loses to the core tool (first occurrence wins)", () => {
-    const bundle = buildMergedHostTools(makePi([fakeTool("read"), fakeTool("web_search"), fakeTool("mcp_x")]), {
-      cwd: process.cwd(),
-    });
+  test("dedupe: a same-named def loses to the earlier core def (first occurrence wins)", () => {
+    const bundle = buildMergedHostTools(
+      makePi({
+        toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),
+        registeredTools: [fakeTool("read"), fakeTool("web_search"), fakeTool("mcp_x")],
+      }),
+      { cwd: process.cwd() },
+    );
     const names = toolNames(bundle);
     const reads = names.filter((name) => name === "read");
     const webSearches = names.filter((name) => name === "web_search");
