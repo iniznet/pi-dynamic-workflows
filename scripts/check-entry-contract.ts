@@ -39,7 +39,7 @@ const ENTRY_CONTRACT: Record<string, string> = {
   createWorkflowStorage: "extension entry imports it",
   createWorkflowTool: "extension entry imports it",
   HostToolGateway: "extension entry imports it",
-  hostToolsFromDefinitions: "extension entry imports it",
+  hostToolsFromDefinitions: "library API (HostToolGateway family; tests import it)",
   installResultDelivery: "extension entry imports it",
   installTaskPanel: "extension entry imports it",
   installWorkflowKeywordArming: "extension entry imports it",

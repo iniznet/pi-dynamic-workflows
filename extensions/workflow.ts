@@ -12,7 +12,7 @@ import {
   WORKFLOW_EXTENSION_VERSION,
   type WorkflowReloadRuntime,
 } from "../src/extension-reload.js";
-import { SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
+import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
 import {
   applyEnvSettingsOverride,
   createEffortState,
@@ -21,7 +21,6 @@ import {
   createWorkflowStorage,
   createWorkflowTool,
   HostToolGateway,
-  hostToolsFromDefinitions,
   installResultDelivery,
   installTaskPanel,
   installWorkflowKeywordArming,
@@ -81,7 +80,12 @@ export default function extension(pi: ExtensionAPI) {
   const hostToolsPolicy = new SubagentHostToolsPolicy({
     gateway: hostToolGateway,
     mode: settings.subagentHostTools ?? "auto",
-    buildHostTools: () => hostToolsFromDefinitions([...createCodingTools(cwd), ...createWebTools()]),
+    // Merged bundle: the six core host tools, plus — when the host SDK exposes
+    // it — every extension-registered tool (MCP servers, third-party
+    // extensions) minus the subagent-hostile exclusions (workflow/
+    // workflow_control + settings.excludeSubagentTools). Older SDKs fall back
+    // to exactly the six tools; hostToolsFromDefinitions dedupes by name.
+    buildHostTools: () => buildMergedHostTools(pi, { cwd, excludeSubagentTools: settings.excludeSubagentTools }),
     buildCodingTools: () => createCodingTools(cwd),
   });
   const gatewayManagerOptions = {
@@ -171,7 +175,7 @@ export default function extension(pi: ExtensionAPI) {
   // stated in the command copy; the "off" escape hatch gets the legacy
   // opt-in-only phrasing.
   registerWorkflowGatewayCommand(pi, hostToolGateway, {
-    buildHostTools: () => hostToolsFromDefinitions([...createCodingTools(cwd), ...createWebTools()]),
+    buildHostTools: () => buildMergedHostTools(pi, { cwd, excludeSubagentTools: settings.excludeSubagentTools }),
     hostToolsAutomatic: hostToolsPolicy.isEnabled(),
   });
   // "on" (opt-in): eager start at load for latency-sensitive users. The

@@ -23,11 +23,68 @@
  * from src/index.ts, so the public entry contract is untouched.
  */
 
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createGatewayProxiedTools, type HostToolGateway, type HostToolsBundle } from "./host-tool-gateway.js";
+import { createCodingTools, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_EXCLUDED_SUBAGENT_TOOLS } from "../agent.js";
+import { createWebTools } from "../web-tools.js";
+import {
+  createGatewayProxiedTools,
+  type HostToolGateway,
+  type HostToolsBundle,
+  hostToolsFromDefinitions,
+} from "./host-tool-gateway.js";
 
 /** Subagent host-tool access mode: "auto" (default) | "on" (eager) | "off" (legacy). */
 export type HostToolsMode = "auto" | "on" | "off";
+
+/**
+ * Options for {@link buildMergedHostTools}.
+ */
+export interface MergedHostToolsOptions {
+  /** Workspace the coding tools operate on. */
+  cwd: string;
+  /**
+   * Extra tool names to deny (wired from `settings.excludeSubagentTools`), on
+   * top of the always-on `workflow`/`workflow_control` denial.
+   */
+  excludeSubagentTools?: string[];
+}
+
+/**
+ * The newer host SDK surface that exposes every registered tool definition.
+ * Intersection-cast only — never referenced statically, because it does NOT
+ * exist in SDK 0.80.10's types (verified against its .d.ts); `tsc` against
+ * 0.80.10 must still compile. On an SDK that has it, this returns the union of
+ * core built-ins and every extension-registered tool (MCP servers, third-party
+ * extensions); on older SDKs the optional method is simply absent.
+ */
+type HostToolDefinitionApi = ExtensionAPI & { getAllToolDefinitions?: () => ToolDefinition[] };
+
+/**
+ * Whether a host tool name may be proxied to subagents. Always denies the
+ * recursive-orchestration tools the extension itself registers (`workflow`,
+ * `workflow_control` — {@link DEFAULT_EXCLUDED_SUBAGENT_TOOLS}, #107), plus any
+ * names the user blocked via `settings.excludeSubagentTools`. Audit: this
+ * extension registers no other host-only tools (task panel / UI / commands are
+ * not tools), so the always-on deny set is exactly the subagent defaults.
+ */
+export function isExcludedHostTool(name: string, extraExcluded: string[] = []): boolean {
+  return DEFAULT_EXCLUDED_SUBAGENT_TOOLS.includes(name) || extraExcluded.includes(name);
+}
+
+/**
+ * Build the host bundle subagents can reach through the gateway: the host
+ * coding + web tools (unchanged baseline) merged with EVERY tool the host SDK
+ * exposes via `getAllToolDefinitions()` (feature-detected), minus the
+ * subagent-hostile exclusions. On an SDK without that method this degrades to
+ * exactly the pre-upgrade bundle (the six core host tools), because
+ * `hostToolsFromDefinitions` also dedupes by name — coding/web defs win on any
+ * collision with same-named extension defs.
+ */
+export function buildMergedHostTools(pi: ExtensionAPI, options: MergedHostToolsOptions): HostToolsBundle {
+  const registered = (pi as HostToolDefinitionApi).getAllToolDefinitions?.() ?? [];
+  const extensionTools = registered.filter((def) => !isExcludedHostTool(def.name, options.excludeSubagentTools));
+  return hostToolsFromDefinitions([...createCodingTools(options.cwd), ...createWebTools(), ...extensionTools]);
+}
 
 export interface SubagentHostToolsPolicyOptions {
   gateway: HostToolGateway;
