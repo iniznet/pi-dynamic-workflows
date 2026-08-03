@@ -181,6 +181,8 @@ const ENTRY_CONTRACT: Record<string, string> = {
   // ── model routing / tiers ──
   classifyTask: "model routing",
   TaskClassification: "model routing",
+  tierNameForTask: "model routing",
+  tierNameForClassification: "model routing",
   parseModelRoutingFromMeta: "model routing",
   resolveModelForPhase: "model routing",
   canonicalModelSpec: "model specs",

@@ -4,16 +4,17 @@ This report records review evidence for the compact workflow tool contract and t
 
 ## Context surfaces
 
-Measurements use UTF-8 bytes. The historical baseline is `818fdd8` (release 3.0.0), captured when concision work began. The candidate is the final tree on `feat/self-documenting-workflow-capabilities`.
+Measurements use UTF-8 bytes. The historical baseline is `818fdd8` (release 3.0.0), captured when concision work began. The candidate is the current package tree (3.5.0), LF-normalized per the release-gate re-baseline.
 
 | Surface | Baseline (`818fdd8`) | Candidate | Change |
 | --- | ---: | ---: | ---: |
 | Permanent workflow prompt | 766 | 742 | -24 |
-| Provider-visible workflow tool definition | 9,558 | 3,918 | -5,640 |
+| Provider-visible workflow tool definition | 9,558 | 4,774 | -4,784 |
 | Workflow-authoring skill discovery | 0 | 338 | +338 |
-| Ordinary workflow-owned always-on total | 10,324 | 4,998 | -5,326 (-51.6%) |
+| Workflow-patterns skill discovery | 0 | 690 | +690 |
+| Ordinary workflow-owned always-on total | 10,324 | 6,544 | -3,780 (-36.6%) |
 
-The candidate also records 67,089 bytes across 27 on-demand skill files. Six representative authoring profiles have a median of 11,662 bytes. `docs/workflow-context-surfaces.json` is the generated, release-checked source for candidate measurements.
+The candidate also records 94,014 bytes across 29 on-demand skill files. Six representative authoring profiles have a median of 13,093.5 bytes. `docs/workflow-context-surfaces.json` is the generated, release-checked source for candidate measurements. All byte counts are LF-basis and release-checked; they were re-baselined when the release gate normalized hashes for CRLF, so they match the generated JSON exactly.
 
 ## Post-tuning comprehension validation
 

@@ -12,6 +12,10 @@ A checkpoint consumes an agent slot but no tokens. A workflow invocation is back
 
 Checkpoint answers are journaled and can replay during an unchanged resume prefix. Do not describe checkpoints as guaranteed arbitrary forms or as remote steering.
 
+## Phase state and gating
+
+When the host wires a persisted phase-state machine (`runWorkflow({ phaseState })`), `phase(title, { stage })` may additionally declare a deterministic stage `0|1|2|3`. Transitions are forward-only: a backward declaration fails the run with `PHASE_TRANSITION_INVALID` at the next flush point. With agent gating enabled (default), an `agent()` call before stage 3 with human approval throws `SUBAGENT_SPAWN_BLOCKED` (recoverable: false) instead of running. A gated checkpoint records submission and, on approval, human approval. Plain scripts without the integration ignore `stage` entirely.
+
 ## Retry and recoverable failure
 
 Recoverable execution failures retry according to the per-agent option or invocation-time tool input, then return `null`. Nonrecoverable failures throw without becoming `null`. The logical `retry()` combinator is separate: it performs new agent calls and returns its last result when exhausted unless the script records and handles that outcome.
@@ -30,7 +34,7 @@ The runtime blocks common accidental nondeterminism, but this is not a security 
 
 ## Nesting and shared state
 
-`workflow(savedName, childArgs)` runs sequentially inline, allows one nested level, and shares limiter, counters, token accounting, and shared store with the parent. It is not independent capacity. Use only a saved-workflow name provided by context; do not guess registry entries or pass raw scripts as a new authoring pattern even where compatibility behavior accepts them.
+`workflow(savedName, childArgs)` runs sequentially inline, allows one nested level, and shares limiter, counters, token accounting, and shared store with the parent. It is not independent capacity. Use only a saved-workflow name provided by context; do not guess registry entries or pass raw scripts as a new authoring pattern even where compatibility behavior accepts them. A saved workflow may declare typed parameters (string/number/integer/boolean/array, optional `required`/default); launching it by name via the `workflow` tool's `name` input or a saved-workflow command coerces and validates the args — missing required params and type mismatches throw descriptive errors, and declared defaults fill omitted keys. `/workflows save` derives that parameter schema from the run's args.
 
 ## Serialization
 

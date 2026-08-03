@@ -78,7 +78,7 @@ return await agent(
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
-- **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`.
+- **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`. Worktrees live at `<repoRoot>/.pi/worktrees/<id>` on branch `pi/wf/<id>`; edits are always finalized (`git add -A` + `git commit --allow-empty`) before teardown, then discarded unless `keepWorktree` is set; leftovers from crashed runs are swept at startup.
 - **Measured usage** — report real tokens and cost from each subagent session; add run, phase, or agent budgets only when you want them.
 - **Visible background runs** — track phases, agents, models, fresh/cache tokens, cost, and live tok/s from the progress panel or `/workflows` navigator.
 - **Quality patterns** — compose `verify()`, `judgePanel()`, `loopUntilDry()`, and `completenessCheck()` instead of rebuilding review loops.
@@ -147,6 +147,8 @@ The installed extension generates this compact index from its executable capabil
 /code-review 42
 ```
 
+Diff fetches for `/code-review` time out after 60 s (hard kill) and surface a clear error instead of hanging.
+
 For an always-on exhaustive mode, use `/ultracode`; `/effort high` is the lighter standing option.
 
 These same 5 patterns — plus the name-only built-ins `plan-then-execute` (decompose an objective into dependency-ordered, verified steps) and `spec-generation` (draft and adversarially review a specification) — are also reachable by name without a slash command. Pi can recognize a decomposable request and run the matching curated pattern directly:
@@ -161,20 +163,24 @@ is equivalent to `/deep-research "..."`. A saved workflow always wins over a bui
 
 Pi can manage background runs directly with the `workflow_control` tool instead of asking you to type a command. It supports `list`, `status`, `pause`, `resume`, and `stop`; run-specific actions use the canonical run ID returned when the workflow starts. Status output includes the run state, current phase, agent counts, active labels, and recorded token total.
 
+`list`/`status` read persisted run state, so runs from before a restart (paused/stopped) show correctly.
+
 | Command | Purpose |
 | --- | --- |
 | `/workflows` | Open the interactive run navigator |
 | `/workflows run <prompt>` | Arm workflow mode for a prompt even when keyword triggering is off |
-| `/workflows status <id>` | Watch a run and print its result when complete |
+| `/workflows status <id>` | Watch a run; the final snapshot reports the truthful state (failed / stopped / paused-resumable) |
 | `/workflows pause\|resume\|stop\|rm <id>` | Control a run |
 | `/workflows save <name>` | Save the latest script as a reusable command |
 | `/workflows-trigger off\|on\|status` | Control automatic keyword triggering |
 | `/workflows-trigger set <word>\|reset` | Set or reset the trigger word |
 | `/workflows-progress compact\|detailed\|status\|max <N>` | Live-panel detail level (and max agents shown per phase in detailed mode) |
-| `/workflows-models` | Map model tiers and thinking levels |
+| `/workflows-models` | Map model tiers and thinking levels (with a per-tier cost preview) |
 | `/workflows-gateway start\|stop\|status` | Lazily start/stop the host tool IPC gateway (MCPBridge) — see below |
 | `/ultracode [off]` | Toggle exhaustive automatic workflows |
 | `/effort off\|high\|ultra` | Set the standing orchestration effort |
+
+Saved workflows can declare typed parameters (string/number/integer/boolean/array): launching by name coerces and validates args (missing-required and type errors throw), `/<name> --help` prints the schema, and `/workflows save` derives the schema from the run's args.
 
 In the navigator: `↑/↓` select · `enter/→` open · `esc/←` back · `p` pause · `x` stop · `r` restart · `s` save · `q` quit.
 
@@ -190,7 +196,11 @@ Subagents never load host extensions by default (see “Upgrading past 3.2”); 
 
 Nothing starts on extension load; `status` reports `STOPPED` until you run `start`. Once running, a run opts in explicitly by naming the `host-tools` toolset at run level — `executeRun({ toolset: "host-tools" })`, the `workflow` tool with a saved/built-in workflow that carries a toolset tag, or direct `runWorkflow({ tools })`. Those subagents receive proxied definitions that forward each tool call back to the host. A run that opts in while the gateway is stopped fails loudly at call time instead of silently dropping the tools.
 
+The gateway authenticates every IPC connection with a per-bridge token; subagent processes connecting via `MCPProxyClient` must present `gateway.getAuthToken()` in their `auth.handshake` (missing → `AUTH_REQUIRED`, wrong → `AUTH_FAILED`).
+
 Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
+
+The detailed panel adds a live per-run `~$/s` estimate (output price × token rate), a spend-vs-budget bar when `tokenBudget` is set, and a session-aggregate 'estimated spend across N active runs' line. The `/workflows status` final snapshot reports the truthful state — 'Workflow failed' / 'Workflow stopped' / 'Workflow paused (resumable)' — never a generic 'completed'. Navigator delete/stop/overwrite actions confirm via `ui.confirm`.
 
 ## Runtime reference
 
@@ -206,12 +216,17 @@ Agent details use a compact summary by default: completed agents show their fina
 | `checkpoint(prompt, opts)` | Add a journaled human-approval gate |
 | `budget` | Inspect real tokens spent and remaining |
 
+Library callers can pass `checkpointGate`: `checkpoint()` then publishes its payload and waits — approve → `true` (or the declared `default`), deny/timeout → `false`; journaled replies replay on resume. `phaseState` persists `phase(title, { stage })` transitions to `.pi/workflows/active-state.json` (forward-only, `PHASE_TRANSITION_INVALID` on rollback) and gates `agent()` behind Phase 3 + human approval (`SUBAGENT_SPAWN_BLOCKED` at spawn; `APPROVAL_REQUIRED` on gated transitions). Journal entries can carry `operations: [{line, op, outcome}]`; the last failing operation is surfaced as `failingOperation` on `onAgentEnd`/error events and snapshots.
+
+**Human approval bridge** — `createPlannotatorBridge({ port: 3123, autoOpenBrowser, approvalTimeout })` serves `/sse` (all `update` events, 15 s heartbeat) and `/reviewed` (named `reviewed` events on settle); plans persist to `.pi/workflows/plans/<id>.json`. `waitForApproval(planId)` polls on a 250 ms bound and is AbortSignal-abortable; bind errors (EADDRINUSE) reject waits instead of crashing.
+
 | Agent option | Description |
 | --- | --- |
 | `tier` | `small`, `medium`, or `big` model routing |
 | `model` | Exact `provider/modelId` or `provider/modelId:thinking`; overrides `tier` |
 | `agentType` | Named role, tool, and model definition |
 | `isolation` | Use `"worktree"` for conflict-free parallel edits |
+| `keepWorktree` | Retain the finalized worktree+branch after the agent finishes |
 | `schema` | JSON Schema for a validated structured result |
 | `label` / `phase` | Display label and phase override |
 | `timeoutMs` / `retries` | Optional per-agent timeout and recoverable-failure retries |
@@ -252,7 +267,13 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 
 Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
 
-Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
+Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures.
+
+Newer run options: `drainTimeoutMs` (default 60 s) waits for un-awaited `agent()` calls after the script finishes, then aborts stragglers; `maxNestedWorkflowDepth` (default 1, clamp 1–8) caps workflow-in-workflow nesting; `preRunTypecheck` (default off) soft-fails `tsc --noEmit` before launch and never blocks when a toolchain is missing.
+
+Workflow tool inputs are range-validated at the boundary: `maxAgents` 1–1000, `concurrency` 1–16, `agentRetries` 0–3, `agentTimeoutMs`/`tokenBudget` ≥ 1; combining `name` + `script` throws. `settings.json` is schema-validated — malformed JSON, unknown keys, or wrong-typed values throw a named `ConfigError` naming the file instead of silently degrading.
+
+Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft pre-call gate, and a project-level override of `null` cancels a global budget.
 
 A schema-less agent call that comes back as whitespace-only text is a recoverable `AGENT_EMPTY_OUTPUT` failure and retries like any other. Some models occasionally hit this on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run.
 
@@ -278,6 +299,14 @@ Pi's `/reload` keeps the live workflow manager in-process when the installed ext
 On any shutdown the extension deterministically disposes the resources it owns: the usage-limit scheduler's timers, the host-tool gateway (ending its MCP bridge socket), and any on-demand review bridge (its `close()` ends open SSE responses and closes the server). The handoff is idempotent — a double-fired shutdown cannot double-close or re-stage the same generation.
 
 Finished runs (completed, failed, or aborted) are retained in full on disk, capped at the 300 most recent per project — older ones are evicted first, and a running or paused run is never touched. Only a smaller number (20 by default) also stay fully loaded in memory for instant access right after they finish; older finished runs still show up in `/workflows` and `workflow_control list`, just read back from disk instead of memory. Library embedders can tune both caps — `maxTerminalRunsInMemory` on `WorkflowManager` and `maxTerminalRunsOnDisk` on the run-persistence layer.
+
+Journals keep at most 50,000 entries (oldest are dropped and re-run live on resume) and the persisted journal is capped at 32 MiB. Run JSON is scrubbed on disk for provider keys, `KEY=value` env pairs, Bearer/Basic/JWT/PEM secrets, and token prefixes (`sk-`, `ghp_`, `xox-`). Run leases carry a 30-minute TTL refreshed by heartbeat, so a crashed or hung owner (even with a reused pid) is reclaimable.
+
+SDK callers may pass `compactJournal: true` on `runWorkflow`/`WorkflowManager.exec` (default off): resolved journal entries are interned into a summary only when reconstruction reproduces the journal byte-identically and the file shrinks — lossless, frozen at run start, carried across resume.
+
+The shared store (`store_put`) is bounded at 10k keys / 8 MiB total / 1 MiB per value with FIFO eviction (oldest first, never the key being written); non-serializable values throw `TypeError`, oversized ones `RangeError` — rejected values never land in the store.
+
+Completed-run result text no longer appends a resume hint; a failed or paused run's delivery carries one and names the `resumableRunId` to continue from. In-memory run logs are a ring buffer capped at 1,000 entries (persisted file logs are uncapped), and a throwing `onLog` sink never breaks the run.
 
 </details>
 
@@ -320,6 +349,13 @@ Unparseable, out-of-range, or unknown values are silently ignored (the same leni
 ```bash
 PI_WORKFLOW_DEFAULT_CONCURRENCY=8 PI_WORKFLOW_PERSIST_AGENT_SESSIONS=false pi
 ```
+
+</details>
+
+<details>
+<summary><strong>Web tools</strong></summary>
+
+`web_search` clamps `count` to 1–10 (default 6) and falls back to Bing RSS when the HTML scrape yields nothing; bodies are byte-capped (search 1 MiB) and the 15 s deadline aborts the in-flight request. `web_fetch`/`web_search` block SSRF targets (loopback/private/literal-IP unless allowlisted via `allowedHosts`), validate redirects (≤5 hops), cap content at 512 KiB, wrap fetched content in untrusted delimiters, and cache URLs across runs for 5 minutes.
 
 </details>
 

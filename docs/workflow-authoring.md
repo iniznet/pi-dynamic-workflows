@@ -45,3 +45,34 @@ See [Workflow prompt guidance rationale](workflow-prompt-guidance-rationale.md) 
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 | dryRun | workflow-tool-input | `dryRun?: boolean = false` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+
+## Run options outside the tool schema
+
+These options are SDK-level (`runWorkflow` / `WorkflowManager.exec`), not tool inputs or globals:
+
+- `drainTimeoutMs` (default 60 s): after the script finishes, the run waits up to this for un-awaited `agent()` calls, then aborts them.
+- `maxNestedWorkflowDepth` (default 1, clamped 1–8): recursion ceiling for nested `workflow()` calls.
+- `preRunTypecheck` (default off): soft-fail `tsc --noEmit` on the script before launch.
+- `compactJournal` (default off): resolved journal segments are replaced by a lossless summary only if reconstruction reproduces the original byte-identically; the option is frozen at run start and carried across resume.
+- `checkpointGate` / `phaseState`: `checkpoint()` publishes and waits for a verdict — approve → `true` (or the declared default for input/select), deny/timeout → `false`; journaled replies replay on resume without re-contacting the gate. `phase(title, {stage})` queues forward-only transitions; gated `agent()` throws `SUBAGENT_SPAWN_BLOCKED` before Phase 3 + human approval.
+- `onRetrySpend(spend)`: receives a full `AgentUsage` breakdown on each retry spend.
+
+The terminating structured-output tool renders its call and captured payload in the TUI (`renderCall`/`renderResult`).
+
+Agent option not in the contract table: `keepWorktree` — edits are always finalized (`git add -A` + `commit --allow-empty`); with it the branch+path are retained, otherwise discarded. Worktrees live at `<repoRoot>/.pi/worktrees/<id>` (branch `pi/wf/<id>`); leftovers from crashed runs are swept at startup.
+
+## Persistence
+
+Persisted runs keep `checkpoints[]` separate from the operation journal (legacy journal-shaped checkpoints are read back transparently). The journal is capped (50,000 entries / 32 MiB budget; oldest dropped and re-run live on resume), and persisted run JSON is scrubbed of secrets.
+
+## Error codes
+
+`WorkflowError.code` is inspectable: `PHASE_TRANSITION_INVALID` (-31001), `SUBAGENT_SPAWN_BLOCKED` (-31002, recoverable: false — thrown by a gated `agent()` spawn, not `UNKNOWN`), `APPROVAL_REQUIRED` (-31003).
+
+## Phase modules (library surface)
+
+Beyond the phase gates above, the package ships the Phase 0–2 planning modules as exported library APIs:
+
+- **Wayfinder (Phase 0)** — `assessPrompt()` replaces a numeric clarity score with a statable-question fog gate (`{ isFoggy, questions[] }`); decision maps persist to `.pi/workflows/map.md` (markdown index) with a `map.json` sidecar, and the ticket lifecycle (`beginSession`, `resolveTicket`/`blockTicket`/`unblockTicket`, one ticket per session) refuses cycle-closing blocking edges and never lets a resolved ticket revert to blocked.
+- **Prewalk (Phase 1)** — `generateBlueprint(codebaseSummary, task)` produces a validated execution blueprint (preconditions / steps / fail-safe procedures / verification tests, capped at 6/8/4/4 items) saved to `.pi/workflows/blueprints/<id>.json`; `loadBlueprint` picks the newest.
+- **Plannotator bridge (Phase 2)** — `createPlannotatorBridge(...)` serves the human approval gate over HTTP (`/sse` updates with heartbeat, `/reviewed` on settle); see the README's runtime reference for usage.

@@ -2,7 +2,7 @@
 
 This document preserves the decision-by-decision record behind the workflow tool's compact model guidance. It records each reviewed insertion, removal, and compaction with its reasoning, evidence, and confidence.
 
-## Current placement in 3.0.0
+## Current placement (3.5.0)
 
 The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to authorization and established one always-on workflow gate. The current implementation preserves that gate and its background-delivery behavior while applying the concision decisions recorded below.
 
@@ -432,6 +432,8 @@ Guideline count does not measure prompt size or clarity. Five arbitrarily long b
 Rendered system-prompt bytes and provider-visible tool-definition bytes remain useful audit measurements, but they should not become byte-level test ratchets. Prompt quality depends on what each surface teaches and where the contract belongs, not on freezing an incidental serialized size.
 
 Exact-copy tests also remain inappropriate for prose that may receive harmless editorial improvements. Intent, placement, absence, and runtime behavior provide the regression signals; surface sizes may be reported during review as evidence without becoming pass/fail thresholds.
+
+Follow-up: the release gate later added byte-budget ratchets for the provider-visible tool definition and context-surface baselines. Those gate serialized-size regressions at release time; the guideline-count test prohibition above remains limited to prompt-guidance tests.
 
 #### Confidence
 

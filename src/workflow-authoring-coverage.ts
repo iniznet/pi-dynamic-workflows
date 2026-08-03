@@ -46,7 +46,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "13b710424bc262a3951e9ad8f7387cdf4d630b89f27c07bbcbc6b47c37e24242",
+    sha256: "840accc31a67f74c724bf5f7ba5b17c03ff6fb159dd844f087b4cbf3f3445de9",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -54,11 +54,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "b08bcdf14a3b1ae9bce45dd3b7bcd4df1c25039c6fa55bdffbbde3b0449d4807",
+    sha256: "9bc32e8fd065b2834d30984a43fc0b7e9fde08899f66bcbaabaddef4a83ac4bf",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "3ff602c61453400396767d23bf0a50b4b04fd6777678860b72780229e48fbcd4",
+    sha256: "6cff8c149e014440561441a0a24cda13e21eb9176a3c4503c7b6129d248666be",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -78,7 +78,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/debugging.md",
-    sha256: "f84ad7be4d2a375ce9ed38b0cdd130e2da43611dc8e9894e30a69b16ac30ee24",
+    sha256: "cecf210ffebdeecf8635c5cbda4189207b04e735c52d5805ae19deee7e63971b",
   },
   {
     path: "skills/workflow-authoring/examples/classify-and-act.js",

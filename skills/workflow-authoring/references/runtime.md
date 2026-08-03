@@ -12,7 +12,7 @@ The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/contro
 
 - `parallel()` takes thunks, runs independent work, and preserves input order. Await the whole array before whole-set synthesis.
 - `pipeline()` runs stages sequentially per item while items proceed concurrently. Each stage receives `(previousValue, originalItem, index)` and forwards `null` to the next stage, so guard missing coverage first.
-- `workflow(name, childArgs?)` runs a context-supplied saved workflow. Nesting is one level and shares limits, counters, tokens, and store.
+- `workflow(name, childArgs?)` runs a context-supplied saved workflow. Nesting is one level and shares limits, counters, tokens, and store; `childArgs` are passed through as-is. Typed-parameter coercion and validation happen on the host-side `name` launch (the `workflow` tool's `name` input or a saved-workflow command), not inside scripts.
 
 ## Data and failure
 
