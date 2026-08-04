@@ -46,6 +46,7 @@ import {
 import { McpToolsManager } from "../src/subagent/mcp-tools.js";
 import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
 import { createVendoredChromeTools } from "../src/subagent/vendored-chrome-tools.js";
+import { guardWorktreeWriteConflicts } from "../src/workflow-status.js";
 
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and /workflows command. Pi loads
@@ -103,12 +104,17 @@ export default function extension(pi: ExtensionAPI) {
     // + settings.excludeSubagentTools). A future SDK's getAllToolDefinitions()
     // would merge extension-registered tools automatically; on 0.83.0 it is
     // absent, so MCP tools are metadata-only and never advertised (logged).
+    // G7: the host write-tool seam — wrap the merged bundle so a main-session
+    // (or proxied) edit targeting a file claimed by an active worktree queues
+    // or blocks with a structured JSON tool error; read-only ops pass through.
     buildHostTools: () =>
-      buildMergedHostTools(pi, {
-        cwd,
-        sessionManager: () => hostSessionManager(),
-        excludeSubagentTools: settings.excludeSubagentTools,
-      }),
+      guardWorktreeWriteConflicts(
+        buildMergedHostTools(pi, {
+          cwd,
+          sessionManager: () => hostSessionManager(),
+          excludeSubagentTools: settings.excludeSubagentTools,
+        }),
+      ),
     buildCodingTools: () => createCodingTools(cwd),
   });
   // SUBAGENT MCP WIRE: the extension-owned MCP client reads the user's
@@ -276,12 +282,16 @@ export default function extension(pi: ExtensionAPI) {
   // stated in the command copy; the "off" escape hatch gets the legacy
   // opt-in-only phrasing.
   registerWorkflowGatewayCommand(pi, hostToolGateway, {
+    // Same G7 guard as the policy bundle above — the /workflows-gateway start
+    // path must not bypass the write-conflict interceptor.
     buildHostTools: () =>
-      buildMergedHostTools(pi, {
-        cwd,
-        sessionManager: () => hostSessionManager(),
-        excludeSubagentTools: settings.excludeSubagentTools,
-      }),
+      guardWorktreeWriteConflicts(
+        buildMergedHostTools(pi, {
+          cwd,
+          sessionManager: () => hostSessionManager(),
+          excludeSubagentTools: settings.excludeSubagentTools,
+        }),
+      ),
     hostToolsAutomatic: hostToolsPolicy.isEnabled(),
   });
   // "on" (opt-in): eager start at load for latency-sensitive users. The

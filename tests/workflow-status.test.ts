@@ -8,14 +8,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import type { HostToolsBundle } from "../src/gateway/host-tool-gateway.js";
+import type { ToolCallResult, ToolExecutor } from "../src/gateway/types.js";
 import { createRunPersistence, type PersistedRunState } from "../src/run-persistence.js";
 import {
   acquireFileLock,
   checkFileConflict,
   getWorkflowStatus,
+  guardWorktreeWriteConflicts,
   listRunningWorkflows,
   releaseFileLock,
   renewFileLock,
+  WORKFLOW_WRITE_TOOL_NAMES,
+  WORKTREE_CONFLICT_BLOCK_CODE,
 } from "../src/workflow-status.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -299,6 +304,130 @@ describe("listRunningWorkflows", () => {
     withStatusEnv(async (dir) => {
       createRunPersistence(dir).save(makeRunState("run-done", "failed"));
       assert.deepEqual(await listRunningWorkflows(), []);
+    }),
+  );
+});
+
+describe("worktree write-conflict interceptor", () => {
+  /** Build a host bundle whose executors are plain, observable stubs. */
+  function makeHostBundle(executors: Record<string, ToolExecutor>): HostToolsBundle {
+    return {
+      tools: new Map(Object.entries(executors)),
+      toolDefs: Object.keys(executors).map((name) => ({
+        name,
+        description: `test ${name}`,
+        inputSchema: { type: "object" },
+        source: "host" as const,
+      })),
+    };
+  }
+
+  it(
+    "blocks a main-session edit on a file claimed by an active worktree with the structured JSON error",
+    withStatusEnv(async () => {
+      await acquireFileLock("src/claimed.ts", "run-1", "task-7");
+      let editCalled = false;
+      const guarded = guardWorktreeWriteConflicts(
+        makeHostBundle({
+          edit: async () => {
+            editCalled = true;
+            return { content: "edited", isError: false };
+          },
+        }),
+        { waitMs: 0 },
+      );
+      const result = await (guarded.tools.get("edit") as ToolExecutor)({ path: "src/claimed.ts" });
+      assert.equal(result.isError, true, "a claimed-file edit must surface as an error result");
+      assert.equal(editCalled, false, "the inner editor must never run for a blocked edit");
+      const payload = JSON.parse(result.content) as Record<string, unknown>;
+      assert.equal(payload.error, "file_locked_by_worktree");
+      assert.equal(payload.code, WORKTREE_CONFLICT_BLOCK_CODE);
+      assert.equal(payload.filePath, "src/claimed.ts");
+      assert.equal(payload.runId, "run-1");
+      assert.equal(payload.taskId, "task-7");
+      assert.match(payload.message as string, /workflow run 'run-1'/);
+      assert.match(payload.message as string, /task 'task-7'/);
+    }),
+  );
+
+  it(
+    "leaves read-only executors untouched and free to run on claimed files",
+    withStatusEnv(async () => {
+      await acquireFileLock("src/claimed.ts", "run-1", "task-7");
+      const readInner: ToolExecutor = async (args) => ({ content: `read ${args.path}`, isError: false });
+      const guarded = guardWorktreeWriteConflicts(
+        makeHostBundle({
+          read: readInner,
+          edit: async () => ({ content: "x", isError: false }),
+        }),
+      );
+      assert.equal(guarded.tools.get("read"), readInner, "read executor must keep its identity");
+      const result = await (guarded.tools.get("read") as ToolExecutor)({ path: "src/claimed.ts" });
+      assert.equal(result.isError, false);
+      assert.equal(result.content, "read src/claimed.ts");
+    }),
+  );
+
+  it(
+    "does not fire for unclaimed files and creates no lock",
+    withStatusEnv(async () => {
+      let editCalled = false;
+      const guarded = guardWorktreeWriteConflicts(
+        makeHostBundle({
+          edit: async (args) => {
+            editCalled = true;
+            return { content: `edited ${args.path}`, isError: false };
+          },
+          write: async () => ({ content: "written", isError: false }),
+        }),
+        { waitMs: 0 },
+      );
+      const editResult = await (guarded.tools.get("edit") as ToolExecutor)({ path: "src/free.ts" });
+      assert.equal(editResult.isError, false);
+      assert.equal(editResult.content, "edited src/free.ts");
+      assert.equal(editCalled, true, "an unclaimed edit must reach the inner executor");
+      assert.deepEqual(await checkFileConflict("src/free.ts"), { locked: false });
+      const writeResult = await (guarded.tools.get("write") as ToolExecutor)({ path: "src/other.ts" });
+      assert.equal(writeResult.isError, false);
+      assert.equal(writeResult.content, "written");
+    }),
+  );
+
+  it(
+    "queues behind a live holder and proceeds once it releases, leaving no interactive lock",
+    withStatusEnv(async () => {
+      await acquireFileLock("src/queued.ts", "run-1", "task-1", 5000);
+      setTimeout(() => void releaseFileLock("src/queued.ts", "run-1"), 120);
+      let editCalled = false;
+      const guarded = guardWorktreeWriteConflicts(
+        makeHostBundle({
+          edit: async () => {
+            editCalled = true;
+            return { content: "edited", isError: false };
+          },
+        }),
+        { waitMs: 2000, pollIntervalMs: 20 },
+      );
+      const result = await (guarded.tools.get("edit") as ToolExecutor)({ path: "src/queued.ts" });
+      assert.equal(result.isError, false, "the edit must proceed once the holder releases");
+      assert.equal(editCalled, true);
+      assert.deepEqual(await checkFileConflict("src/queued.ts"), { locked: false });
+    }),
+  );
+
+  it(
+    "wraps only the declared write tool names and shares every other executor",
+    withStatusEnv(async () => {
+      const inner: ToolExecutor = async () => ({ content: "ok", isError: false }) as ToolCallResult;
+      const guarded = guardWorktreeWriteConflicts(
+        makeHostBundle({ edit: inner, write: inner, grep: inner, ls: inner, read: inner }),
+      );
+      assert.deepEqual([...guarded.tools.keys()].sort(), [...WORKFLOW_WRITE_TOOL_NAMES, "grep", "ls", "read"].sort());
+      for (const name of ["grep", "ls", "read"]) {
+        assert.equal(guarded.tools.get(name), inner, `${name} must keep its original executor`);
+      }
+      assert.notEqual(guarded.tools.get("edit"), inner, "edit must be wrapped");
+      assert.notEqual(guarded.tools.get("write"), inner, "write must be wrapped");
     }),
   );
 });

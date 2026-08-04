@@ -4,6 +4,10 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+// Type-only: erased at compile, so the lock module gains no runtime dependency
+// on the gateway layer (same pattern as subagent-host-tools.ts).
+import type { HostToolsBundle } from "./gateway/host-tool-gateway.js";
+import type { ToolExecutor } from "./gateway/types.js";
 import { createRunPersistence, type PersistedRunState, type RunStatus } from "./run-persistence.js";
 import { safeSetTimeout } from "./timing.js";
 
@@ -304,4 +308,134 @@ export async function checkFileConflict(
   const lock = await readActiveLock(lockPathFor(filePath), Date.now());
   if (lock) return { locked: true, runId: lock.runId, taskId: lock.taskId };
   return { locked: false };
+}
+
+// ---------------------------------------------------------------------------
+// Worktree write-conflict interceptor (PRD Task 9, audit G7)
+// ---------------------------------------------------------------------------
+// The host bundle's write executors are wrapped so a main-session (or proxied)
+// edit targeting a file claimed by an active worktree queues behind the holder
+// (bounded) or blocks with a structured JSON tool error naming the run/task.
+// Read-only executors are never touched. Lock keys are exact-string, so the
+// caller must claim with the same path spelling the guard checks with.
+
+/** Host-bundle tool names that mutate files; everything else is left untouched. */
+export const WORKFLOW_WRITE_TOOL_NAMES: readonly string[] = ["edit", "write"];
+
+/** How long an edit may queue behind a live worktree holder before blocking. */
+export const DEFAULT_WORKTREE_CONFLICT_WAIT_MS = 5000;
+
+/** Stable machine-readable code carried by the structured block error. */
+export const WORKTREE_CONFLICT_BLOCK_CODE = "FILE_LOCKED_BY_WORKTREE";
+
+/** Lock owner recorded when this seam takes over a freed/expired lock. */
+const INTERACTIVE_SESSION_OWNER = { runId: "interactive-session", taskId: "manual-edit" };
+
+/** Queue/owner knobs for {@link guardWorktreeWriteConflicts}. */
+export interface WorktreeWriteGuardOptions {
+  /** Bounded wait behind a live holder (0/omitted = default 5s). */
+  waitMs?: number;
+  /** Poll interval while waiting for a live holder to release or expire. */
+  pollIntervalMs?: number;
+  /** TTL for the lock this seam acquires while performing the guarded edit. */
+  lockTtlMs?: number;
+  /** Run identity recorded when the seam takes over a freed lock. */
+  ownerRunId?: string;
+  /** Task identity recorded when the seam takes over a freed lock. */
+  ownerTaskId?: string;
+}
+
+/** Structured JSON tool-error payload naming the conflicting worktree run/task. */
+export interface WorktreeConflictBlockPayload {
+  error: "file_locked_by_worktree";
+  code: string;
+  filePath: string;
+  runId?: string;
+  taskId?: string;
+  message: string;
+}
+
+/**
+ * Build the structured block payload for a claimed file. Pure and deterministic
+ * so tests can assert on the exact shape without driving a real lock.
+ */
+export function buildWorktreeConflictBlockError(
+  filePath: string,
+  conflict: { runId?: string; taskId?: string },
+): WorktreeConflictBlockPayload {
+  const owner = conflict.runId ? `workflow run '${conflict.runId}'` : "an active workflow run";
+  const task = conflict.taskId ? ` (task '${conflict.taskId}')` : "";
+  return {
+    error: "file_locked_by_worktree",
+    code: WORKTREE_CONFLICT_BLOCK_CODE,
+    filePath,
+    runId: conflict.runId,
+    taskId: conflict.taskId,
+    message:
+      `File '${filePath}' is claimed by ${owner}${task}; ` +
+      "the edit was blocked to avoid racing the worktree subagent. " +
+      "Wait for the run to finish, or retry once the file lock expires.",
+  };
+}
+
+/** Resolve guard options onto their defaults. */
+function resolveGuardOptions(options: WorktreeWriteGuardOptions): Required<WorktreeWriteGuardOptions> {
+  return {
+    waitMs: options.waitMs ?? DEFAULT_WORKTREE_CONFLICT_WAIT_MS,
+    pollIntervalMs: options.pollIntervalMs ?? 100,
+    lockTtlMs: options.lockTtlMs ?? DEFAULT_LOCK_TTL_MS,
+    ownerRunId: options.ownerRunId ?? INTERACTIVE_SESSION_OWNER.runId,
+    ownerTaskId: options.ownerTaskId ?? INTERACTIVE_SESSION_OWNER.taskId,
+  };
+}
+
+/**
+ * Wrap one host write executor with the conflict check → bounded queue →
+ * block flow. The acquired lock is held only for the duration of the edit, so
+ * the check→write window cannot race a concurrent claimer, and a success never
+ * leaves a stale interactive-session lock behind.
+ */
+function createGuardedWriteExecutor(inner: ToolExecutor, options: Required<WorktreeWriteGuardOptions>): ToolExecutor {
+  return async (args, signal) => {
+    const filePath = typeof args?.path === "string" && args.path.length > 0 ? args.path : undefined;
+    if (!filePath) return inner(args, signal);
+    const conflict = await checkFileConflict(filePath);
+    // Unclaimed file: the interceptor does not fire, and no lock is created.
+    if (!conflict.locked) return inner(args, signal);
+    // Claimed by an active worktree: queue behind the holder (bounded wait;
+    // reclaims an expired/stale holder), then proceed while we own the lock.
+    const acquired = await acquireFileLock(filePath, options.ownerRunId, options.ownerTaskId, options.lockTtlMs, {
+      waitMs: options.waitMs,
+      pollIntervalMs: options.pollIntervalMs,
+    });
+    if (!acquired) {
+      return {
+        content: JSON.stringify(buildWorktreeConflictBlockError(filePath, conflict), null, 2),
+        isError: true,
+      };
+    }
+    try {
+      return await inner(args, signal);
+    } finally {
+      await releaseFileLock(filePath, options.ownerRunId);
+    }
+  };
+}
+
+/**
+ * Wrap a host tool bundle so its write executors are conflict-guarded. Returns
+ * a new bundle sharing toolDefs; non-write executors keep their original
+ * references (read-only operations are unaffected).
+ */
+export function guardWorktreeWriteConflicts(
+  bundle: HostToolsBundle,
+  options: WorktreeWriteGuardOptions = {},
+): HostToolsBundle {
+  const resolved = resolveGuardOptions(options);
+  const tools = new Map(bundle.tools);
+  for (const name of WORKFLOW_WRITE_TOOL_NAMES) {
+    const inner = bundle.tools.get(name);
+    if (inner) tools.set(name, createGuardedWriteExecutor(inner, resolved));
+  }
+  return { ...bundle, tools };
 }
