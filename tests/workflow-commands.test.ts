@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, normalize } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
+import { WorkflowStateManager } from "../src/phases/state-machine.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
@@ -665,6 +670,205 @@ test("/workflows save derives the arg schema from the run's args and wires /name
   assert.match(launch.script, /name: 'scan'/);
   assert.equal(launch.args.scope, "src/", "declared defaults replay the originating invocation");
   assert.equal(launch.args.depth, 2);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// implement — Phase 3 fan-out, gated on human approval (G1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Minimal git repo with identity + a base commit (worktree fixture). */
+function initRepo(prefix: string): string {
+  const repo = mkdtempSync(join(tmpdir(), prefix));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "t@t.t");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "file.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return repo;
+}
+
+/**
+ * Fixture for `/workflows implement`: writes the run's plan file at the
+ * canonical `.pi/workflows/plans/<runId>.json` path and drives the REAL phase
+ * machine into the gate-open state (Phase 3 + humanApproved).
+ */
+async function approvedImplementFixture(repo: string, runId: string, stepCount = 2): Promise<WorkflowStateManager> {
+  const plansDir = join(repo, ".pi", "workflows", "plans");
+  mkdirSync(plansDir, { recursive: true });
+  writeFileSync(
+    join(plansDir, `${runId}.json`),
+    JSON.stringify({
+      id: `bp-${runId}`,
+      title: `plan for ${runId}`,
+      preconditions: ["p"],
+      executionSteps: Array.from({ length: stepCount }, (_, i) => ({
+        id: `s${i}`,
+        description: `step ${i}`,
+        action: `action ${i}`,
+        expectedOutcome: "done",
+        rollbackProcedure: "revert",
+      })),
+      failSafeProcedures: ["fs"],
+      verificationTests: ["vt"],
+      createdAt: new Date().toISOString(),
+    }),
+    "utf-8",
+  );
+  const phaseState = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+  await phaseState.markWayfinderComplete();
+  await phaseState.markPrewalkComplete();
+  await phaseState.transitionTo(1);
+  await phaseState.transitionTo(2);
+  await phaseState.approvePlan();
+  await phaseState.transitionTo(3);
+  return phaseState;
+}
+
+test("/workflows implement without id warns usage", async () => {
+  const h = harness();
+  await h.run("implement");
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "warning");
+  assert.match(h.notified[0].message, /Usage: \/workflows implement/);
+});
+
+test("/workflows implement <id> errors when the run does not exist and never fans out", async () => {
+  let factoryCalls = 0;
+  const h = harness(
+    {},
+    {
+      cwd: "/tmp",
+      implementRunnerFactory: () => {
+        factoryCalls++;
+        return {
+          executeTasks: async () => [],
+          getTaskStatus: () => undefined,
+          cleanup: async () => {},
+          abort: () => {},
+        };
+      },
+    },
+  );
+  await h.run("implement run-missing");
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "error");
+  assert.match(h.notified[0].message, /No workflow run/);
+  assert.equal(factoryCalls, 0, "no fan-out without a run");
+});
+
+test("/workflows implement <id> refuses while humanApproved is false (no phase state = Phase 0)", async () => {
+  const repo = initRepo("wf-cmd-gate1-");
+  let factoryCalls = 0;
+  try {
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "completed" }) },
+      {
+        cwd: repo,
+        // A fresh state machine (no state file) reads defaults: Phase 0, no approval.
+        phaseState: new WorkflowStateManager(join(repo, ".pi", "workflows")),
+        implementRunnerFactory: () => {
+          factoryCalls++;
+          return {
+            executeTasks: async () => [],
+            getTaskStatus: () => undefined,
+            cleanup: async () => {},
+            abort: () => {},
+          };
+        },
+      },
+    );
+    await h.run("implement run-unapproved");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("implement blocked")),
+      "the Phase 3 + humanApproved gate must refuse an unapproved run",
+    );
+    assert.ok(
+      h.notified.some((n) => n.message.includes("Phase 3 with human approval")),
+      "the refusal names the missing gate",
+    );
+    assert.equal(factoryCalls, 0, "no fan-out while the approval gate is closed");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows implement <id> refuses in Phase 3 when the plan was never approved", async () => {
+  const repo = initRepo("wf-cmd-gate2-");
+  let factoryCalls = 0;
+  try {
+    // Phase 3 reached without approvePlan — humanApproved stays false.
+    const phaseState = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+    await phaseState.setState({ activePhase: 3, humanApproved: false });
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "completed" }) },
+      {
+        cwd: repo,
+        phaseState,
+        implementRunnerFactory: () => {
+          factoryCalls++;
+          return {
+            executeTasks: async () => [],
+            getTaskStatus: () => undefined,
+            cleanup: async () => {},
+            abort: () => {},
+          };
+        },
+      },
+    );
+    await h.run("implement run-unapproved");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("implement blocked")),
+      "Phase 3 alone is not enough — human approval is the gate",
+    );
+    assert.equal(factoryCalls, 0);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows implement <id> fans approved plan steps out into isolated worktrees", async () => {
+  const repo = initRepo("wf-cmd-impl-");
+  let factoryCalls = 0;
+  const receivedTasks: Array<{ id: string; branch?: string; worktreePath: string; repoRoot: string }> = [];
+  try {
+    const phaseState = await approvedImplementFixture(repo, "run-impl", 2);
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "completed" }) },
+      {
+        cwd: repo,
+        phaseState,
+        implementRunnerFactory: () => {
+          factoryCalls++;
+          return {
+            executeTasks: async (tasks: any[]) => {
+              receivedTasks.push(...tasks);
+              return tasks.map((t) => ({ taskId: t.id, success: true, output: "ok", duration: 5 }));
+            },
+            getTaskStatus: () => undefined,
+            cleanup: async () => {},
+            abort: () => {},
+          };
+        },
+      },
+    );
+    await h.run("implement run-impl");
+
+    assert.equal(factoryCalls, 1, "the runner factory supplies the production runner seam");
+    assert.equal(receivedTasks.length, 2, "one worktree task per blueprint execution step");
+    for (const [index, task] of receivedTasks.entries()) {
+      assert.equal(task.id, `run-impl-${index}`);
+      assert.match(task.branch ?? "", /^pi\/wf\//, "each task lands on its own worktree branch");
+      assert.ok(task.worktreePath.includes(join(".pi", "worktrees")), `task ${index} runs in an isolated worktree`);
+      assert.equal(normalize(task.repoRoot), normalize(repo));
+    }
+    assert.match(h.printed[0], /Implement run-impl: 2 task\(s\) from "plan for run-impl"/);
+    assert.match(h.printed[0], /✓ run-impl-0/);
+    assert.match(h.printed[0], /✓ run-impl-1/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

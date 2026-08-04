@@ -3,7 +3,10 @@
  * Shares the extension's single WorkflowManager so background runs are reachable.
  */
 
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { createWorktreeRunner, type WorktreeRunner, type WorktreeTask } from "./agent/worktree-runner.js";
 import {
   fmtFull,
   fmtTokenSegment,
@@ -14,6 +17,8 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
+import type { ExecutionBlueprint } from "./phases/prewalk.js";
+import { WorkflowStateManager } from "./phases/state-machine.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { parametersFromArgs, registerSavedWorkflow } from "./saved-commands.js";
 import { parseWorkflowScript } from "./workflow.js";
@@ -21,6 +26,7 @@ import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
+import { createWorktree } from "./worktree.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: "·",
@@ -44,7 +50,7 @@ const FINAL_EVENT_STATUS: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -61,6 +67,32 @@ function summarizeRun(run: PersistedRunState): string {
   const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   const tokens = segment ? ` · ${segment}` : "";
   return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
+}
+
+/** Deterministic, filesystem-safe slug for a blueprint step's worktree name. */
+function stepSlug(text: string): string {
+  return (
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 32) || "step"
+  );
+}
+
+/**
+ * Read the plan file for one run (`.pi/workflows/plans/<runId>.json`) — the
+ * exact path the Phase 1 prewalk stage writes and the Phase 2 gate reads, so
+ * `/workflows implement <runId>` fans out the SAME plan a human approved.
+ * Returns null for a missing/unreadable plan (caller reports it as an error).
+ */
+async function loadRunPlan(dir: string, runId: string): Promise<ExecutionBlueprint | null> {
+  try {
+    const raw = await readFile(join(dir, ".pi", "workflows", "plans", `${runId}.json`), "utf-8");
+    return JSON.parse(raw) as ExecutionBlueprint;
+  } catch {
+    return null;
+  }
 }
 
 function oneLineProgress(snapshot: WorkflowSnapshot): string {
@@ -161,6 +193,18 @@ export interface WorkflowCommandOptions {
   cwd?: string;
   /** Standing effort mode; when high/ultra, `/workflows run` carries its directive too. */
   effort?: EffortState;
+  /**
+   * Persisted phase-state machine for the `/workflows implement` gate. Defaults to a
+   * fresh WorkflowStateManager at `<cwd>/.pi/workflows` — the same active-state.json
+   * a PhaseStateIntegration-enabled workflow run writes, so the command reuses the
+   * canonical `canSpawnSubagents()` gate (Phase 3 + humanApproved) without plumbing.
+   */
+  phaseState?: WorkflowStateManager;
+  /**
+   * Test seam: replaces the real worktree runner so fan-out can be asserted
+   * without touching git. Production callers omit it.
+   */
+  implementRunnerFactory?: () => WorktreeRunner;
 }
 
 /** Register the `/workflows` command against the shared manager. Idempotent. */
@@ -178,7 +222,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/implement <id> | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -294,6 +338,66 @@ export function registerWorkflowCommands(
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
           ctx.ui.notify(ok ? `Resumed ${id}` : `Resume not available for ${id} yet`, ok ? "info" : "warning");
+          return;
+        }
+        case "implement": {
+          if (!id) return ctx.ui.notify("Usage: /workflows implement <runId>", "warning");
+          const run = manager.getRun(id);
+          if (!run) {
+            ctx.ui.notify(`No workflow run "${id}"`, "error");
+            return;
+          }
+          const cwd = opts.cwd ?? process.cwd();
+          // Phase 3 fan-out gate (G1): reuse the persisted phase machine's
+          // canSpawnSubagents() — Phase 3 active AND humanApproved. The state
+          // file is the same one a PhaseStateIntegration run writes, so an
+          // unapproved run is refused here exactly as the gate would refuse it
+          // inside agent(). No state file → defaults (phase 0) → refused.
+          const phaseState = opts.phaseState ?? new WorkflowStateManager(join(cwd, ".pi", "workflows"));
+          await phaseState.getState();
+          if (!phaseState.canSpawnSubagents()) {
+            ctx.ui.notify(
+              `implement blocked for ${id}: subagent fan-out requires Phase 3 with human approval (approve the plan in Phase 2 first).`,
+              "warning",
+            );
+            return;
+          }
+          const blueprint = await loadRunPlan(cwd, id);
+          if (!blueprint) {
+            ctx.ui.notify(`No plan found for run ${id} — run a Phase 1 prewalk first.`, "error");
+            return;
+          }
+          if (!blueprint.executionSteps?.length) {
+            ctx.ui.notify(`Blueprint "${blueprint.title}" has no execution steps to implement`, "error");
+            return;
+          }
+          // One isolated worktree per blueprint execution step, then fan out
+          // through the shared runner. Prose-only steps carry no authored spec,
+          // so their protocol honestly reports what it cannot mechanically do.
+          const tasks: WorktreeTask[] = [];
+          for (const [index, step] of blueprint.executionSteps.entries()) {
+            const wt = await createWorktree(cwd, `${id}-${index}-${stepSlug(step.action)}`);
+            tasks.push({
+              id: `${id}-${index}`,
+              description: `${step.description} — ${step.action}`,
+              branch: wt.branch ?? `pi/wf/${id}-${index}`,
+              worktreePath: wt.cwd,
+              repoRoot: wt.repoRoot ?? cwd,
+              status: "pending",
+            });
+          }
+          const runner = opts.implementRunnerFactory ? opts.implementRunnerFactory() : createWorktreeRunner({});
+          const results = await runner.executeTasks(tasks);
+          await print(
+            [
+              `Implement ${id}: ${results.length} task(s) from "${blueprint.title}"`,
+              ...results.map((r) =>
+                r.success
+                  ? `✓ ${r.taskId} — verified commit in ${r.duration}ms`
+                  : `✗ ${r.taskId} — failed: ${r.output.slice(0, 240)}`,
+              ),
+            ].join("\n"),
+          );
           return;
         }
         case "rm": {
