@@ -354,6 +354,26 @@ export class WorkflowStateManager {
    * Only valid when the active phase is exactly 2.
    * Throws APPROVAL_REQUIRED if called from any other phase.
    */
+  /**
+   * Record that the Phase 0 wayfinder step completed — the prerequisite for
+   * entering Phase 1 (prewalk). Set by the run-entry pipeline once the
+   * decision map's fog is dissolved (or the prompt was never foggy);
+   * PHASE_PREREQUISITES[1] gates on this flag.
+   */
+  async markWayfinderComplete(): Promise<void> {
+    await this.setState({ wayfinderComplete: true });
+  }
+
+  /**
+   * Record that the Phase 1 prewalk step produced a blueprint — the
+   * prerequisite for entering Phase 2 (plannotator review). Set by the
+   * run-entry pipeline after the blueprint lands in
+   * `.pi/workflows/plans/<run-id>.json`; PHASE_PREREQUISITES[2] gates on it.
+   */
+  async markPrewalkComplete(): Promise<void> {
+    await this.setState({ prewalkComplete: true });
+  }
+
   async approvePlan(): Promise<void> {
     const current = await this.getState();
 
@@ -417,6 +437,14 @@ export class WorkflowStateManager {
 
 /**
  * Wraps tool definitions with phase-aware execution guards.
+ *
+ * Internal helper: NOT part of the package's public barrel exports (see
+ * src/index.ts). The single enforced gate in the product is the one inside
+ * `agent()` (`assertPhaseGateOpen` in runWorkflow, workflow.ts) — it uses the
+ * same predicate (`canSpawnSubagents`) and error code (`SUBAGENT_SPAWN_BLOCKED`)
+ * as this wrapper, so behavior cannot drift between the two paths. This class
+ * exists for embedders/tests that need the same guard on a tool outside
+ * `agent()` without re-implementing the check.
  *
  * Primary use-case: intercept subagent-spawning tools before Phase 3 so the
  * LLM cannot bypass the deterministic phase ordering.

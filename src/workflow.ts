@@ -458,10 +458,13 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    */
   model?: string;
   /**
-   * Coarse model tier ("small" | "medium" | "big"), resolved from the user's
-   * model-tiers config (see /workflows-models). An explicit `model` takes
-   * precedence; a tier takes precedence over the phase model. When the tier has
-   * no configured entry it falls back to the session's main model.
+   * Coarse model tier, resolved from the user's model-tiers config (see
+   * /workflows-models). The contract's standard vocabulary is the closed
+   * union `"small" | "medium" | "big"` (PRD Task 3); a user-configured route
+   * outside it is honored only when context supplies its name and purpose.
+   * An explicit `model` takes precedence; a tier takes precedence over the
+   * phase model. When the tier has no configured entry it falls back to the
+   * session's main model.
    */
   tier?: string;
   isolation?: "worktree";

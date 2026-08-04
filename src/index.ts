@@ -143,7 +143,6 @@ export type { PhaseState } from "./phases/state-machine.js";
 export {
   APPROVAL_REQUIRED,
   PHASE_TRANSITION_INVALID,
-  PhaseGuard,
   SUBAGENT_SPAWN_BLOCKED,
   WorkflowStateManager,
 } from "./phases/state-machine.js";

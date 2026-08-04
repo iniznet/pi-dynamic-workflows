@@ -7,6 +7,8 @@ import {
   CapabilityOrigin,
   CapabilitySupport,
   defineWorkflowCapabilityContract,
+  isStandardTierName,
+  STANDARD_TIER_NAMES,
   WORKFLOW_CAPABILITY_CONTRACT,
   WORKFLOW_CAPABILITY_DEFINITION,
   WorkflowCapabilityContractError,
@@ -211,6 +213,39 @@ test("static reference projection keeps live catalogue values out of contract da
     ["tier"],
   );
   assert.match(agent?.reference ?? "", /capability-details\.md#agent$/);
+});
+
+test("agent tier option contract declares the closed standard vocabulary (G10)", () => {
+  const agentShape = WORKFLOW_CAPABILITY_DEFINITION.optionShapes.find((shape) => shape.id === "agent-options");
+  const tier = agentShape?.options.find((optionShape) => optionShape.name === "tier");
+  assert.ok(tier, "agent options must declare the tier option");
+  // PRD Task 3 requires the closed union in the script-generator schema: the
+  // contract no longer advertises free-form "string". The runtime keeps its
+  // permissive fallback for user-configured routes (see the constraint).
+  assert.equal(tier.type, '"small" | "medium" | "big"');
+  // Optionality unchanged: an untagged agent routes through the implicit
+  // medium tier, so omitting tier remains valid.
+  assert.equal(tier.optional, true);
+  // The configured-route seam stays discoverable via the dynamic reference.
+  assert.equal(tier.dynamicReference, "model-routes");
+  assert.ok(
+    tier.constraints.some((constraint) => constraint.includes("closed union 'small' | 'medium' | 'big'")),
+    "the tier option must document the closed standard vocabulary",
+  );
+  assert.deepEqual([...STANDARD_TIER_NAMES], ["small", "medium", "big"]);
+});
+
+test("the contract rejects a tier string outside the standard vocabulary (G10)", () => {
+  for (const standard of STANDARD_TIER_NAMES) {
+    assert.equal(isStandardTierName(standard), true, `${standard} is a standard tier`);
+  }
+  // Invented/typo'd names are rejected by the contract's standard vocabulary
+  // even though the permissive runtime may still resolve a user-configured
+  // route with that name (model-tiers.json is the model-routes catalogue).
+  assert.equal(isStandardTierName("tiny"), false);
+  assert.equal(isStandardTierName("smal"), false);
+  assert.equal(isStandardTierName(""), false);
+  assert.equal(isStandardTierName("Medium"), false);
 });
 
 test("alignment diagnostics compare declared and observed project globals", () => {

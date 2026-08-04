@@ -17,7 +17,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `phase`: string (optional; default: current phase)
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
-- `tier`: string (optional; configured route name; dynamic reference: model-routes)
+- `tier`: "small" | "medium" | "big" (optional; standard vocabulary is the closed union 'small' | 'medium' | 'big'; a user-configured route outside it is honored only when context supplies its name and purpose; dynamic reference: model-routes)
 - `isolation`: "worktree" (optional)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)

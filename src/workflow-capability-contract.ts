@@ -180,6 +180,30 @@ const option = (
   dynamicReference: OptionDescriptor["dynamicReference"] = null,
 ): OptionDescriptor => ({ name, type, optional, default: defaultValue, constraints, dynamicReference });
 
+/**
+ * The closed standard vocabulary the `tier` option's contract declares (PRD
+ * Task 3). The runtime ALSO honors user-configured routes from the user's
+ * model-tiers.json (the "model-routes" dynamic reference), so this is the
+ * contract's standard subset — not a runtime validation gate.
+ * `isStandardTierName` is the contract's rejection predicate: a name outside
+ * this set is rejected as a STANDARD tier even though the permissive runtime
+ * may still resolve it when the user configured that route.
+ */
+export const STANDARD_TIER_NAMES = ["small", "medium", "big"] as const;
+
+/** The closed union of standard tier names declared by the tier option. */
+export type StandardTierName = (typeof STANDARD_TIER_NAMES)[number];
+
+/**
+ * Whether a tier name belongs to the contract's closed standard vocabulary.
+ * Returns false for invented or typo'd names ("tiny", "smal") — the contract
+ * rejects them as standard tiers, so authors must only use names the
+ * model-routes dynamic reference (or the context) supplies.
+ */
+export function isStandardTierName(tier: string): boolean {
+  return (STANDARD_TIER_NAMES as readonly string[]).includes(tier);
+}
+
 const AGENT_OPTIONS: OptionShape = {
   id: "agent-options",
   options: [
@@ -187,7 +211,16 @@ const AGENT_OPTIONS: OptionShape = {
     option("phase", "string", true, "current phase"),
     option("schema", "plain JSON Schema", true),
     option("model", "string", true, null, ["highest-priority exact model selector"]),
-    option("tier", "string", true, null, ["configured route name"], "model-routes"),
+    option(
+      "tier",
+      '"small" | "medium" | "big"',
+      true,
+      null,
+      [
+        "standard vocabulary is the closed union 'small' | 'medium' | 'big'; a user-configured route outside it is honored only when context supplies its name and purpose",
+      ],
+      "model-routes",
+    ),
     option("isolation", '"worktree"', true),
     option("agentType", "string", true, null, ["must come from provided context"], "agent-types"),
     option("timeoutMs", "number | null", true, "run timeout; null disables"),

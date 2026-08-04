@@ -38,7 +38,7 @@
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 29,
-      "bytes": 94864
+      "bytes": 95046
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",

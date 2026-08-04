@@ -431,3 +431,20 @@ test("a hand-edited stale sidecar degrades to defaults instead of throwing", asy
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ─── public surface (G12): the enforced gate is agent(), not a barrel wrapper ──
+
+test("the package barrel does not export PhaseGuard (single enforced gate is agent()'s)", async () => {
+  const barrel = await import("../src/index.js");
+  // PhaseGuard was dropped from the public barrel: the product's ONLY enforced
+  // gate is assertPhaseGateOpen inside agent() (runWorkflow). The class stays
+  // module-level (imported directly in this suite) for embedders/tests that
+  // need the same check outside agent().
+  assert.equal("PhaseGuard" in barrel, false, "PhaseGuard must not be part of the package's public entry surface");
+  // The persisted state machine and the gate error codes remain public so
+  // embedders can still drive approval + match on the blocked error.
+  assert.equal(typeof barrel.WorkflowStateManager, "function");
+  assert.equal(typeof barrel.APPROVAL_REQUIRED, "number");
+  assert.equal(typeof barrel.SUBAGENT_SPAWN_BLOCKED, "number");
+  assert.equal(typeof barrel.PHASE_TRANSITION_INVALID, "number");
+});

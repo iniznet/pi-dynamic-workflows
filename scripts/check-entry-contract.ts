@@ -114,7 +114,6 @@ const ENTRY_CONTRACT: Record<string, string> = {
   APPROVAL_REQUIRED: "phase gate code (phases-machinery)",
   PHASE_TRANSITION_INVALID: "phase gate code (phases-machinery)",
   SUBAGENT_SPAWN_BLOCKED: "phase gate code (phases-machinery)",
-  PhaseGuard: "phases machinery",
   WorkflowStateManager: "phases machinery",
   // ── agent / runtime machinery ──
   WorkflowAgent: "agent runner",

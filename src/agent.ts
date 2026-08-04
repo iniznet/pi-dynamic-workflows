@@ -555,7 +555,10 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   model?: string;
   /**
-   * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
+   * Model tier name (e.g. "small", "medium", "big"). The contract's standard
+   * vocabulary is the closed union `"small" | "medium" | "big"` (PRD Task 3);
+   * a user-configured route outside it is honored only when context supplies
+   * its name and purpose. When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
    * the tier has no configured entry. A tier whose configured entry is the
