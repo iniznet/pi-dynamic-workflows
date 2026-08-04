@@ -9,7 +9,9 @@
  * content) short-circuits to honest `false` steps: the protocol never fabricates
  * tests, typechecks, or commits that did not occur.
  */
-import { exec } from "node:child_process";
+
+import type { ChildProcess } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { gitExec, removeWorktree, sweepOrphanWorktrees } from "../worktree.js";
@@ -115,6 +117,15 @@ export interface WorktreeRunnerConfig {
   typecheckCommand?: string;
   /** Hard per-command timeout for test/typecheck runs (default 120s). */
   commandTimeoutMs?: number;
+  /**
+   * Task-completion hook (G5): fired the moment each task's protocol settles
+   * (status final, completedAt stamped), before the runner proceeds to the next
+   * task — the exact point a per-subagent checkpoint must be persisted.
+   * Production wires this to the run-persistence layer's atomic saveCheckpoint();
+   * the runner treats a rejecting hook as best-effort so a checkpoint write
+   * failure can never flip an already-landed protocol result.
+   */
+  onTaskComplete?: (task: WorktreeTask, result: RunResult) => void | Promise<void>;
 }
 
 export interface RunResult {
@@ -151,6 +162,36 @@ interface CommandResult {
 }
 
 /**
+ * Terminate a spawned command's WHOLE process tree, not just the direct shell
+ * child. With `shell: true` the direct child is a shell (cmd.exe on Windows,
+ * /bin/sh on POSIX) and a bare `child.kill()` orphans the actual command
+ * process — the orphan keeps running (and, on Windows, keeps holding the
+ * worktree dir as its cwd) long after the shell died. POSIX spawns detached
+ * into their own process group so group-kill reaches every descendant;
+ * Windows walks the tree via taskkill.
+ */
+function killProcessTree(child: ChildProcess): void {
+  if (process.platform === "win32") {
+    if (child.pid) {
+      try {
+        spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+        return;
+      } catch {
+        // taskkill unavailable — fall through to the direct kill
+      }
+    }
+  } else {
+    try {
+      process.kill(-(child.pid ?? 0), "SIGKILL");
+      return;
+    } catch {
+      // group already gone — fall through to the direct kill
+    }
+  }
+  child.kill();
+}
+
+/**
  * Run one shell command line in a worktree and capture its exit code and output.
  * Shell-resolved (`npx`/`node` from PATH) so the protocol works on Windows too;
  * the command lines are developer/spec-authored, never raw user input.
@@ -160,25 +201,67 @@ interface CommandResult {
  * unit tests) the parent sets NODE_TEST_CONTEXT, and a spawned `node --test`
  * that sees it believes it is nested inside another test run, skips the file,
  * and exits 0 — a FALSE green that silently skips TDD verification.
+ *
+ * stdio lifecycle (G8): the child's stdin is explicitly ignored (protocol
+ * commands never read it) and stdout/stderr are piped ONLY for the protocol's
+ * captured output — then destroyed the instant the child closes, so the pipe
+ * handles are unbound immediately instead of lingering until GC across the
+ * many spawn cycles a long fan-out performs.
  */
-function runCommand(commandLine: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
+export async function runWorktreeCommand(commandLine: string, cwd: string, timeoutMs: number): Promise<CommandResult> {
   return new Promise<CommandResult>((resolveCommand) => {
     const env = { ...process.env };
     delete env.NODE_TEST_CONTEXT;
-    exec(
-      commandLine,
-      { cwd, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true, env },
-      (error, stdout, stderr) => {
-        resolveCommand({
-          // exec reports a non-zero exit as an error with a numeric code; a spawn
-          // failure (e.g. npx missing) has a string code — neither is a pass.
-          ok: error === null || error.code === 0,
-          code: error?.code ?? 0,
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-        });
-      },
-    );
+    const child = spawn(commandLine, {
+      cwd,
+      windowsHide: true,
+      env,
+      shell: true,
+      // Detached on POSIX so the timeout path can group-kill the whole tree
+      // (see killProcessTree); stdio: no stdin pipe at all, stdout/stderr
+      // piped only for capture and released in the settle path below.
+      detached: process.platform !== "win32",
+      // G8: no stdin pipe at all; stdout/stderr piped only for capture and
+      // released in the settle path below (pipe-then-destroy).
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let stdioOverflow = false;
+    let settled = false;
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      settle(false, "timeout");
+    }, timeoutMs);
+    timer.unref?.();
+    const settle = (ok: boolean, code: number | string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Pipe-then-destroy (G8): the captured output has been handed to the
+      // caller — release the pipe handles NOW so no fd lingers across cycles.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolveCommand({ ok, code, stdout, stderr });
+    };
+    child.stdout?.setEncoding("utf-8");
+    child.stderr?.setEncoding("utf-8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+      // exec's maxBuffer analogue: a runaway command flooding stdout must be
+      // killed rather than buffered without bound.
+      if (stdout.length > COMMAND_MAX_BUFFER) {
+        stdioOverflow = true;
+        killProcessTree(child);
+      }
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    // A spawn failure (npx missing etc.) reports a string code; a non-zero
+    // exit reports a numeric code — neither is a pass.
+    child.on("error", (error: NodeJS.ErrnoException) => settle(false, error.code ?? "spawn"));
+    child.on("close", (code) => settle(code === 0 && !stdioOverflow, code));
   });
 }
 
@@ -317,7 +400,7 @@ export async function implementProtocol(
   let implWritten = false;
   const testOutputs: string[] = [];
   for (let attempt = 1; attempt <= MAX_TEST_RUN_ATTEMPTS; attempt++) {
-    const run = await runCommand(testCommand, task.worktreePath, timeoutMs);
+    const run = await runWorktreeCommand(testCommand, task.worktreePath, timeoutMs);
     testOutputs.push(formatCommandOutput(run, attempt));
     if (run.ok) {
       testsPassed = true;
@@ -348,7 +431,7 @@ export async function implementProtocol(
 
   // ── 3. typecheck ─────────────────────────────────────────────────────────
   const typecheckStart = Date.now();
-  const tc = await runCommand(typecheckCommand, task.worktreePath, timeoutMs);
+  const tc = await runWorktreeCommand(typecheckCommand, task.worktreePath, timeoutMs);
   const typecheckPassed = tc.ok;
   steps.push({
     name: "typecheck",
@@ -446,6 +529,7 @@ export async function executeTask(task: WorktreeTask, config: WorktreeRunnerConf
   const start = Date.now();
   task.status = "running";
   task.startedAt = new Date().toISOString();
+  let result: RunResult;
   try {
     const protocol = await implementProtocol(task, {
       testCommand: config.testCommand,
@@ -461,7 +545,7 @@ export async function executeTask(task: WorktreeTask, config: WorktreeRunnerConf
       task.error = protocol.steps.find((s) => !stepOk(s))?.output ?? "implement protocol incomplete";
     }
     task.completedAt = new Date().toISOString();
-    return {
+    result = {
       taskId: task.id,
       success,
       output: JSON.stringify(protocol, null, 2),
@@ -472,8 +556,20 @@ export async function executeTask(task: WorktreeTask, config: WorktreeRunnerConf
     task.status = "failed";
     task.error = err instanceof Error ? err.message : String(err);
     task.completedAt = new Date().toISOString();
-    return { taskId: task.id, success: false, output: task.error, duration: Date.now() - start };
+    result = { taskId: task.id, success: false, output: task.error, duration: Date.now() - start };
   }
+  // G5: the task-completion hook fires exactly here — status is final, the
+  // protocol result is fixed — so a per-subagent checkpoint can be persisted
+  // atomically (tmp+rename via the persistence layer) BEFORE the runner moves
+  // on. Rejections are best-effort: a checkpoint write must never flip an
+  // already-landed task result (the production wiring additionally collects
+  // them for the printed summary).
+  try {
+    await config.onTaskComplete?.(task, result);
+  } catch {
+    // durability side-channel failure — the protocol verdict stands
+  }
+  return result;
 }
 
 export function createWorktreeRunner(config?: Partial<WorktreeRunnerConfig>): WorktreeRunner {

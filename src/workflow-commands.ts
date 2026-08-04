@@ -19,14 +19,14 @@ import {
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { ExecutionBlueprint } from "./phases/prewalk.js";
 import { WorkflowStateManager } from "./phases/state-machine.js";
-import type { PersistedRunState } from "./run-persistence.js";
+import { type PersistedRunState, saveCheckpoint } from "./run-persistence.js";
 import { parametersFromArgs, registerSavedWorkflow } from "./saved-commands.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
-import { createWorktree } from "./worktree.js";
+import { createWorktree, gitExec, sweepOrphanWorktrees } from "./worktree.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: "·",
@@ -50,7 +50,7 @@ const FINAL_EVENT_STATUS: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | clean | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -207,7 +207,58 @@ export interface WorkflowCommandOptions {
   implementRunnerFactory?: () => WorktreeRunner;
 }
 
-/** Register the `/workflows` command against the shared manager. Idempotent. */
+/**
+ * Enumerate every registered git worktree under `repoRoot` via `git worktree
+ * list --porcelain`. Best-effort: a non-repo/odd repo yields an empty list so
+ * the clean sweep has nothing to protect and nothing to reclaim.
+ */
+async function listRegisteredWorktrees(repoRoot: string): Promise<string[]> {
+  try {
+    const out = await gitExec(["-C", repoRoot, "worktree", "list", "--porcelain"]);
+    const paths: string[] = [];
+    for (const record of out.split(/\n\s*\n/)) {
+      const line = record.split("\n").find((l) => l.startsWith("worktree "));
+      if (line) paths.push(line.slice("worktree ".length).trim());
+    }
+    return paths;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Delete leftover `pi/wf/*` temporary branches in `repoRoot` (best-effort per
+ * branch; a branch checked out in a live worktree is left for later). Returns
+ * how many were removed so the clean command can report a real count.
+ */
+async function deleteTemporaryWorktreeBranches(repoRoot: string): Promise<number> {
+  let refs: string;
+  try {
+    refs = await gitExec(["-C", repoRoot, "for-each-ref", "--format=%(refname:short)", "refs/heads/pi/wf"]);
+  } catch {
+    return 0; // refs missing / not a git repo — nothing to delete
+  }
+  let deleted = 0;
+  for (const line of refs.split("\n")) {
+    const branch = line.trim();
+    if (!branch) continue;
+    try {
+      await gitExec(["-C", repoRoot, "branch", "-D", branch]);
+      deleted++;
+    } catch {
+      // checked out elsewhere or already gone — leave it for the next sweep
+    }
+  }
+  return deleted;
+}
+
+function normalizeWorktreePath(path: string): string {
+  return path.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+}
+
+/**
+ * Register the `/workflows` command against the shared manager. Idempotent.
+ */
 export function registerWorkflowCommands(
   pi: ExtensionAPI,
   manager: WorkflowManager,
@@ -222,7 +273,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/implement <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/implement <id> | clean | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
@@ -386,7 +437,35 @@ export function registerWorkflowCommands(
               status: "pending",
             });
           }
-          const runner = opts.implementRunnerFactory ? opts.implementRunnerFactory() : createWorktreeRunner({});
+          const checkpointWarnings: string[] = [];
+          const runner = opts.implementRunnerFactory
+            ? opts.implementRunnerFactory()
+            : createWorktreeRunner({
+                // G5: persist an atomic per-subagent checkpoint (tmp+rename via
+                // the run-persistence layer) the instant each task's protocol
+                // settles, so /workflows resume skips exactly the tasks already
+                // recorded on disk. A failed write must never flip an
+                // already-landed protocol result — it is surfaced in the summary.
+                onTaskComplete: async (task, result) => {
+                  try {
+                    await saveCheckpoint(
+                      id,
+                      {
+                        runId: id,
+                        taskId: task.id,
+                        status: result.success ? "completed" : "failed",
+                        worktreePath: task.worktreePath,
+                        branch: task.branch,
+                        output: result.output.slice(0, 512),
+                        timestamp: new Date().toISOString(),
+                      },
+                      cwd,
+                    );
+                  } catch (error) {
+                    checkpointWarnings.push(`${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+                  }
+                },
+              });
           const results = await runner.executeTasks(tasks);
           await print(
             [
@@ -396,7 +475,44 @@ export function registerWorkflowCommands(
                   ? `✓ ${r.taskId} — verified commit in ${r.duration}ms`
                   : `✗ ${r.taskId} — failed: ${r.output.slice(0, 240)}`,
               ),
+              ...(checkpointWarnings.length
+                ? ["", "checkpoint warnings:", ...checkpointWarnings.map((w) => `  ⚠ ${w}`)]
+                : []),
             ].join("\n"),
+          );
+          return;
+        }
+        case "clean": {
+          const cwd = opts.cwd ?? process.cwd();
+          let repoRoot: string;
+          try {
+            repoRoot = (await gitExec(["-C", cwd, "rev-parse", "--show-toplevel"])).trim();
+          } catch {
+            ctx.ui.notify("clean: not inside a git repository — nothing to sweep", "warning");
+            return;
+          }
+          // Safety handbrake: a running/paused run owns live worktrees — clean
+          // must not reclaim them out from under it.
+          const activeRuns = manager.listRuns().filter((r) => r.status === "running" || r.status === "paused");
+          if (activeRuns.length > 0) {
+            ctx.ui.notify(
+              `clean refused: ${activeRuns.length} run(s) still active (running/paused) — stop or remove them first`,
+              "warning",
+            );
+            return;
+          }
+          // Sweep ONLY the worktrees this project owns (under <root>/.pi/worktrees):
+          // every other registered worktree is treated as someone else's and kept.
+          const projectDir = join(repoRoot, ".pi", "worktrees");
+          const kept: string[] = [];
+          for (const path of await listRegisteredWorktrees(repoRoot)) {
+            if (!normalizeWorktreePath(path).startsWith(normalizeWorktreePath(projectDir))) kept.push(path);
+          }
+          await sweepOrphanWorktrees(repoRoot, kept);
+          const branches = await deleteTemporaryWorktreeBranches(repoRoot);
+          ctx.ui.notify(
+            `Clean ${repoRoot}: project worktrees pruned; ${branches} temporary pi/wf branch(es) removed`,
+            "info",
           );
           return;
         }

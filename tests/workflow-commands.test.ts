@@ -8,9 +8,11 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
 import { WorkflowStateManager } from "../src/phases/state-machine.js";
+import { createRunPersistence, loadRunState } from "../src/run-persistence.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
+import { createWorktree } from "../src/worktree.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 
@@ -866,6 +868,134 @@ test("/workflows implement <id> fans approved plan steps out into isolated workt
     assert.match(h.printed[0], /Implement run-impl: 2 task\(s\) from "plan for run-impl"/);
     assert.match(h.printed[0], /✓ run-impl-0/);
     assert.match(h.printed[0], /✓ run-impl-1/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// clean + end-to-end checkpoint wiring (G5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** git porcelain prints forward-slash paths even on Windows — mirror that. */
+const forward = (p: string) => p.replace(/\\/g, "/");
+
+/** Seed a run in the same persistence store the real WorkflowManager uses. */
+function seedRun(cwd: string, runId: string): void {
+  createRunPersistence(cwd).save({
+    runId,
+    workflowName: "wf",
+    script: "export const meta = { name: 'w', description: 'w' }",
+    status: "running",
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  });
+}
+
+test("/workflows clean refuses while a run is running or paused", async () => {
+  const repo = initRepo("wf-cmd-clean-active-");
+  try {
+    const h = harness(
+      {
+        listRuns: () => [{ runId: "run-1", workflowName: "w", status: "running", phases: [], agents: [], logs: [] }],
+      },
+      { cwd: repo },
+    );
+    await h.run("clean");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("clean refused")),
+      "clean must refuse to reclaim a live run's worktrees",
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows clean outside a git repository warns and sweeps nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-wt-norepo-"));
+  try {
+    const h = harness({}, { cwd: dir });
+    await h.run("clean");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("not inside a git repository")),
+      "a non-repo cwd must warn instead of sweeping",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("/workflows clean prunes orphaned project worktrees + pi/wf branches, keeps foreign worktrees", async () => {
+  const repo = initRepo("wf-cmd-clean-");
+  const foreign = mkdtempSync(join(tmpdir(), "pi-wt-foreign-"));
+  try {
+    // A project-owned worktree (under <root>/.pi/worktrees) whose branch must die
+    // with it, a dangling pi/wf branch, and a foreign worktree that is NOT ours.
+    const wt = await createWorktree(repo, "run-1-0-step");
+    execFileSync("git", ["-C", repo, "branch", "pi/wf/zzz-dangling"], { stdio: "pipe" });
+    execFileSync("git", ["-C", repo, "worktree", "add", "-q", foreign, "-b", "foreign-branch"], {
+      stdio: "pipe",
+    });
+    const before = execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf8" });
+    assert.ok(before.includes(forward(wt.cwd)), "fixture: project worktree is registered");
+    assert.ok(before.includes(forward(foreign)), "fixture: foreign worktree is registered");
+
+    const h = harness({}, { cwd: repo });
+    await h.run("clean");
+
+    const after = execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf8" });
+    assert.ok(!after.includes(forward(wt.cwd)), "the orphaned project worktree is reclaimed");
+    assert.ok(after.includes(forward(foreign)), "a foreign worktree is never touched");
+    const branches = execFileSync("git", ["-C", repo, "branch", "--list", "pi/wf/*"], { encoding: "utf8" });
+    assert.doesNotMatch(branches, /pi\/wf\//, "all temporary pi/wf branches are deleted");
+    assert.ok(
+      h.notified.some((n) => n.type === "info" && n.message.includes("branch(es) removed")),
+      "clean reports the number of removed branches",
+    );
+  } finally {
+    try {
+      execFileSync("git", ["-C", repo, "worktree", "remove", "--force", foreign], { stdio: "ignore" });
+    } catch {
+      // foreign worktree already gone — nothing to deregister
+    }
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(foreign, { recursive: true, force: true });
+  }
+});
+
+test("/workflows implement persists one atomic checkpoint per task via the real runner", async () => {
+  const repo = initRepo("wf-cmd-ckpt-");
+  try {
+    seedRun(repo, "run-ckpt-e2e");
+    const phaseState = await approvedImplementFixture(repo, "run-ckpt-e2e", 2);
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "running" }) },
+      { cwd: repo, phaseState }, // NO implementRunnerFactory — the real runner path
+    );
+    await h.run("implement run-ckpt-e2e");
+
+    const state = await loadRunState("run-ckpt-e2e", repo);
+    assert.ok(state, "the run's persisted state exists after fan-out");
+    assert.equal(state?.checkpoints.length, 2, "one checkpoint per blueprint execution step");
+    assert.deepEqual(
+      state?.checkpoints.map((c) => c.taskId),
+      ["run-ckpt-e2e-0", "run-ckpt-e2e-1"],
+      "checkpoints keep first-seen order (dedupe by taskId)",
+    );
+    for (const cp of state?.checkpoints ?? []) {
+      assert.equal(cp.status, "failed", "a spec-less step honestly fails — no fabricated commit");
+      assert.match(cp.branch ?? "", /^pi\/wf\//, "the checkpoint records the worktree branch");
+      assert.ok(
+        cp.worktreePath?.includes(join(".pi", "worktrees")),
+        "the checkpoint records the isolated worktree path",
+      );
+      assert.ok(cp.timestamp, "the checkpoint carries a timestamp");
+    }
+    assert.match(h.printed[0], /Implement run-ckpt-e2e: 2 task\(s\)/);
+    assert.match(h.printed[0], /✗ run-ckpt-e2e-0/, "the honest failure is printed");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

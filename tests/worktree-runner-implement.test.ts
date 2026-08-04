@@ -7,11 +7,15 @@ import test from "node:test";
 import type { WorktreeTask } from "../src/agent/worktree-runner.js";
 import {
   createWorktreeRunner,
+  executeTask,
   type ImplementProtocolResult,
   implementProtocol,
+  type RunResult,
   resolveProtocolCommands,
   reviewProtocolDiff,
+  type WorktreeRunnerConfig,
 } from "../src/agent/worktree-runner.js";
+import { createRunPersistence, loadRunState, saveCheckpoint } from "../src/run-persistence.js";
 import { createWorktree as createWorktreeLive } from "../src/worktree.js";
 
 /** Minimal git repo with identity + a base commit, like the worktree suite. */
@@ -229,6 +233,139 @@ test("implementProtocol runs directly with runtime overrides (no runner required
     });
     assert.equal(protocol.committed, true);
     assert.ok(protocol.commitHash);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ── G5 acceptance: saveCheckpoint (atomic tmp+rename via the persistence
+//    layer) lands per-subagent state writes the moment each task completes. ──
+
+/** Seed a persisted run in the same store the real WorkflowManager uses. */
+function seedRun(cwd: string, runId: string): void {
+  createRunPersistence(cwd).save({
+    runId,
+    workflowName: "wf",
+    script: "export const meta = { name: 'w', description: 'w' }",
+    status: "running",
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+  });
+}
+
+function checkpointOnComplete(runId: string, repo: string): (task: WorktreeTask, result: RunResult) => Promise<void> {
+  return async (task, result) => {
+    await saveCheckpoint(
+      runId,
+      {
+        runId,
+        taskId: task.id,
+        status: result.success ? "completed" : "failed",
+        worktreePath: task.worktreePath,
+        branch: task.branch,
+        output: result.output.slice(0, 256),
+        timestamp: new Date().toISOString(),
+      },
+      repo,
+    );
+  };
+}
+
+const GIT_TASK_COMMANDS = {
+  testCommand: "node --test tests/math.test.mjs",
+  typecheckCommand: "node --check math.mjs",
+} as const;
+
+test("G5: onTaskComplete persists an atomic per-subagent checkpoint exactly once per completed task", async () => {
+  const repo = initRepo("pi-wt-ckpt-");
+  try {
+    seedRun(repo, "run-ckpt");
+    const wt = await createWorktreeLive(repo, "run-ckpt-0-math");
+    const calls: string[] = [];
+    const runner = createWorktreeRunner({
+      cleanupOnComplete: false,
+      ...GIT_TASK_COMMANDS,
+      onTaskComplete: async (task, result) => {
+        calls.push(task.id);
+        await checkpointOnComplete("run-ckpt", repo)(task, result);
+      },
+    });
+    const results = await runner.executeTasks([specTask("run-ckpt-0", wt)]);
+
+    assert.equal(results[0].success, true);
+    assert.deepEqual(calls, ["run-ckpt-0"], "the completion hook fires exactly once per task");
+
+    const state = await loadRunState("run-ckpt", repo);
+    assert.ok(state, "the run's persisted state exists after fan-out");
+    assert.equal(state?.checkpoints.length, 1);
+    assert.equal(state?.checkpoints[0].taskId, "run-ckpt-0");
+    assert.equal(state?.checkpoints[0].status, "completed");
+    assert.equal(state?.checkpoints[0].branch, wt.branch);
+    assert.equal(state?.checkpoints[0].worktreePath, wt.cwd);
+    assert.ok(state?.checkpoints[0].timestamp, "the checkpoint carries a timestamp");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("G5: state.json writes land after EACH completion, never batched at the end", async () => {
+  const repo = initRepo("pi-wt-ckpt-seq-");
+  try {
+    seedRun(repo, "run-ckpt-seq");
+    const wt1 = await createWorktreeLive(repo, "run-ckpt-seq-0-a");
+    const wt2 = await createWorktreeLive(repo, "run-ckpt-seq-1-b");
+    const config: WorktreeRunnerConfig = {
+      maxConcurrent: 1,
+      modelTier: "medium",
+      cleanupOnComplete: false,
+      ...GIT_TASK_COMMANDS,
+      onTaskComplete: checkpointOnComplete("run-ckpt-seq", repo),
+    };
+
+    await executeTask(specTask("run-ckpt-seq-0", wt1), config);
+    const afterFirst = await loadRunState("run-ckpt-seq", repo);
+    assert.equal(
+      afterFirst?.checkpoints.length,
+      1,
+      "the first completion is already on disk before the second task even runs",
+    );
+
+    await executeTask(specTask("run-ckpt-seq-1", wt2), config);
+    const afterSecond = await loadRunState("run-ckpt-seq", repo);
+    assert.equal(afterSecond?.checkpoints.length, 2);
+    assert.deepEqual(
+      afterSecond?.checkpoints.map((c) => c.taskId),
+      ["run-ckpt-seq-0", "run-ckpt-seq-1"],
+      "checkpoints keep first-seen order (dedupe by taskId)",
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("G5: a rejecting onTaskComplete never flips an already-landed task result", async () => {
+  const repo = initRepo("pi-wt-ckpt-throw-");
+  try {
+    seedRun(repo, "run-ckpt-throw");
+    const wt = await createWorktreeLive(repo, "run-ckpt-throw-0");
+    const task = specTask("run-ckpt-throw-0", wt);
+    const config: WorktreeRunnerConfig = {
+      maxConcurrent: 1,
+      modelTier: "medium",
+      cleanupOnComplete: false,
+      ...GIT_TASK_COMMANDS,
+      onTaskComplete: async () => {
+        throw new Error("disk unavailable");
+      },
+    };
+
+    const result = await executeTask(task, config);
+    assert.equal(result.success, true, "the protocol verdict stands despite the checkpoint write failure");
+    assert.equal(task.status, "completed");
+    assert.ok(task.completedAt, "completedAt is stamped on the task");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
