@@ -1,4 +1,13 @@
 /**
+ * Sentinel tier value usable as a model spec in model-tiers.json: the tier
+ * resolves to the MAIN/active chat session model instead of a fixed provider
+ * spec. PRD Task 3 requires `"big": "inherit:main"` so flagship phases track
+ * the user's current session model. Kept as a named constant so the special
+ * case in resolveTierModel (and its tests) never embeds the magic string.
+ */
+export const TIER_INHERIT_MAIN = "inherit:main";
+
+/**
  * Model tier configuration for workflow subagent model routing.
  *
  * A tier is a named slot (small/medium/big) holding exactly ONE model spec
@@ -311,9 +320,18 @@ export function saveModelTierConfig(config: ModelTierConfig, configPath?: string
 /**
  * Resolve a tier name to its configured model spec, or undefined if the tier
  * is not configured.
+ *
+ * Special case (PRD Task 3 / audit G6): a tier whose configured spec is the
+ * `inherit:main` sentinel resolves to the main/active chat session model id —
+ * BEFORE the verbatim passthrough — so the sentinel can never reach the model
+ * registry as a literal spec (which would throw MODEL_NOT_FOUND). When no main
+ * model is known (undefined) the tier resolves to undefined, letting callers
+ * fall back to the session default exactly as an unconfigured tier would.
  */
-export function resolveTierModel(tier: string, config: ModelTierConfig): string | undefined {
-  return config.tiers[tier];
+export function resolveTierModel(tier: string, config: ModelTierConfig, mainModel?: string): string | undefined {
+  const spec = config.tiers[tier];
+  if (spec === TIER_INHERIT_MAIN) return mainModel;
+  return spec;
 }
 
 /** Return all tier names sorted: small < medium < big, then alphabetically. */

@@ -151,6 +151,21 @@ test("resolveAgentModelSpec: unconfigured tier falls back to the main model", ()
   assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
 });
 
+test("resolveAgentModelSpec: a tier configured to inherit:main resolves to the session's main model (G6)", () => {
+  const inheritCfg = () => ({ tiers: { small: "vendor/small", big: "inherit:main" } });
+  assert.equal(resolveAgentModelSpec({ tier: "big" }, "session/main-model", inheritCfg), "session/main-model");
+  // An explicit model still wins over an inherit:main tier.
+  assert.equal(
+    resolveAgentModelSpec({ model: "explicit/model", tier: "big" }, "session/main-model", inheritCfg),
+    "explicit/model",
+  );
+});
+
+test("resolveAgentModelSpec: an unknown tier name still falls back to the main model even when a sibling tier uses inherit:main", () => {
+  const cfg = () => ({ tiers: { small: "vendor/small", big: "inherit:main" } });
+  assert.equal(resolveAgentModelSpec({ tier: "doesnotexist" }, "session/main-model", cfg), "session/main-model");
+});
+
 test("resolvePromptAwareTier: classifies the prompt and picks the fitting tier from the ranked registry (i3)", () => {
   const models = [
     { spec: "vendor/a-mini", costOutput: 0.4 },
@@ -354,6 +369,92 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
         secondResult,
         "the SAME config object must be reused across run() calls — the file was read/parsed only once",
       );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): a tier configured to inherit:main resolves to the session's main model and completes (G6)", async () => {
+  // PRD Task 3 acceptance: `"big": "inherit:main"` in model-tiers.json must
+  // route the run through the active chat session model, not a literal spec
+  // (which previously reached the registry and threw MODEL_NOT_FOUND).
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-inherit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-inherit-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-inherit",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { big: "inherit:main" } }));
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-inherit", {
+        name: "Faux Test Inherit",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([fauxAssistantMessage("inherited-main-answer", { stopReason: "stop" })]);
+
+      // mainModel = the active chat session model; tier "big" must inherit it.
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-inherit/faux-model",
+      });
+      const text = await agent.run("task", { tier: "big", label: "inherit-main" });
+      assert.ok(text.includes("inherited-main-answer"), "run should complete via the inherited session model");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): a genuinely unknown model spec behind another tier still throws MODEL_NOT_FOUND even when a sibling tier uses inherit:main (G6 scoping)", async () => {
+  // The inherit:main special case must not swallow the fail-loud guarantee for
+  // genuinely broken tier entries: only the exact sentinel may resolve to the
+  // session model; anything else still throws MODEL_NOT_FOUND.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-inherit-dead-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-inherit-dead-cwd-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(
+        join(tiersDir, "model-tiers.json"),
+        JSON.stringify({ tiers: { big: "inherit:main", medium: "deadprov/ghost-model" } }),
+      );
+
+      const registry = {
+        getAll: () => [{ provider: "fauxtest", id: "faux-model", name: "faux-model" } as any],
+      } as any;
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, mainModel: "fauxtest/faux-model" });
+      await assert.rejects(agent.run("task", { tier: "medium", label: "scoped-tier" }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.MODEL_NOT_FOUND);
+        assert.equal(error.recoverable, false, "a broken tier pin is deterministic — retrying it is pointless");
+        assert.match(error.message, /deadprov\/ghost-model/);
+        assert.equal(error.agentLabel, "scoped-tier");
+        return true;
+      });
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

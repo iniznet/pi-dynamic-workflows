@@ -250,7 +250,7 @@ export function resolvePromptAwareTier(
 ): string | undefined {
   const defaults = buildDefaultTierConfig(mainModel, availableModels);
   const tier = tierNameForTask("runtime", prompt);
-  return resolveTierModel(tier, defaults) ?? mainModel;
+  return resolveTierModel(tier, defaults, mainModel) ?? mainModel;
 }
 
 export function resolveAgentModelSpec(
@@ -273,11 +273,16 @@ export function resolveAgentModelSpec(
       onTierWithoutConfig?.(options.tier);
       if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels());
     }
-    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+    // An "inherit:main" configured tier resolves to the session's main model
+    // INSIDE resolveTierModel (PRD Task 3) — passing mainModel through is what
+    // makes the sentinel mean "active chat session model" instead of leaking a
+    // literal spec to the registry. Any other unresolved tier falls back to
+    // mainModel here, as before.
+    return (config ? resolveTierModel(options.tier, config, mainModel) : undefined) ?? mainModel;
   }
   // Untagged agent: default to the configured medium tier when one exists.
   if (config) {
-    const medium = resolveTierModel("medium", config);
+    const medium = resolveTierModel("medium", config, mainModel);
     if (medium) return medium;
   }
   return undefined;
@@ -553,7 +558,10 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
    * config before `run()` starts, falling back to the session's main model when
-   * the tier has no configured entry. An explicit `model` always takes priority,
+   * the tier has no configured entry. A tier whose configured entry is the
+   * sentinel `"inherit:main"` resolves to the session's main/active model (PRD
+   * Task 3) — useful for a `"big"` tier that should track whatever model the
+   * user is currently chatting with. An explicit `model` always takes priority,
    * so workflow scripts can use `{ tier: "small" }` for coarse routing without
    * caring which concrete model backs that tier.
    *

@@ -418,6 +418,18 @@ describe("model-tier-config", () => {
       const { resolveTierModel } = await loadModule();
       assert.equal(resolveTierModel("medium", { tiers: { small: "gpt-4.1-mini", medium: "" } }), "");
     });
+
+    it("resolves the inherit:main sentinel to the active session model (G6)", async () => {
+      const { resolveTierModel, TIER_INHERIT_MAIN } = await loadModule();
+      assert.equal(TIER_INHERIT_MAIN, "inherit:main", "sentinel constant must be the PRD-documented magic value");
+      const config = { tiers: { small: "openai/gpt-4.1-mini", big: "inherit:main" } };
+      assert.equal(resolveTierModel("big", config, "session/openai-gpt-5"), "session/openai-gpt-5");
+      // No main model known → resolves like an unconfigured tier (undefined),
+      // never a literal sentinel that would reach the registry as a model spec.
+      assert.equal(resolveTierModel("big", config), undefined);
+      // Non-sentinel tiers are untouched by the special case.
+      assert.equal(resolveTierModel("small", config, "session/openai-gpt-5"), "openai/gpt-4.1-mini");
+    });
   });
 
   describe("loadModelTierConfig / saveModelTierConfig (scoped to tmpdir)", () => {
