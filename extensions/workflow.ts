@@ -141,7 +141,14 @@ export default function extension(pi: ExtensionAPI) {
         const manager = hostSessionManager() as
           | (SessionManagerLike & { getSessionName?: () => string | undefined })
           | undefined;
-        return `Pi Session: ${manager?.getSessionName?.() ?? manager?.getSessionId?.() ?? "unknown"}`;
+        const sessionName = manager?.getSessionName?.();
+        const sessionId = manager?.getSessionId?.();
+        // Before session_start the host session id/name is undefined: return
+        // undefined so createVendoredChromeTools skips group-title tagging for
+        // tab.new/tab.group and the page.* joinSessionGroup wire (its guards
+        // run on `sessionTitle !== undefined`), instead of stranding early
+        // subagent tabs in a "Pi Session: unknown" group that is never regrouped.
+        return (sessionName ?? sessionId) ? `Pi Session: ${sessionName ?? sessionId}` : undefined;
       },
     });
   const chromeToolsSupplier =
