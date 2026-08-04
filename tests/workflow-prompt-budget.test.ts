@@ -59,13 +59,15 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // to 4,392 bytes (+116), and the accepted ceiling moves with it, from
 // 4,283 to 4,392.
 //
-// Added an optional `dryRun` input (validate a script or named workflow
-// without launching a run — parse/check it and return its meta, with no
-// subagents) so the model can iterate on a script before committing to a
-// run. The new boolean parameter and its deliberately concise description
-// increase the measured definition from 4,392 to 4,782 bytes (+390), and
-// the accepted ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_782;
+// Added an optional `failOnExhaustedAgent` input (strict completion: an
+// exhausted subagent — recoverable retries exhausted or a context-window
+// overflow — settles the run FAILED instead of completing with a silent
+// null, so the model is never handed an incomplete result that looks
+// complete) plus two resume-first guidance clauses (one always-on tool
+// line, one on the resumeFromRunId param). The new boolean parameter, its
+// description, and the two clauses increase the measured definition from
+// 4,782 to 5,168 bytes (+386), and the accepted ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 5_168;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

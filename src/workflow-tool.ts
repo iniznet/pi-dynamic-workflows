@@ -71,6 +71,7 @@ const workflowToolSchema = Type?.Object({
         "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
         "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
         "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
+        "On failure or pause, resume with resumeFromRunId instead of starting a new run.",
       ].join(" "),
     }),
   ),
@@ -131,6 +132,12 @@ const workflowToolSchema = Type?.Object({
         "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
     }),
   ),
+  failOnExhaustedAgent: Type.Optional(
+    Type.Boolean({
+      description:
+        "Strict completion (default true): exhausted agents settle the run FAILED (resumable) instead of completing with silent nulls. Pass false for best-effort runs that report failed agents.",
+    }),
+  ),
   agentTimeoutMs: Type.Optional(
     Type.Number({
       minimum: 1,
@@ -151,6 +158,7 @@ const workflowToolSchema = Type?.Object({
         "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
         "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
         "Calls match by position: keep earlier good calls identical and in order. Always background.",
+        "Use for any failed or paused run — never start a new run to recover.",
       ].join(" "),
     }),
   ),
@@ -171,6 +179,11 @@ export type WorkflowToolInput = {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
+  /**
+   * Strict completion (default true): exhausted agents settle the run failed +
+   * resumable instead of completing with silent nulls.
+   */
+  failOnExhaustedAgent?: boolean;
   tokenBudget?: number;
   resumeFromRunId?: string;
   dryRun?: boolean;
@@ -314,6 +327,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
+          failOnExhaustedAgent: params.failOnExhaustedAgent ?? true,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
           tools: invocationTools,
@@ -343,6 +357,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
+          failOnExhaustedAgent: params.failOnExhaustedAgent ?? true,
           agentTimeoutMs: params.agentTimeoutMs,
           tokenBudget: params.tokenBudget,
           tools: invocationTools,
@@ -442,10 +457,24 @@ export function formatCompletedResultText(result: WorkflowRunResult): string {
     ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
     : "";
 
+  // Failures are VISIBLE even on a lenient run (failOnExhaustedAgent: false):
+  // an incomplete result must never be mistaken for a clean success. On a
+  // strict run this section never appears — the run settles failed instead and
+  // the failure path's resume hint applies. Completed runs still carry no
+  // resume hint (M18); the directive below is re-run guidance, not a promise
+  // that this run is resumable.
+  const failures = result.failedAgents?.length
+    ? `\n\n## ⚠ Agent failures (${result.failedAgents.length}/${result.agentCount})\n` +
+      result.failedAgents
+        .map((f) => `- **${f.label}**${f.nested ? ` (nested in ${f.nested})` : ""}: ${f.errorCode} — ${f.error}`)
+        .join("\n") +
+      "\n\nThese agents did not produce results. Do NOT treat this output as complete: edit the workflow (e.g. raise agentRetries, shorten the failing agent's prompt, or use a larger-context model) and re-run, or pass failOnExhaustedAgent to have the run fail resumable instead of completing silently."
+    : "";
+
   const formattedResult =
     result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
 
-  return `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}`;
+  return `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}${failures}\n\n## Result${formattedResult}`;
 }
 
 /**

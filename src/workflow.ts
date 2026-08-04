@@ -226,6 +226,16 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
+  /**
+   * Whether an agent that ends with a failure (exhausted recoverable retries,
+   * or an error absorbed as a null by parallel()/pipeline()) should make the
+   * RUN fail (settle failed, journal preserved → resumable via resumeFromRunId)
+   * instead of silently completing with a null result. Default false for direct
+   * embeds (agent() still returns null; script null-handling is unchanged); the
+   * workflow TOOL defaults it to true so an orchestrator never mistakes an
+   * incomplete run for success and restarts from scratch.
+   */
+  failOnExhaustedAgent?: boolean;
   tokenBudget?: number | null;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
@@ -408,6 +418,15 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   durationMs: number;
   runId?: string;
+  /**
+   * Agents that ended with a failure (exhausted recoverable retries, or an
+   * error absorbed as a null by parallel()/pipeline()). Empty/absent when every
+   * agent succeeded. The manager reads this at completion time to settle the run
+   * failed+resumable when failOnExhaustedAgent is on; the tool renders it as a
+   * visible failure section so a lenient run's result is never mistaken for a
+   * clean success.
+   */
+  failedAgents?: Array<{ label: string; error: string; errorCode: WorkflowErrorCode; nested?: string }>;
   tokenUsage?: {
     input: number;
     output: number;
@@ -582,6 +601,14 @@ interface RuntimeState {
   lastTopLevelPhase?: string;
   /** True once the first top-level agent() call has run (handoff chain root). */
   sawTopLevelAgent: boolean;
+  /**
+   * Agents that ended with a failure (exhausted recoverable retries, or a
+   * non-recoverable error absorbed as a null by parallel()/pipeline()). The
+   * manager's completion-time AGENT_EXHAUSTED gate reads this to settle the run
+   * failed+resumable instead of silently completing with nulls. Nested
+   * workflow() failures are merged in with a `nested` marker.
+   */
+  failedAgents: Array<{ label: string; error: string; errorCode: WorkflowErrorCode; nested?: string }>;
 }
 
 type AnyNode = Node & { [key: string]: any; start: number; end: number };
@@ -671,6 +698,7 @@ export async function runWorkflow<T = unknown>(
 
   const state: RuntimeState = {
     logs: [],
+    failedAgents: [],
     // When the script declares meta.phases, default the current phase to the
     // first one so agents created before any explicit phase() call still group
     // under a declared phase instead of an orphan "(no phase)" bucket. An
@@ -1299,12 +1327,20 @@ export async function runWorkflow<T = unknown>(
               continue;
             }
 
-            // The failing operation (Fabric-style line-numbered failure repair):
-            // the last tool call whose outcome was not ok, else the final call.
             const failingOperation =
               operations.length > 0
                 ? ([...operations].reverse().find((t) => t.outcome !== "ok") ?? operations[operations.length - 1])
                 : undefined;
+            // Record the failure for the manager's completion-time AGENT_EXHAUSTED
+            // gate (and the tool's failure text). Covers BOTH the exhausted-
+            // recoverable null return below AND a non-recoverable error absorbed
+            // as a null item by parallel()/pipeline() — a throw never reaches the
+            // gate, so every agent that ended with a null must be listed here.
+            state.failedAgents.push({
+              label,
+              error: workflowError.message,
+              errorCode: workflowError.code,
+            });
             safeCallback("onAgentEnd", options.onAgentEnd, {
               id: deltaKey,
               label,
@@ -1508,6 +1544,14 @@ export async function runWorkflow<T = unknown>(
         runId: `${runId}-nested${++shared.nestedCallSeq}`,
         persistLogs: false,
       });
+      // Merge the child frame's failures up so the top-level completion gate sees
+      // them (a parallel-absorbed child failure is invisible to the parent's own
+      // agent() bookkeeping).
+      if (child.failedAgents?.length) {
+        for (const f of child.failedAgents) {
+          state.failedAgents.push({ ...f, nested: workflowName });
+        }
+      }
       return child.result;
     } finally {
       shared.depth--;
@@ -2306,6 +2350,10 @@ export async function runWorkflow<T = unknown>(
       durationMs: Date.now() - started,
       runId,
       tokenUsage: shared.tokenUsage,
+      // The manager's completion-time AGENT_EXHAUSTED gate + the tool's failure
+      // text both read this; absent when every agent succeeded (undefined keys
+      // are JSON-dropped, keeping lenient runs' persisted shape unchanged).
+      failedAgents: state.failedAgents.length > 0 ? state.failedAgents : undefined,
     };
   } catch (error) {
     // This error just escaped THIS frame's own vm script execution completely

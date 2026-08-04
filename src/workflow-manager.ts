@@ -62,6 +62,13 @@ export interface ManagedRunBase {
    */
   autoResume?: boolean;
   /**
+   * Frozen at start (like autoResume): whether agent failures settle this run
+   * failed+resumable instead of completing with silent nulls. Undefined =
+   * lenient (never set by the caller). Carried through resume() so a resumed
+   * run keeps the strictness it started with.
+   */
+  failOnExhaustedAgent?: boolean;
+  /**
    * OPT-IN resume-journal compaction (default OFF), frozen at run start like
    * tokenBudget and carried through resume() so a resumed run keeps
    * compacting if it started with the flag. When true, writeRunToDisk folds
@@ -254,6 +261,14 @@ export interface ExecOptions {
   concurrency?: number;
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
+  /**
+   * Whether agents that end with a failure (exhausted recoverable retries, or a
+   * parallel-absorbed item error) make this run settle failed (journal kept,
+   * resumable) instead of completing with silent nulls. Frozen at start like
+   * autoResume; undefined means the flag was not set (lenient, matches direct
+   * runWorkflow embeds). The workflow TOOL sets true by default.
+   */
+  failOnExhaustedAgent?: boolean;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
   /**
@@ -666,6 +681,7 @@ export class WorkflowManager extends EventEmitter {
       background: true,
       lease,
       autoResume: exec.autoResume,
+      failOnExhaustedAgent: exec.failOnExhaustedAgent,
       compactJournal: exec.compactJournal === true,
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
@@ -700,6 +716,7 @@ export class WorkflowManager extends EventEmitter {
         startedAt: managed.startedAt.toISOString(),
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
+        failOnExhaustedAgent: managed.failOnExhaustedAgent,
         // Persisted only when opted in so a default run's file is byte-identical
         // to the pre-compaction shape (undefined keys are dropped by JSON).
         compactJournal: managed.compactJournal === true ? true : undefined,
@@ -742,6 +759,7 @@ export class WorkflowManager extends EventEmitter {
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     const executing = this.startExecuting(managed, lease);
     executing.autoResume = exec.autoResume;
+    executing.failOnExhaustedAgent = exec.failOnExhaustedAgent;
     executing.compactJournal = exec.compactJournal === true;
     executing.tokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
     executing.toolset = exec.toolset;
@@ -841,6 +859,10 @@ export class WorkflowManager extends EventEmitter {
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
       managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
+    // Frozen at start like the other knobs (undefined = lenient, never set by
+    // the caller; the workflow TOOL sends true/false explicitly).
+    const resolvedFailOnExhaustedAgent =
+      managed.failOnExhaustedAgent !== undefined ? managed.failOnExhaustedAgent : exec.failOnExhaustedAgent;
     // Same freeze-at-start pattern as the other per-run knobs (H1): a resumed
     // run keeps the drain grace it started with.
     const resolvedDrainTimeoutMs = managed.drainTimeoutMs !== undefined ? managed.drainTimeoutMs : drainTimeoutMs;
@@ -1074,6 +1096,24 @@ export class WorkflowManager extends EventEmitter {
       // armSettleWatchdog) so it can't later fire against a newer execution
       // of this runId.
       this.disarmSettleWatchdog(managed);
+
+      // Completion-time strictness gate: agent() returning null is the SCRIPT's
+      // contract (recoverable retries exhausted, or a parallel()-absorbed item
+      // error), but a run that resolves with failed agents must not silently
+      // "complete" on the orchestration surface — that is exactly what used to
+      // force the orchestrator into a full restart (completion drops the
+      // journal, so every agent re-ran from scratch). Fail here instead (settles
+      // "failed", journal preserved) so the tool's sync path throws
+      // withResumeHint: the orchestrator resumes, completed agents replay from
+      // cache, and only the failed call re-runs live with a fresh session.
+      if (resolvedFailOnExhaustedAgent === true && result.failedAgents?.length) {
+        const summary = result.failedAgents.map((f) => `${f.label} (${f.errorCode})`).join(", ");
+        throw new WorkflowError(
+          `${result.failedAgents.length} agent(s) exhausted retries: ${summary}`,
+          WorkflowErrorCode.AGENT_EXHAUSTED,
+          { recoverable: false },
+        );
+      }
 
       return result;
     } catch (error) {
@@ -1527,6 +1567,7 @@ export class WorkflowManager extends EventEmitter {
         // "paused" event race (see UsageLimitScheduler) is still correct — this
         // is fixed at run-start and doesn't change over the run's lifetime.
         autoResume: managed.autoResume,
+        failOnExhaustedAgent: managed.failOnExhaustedAgent,
         // The run's frozen compaction opt-in (see ExecOptions.compactJournal),
         // persisted so a resumed run keeps compacting if it started with the
         // flag; omitted (JSON-dropped) on default runs so their persisted files
@@ -1756,6 +1797,7 @@ export class WorkflowManager extends EventEmitter {
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
+      failOnExhaustedAgent: persisted.failOnExhaustedAgent,
       // Carry the compaction opt-in forward across resumes the same way: a run
       // that started compacting keeps compacting (persisted as a boolean).
       compactJournal: persisted.compactJournal === true,

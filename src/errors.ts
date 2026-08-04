@@ -43,6 +43,21 @@ export enum WorkflowErrorCode {
    * so the run is checkpointed (paused) and replayed by resume() rather than failed.
    */
   PROVIDER_USAGE_LIMIT = "PROVIDER_USAGE_LIMIT",
+  /**
+   * The request exceeded the model's context window (provider error). Unlike a
+   * usage/quota limit this does NOT refill on its own: retrying the same prompt
+   * hits the identical wall, so the run settles failed (journal preserved) and the
+   * orchestrator must resume with an edited script (shorter prompt / different
+   * model) instead of being retried into the same wall or silently nulled.
+   */
+  CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW",
+  /**
+   * Run-level failure raised by the manager when agents returned null (exhausted
+   * recoverable retries or parallel-absorbed item failures) and the run opted into
+   * strict completion (failOnExhaustedAgent). Settles the run failed — resumable,
+   * journal preserved — so the orchestrator resumes instead of restarting.
+   */
+  AGENT_EXHAUSTED = "AGENT_EXHAUSTED",
   /** Script validation failed. */
   SCRIPT_VALIDATION_ERROR = "SCRIPT_VALIDATION_ERROR",
   /** A schema agent never produced valid structured_output (after repair + extraction). */
@@ -166,6 +181,76 @@ export function classifyProviderLimit(text: string | undefined): { matched: bool
 }
 
 /**
+ * Context-window overflow error text, per provider. Mirrors the SDK's own
+ * overflow table (pi-ai utils/overflow OVERFLOW_PATTERNS) restricted to the
+ * text-detectable cases — the SDK additionally detects silent overflow via
+ * usage-vs-contextWindow and length-stop heuristics, which need usage data a
+ * text classifier cannot see. Kept local (no SDK import) so the extension
+ * compiles and runs against any pinned SDK version (feature-detect rule).
+ *
+ * Example wordings:
+ * - Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
+ * - OpenAI: "Your input exceeds the context window of this model"
+ * - LiteLLM: "Requested token count exceeds the model's maximum context length of 131072 tokens"
+ * - OpenRouter: "This endpoint's maximum context length is X tokens. However, you requested about Y tokens"
+ * - xAI: "This model's maximum prompt length is 131072 but the request contains 537812 tokens"
+ * - Mistral: "Prompt contains X tokens ... too large for model with Y maximum context length"
+ */
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /prompt is too long/i, // Anthropic token overflow
+  /request_too_large/i, // Anthropic request byte-size overflow (HTTP 413)
+  /input is too long for requested model/i, // Amazon Bedrock
+  /exceeds the context window/i, // OpenAI (Completions & Responses API)
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i, // OpenAI-compatible proxies (LiteLLM)
+  /input token count.*exceeds the maximum/i, // Google (Gemini)
+  /maximum prompt length is \d+/i, // xAI (Grok)
+  /reduce the length of the messages/i, // Groq
+  /maximum context length is \d+ tokens/i, // OpenRouter (most backends)
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i, // OpenRouter/Poolside
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i, // Together AI
+  /exceeds the limit of \d+/i, // GitHub Copilot
+  /exceeds the available context size/i, // llama.cpp server
+  /greater than the context length/i, // LM Studio
+  /context window exceeds limit/i, // MiniMax
+  /exceeded model token limit/i, // Kimi For Coding
+  /too large for model with \d+ maximum context length/i, // Mistral
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i, // DS4 server
+  /prompt too long; exceeded (?:max )?context length/i, // Ollama explicit overflow error
+  /range of input length should be/i, // DashScope / Qwen Token Plan
+  /context[_ ]length[_ ]exceeded/i, // Generic fallback
+  /token limit exceeded/i, // Generic fallback
+];
+
+/**
+ * Non-overflow errors that would accidentally match an overflow pattern. Mirrors
+ * the SDK's NON_OVERFLOW_PATTERNS: e.g. Bedrock throttling is worded
+ * "ThrottlingException: Too many tokens, please wait before trying again." and
+ * must NOT be classified as overflow (it is a transient provider limit instead).
+ */
+const CONTEXT_NON_OVERFLOW_PATTERNS = [
+  /^(Throttling error|Service unavailable):/i, // AWS Bedrock human-readable prefixes
+  /rate limit/i, // Generic rate limiting
+  /too many requests/i, // Generic HTTP 429 style
+];
+
+/**
+ * Detect provider context-window overflow from free-form error text. Anchored
+ * (H2-style): a task whose own output merely mentions "context length" is never
+ * misclassified — callers gate on stopReason === "error" (agent.ts) or the
+ * thrown-error path (wrapError) before trusting this.
+ */
+export function classifyContextOverflow(text: string | undefined): boolean {
+  if (!text) return false;
+  if (CONTEXT_NON_OVERFLOW_PATTERNS.some((p) => p.test(text))) return false;
+  return CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(text));
+}
+
+/** Report whether an unknown failure is a context-overflow WorkflowError. */
+export function isContextOverflowError(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.CONTEXT_OVERFLOW;
+}
+
+/**
  * Standard JS error names a workflow SCRIPT can throw directly. These can never
  * be SDK/API-layer failures, so their messages must not be classified as
  * provider limits (H2 gating) — a script bug whose message merely mentions
@@ -225,13 +310,21 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
     );
   }
 
-  // Defense-in-depth: today the SDK buries provider usage/quota limits in an
-  // assistant message (detected in agent.ts), but a future SDK might throw them.
-  // Classify a thrown limit here too — recoverable:false so the run checkpoints
-  // (paused) instead of being retried into the same wall or silently nulled.
-  // Gated to non-script-origin errors (H2): a plain script bug whose message
-  // merely mentions quota/usage must stay a normal recoverable execution error.
+  // Defense-in-depth: today the SDK buries provider limits AND context overflow
+  // in an assistant message (detected in agent.ts), but a future SDK might throw
+  // them. Classify thrown context overflow FIRST (more specific; settles the run
+  // failed rather than paused — a context wall never refills on its own), then
+  // provider limits (recoverable:false so the run checkpoints/pauses instead of
+  // being retried into the same wall or silently nulled). Gated to
+  // non-script-origin errors (H2): a plain script bug whose message merely
+  // mentions quota/context must stay a normal recoverable execution error.
   if (error instanceof Error && !SCRIPT_ERROR_NAMES.has(error.name)) {
+    if (classifyContextOverflow(error.message)) {
+      return new WorkflowError(error.message, WorkflowErrorCode.CONTEXT_OVERFLOW, {
+        recoverable: false,
+        agentLabel: context?.agentLabel,
+      });
+    }
     const limit = classifyProviderLimit(error.message);
     if (limit.matched) {
       return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {

@@ -1429,3 +1429,37 @@ test("workflow keepWorktree retains the branch + path with finalized agent edits
     rmSync(repo, { recursive: true, force: true });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Context-window overflow: a subagent whose SDK throws (or whose session
+// records) an overflow must surface as CONTEXT_OVERFLOW (non-recoverable) —
+// never as a silent null that lets the run "complete" with a missing result.
+// The thrown path (wrapError defense) is exercised end-to-end here; the
+// buried-message path (throwIfContextOverflow) is unit-tested in
+// schema-resolution.test.ts.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("runWorkflow surfaces a thrown context-overflow as CONTEXT_OVERFLOW (non-recoverable), not a silent null", async () => {
+  const overflowAgent = {
+    async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      throw new Error("prompt is too long: 213462 tokens > 200000 maximum");
+    },
+  };
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'overflow_demo', description: 'context overflow' }
+         const r = await agent('analyze', { label: 'a' })
+         return r`,
+        { agent: overflowAgent, persistLogs: false },
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.CONTEXT_OVERFLOW);
+      assert.equal(error.recoverable, false, "overflow is a hard failure, never a checkpoint");
+      assert.equal(error.agentLabel, "a");
+      return true;
+    },
+  );
+});

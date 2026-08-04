@@ -342,6 +342,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `agentRetries?: number = configured value or 0`
 - Constraint: floored and clamped to 0..3
+- Constraint: a subagent that still fails after retries is exhausted
 
 <a id="tool-input-agenttimeoutms"></a>
 ## agentTimeoutMs
@@ -349,6 +350,16 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `agentTimeoutMs?: number = configured default or unbounded`
+
+<a id="tool-input-failonexhaustedagent"></a>
+## failOnExhaustedAgent
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `failOnExhaustedAgent?: boolean = true`
+- Constraint: strict completion: an exhausted subagent (retries exhausted, context-window overflow) settles the run FAILED
+- Constraint: a failed run is resumable via resumeFromRunId; completed agents replay from cache, only the failed call re-runs
+- Constraint: false = best-effort: the run completes and reports failed agents in the result instead of failing
 
 <a id="tool-input-tokenbudget"></a>
 ## tokenBudget
@@ -367,6 +378,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: resumes a prior incomplete run with an edited script
 - Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
 - Constraint: always runs in the background
+- Constraint: use for any failed or paused run (retries exhausted, context overflow, provider limit) — never start a new run to recover
 
 <a id="tool-input-dryrun"></a>
 ## dryRun

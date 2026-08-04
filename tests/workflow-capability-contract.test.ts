@@ -45,6 +45,7 @@ const EXPECTED_TOOL_INPUTS = [
   "background",
   "concurrency",
   "dryRun",
+  "failOnExhaustedAgent",
   "maxAgents",
   "name",
   "resumeFromRunId",

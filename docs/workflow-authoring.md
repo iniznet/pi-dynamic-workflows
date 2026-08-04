@@ -41,6 +41,7 @@ See [Workflow prompt guidance rationale](workflow-prompt-guidance-rationale.md) 
 | concurrency | workflow-tool-input | `concurrency?: number` | — |
 | agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
+| failOnExhaustedAgent | workflow-tool-input | `failOnExhaustedAgent?: boolean = true` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 | dryRun | workflow-tool-input | `dryRun?: boolean = false` | — |

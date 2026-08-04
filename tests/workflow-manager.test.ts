@@ -4064,3 +4064,106 @@ test(
     );
   }),
 );
+
+/** Agent whose first invocation for a given label throws a recoverable error
+ * (retries exhausted -> null), then succeeds on every later call. */
+function failOnceForLabel(label: string, message = "boom: recoverable failure") {
+  let failed = false;
+  return {
+    async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      if (options?.label === label && !failed) {
+        failed = true;
+        throw new Error(message);
+      }
+      return "ok";
+    },
+  };
+}
+
+const parallelAbsorbScript = `export const meta = { name: 'parallel_absorb', description: 'one parallel item fails' }
+phase('Fan')
+const r = await parallel([() => agent('a', { label: 'a' }), () => agent('b', { label: 'b' })])
+return { r }`;
+
+test(
+  "failOnExhaustedAgent (default lenient): a failing agent completes with a visible failedAgents entry",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: failOnceForLabel("a") });
+    const result = await manager.runSync(oneAgentScript, undefined, { failOnExhaustedAgent: false });
+    assert.equal(result.agentCount, 1);
+    assert.equal((result.result as { a: unknown }).a, null, "the exhausted agent returns null to the script");
+    assert.equal(result.failedAgents?.length, 1, "the failed agent is reported on the result");
+    assert.equal(result.failedAgents?.[0].label, "a");
+    assert.equal(manager.listRuns()[0].status, "completed", "lenient runs still complete");
+  }),
+);
+
+test(
+  "failOnExhaustedAgent (strict): a failing agent settles the run FAILED and a resume re-runs only the failed call",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: failOnceForLabel("a") });
+    const { runId, promise } = manager.startInBackground(oneAgentScript, undefined, {
+      failOnExhaustedAgent: true,
+    });
+    await assert.rejects(promise, (err: unknown) => {
+      assert.equal((err as { code?: string }).code, WorkflowErrorCode.AGENT_EXHAUSTED);
+      assert.equal((err as { recoverable?: boolean }).recoverable, false);
+      assert.match((err as Error).message, /agent\(s\) exhausted retries/);
+      return true;
+    });
+    const settled = manager.getPersistence().load(runId);
+    assert.equal(settled?.status, "failed", "strict failure settles failed (journal preserved, resumable)");
+
+    // Resume the SAME script: the failed call re-runs live (failOnceForLabel
+    // already consumed its one failure) and the run completes.
+    assert.equal(await manager.resume(runId, { script: oneAgentScript }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(resumed?.status, "completed", "resume after AGENT_EXHAUSTED completes");
+    assert.equal(resumed?.agents[0]?.result, "ok", "the previously failed agent produced a real result");
+  }),
+);
+
+test(
+  "failOnExhaustedAgent (strict) is frozen at run start: a resume cannot downgrade it",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: failOnceForLabel("a") });
+    const { runId, promise } = manager.startInBackground(oneAgentScript, undefined, {
+      failOnExhaustedAgent: true,
+    });
+    await assert.rejects(promise, (err: unknown) => {
+      assert.equal((err as { code?: string }).code, WorkflowErrorCode.AGENT_EXHAUSTED);
+      return true;
+    });
+    // Resume with an explicit downgrade attempt — the frozen start-time value
+    // must win, so the run stays strict and still fails (failOnceForLabel has
+    // consumed its failure though, so this run actually succeeds... assert the
+    // FLAG is carried instead by checking the persisted value).
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.failOnExhaustedAgent, true, "the flag is persisted with the run");
+    assert.equal(await manager.resume(runId, { script: oneAgentScript, failOnExhaustedAgent: false }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.getPersistence().load(runId)?.failOnExhaustedAgent, true);
+  }),
+);
+
+test(
+  "failOnExhaustedAgent (strict): a parallel()-absorbed failure fails the run instead of a silent null item",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: failOnceForLabel("b") });
+    const { runId, promise } = manager.startInBackground(parallelAbsorbScript, undefined, {
+      failOnExhaustedAgent: true,
+    });
+    await assert.rejects(promise, (err: unknown) => {
+      assert.equal((err as { code?: string }).code, WorkflowErrorCode.AGENT_EXHAUSTED);
+      assert.match((err as Error).message, /b \(AGENT_EXECUTION_ERROR\)/);
+      return true;
+    });
+    assert.equal(manager.getPersistence().load(runId)?.status, "failed");
+  }),
+);

@@ -138,6 +138,14 @@ export interface PersistedRunState {
    */
   autoResume?: boolean;
   /**
+   * Frozen at run start (like autoResume): whether agent failures settle this
+   * run failed+resumable instead of completing with silent nulls. Undefined =
+   * lenient (never set by the caller); the workflow TOOL persists true by
+   * default. Carried through resume() so a resumed run keeps the strictness it
+   * started with.
+   */
+  failOnExhaustedAgent?: boolean;
+  /**
    * The run's opt-in resume-journal compaction flag (see
    * ExecOptions.compactJournal), frozen at run start and persisted so a
    * resumed run keeps compacting if it started with the flag. Absent/undefined

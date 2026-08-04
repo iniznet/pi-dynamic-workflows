@@ -574,8 +574,16 @@ const capabilities: readonly CapabilityDescriptor[] = [
   ]),
   toolInput("maxAgents", "maxAgents?: number = 1000", ["default, not a hard product maximum"]),
   toolInput("concurrency", "concurrency?: number", ["runtime clamps to 1..16"]),
-  toolInput("agentRetries", "agentRetries?: number = configured value or 0", ["floored and clamped to 0..3"]),
+  toolInput("agentRetries", "agentRetries?: number = configured value or 0", [
+    "floored and clamped to 0..3",
+    "a subagent that still fails after retries is exhausted",
+  ]),
   toolInput("agentTimeoutMs", "agentTimeoutMs?: number = configured default or unbounded"),
+  toolInput("failOnExhaustedAgent", "failOnExhaustedAgent?: boolean = true", [
+    "strict completion: an exhausted subagent (retries exhausted, context-window overflow) settles the run FAILED",
+    "a failed run is resumable via resumeFromRunId; completed agents replay from cache, only the failed call re-runs",
+    "false = best-effort: the run completes and reports failed agents in the result instead of failing",
+  ]),
   toolInput("tokenBudget", "tokenBudget?: number = configured default or unlimited", [
     "soft pre-call gate; in-flight work can overshoot",
   ]),
@@ -583,6 +591,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "resumes a prior incomplete run with an edited script",
     "unchanged positional agent calls replay from cache until the first changed or inserted call",
     "always runs in the background",
+    "use for any failed or paused run (retries exhausted, context overflow, provider limit) — never start a new run to recover",
   ]),
   toolInput("dryRun", "dryRun?: boolean = false", [
     "validates the script or named workflow without launching a run",

@@ -19,7 +19,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
-import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { classifyContextOverflow, classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { tierNameForTask } from "./model-routing.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import {
@@ -109,6 +109,24 @@ export function throwIfProviderLimit(messages: unknown[], label?: string): void 
   );
 }
 
+/**
+ * Detect a provider context-window overflow recorded as an assistant message
+ * with stopReason "error" (the SDK buries it, exactly like usage limits).
+ * Classified CONTEXT_OVERFLOW (non-recoverable) so the run settles failed with
+ * its journal preserved instead of being retried into the same wall or silently
+ * nulled — resume() then replays completed agents and re-runs only the
+ * overflowing one with a fresh session/context.
+ */
+export function throwIfContextOverflow(messages: unknown[], label?: string): void {
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  if (!classifyContextOverflow(err.errorMessage)) return;
+  throw new WorkflowError(err.errorMessage ?? "Context window overflow", WorkflowErrorCode.CONTEXT_OVERFLOW, {
+    recoverable: false,
+    agentLabel: label,
+  });
+}
+
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
@@ -156,9 +174,11 @@ export async function resolveStructuredOutput<T>(
     return extracted;
   }
 
-  // A repair re-prompt can itself hit the provider limit. Surface that as the real
-  // (recoverable) cause instead of the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
+  // A repair re-prompt can itself hit the provider limit (or overflow the context
+  // window). Surface that as the real (recoverable/checkpointed) cause instead of
+  // the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
   throwIfProviderLimit(session.messages, options.label);
+  throwIfContextOverflow(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -1184,8 +1204,11 @@ export class WorkflowAgent {
       // The SDK buries a provider usage/quota limit in the assistant message rather
       // than throwing; detect it here (before the schema/empty-text branches) so it
       // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
-      // (schema path) or a silent empty-output null (non-schema path).
+      // (schema path) or a silent empty-output null (non-schema path). Context
+      // overflow is buried the same way; detect it first so it settles the run
+      // failed+resumable rather than exhausting retries into a silent null.
       throwIfProviderLimit(session.messages, options.label);
+      throwIfContextOverflow(session.messages, options.label);
 
       if (options.schema) {
         return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>

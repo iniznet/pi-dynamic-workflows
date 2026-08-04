@@ -6,6 +6,7 @@ import {
   lastAssistantError,
   resolveStructuredOutput,
   type StructuredSession,
+  throwIfContextOverflow,
   throwIfProviderLimit,
 } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
@@ -172,6 +173,40 @@ describe("lastAssistantError / throwIfProviderLimit", () => {
   it("does not throw for a non-limit error turn", () => {
     assert.doesNotThrow(() =>
       throwIfProviderLimit([{ role: "assistant", content: [], stopReason: "error", errorMessage: "network blip" }]),
+    );
+  });
+
+  it("throws CONTEXT_OVERFLOW when the error turn matches a context-window overflow", () => {
+    assert.throws(
+      () =>
+        throwIfContextOverflow(
+          [
+            {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "prompt is too long: 213462 tokens > 200000 maximum",
+            },
+          ],
+          "lbl",
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.CONTEXT_OVERFLOW);
+        assert.equal((err as { recoverable?: boolean }).recoverable, false);
+        assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
+        return true;
+      },
+    );
+  });
+
+  it("does not throw CONTEXT_OVERFLOW for a rate limit or a benign error turn", () => {
+    assert.doesNotThrow(() =>
+      throwIfContextOverflow([
+        { role: "assistant", content: [], stopReason: "error", errorMessage: "rate limit reached, resets in 3h" },
+      ]),
+    );
+    assert.doesNotThrow(() =>
+      throwIfContextOverflow([{ role: "assistant", content: [], stopReason: "error", errorMessage: "network blip" }]),
     );
   });
 });
