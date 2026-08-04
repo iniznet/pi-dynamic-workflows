@@ -192,6 +192,12 @@ export type {
   RunPersistence,
   RunStatus,
 } from "./run-persistence.js";
+// Task 8 convenience exports: low-level CAS status-flip bookkeeping ONLY.
+// resumeRun()/cleanupRun() flip a persisted run's status on disk — they do NOT
+// re-execute the script, replay the journal, acquire a run lease, or reclaim
+// worktrees. The canonical resume/cleanup surface is WorkflowManager.resume()
+// (journal replay, checkpoint seeding, lease) plus the /workflows resume|clean
+// commands; keep this pair for embedders that only need the bookkeeping flip.
 export {
   cleanupRun,
   createRunPersistence,
@@ -320,6 +326,12 @@ export {
   parseFieldInput,
   SettingsFormModel,
 } from "./workflow-settings-fields.js";
+// Task 9 convenience exports: raw persistence reads + lock primitives. The
+// canonical live surfaces are the manager-backed `workflow_control` tool
+// (list/status) and guardWorktreeWriteConflicts(), which is already wired into
+// the host tool seams. getWorkflowStatus()/listRunningWorkflows() read persisted
+// state directly; the lock helpers are primitives — worktree agents claim locks
+// today only from tests/library callers (no live claimer yet).
 export type { FileLock, WorkflowStatus } from "./workflow-status.js";
 export {
   acquireFileLock,

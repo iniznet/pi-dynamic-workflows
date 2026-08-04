@@ -244,6 +244,24 @@ Library callers can pass `checkpointGate`: `checkpoint()` then publishes its pay
 
 **Human approval bridge** — `createPlannotatorBridge({ port: 3123, autoOpenBrowser, approvalTimeout })` serves `/sse` (all `update` events, 15 s heartbeat) and `/reviewed` (named `reviewed` events on settle); plans persist to `.pi/workflows/plans/<id>.json`. `waitForApproval(planId)` polls on a 250 ms bound and is AbortSignal-abortable; bind errors (EADDRINUSE) reject waits instead of crashing.
 
+<details>
+<summary><strong>Phased pipeline and run control — live vs manual</strong></summary>
+
+A default top-level run walks the phased pipeline before the script body executes (wayfinder → prewalk → PhaseGuard), and the extension creates a per-cwd persisted state machine so the phase flags are armed on every run. The pipeline is strictly additive: an embedding that passes neither `pipeline` nor `phaseState` gets byte-identical pre-wiring behavior.
+
+| PRD task | Feature | Live by default? | Canonical surface |
+| --- | --- | --- | --- |
+| 4 | Wayfinder decision map (Phase 0): fog verdict on the task prompt; a foggy prompt persists a decision map via the deterministic zero-model stub mapper | Yes — runs on every top-level run | `.pi/workflows/map.md` + `map.json` |
+| 5 | Prewalk “1986 Aircraft Manual” blueprint (Phase 1): gated on `wayfinderComplete`; the blueprint is the plan the plannotator gate and `/workflows implement` read | Yes — follows wayfinder | `.pi/workflows/plans/<runId>.json` |
+| 2 | PhaseGuard: `phase(title, { stage })` transitions persist forward-only (`PHASE_TRANSITION_INVALID` on rollback); the pipeline’s `wayfinderComplete`/`prewalkComplete` gates are enforced; `agent()` spawns stay ungated on default runs and are gated behind Phase 3 + human approval wherever `phaseState.gateAgentCalls` is on (embedding opt-in, or the `/workflows implement` command) | State machine armed per cwd; agent gate opt-in | `.pi/workflows/active-state.json` |
+| 6 | Plannotator visual review gate (Phase 2): a script-authored `checkpoint()` publishes the plan to the SSE bridge and waits for approve/deny | Partial — user-authored gated scripts only (none of the 5 shipped builtins call `checkpoint()`) | `createPlannotatorBridge` + plan file + `plannotatorSubmitted`/`humanApproved` flags |
+| 7 | Worktree implement (Phase 3): `/workflows implement <id>` fans blueprint steps out to worktree subagents | Manual slash command; refused until the run reached Phase 3 + human approval and a blueprint exists | per-task commits on `pi/wf/` branches |
+| 8 | Atomic checkpointing, crash recovery, cleanup | Yes for the manager path | `/workflows resume` (journal replay, lease) and `/workflows clean` (worktree sweep); standalone `resumeRun()`/`cleanupRun()` only flip a persisted run’s status on disk — no journal replay, no re-execution, no lease |
+| 9 | Non-blocking runs + read-only interceptor + status | Yes | `background: true` default; write executors conflict-guarded via `guardWorktreeWriteConflicts`; status via the manager-backed `workflow_control` tool and `/workflows status` |
+
+**Library helpers vs canonical surfaces.** The raw exports `resumeRun`, `cleanupRun`, `getWorkflowStatus`, `listRunningWorkflows`, `acquireFileLock`, `releaseFileLock`, and `checkFileConflict` remain public for embedders, but the production surfaces above are canonical: `WorkflowManager` (resume/settle/status) and the `/workflows` commands. `resumeRun()`/`cleanupRun()` are bookkeeping status flips only; the lock helpers are primitives whose only live consumer is the `guardWorktreeWriteConflicts()` interceptor already wrapped into the host tool seams (worktree agents today claim locks only from tests/library callers — there is no live claimer yet).
+</details>
+
 | Agent option | Description |
 | --- | --- |
 | `tier` | `small`, `medium`, or `big` model routing |
