@@ -3,6 +3,8 @@ import { describe, it } from "node:test";
 import {
   classifyContextOverflow,
   classifyProviderLimit,
+  classifyProviderUnavailable,
+  isProviderOverloaded,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
@@ -47,6 +49,51 @@ describe("classifyProviderLimit", () => {
   });
 });
 
+describe("classifyProviderUnavailable", () => {
+  it("classifies 503/504 status codes as pause-worthy", () => {
+    for (const text of [
+      "503 status code (no body)",
+      "504 status code (no body)",
+      "503 Service Unavailable",
+      "HTTP 504: Gateway Timeout",
+    ]) {
+      assert.equal(classifyProviderUnavailable(text), "pause", `should pause: ${text}`);
+    }
+  });
+
+  it("classifies 500/502 status codes as retry-worthy", () => {
+    for (const text of ["500 status code (no body)", "502 status code (no body)", "502 Bad Gateway"]) {
+      assert.equal(classifyProviderUnavailable(text), "retry", `should retry: ${text}`);
+    }
+  });
+
+  it("matches overload/outage phrase shapes without a status code", () => {
+    for (const text of [
+      "overloaded_error: server is busy", // Anthropic 529
+      "Service Unavailable",
+      "The service is temporarily unavailable",
+      "upstream_request_timeout",
+      "scheduled maintenance window",
+    ]) {
+      assert.equal(classifyProviderUnavailable(text), "pause", `should pause: ${text}`);
+    }
+    assert.equal(classifyProviderUnavailable("bad gateway: upstream connection refused"), "retry");
+  });
+
+  it("does NOT classify non-5xx or benign text", () => {
+    for (const text of [
+      "403 status code (no body)",
+      "429 too many requests",
+      "request timed out after 30s",
+      "file not found",
+      "5000 dollar bill", // a 4-digit number, not a status code
+      undefined,
+    ]) {
+      assert.equal(classifyProviderUnavailable(text), undefined, `should be undefined: ${text}`);
+    }
+  });
+});
+
 describe("wrapError provider-limit classification", () => {
   it("classifies a thrown usage-limit Error as non-recoverable PROVIDER_USAGE_LIMIT (defense for a throwing SDK)", () => {
     const e = wrapError(new Error("Codex usage limit reached (plus plan). Resets in ~3h."), { agentLabel: "a" });
@@ -56,15 +103,27 @@ describe("wrapError provider-limit classification", () => {
     assert.equal(e.agentLabel, "a");
   });
 
-  it("keeps transient overloaded/5xx errors as recoverable AGENT_EXECUTION_ERROR (not a quota pause)", () => {
+  it("classifies transient overload (529/503-class) as a pause-worthy PROVIDER_OVERLOADED", () => {
     const e = wrapError(new Error("overloaded_error: server is busy"));
-    assert.equal(e.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.equal(e.code, WorkflowErrorCode.PROVIDER_OVERLOADED);
+    assert.equal(e.recoverable, false);
+  });
+
+  it("classifies a transient 5xx (500/502) as recoverable PROVIDER_UNAVAILABLE", () => {
+    const e = wrapError(new Error("500 status code (no body)"));
+    assert.equal(e.code, WorkflowErrorCode.PROVIDER_UNAVAILABLE);
     assert.equal(e.recoverable, true);
   });
 
   it("passes an existing WorkflowError through unchanged", () => {
     const orig = new WorkflowError("nope", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, { recoverable: false });
     assert.equal(wrapError(orig), orig);
+  });
+
+  it("isProviderOverloaded mirrors isProviderUsageLimit's shape", () => {
+    assert.equal(isProviderOverloaded(new WorkflowError("x", WorkflowErrorCode.PROVIDER_OVERLOADED)), true);
+    assert.equal(isProviderOverloaded(new WorkflowError("x", WorkflowErrorCode.PROVIDER_USAGE_LIMIT)), false);
+    assert.equal(isProviderOverloaded(new Error("503")), false);
   });
 });
 
@@ -132,6 +191,8 @@ describe("classifyContextOverflow", () => {
       "prompt too long; exceeded context length", // Ollama
       "range of input length should be [1, 128000]", // DashScope
       "context_length_exceeded: the conversation is too long", // generic
+      "413 status code (no body)", // Cerebras overflow normalized by the SDK
+      "400 status code (no body)", // Cerebras overflow (HTTP 400, no body)
     ];
     for (const text of cases) {
       assert.equal(classifyContextOverflow(text), true, `should match: ${text}`);
@@ -157,6 +218,10 @@ describe("classifyContextOverflow", () => {
     // A context error that also mentions a limit must classify as overflow
     // (settles failed) — never as a pausable usage limit.
     assert.equal(classifyContextOverflow("context_length_exceeded: usage limit reached"), true);
+
+    // A 5xx status is NEVER overflow (the Cerebras no-body pattern is 4xx-only),
+    // so a 500 stays a transient provider failure, not a context wall.
+    assert.equal(classifyContextOverflow("500 status code (no body)"), false);
   });
 });
 

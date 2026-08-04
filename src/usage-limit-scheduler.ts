@@ -271,7 +271,12 @@ export class UsageLimitScheduler {
   // ---- event handlers -----------------------------------------------------
 
   private handlePaused(event: { runId?: string; reason?: string; resetHint?: string }): void {
-    if (this.disposed || !event?.runId || event.reason !== "usage_limit") return;
+    // "usage_limit" (budget refills) and "provider_overloaded" (503/504
+    // outage — the endpoint recovers on its own) are both provider conditions
+    // that resolve without user action, so both arm the same auto-resume
+    // backoff. Anything else (manual pause) stays manual.
+    if (this.disposed || !event?.runId || (event.reason !== "usage_limit" && event.reason !== "provider_overloaded"))
+      return;
     const runId = event.runId;
 
     // The "paused" event fires BEFORE the manager's own persistRun() write for
@@ -320,7 +325,8 @@ export class UsageLimitScheduler {
   private coldStartRearm(): void {
     const runs = this.manager.listAllRuns();
     for (const run of runs) {
-      if (run.status !== "paused" || run.pauseReason !== "usage_limit") continue;
+      if (run.status !== "paused" || (run.pauseReason !== "usage_limit" && run.pauseReason !== "provider_overloaded"))
+        continue;
       if (run.autoResume === false) continue;
       if (this.state.has(run.runId)) continue;
 

@@ -19,7 +19,13 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
-import { classifyContextOverflow, classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import {
+  classifyContextOverflow,
+  classifyProviderLimit,
+  classifyProviderUnavailable,
+  WorkflowError,
+  WorkflowErrorCode,
+} from "./errors.js";
 import { tierNameForTask } from "./model-routing.js";
 import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
 import {
@@ -127,6 +133,32 @@ export function throwIfContextOverflow(messages: unknown[], label?: string): voi
   });
 }
 
+/**
+ * Detect a provider outage/overload (5xx) recorded as an assistant message with
+ * stopReason "error" (the SDK buries it, exactly like usage limits/overflow).
+ * Mirrors wrapError's thrown-error classification: 503/504 pause the run
+ * (PROVIDER_OVERLOADED, recoverable:false) so it checkpoints and resumes after
+ * the endpoint recovers; 500/502 are recoverable (PROVIDER_UNAVAILABLE) so the
+ * attempt is retried with backoff before the run fails resumable.
+ */
+export function throwIfProviderUnavailable(messages: unknown[], label?: string): void {
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "error") return;
+  const cls = classifyProviderUnavailable(err.errorMessage);
+  if (cls === "pause") {
+    throw new WorkflowError(err.errorMessage ?? "Provider overloaded", WorkflowErrorCode.PROVIDER_OVERLOADED, {
+      recoverable: false,
+      agentLabel: label,
+    });
+  }
+  if (cls === "retry") {
+    throw new WorkflowError(err.errorMessage ?? "Provider unavailable", WorkflowErrorCode.PROVIDER_UNAVAILABLE, {
+      recoverable: true,
+      agentLabel: label,
+    });
+  }
+}
+
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
@@ -175,10 +207,12 @@ export async function resolveStructuredOutput<T>(
   }
 
   // A repair re-prompt can itself hit the provider limit (or overflow the context
-  // window). Surface that as the real (recoverable/checkpointed) cause instead of
-  // the misleading non-recoverable SCHEMA_NONCOMPLIANCE.
+  // window, or hit a 5xx outage). Surface that as the real (recoverable/
+  // checkpointed) cause instead of the misleading non-recoverable
+  // SCHEMA_NONCOMPLIANCE.
   throwIfProviderLimit(session.messages, options.label);
   throwIfContextOverflow(session.messages, options.label);
+  throwIfProviderUnavailable(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -1206,9 +1240,12 @@ export class WorkflowAgent {
       // is classified as a recoverable checkpoint, not a SCHEMA_NONCOMPLIANCE failure
       // (schema path) or a silent empty-output null (non-schema path). Context
       // overflow is buried the same way; detect it first so it settles the run
-      // failed+resumable rather than exhausting retries into a silent null.
+      // failed+resumable rather than exhausting retries into a silent null. A 5xx
+      // outage is buried the same way: 503/504 pause the run, 500/502 retry with
+      // backoff (see throwIfProviderUnavailable).
       throwIfProviderLimit(session.messages, options.label);
       throwIfContextOverflow(session.messages, options.label);
+      throwIfProviderUnavailable(session.messages, options.label);
 
       if (options.schema) {
         return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>

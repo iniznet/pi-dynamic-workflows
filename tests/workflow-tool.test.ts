@@ -277,6 +277,7 @@ test("createWorkflowTool prepareArguments passes through args", () => {
       maxAgents: 5,
       concurrency: 2,
       agentRetries: 1,
+      retryBackoffMs: 0,
     });
     assert.equal(result.script, "export const meta = { name: 't', description: 't' }");
     assert.deepEqual(result.args, { question: "test" });

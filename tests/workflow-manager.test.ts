@@ -679,7 +679,7 @@ const a = await agent('a', { label: 'a' })
 const b = await agent('b', { label: 'b' })
 return { a, b }`;
 
-    const { runId, promise } = manager.startInBackground(script, undefined, { agentRetries: 1 });
+    const { runId, promise } = manager.startInBackground(script, undefined, { agentRetries: 1, retryBackoffMs: 0 });
     promise.catch(() => {});
     for (let i = 0; i < 200 && aAttempts < 2; i++) {
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -725,7 +725,7 @@ test(
 const xs = await parallel(['a','b'].map((p) => () => agent(p, { label: p })))
 return xs`;
 
-    const result = await manager.runSync(script, undefined, { concurrency: 1, agentRetries: 1 });
+    const result = await manager.runSync(script, undefined, { concurrency: 1, agentRetries: 1, retryBackoffMs: 0 });
 
     assert.deepEqual(result.result, ["ok:a", "ok:b"]);
     assert.equal(maxActive, 1, "exec concurrency should override the manager default");
@@ -748,7 +748,7 @@ test(
       },
     });
 
-    const result = await manager.runSync(oneAgentScript);
+    const result = await manager.runSync(oneAgentScript, undefined, { retryBackoffMs: 0 });
 
     assert.equal((result.result as { a: unknown }).a, "ok");
     assert.equal(calls, 2);
@@ -4165,5 +4165,54 @@ test(
       return true;
     });
     assert.equal(manager.getPersistence().load(runId)?.status, "failed");
+  }),
+);
+
+test(
+  "provider 503: an agent outage checkpoints the run as PAUSED (provider_overloaded), not failed",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          throw new Error("503 status code (no body)");
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript, undefined, {
+      agentRetries: 2,
+      retryBackoffMs: 0,
+    });
+    await assert.rejects(promise, (err: unknown) => {
+      assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_OVERLOADED);
+      assert.equal((err as { recoverable?: boolean }).recoverable, false);
+      return true;
+    });
+    const settled = manager.getPersistence().load(runId);
+    assert.equal(settled?.status, "paused", "an outage checkpoints the run (resumable) instead of failing it");
+    assert.equal(settled?.pauseReason, "provider_overloaded");
+  }),
+);
+
+test(
+  "provider 500: an exhausted transient outage surfaces PROVIDER_UNAVAILABLE in the failure text",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+          throw new Error("500 status code (no body)");
+        },
+      },
+    });
+    const result = await manager.runSync(oneAgentScript, undefined, { agentRetries: 0, retryBackoffMs: 0 });
+    assert.equal(result.agentCount, 1);
+    assert.equal((result.result as { a: unknown }).a, null, "the exhausted agent returns null to the script");
+    assert.equal(result.failedAgents?.length, 1);
+    assert.equal(result.failedAgents?.[0].errorCode, WorkflowErrorCode.PROVIDER_UNAVAILABLE);
+    assert.match(result.failedAgents?.[0].error ?? "", /500 status code \(no body\)/);
   }),
 );

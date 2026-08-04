@@ -220,3 +220,88 @@ test("parseResetHintMs does not misread day words as bare units (L11)", () => {
   assert.equal(parseResetHintMs("resets in 3days"), 3 * 86_400_000);
   assert.equal(parseResetHintMs("in 2 weeks time"), 2 * 7 * 86_400_000);
 });
+
+// ---- provider_overloaded pauses (503/504 outages) -----------------------------
+
+test("provider_overloaded pause arms at the reset-hint delay, like usage_limit (500-path)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 30m" }));
+  const clock = createFakeClock();
+  manager.resumeImpl = async () => true;
+
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    maxAttempts: 3,
+    maxConsecutiveRefusals: 2,
+    minDelayMs: 60_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+  });
+
+  manager.emit("paused", { runId: "run-1", reason: "provider_overloaded", resetHint: "resets in 30m" });
+  assert.deepEqual(
+    clock.pendingDelays(),
+    [30 * 60_000],
+    "a provider-overloaded pause arms at the reset-hint delay, not the floor",
+  );
+  scheduler.dispose();
+});
+
+test("provider_overloaded pause without a reset hint arms at the fallback delay (500-path)", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({}));
+  const clock = createFakeClock();
+  manager.resumeImpl = async () => false;
+
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    maxAttempts: 3,
+    maxConsecutiveRefusals: 2,
+    minDelayMs: 60_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+  });
+
+  manager.emit("paused", { runId: "run-1", reason: "provider_overloaded" });
+  assert.deepEqual(
+    clock.pendingDelays(),
+    [300_000],
+    "no reset hint → the fallback delay is used for the provider-outage arm",
+  );
+  scheduler.dispose();
+});
+
+test("cold start re-arms a provider_overloaded paused run left by a previous process (500-path)", async () => {
+  const manager = new FakeManager();
+  // A run the previous process paused on a 503 outage, persisted with autoResume on.
+  manager.persistence.seed(makeRun({ autoResume: true, pauseReason: "provider_overloaded", autoResumeAttempts: 1 }));
+  const clock = createFakeClock(0);
+  let resumeCalls = 0;
+  manager.resumeImpl = async () => {
+    resumeCalls++;
+    return true;
+  };
+
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    maxAttempts: 3,
+    maxConsecutiveRefusals: 2,
+    minDelayMs: 60_000,
+    fallbackDelayMs: 300_000,
+    maxDelayMs: 3_600_000,
+  });
+
+  assert.equal(scheduler.hasArmedTimer("run-1"), true, "cold start arms the stalled provider-overloaded run");
+  assert.equal(scheduler.getAttemptCount("run-1"), 2, "attempts continue from the persisted counter");
+
+  clock.fireAll();
+  await flush();
+  assert.equal(resumeCalls, 1, "the cold-start timer fires a resume for the stalled run");
+  scheduler.dispose();
+});

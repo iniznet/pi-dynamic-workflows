@@ -49,7 +49,7 @@ const a = await agent('a', { label: 'a' })
 const b = await agent('b', { label: 'b' })
 return { a, b }`;
 
-    const { runId, promise } = manager.startInBackground(script, undefined, { agentRetries: 1 });
+    const { runId, promise } = manager.startInBackground(script, undefined, { agentRetries: 1, retryBackoffMs: 0 });
     await promise;
 
     const persisted = manager.getPersistence().load(runId);

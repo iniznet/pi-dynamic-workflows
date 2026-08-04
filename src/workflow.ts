@@ -16,11 +16,13 @@ import {
 } from "./agent-registry.js";
 import {
   DEFAULT_AGENT_TIMEOUT_MS,
+  DEFAULT_RETRY_BACKOFF_MS,
   DRAIN_ABORT_TIMEOUT_MS,
   MAX_AGENT_RETRIES,
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
   MAX_NESTED_WORKFLOW_DEPTH,
+  MAX_RETRY_BACKOFF_MS,
 } from "./config.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import { createWorkflowLogger } from "./logger.js";
@@ -226,6 +228,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
+  /**
+   * Base exponential-backoff delay (ms) between retry attempts after a
+   * recoverable agent failure: attempt N→N+1 waits base × 2^(N-1), capped at
+   * 8× base. Default 1000. 0 disables the wait. A pure timing knob (not frozen
+   * per run, unlike agentRetries).
+   */
+  retryBackoffMs?: number;
   /**
    * Whether an agent that ends with a failure (exhausted recoverable retries,
    * or an error absorbed as a null by parallel()/pipeline()) should make the
@@ -1090,6 +1099,7 @@ export async function runWorkflow<T = unknown>(
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
+      const retryBackoffMs = normalizeRetryBackoffMs(options.retryBackoffMs);
 
       safeCallback("onAgentStart", options.onAgentStart, {
         id: deltaKey,
@@ -1302,8 +1312,10 @@ export async function runWorkflow<T = unknown>(
             store.discardDelta(deltaKey);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
+              const delayMs = retryBackoffDelayMs(retryBackoffMs, attempt);
               log(
-                `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
+                `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying` +
+                  (delayMs > 0 ? ` in ${delayMs}ms` : ""),
               );
               // This attempt's spend already accrued into shared.spent/tokenUsage
               // above (recordTokens) — but it will never reach onAgentEnd (only
@@ -1324,6 +1336,15 @@ export async function runWorkflow<T = unknown>(
                 cost: attemptUsage?.cost ?? 0,
               };
               safeCallback("onRetrySpend", options.onRetrySpend, retrySpend);
+              // Exponential backoff before the next attempt: a provider mid-outage
+              // gets spaced retries instead of an immediate hammer. Abort-aware — a
+              // pause/stop/Esc or a sealed run fate during the wait bails out and
+              // rethrows rather than sleeping through the abort (throwIfAborted
+              // below also honors an abort that fired during the sleep).
+              if (delayMs > 0) {
+                await backoffSleep(delayMs, [options.signal, shared.runFatalController.signal]);
+                throwIfAborted();
+              }
               continue;
             }
 
@@ -2836,6 +2857,48 @@ function normalizeConcurrency(value: unknown): number {
 function normalizeAgentRetries(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
+}
+
+function normalizeRetryBackoffMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return DEFAULT_RETRY_BACKOFF_MS;
+  return Math.min(MAX_RETRY_BACKOFF_MS, Math.floor(value));
+}
+
+/**
+ * Exponential-backoff wait before retry #N (attempt N→N+1): base × 2^(N-1),
+ * capped at 8× base so a long retry chain never stalls the run. Pure function
+ * so the schedule is unit-testable without timers.
+ */
+export function retryBackoffDelayMs(baseMs: number, attempt: number): number {
+  return Math.min(baseMs * 2 ** (attempt - 1), baseMs * 8);
+}
+
+/**
+ * Sleep for `ms` while staying abort-aware (500-path hardening): resolve early
+ * when any of `signals` fires (the run's external pause/stop/Esc signal or the
+ * run-fatal controller), so a backoff wait never outlives the run it serves.
+ * Zero/negative ms resolves immediately (tests disable backoff this way).
+ */
+function backoffSleep(ms: number, signals: ReadonlyArray<AbortSignal | undefined>): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      for (const s of signals) s?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    for (const s of signals) {
+      if (s?.aborted) {
+        clearTimeout(timer);
+        finish();
+        return;
+      }
+      s?.addEventListener("abort", finish, { once: true });
+    }
+  });
 }
 
 /**

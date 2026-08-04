@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { usageComponentsTotal, type WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
-import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
 import {
   buildResumeJournal,
@@ -221,6 +221,14 @@ export interface ResumeOptions extends ExecOptions {
 
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
+  /**
+   * Base exponential-backoff delay (ms) between retry attempts after a
+   * recoverable agent failure (attempt N→N+1 waits base × 2^(N-1), capped at
+   * 8× base). Default 1000. 0 disables the wait (tests). A pure timing knob —
+   * deliberately NOT frozen per run (unlike agentRetries, which is
+   * safety-relevant): a resumed run just uses whatever this execution passes.
+   */
+  retryBackoffMs?: number;
   /**
    * Replay these journaled agent/checkpoint results for the unchanged prefix
    * (resume), keyed by `${runId}:${index}` — see
@@ -836,6 +844,7 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget,
       concurrency,
       agentRetries,
+      retryBackoffMs,
       confirm,
       tools,
       initialTokenUsage,
@@ -918,6 +927,7 @@ export class WorkflowManager extends EventEmitter {
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
+        retryBackoffMs,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         drainTimeoutMs: resolvedDrainTimeoutMs,
@@ -1127,6 +1137,11 @@ export class WorkflowManager extends EventEmitter {
             );
 
       const usageLimitPaused = !managed.controller.signal.aborted && isProviderUsageLimit(workflowError);
+      // 503/504 overload: like a usage limit, the condition resolves on its own
+      // (the endpoint recovers) — checkpoint the run as paused instead of
+      // failing it, so resume() replays the journal once the provider is back.
+      const overloadedPaused = !managed.controller.signal.aborted && isProviderOverloaded(workflowError);
+      const checkpointPaused = usageLimitPaused || overloadedPaused;
       // Settle the run to idle in the status this failure warrants. The abort
       // branch is the abort/drain interplay's hinge: pause()/stop() may have
       // already settled THIS SAME object to idle (status flipped + lease
@@ -1140,10 +1155,12 @@ export class WorkflowManager extends EventEmitter {
         if (managed.status === "running") {
           this.settleExecuting(managed, "aborted");
         }
-      } else if (usageLimitPaused) {
-        // Provider quota/usage limit: NOT a failure. Checkpoint the run as paused so
-        // the persisted journal (completed agent results) is replayed by resume()
-        // once the budget refills — instead of the user starting from scratch.
+      } else if (checkpointPaused) {
+        // Provider condition that resolves on its own (quota/usage limit, or a
+        // 503/504 outage): NOT a failure. Checkpoint the run as paused so the
+        // persisted journal (completed agent results) is replayed by resume()
+        // once the budget refills / the endpoint recovers — instead of the
+        // user starting from scratch.
         this.settleExecuting(managed, "paused");
       } else {
         this.settleExecuting(managed, "failed");
@@ -1151,10 +1168,10 @@ export class WorkflowManager extends EventEmitter {
       managed.error = workflowError;
       // Both branches gated via emitLive() (see its doc comment) — a stale
       // execution's "paused"/"error" is equally misleading once superseded.
-      if (usageLimitPaused) {
+      if (checkpointPaused) {
         this.emitLive(managed, "paused", {
           runId: managed.runId,
-          reason: "usage_limit",
+          reason: overloadedPaused ? "provider_overloaded" : "usage_limit",
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
@@ -1581,9 +1598,15 @@ export class WorkflowManager extends EventEmitter {
         drainTimeoutMs: managed.drainTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
-        // Why a usage-limit pause happened, so the navigator / a future cold start
-        // can show it and (eventually) re-arm resume after the budget refills.
-        pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
+        // Why a usage-limit/provider-outage pause happened, so the navigator /
+        // a future cold start can show it and (eventually) re-arm resume after
+        // the budget refills / the endpoint recovers.
+        pauseReason:
+          managed.status === "paused" && isProviderUsageLimit(managed.error)
+            ? "usage_limit"
+            : managed.status === "paused" && isProviderOverloaded(managed.error)
+              ? "provider_overloaded"
+              : undefined,
         resetHint:
           managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
         phases: managed.snapshot.phases,

@@ -44,6 +44,17 @@ export const MAX_NESTED_WORKFLOW_DEPTH = 8;
 /** Maximum automatic retry attempts after a recoverable agent failure. */
 export const MAX_AGENT_RETRIES = 3;
 
+/**
+ * Base exponential-backoff delay between retry attempts after a recoverable
+ * agent failure (default 1s; each further retry doubles up to 8× the base).
+ * 0 disables the wait entirely (tests). A pure timing knob — never frozen per
+ * run, unlike agentRetries which is safety-relevant.
+ */
+export const DEFAULT_RETRY_BACKOFF_MS = 1000;
+
+/** Hard ceiling for a single backoff wait, so a long retry chain never stalls a run. */
+export const MAX_RETRY_BACKOFF_MS = 60_000;
+
 /** Default token budget if none specified. */
 export const DEFAULT_TOKEN_BUDGET = null;
 

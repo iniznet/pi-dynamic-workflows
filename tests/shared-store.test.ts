@@ -596,6 +596,7 @@ test("a failed retry attempt's store writes are rolled back: absent from the rec
   const result = await runWorkflow<{ r: string; check: boolean }>(script, {
     agent,
     agentRetries: 1,
+    retryBackoffMs: 0,
     persistLogs: false,
     onAgentJournal: (e) => journal.push(e),
   });
@@ -652,6 +653,7 @@ test("a failed retry attempt's rolled-back write matches what resume replay reco
   await runWorkflow(script, {
     agent,
     agentRetries: 1,
+    retryBackoffMs: 0,
     persistLogs: false,
     runId: "retry-isolation-resume-run",
     onAgentJournal: (e) => journal.push(e),

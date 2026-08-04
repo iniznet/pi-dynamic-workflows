@@ -52,6 +52,23 @@ export enum WorkflowErrorCode {
    */
   CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW",
   /**
+   * The provider is mid-outage/overload (503/504 class). Distinct from
+   * PROVIDER_USAGE_LIMIT (a budget that refills) and PROVIDER_UNAVAILABLE (a
+   * transient 500/502 worth retrying): like a usage limit, an outage resolves
+   * on its own, so the run is checkpointed (paused) and replayed by resume()
+   * once the provider recovers — instead of burning retries into a dead
+   * endpoint or failing the run.
+   */
+  PROVIDER_OVERLOADED = "PROVIDER_OVERLOADED",
+  /**
+   * A transient provider failure (500/502 class) that may succeed on retry.
+   * Recoverable: retried with exponential backoff, then the run fails resumable
+   * with this code visible in the failure text so the orchestrator knows the
+   * guidance is "wait out the outage / raise agentRetries", not "fix the
+   * script".
+   */
+  PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE",
+  /**
    * Run-level failure raised by the manager when agents returned null (exhausted
    * recoverable retries or parallel-absorbed item failures) and the run opted into
    * strict completion (failOnExhaustedAgent). Settles the run failed — resumable,
@@ -156,6 +173,47 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
 }
 
 /**
+ * Classify a provider outage/overload (5xx) from free-form error text.
+ *
+ * Returns:
+ * - "pause": 503/504 (and overload phrase shapes such as Anthropic's 529
+ *   "overloaded_error") — the endpoint is down but will recover on its own,
+ *   so the run checkpoints (paused) like a usage limit.
+ * - "retry": 500/502 (and gateway phrase shapes) — transient failures that
+ *   may succeed on a spaced retry, so the attempt is retried with backoff.
+ * - undefined: not a 5xx condition (no status code and no outage phrasing).
+ *
+ * Status codes are authoritative (the SDK normalizes no-body HTTP errors to
+ * messages like "503 status code (no body)"); phrase shapes cover providers
+ * that return descriptive text instead of a code.
+ */
+export type ProviderUnavailableClass = "pause" | "retry";
+
+const PROVIDER_UNAVAILABLE_PAUSE_PHRASES =
+  /overloaded|service unavailable|temporarily unavailable|server busy|maintenance|gateway timeout|upstream_request_timeout/i;
+const PROVIDER_UNAVAILABLE_RETRY_PHRASES = /bad gateway/i;
+
+export function classifyProviderUnavailable(text: string | undefined): ProviderUnavailableClass | undefined {
+  if (!text) return undefined;
+  const status = text.match(/\b(5\d{2})\b/);
+  if (status) {
+    const code = Number(status[1]);
+    // 503 (Service Unavailable) and 504 (Gateway Timeout) mean the endpoint is
+    // down/overloaded — pause-worthy. Any other 5xx (500/502/529/...) is a
+    // transient failure worth a spaced retry.
+    return code === 503 || code === 504 ? "pause" : "retry";
+  }
+  if (PROVIDER_UNAVAILABLE_PAUSE_PHRASES.test(text)) return "pause";
+  if (PROVIDER_UNAVAILABLE_RETRY_PHRASES.test(text)) return "retry";
+  return undefined;
+}
+
+/** Report whether an unknown failure is a provider-overload checkpoint condition. */
+export function isProviderOverloaded(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_OVERLOADED;
+}
+
+/**
  * Detect a provider subscription/usage/quota/rate-limit exhaustion from free-form
  * error text, and extract the provider's human reset hint when present.
  *
@@ -219,6 +277,12 @@ const CONTEXT_OVERFLOW_PATTERNS = [
   /range of input length should be/i, // DashScope / Qwen Token Plan
   /context[_ ]length[_ ]exceeded/i, // Generic fallback
   /token limit exceeded/i, // Generic fallback
+  // Cerebras: rejects an oversized prompt at the HTTP layer with NO body,
+  // normalized by the SDK to "400/413 status code (no body)" — parity with the
+  // SDK's own OVERFLOW_PATTERNS entry. A no-body 4xx is non-retryable client
+  // error either way, so matching 400 as well as 413 only fails fast instead of
+  // wasting a retry into the same wall.
+  /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i,
 ];
 
 /**
@@ -331,6 +395,23 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
         recoverable: false,
         agentLabel: context?.agentLabel,
         resetHint: limit.resetHint,
+      });
+    }
+    // Provider outages (5xx): 503/504 pause-worthy, 500/502 recoverable. After
+    // the limit branch (a 5xx body that ALSO quotes limit phrasing — e.g. a
+    // gateway wrapper with "rate limit" inside — keeps the existing usage-limit
+    // semantics rather than being reclassified).
+    const unavailable = classifyProviderUnavailable(error.message);
+    if (unavailable === "pause") {
+      return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_OVERLOADED, {
+        recoverable: false,
+        agentLabel: context?.agentLabel,
+      });
+    }
+    if (unavailable === "retry") {
+      return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_UNAVAILABLE, {
+        recoverable: true,
+        agentLabel: context?.agentLabel,
       });
     }
   }

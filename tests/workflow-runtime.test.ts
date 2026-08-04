@@ -94,6 +94,7 @@ return a`,
         },
       },
       agentRetries: 1,
+      retryBackoffMs: 0,
       persistLogs: false,
       onAgentJournal: (entry) => journal.push(entry),
     },
@@ -156,6 +157,7 @@ return a`,
           },
         },
         agentRetries: 2,
+        retryBackoffMs: 0,
         persistLogs: false,
       },
     ),
@@ -178,6 +180,7 @@ return a`,
         },
       },
       agentRetries: 0,
+      retryBackoffMs: 0,
       persistLogs: false,
     },
   );
@@ -1524,4 +1527,58 @@ return 'done'`;
   });
   assert.equal(result.result, "done");
   assert.equal(sawAbort, true, "the in-flight agent must observe its abort signal once the drain deadline fires");
+});
+
+test("retryBackoffMs delays consecutive recoverable retries (500-path)", async () => {
+  const delays: number[] = [];
+  const retryBackoffMs = 30;
+  const t0 = Date.now();
+  let calls = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'backoff', description: 'backoff retry' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          if (calls > 1) delays.push(Date.now() - t0);
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 2,
+      retryBackoffMs,
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+  assert.equal(delays.length, 1);
+  assert.ok(
+    delays[0] >= retryBackoffMs,
+    `the retry must wait at least retryBackoffMs (${retryBackoffMs}) before re-invoking the agent; got ${delays[0]}ms`,
+  );
+});
+
+test("retryBackoffMs 0 retries without artificial delay (500-path)", async () => {
+  let calls = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'backoff_zero', description: 'no backoff' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 2,
+      retryBackoffMs: 0,
+      persistLogs: false,
+    },
+  );
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
 });

@@ -8,6 +8,7 @@ import {
   type StructuredSession,
   throwIfContextOverflow,
   throwIfProviderLimit,
+  throwIfProviderUnavailable,
 } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { StructuredOutputCapture } from "../src/structured-output.js";
@@ -207,6 +208,72 @@ describe("lastAssistantError / throwIfProviderLimit", () => {
     );
     assert.doesNotThrow(() =>
       throwIfContextOverflow([{ role: "assistant", content: [], stopReason: "error", errorMessage: "network blip" }]),
+    );
+  });
+});
+
+describe("lastAssistantError / throwIfProviderUnavailable", () => {
+  it("throws PROVIDER_OVERLOADED (pause-worthy) for a 503 error turn", () => {
+    assert.throws(
+      () =>
+        throwIfProviderUnavailable(
+          [
+            {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "503 status code (no body)",
+            },
+          ],
+          "lbl",
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_OVERLOADED);
+        assert.equal((err as { recoverable?: boolean }).recoverable, false);
+        assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
+        return true;
+      },
+    );
+  });
+
+  it("throws PROVIDER_UNAVAILABLE (recoverable) for a 500 error turn", () => {
+    assert.throws(
+      () =>
+        throwIfProviderUnavailable(
+          [
+            {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "500 status code (no body)",
+            },
+          ],
+          "lbl",
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, WorkflowErrorCode.PROVIDER_UNAVAILABLE);
+        assert.equal((err as { recoverable?: boolean }).recoverable, true);
+        assert.equal((err as { agentLabel?: string }).agentLabel, "lbl");
+        return true;
+      },
+    );
+  });
+
+  it("does not throw for a successful turn or a non-5xx error turn", () => {
+    assert.doesNotThrow(() =>
+      throwIfProviderUnavailable([
+        { role: "assistant", content: [{ type: "text", text: "fine" }], stopReason: "stop" },
+      ]),
+    );
+    assert.doesNotThrow(() =>
+      throwIfProviderUnavailable([
+        { role: "assistant", content: [], stopReason: "error", errorMessage: "403 status code (no body)" },
+      ]),
+    );
+    assert.doesNotThrow(() =>
+      throwIfProviderUnavailable([
+        { role: "assistant", content: [], stopReason: "error", errorMessage: "network blip" },
+      ]),
     );
   });
 });

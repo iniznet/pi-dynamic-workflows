@@ -1463,3 +1463,53 @@ test("runWorkflow surfaces a thrown context-overflow as CONTEXT_OVERFLOW (non-re
     },
   );
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Provider outages (5xx): a thrown 503 is pause-worthy (PROVIDER_OVERLOADED);
+// a thrown 500 is recoverable (PROVIDER_UNAVAILABLE) and retried with backoff.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("runWorkflow surfaces a thrown 503 as PROVIDER_OVERLOADED (pause-worthy), not a silent null", async () => {
+  const overloadedAgent = {
+    async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      throw new Error("503 status code (no body)");
+    },
+  };
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'overload_demo', description: 'provider outage' }
+         const r = await agent('analyze', { label: 'a' })
+         return r`,
+        { agent: overloadedAgent, persistLogs: false, agentRetries: 2, retryBackoffMs: 0 },
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.PROVIDER_OVERLOADED);
+      assert.equal(error.recoverable, false, "an outage is a checkpoint, never retried into the same dead endpoint");
+      assert.equal(error.agentLabel, "a");
+      return true;
+    },
+  );
+});
+
+test("runWorkflow retries a thrown 500 (PROVIDER_UNAVAILABLE) with backoff, then succeeds", async () => {
+  let calls = 0;
+  const flakyAgent = {
+    async run(_prompt: string, options?: { label?: string; onUsage?: (u: AgentUsage) => void }) {
+      options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+      calls++;
+      if (calls === 1) throw new Error("500 status code (no body)");
+      return "ok";
+    },
+  };
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_500_demo', description: 'transient outage' }
+     const r = await agent('analyze', { label: 'a' })
+     return r`,
+    { agent: flakyAgent, persistLogs: false, agentRetries: 1, retryBackoffMs: 0 },
+  );
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2, "the 500 attempt must be retried, not swallowed as a null");
+});
