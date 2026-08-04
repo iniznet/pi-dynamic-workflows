@@ -9,9 +9,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   type ExecutionBlueprint,
+  type FailSafeProcedure,
   generateBlueprint,
   loadBlueprint,
+  REQUIRED_FAIL_SAFE_KINDS,
   saveBlueprint,
+  toMarkdown,
   validateBlueprint,
 } from "../src/phases/prewalk.js";
 
@@ -29,7 +32,25 @@ function validBlueprint(): ExecutionBlueprint {
         rollbackProcedure: "Delete test file",
       },
     ],
-    failSafeProcedures: ["If typecheck fails, fix types"],
+    failSafeProcedures: [
+      {
+        kind: "timeout",
+        trigger: "a command exceeds its allotted time",
+        fallback: "retry once, then abort and log",
+        maxAttempts: 2,
+      },
+      {
+        kind: "api-error",
+        trigger: "an API call returns a non-2xx status",
+        fallback: "retry with backoff, then surface the error",
+        maxAttempts: 3,
+      },
+      {
+        kind: "typecheck",
+        trigger: "typecheck fails",
+        fallback: "fix types",
+      },
+    ],
     verificationTests: ["tsc --noEmit passes"],
     createdAt: new Date().toISOString(),
   };
@@ -90,7 +111,7 @@ describe("generateBlueprint", () => {
     assert.equal(bp.title, "Add auth middleware");
     assert.ok(bp.preconditions.length >= 3);
     assert.ok(bp.executionSteps.length >= 3);
-    assert.ok(bp.failSafeProcedures.length >= 1);
+    assert.ok(bp.failSafeProcedures.length >= REQUIRED_FAIL_SAFE_KINDS.length);
     assert.ok(bp.verificationTests.length >= 1);
     for (const step of bp.executionSteps) {
       assert.ok(step.description);
@@ -132,7 +153,10 @@ describe("generateBlueprint", () => {
     const bp = await generateBlueprint(big, "Huge task");
     assert.ok(bp.preconditions.length <= 6, `preconditions capped: ${bp.preconditions.length}`);
     assert.ok(bp.executionSteps.length <= 8, `steps capped: ${bp.executionSteps.length}`);
-    assert.ok(bp.failSafeProcedures.length <= 4, `fail-safes capped: ${bp.failSafeProcedures.length}`);
+    assert.ok(
+      bp.failSafeProcedures.length <= 6,
+      `fail-safes capped at the closed kind set: ${bp.failSafeProcedures.length}`,
+    );
     assert.ok(bp.verificationTests.length <= 4, `verification tests capped: ${bp.verificationTests.length}`);
     assert.ok(bp.executionSteps.length >= 3, "caps must not starve the required minimum");
     assert.equal(validateBlueprint(bp).valid, true);
@@ -143,6 +167,103 @@ describe("generateBlueprint", () => {
     assert.equal(validateBlueprint(bp).valid, true);
     assert.ok(bp.preconditions.length >= 3);
     assert.ok(bp.executionSteps.length >= 3);
+  });
+});
+
+describe("fail-safe model (PRD Task 5: explicit timeout/API-error fallback)", () => {
+  it("always includes timeout and api-error procedures, regardless of the summary", async () => {
+    const summaries = ["", "a plain codebase", "TypeScript with vitest, tsc, biome, and GitHub Actions CI"];
+    for (const summary of summaries) {
+      const bp = await generateBlueprint(summary, "Any task");
+      const kinds = new Set(bp.failSafeProcedures.map((procedure) => procedure.kind));
+      for (const required of REQUIRED_FAIL_SAFE_KINDS) {
+        assert.ok(kinds.has(required), `${required} fail-safe must be present for summary: ${JSON.stringify(summary)}`);
+      }
+      assert.equal(validateBlueprint(bp).valid, true);
+    }
+  });
+
+  it("gives timeout and api-error entries an explicit attempt ceiling", async () => {
+    const bp = await generateBlueprint("", "Task");
+    const timeout = bp.failSafeProcedures.find((procedure) => procedure.kind === "timeout");
+    const apiError = bp.failSafeProcedures.find((procedure) => procedure.kind === "api-error");
+    assert.ok(timeout?.maxAttempts && timeout.maxAttempts >= 1, "timeout procedure carries maxAttempts");
+    assert.ok(apiError?.maxAttempts && apiError.maxAttempts >= 1, "api-error procedure carries maxAttempts");
+  });
+
+  it("rejects a blueprint that omits the mandated timeout kind", () => {
+    const bp = validBlueprint();
+    bp.failSafeProcedures = bp.failSafeProcedures.filter((procedure) => procedure.kind !== "timeout");
+    const result = validateBlueprint(bp);
+    assert.equal(result.valid, false);
+    assert.ok(result.issues.includes("Missing timeout fail-safe procedure"));
+  });
+
+  it("rejects a fail-safe entry missing its fallback steps", () => {
+    const bp = validBlueprint();
+    bp.failSafeProcedures.push({ kind: "ci", trigger: "CI fails", fallback: "" });
+    const result = validateBlueprint(bp);
+    assert.equal(result.valid, false);
+    assert.ok(result.issues.includes("Fail-safe ci: missing fallback"));
+  });
+
+  it("rejects an unknown fail-safe kind (defensive JSON round-trip guard)", () => {
+    const bp = validBlueprint();
+    const malformed = { kind: "crash-loop", trigger: "x", fallback: "y" } as unknown as FailSafeProcedure;
+    bp.failSafeProcedures.push(malformed);
+    const result = validateBlueprint(bp);
+    assert.equal(result.valid, false);
+    assert.ok(result.issues.some((issue) => issue.includes("unknown kind")));
+  });
+});
+
+describe("toMarkdown (1986 Aircraft Manual renderer)", () => {
+  it("renders the four mandated section headers in order", async () => {
+    const bp = await generateBlueprint("typescript with vitest", "Add auth");
+    const md = toMarkdown(bp);
+    const headers = [
+      "## PRE-CONDITIONS & CONSTRAINTS",
+      "## EXECUTION STEPS",
+      "## FAIL-SAFE & ERROR HANDLING",
+      "## VERIFICATION TESTS",
+    ];
+    let last = -1;
+    for (const header of headers) {
+      const index = md.indexOf(header);
+      assert.ok(index !== -1, `header ${header} must be present`);
+      assert.ok(index > last, `headers must appear in PRD order: ${header}`);
+      last = index;
+    }
+  });
+
+  it("renders the title, per-step directives, and verification checklist", () => {
+    const md = toMarkdown(validBlueprint());
+    assert.ok(md.startsWith("# Add health endpoint"));
+    assert.ok(md.includes("### Step 1 — Write failing test"));
+    assert.ok(md.includes("**ACTION:** Create test file"));
+    assert.ok(md.includes("**EXPECTED OUTCOME:** Test fails"));
+    assert.ok(md.includes("**ROLLBACK PROCEDURE:** Delete test file"));
+    assert.ok(md.includes("1. [ ] tsc --noEmit passes"));
+  });
+
+  it("labels fail-safe entries by kind with fallback and attempt ceiling", () => {
+    const md = toMarkdown(validBlueprint());
+    assert.ok(md.includes("**TIMEOUT** — if a command exceeds its allotted time"));
+    assert.ok(md.includes("(max 2 attempts)"));
+    assert.ok(md.includes("**API ERROR** — if an API call returns a non-2xx status"));
+    assert.ok(md.includes("(max 3 attempts)"));
+    assert.ok(md.includes("**TYPECHECK** — if typecheck fails: fix types"));
+  });
+
+  it("still renders legacy string-shaped fail-safes read back from disk", () => {
+    // A blueprint persisted before the typed fail-safe model round-trips as
+    // plain strings; the renderer must not choke on them.
+    const legacy = validBlueprint();
+    const raw = JSON.stringify({ ...legacy, failSafeProcedures: ["If typecheck fails, fix types"] });
+    const parsed = JSON.parse(raw) as ExecutionBlueprint;
+    const md = toMarkdown(parsed);
+    assert.ok(md.includes("## FAIL-SAFE & ERROR HANDLING"));
+    assert.ok(md.includes("If typecheck fails, fix types"));
   });
 });
 
