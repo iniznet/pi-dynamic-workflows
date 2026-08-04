@@ -17,7 +17,14 @@ import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { coerceArgs } from "./saved-commands.js";
-import { type CheckpointGate, parseWorkflowScript, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
+import {
+  type CheckpointGate,
+  type PhasePipelineOptions,
+  type PhaseStateIntegration,
+  parseWorkflowScript,
+  type WorkflowMeta,
+  type WorkflowRunResult,
+} from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -208,6 +215,18 @@ export interface WorkflowToolOptions {
    * behavior (declared default or inline confirm).
    */
   checkpointGate?: CheckpointGate;
+  /**
+   * Opt-in Phase 0/1 pipeline wiring (wayfinder -> prewalk) threaded into every
+   * run this tool starts. Absent → the run behaves exactly as before (no
+   * wayfinder/prewalk stages fire). See PhasePipelineOptions in workflow.ts.
+   */
+  pipeline?: PhasePipelineOptions;
+  /**
+   * Opt-in PhaseGuard phase-state integration (persisted state machine) threaded
+   * into every run this tool starts. Absent → agent() calls are ungated. See
+   * PhaseStateIntegration in workflow.ts.
+   */
+  phaseState?: PhaseStateIntegration;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<TSchema, unknown> {
@@ -303,7 +322,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // detached and its result is delivered back into the conversation).
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
-        const resumed = await manager.resume(runId, { script, args: runArgs, checkpointGate: options.checkpointGate });
+        const resumed = await manager.resume(runId, {
+          script,
+          args: runArgs,
+          checkpointGate: options.checkpointGate,
+          pipeline: options.pipeline,
+          phaseState: options.phaseState,
+        });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId));
         }
@@ -339,6 +364,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tools: invocationTools,
           toolset: invocationToolset,
           checkpointGate: options.checkpointGate,
+          pipeline: options.pipeline,
+          phaseState: options.phaseState,
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
@@ -371,6 +398,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           toolset: invocationToolset,
           confirm,
           checkpointGate: options.checkpointGate,
+          pipeline: options.pipeline,
+          phaseState: options.phaseState,
           externalSignal: signal,
           onProgress(live) {
             snapshot = recomputeWorkflowSnapshot(live);

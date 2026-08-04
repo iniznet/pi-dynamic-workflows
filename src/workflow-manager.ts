@@ -27,6 +27,8 @@ import {
 import {
   type CheckpointGate,
   type JournalEntry,
+  type PhasePipelineOptions,
+  type PhaseStateIntegration,
   parseWorkflowScript,
   runWorkflow,
   type WorkflowRunResult,
@@ -291,6 +293,18 @@ export interface ExecOptions {
    * default headless/confirm behavior. Additive: no existing caller regresses.
    */
   checkpointGate?: CheckpointGate;
+  /**
+   * Opt-in Phase 0/1 pipeline wiring (wayfinder -> prewalk) threaded into
+   * runWorkflow for this execution. Absent → no wayfinder/prewalk stages fire;
+   * strictly additive (see PhasePipelineOptions in workflow.ts).
+   */
+  pipeline?: PhasePipelineOptions;
+  /**
+   * Opt-in PhaseGuard phase-state integration (persisted state machine) threaded
+   * into runWorkflow for this execution. Absent → agent() calls stay ungated;
+   * strictly additive (see PhaseStateIntegration in workflow.ts).
+   */
+  phaseState?: PhaseStateIntegration;
   /**
    * Whether this run is eligible for auto-resume when it pauses on a provider
    * usage limit. Default-on: omit or pass true to stay eligible, pass false to
@@ -859,6 +873,8 @@ export class WorkflowManager extends EventEmitter {
       retryBackoffMs,
       confirm,
       checkpointGate,
+      pipeline,
+      phaseState,
       tools,
       initialTokenUsage,
     } = exec;
@@ -949,6 +965,8 @@ export class WorkflowManager extends EventEmitter {
         excludeTools: this.excludeSubagentTools,
         confirm,
         checkpointGate,
+        pipeline,
+        phaseState,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,
