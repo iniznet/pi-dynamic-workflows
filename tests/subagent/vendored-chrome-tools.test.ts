@@ -200,3 +200,111 @@ describe("vendored chrome execute", () => {
     );
   });
 });
+
+describe("formatter golden output (shadow DOM + iframe snapshots)", () => {
+  // Golden fixture: a snapshot as pi-chrome's shadow-DOM/iframe producers will emit it —
+  // elements collected from inside an open shadow root (context = shadow host) and from a
+  // child iframe (context = frame label), plus a diff block. The golden string pins that
+  // these elements render with uid + role/tag + context + rect, that the iframe itself is
+  // not dropped, and that diff sections still format. Change it only deliberately.
+  const shadowIframeSnapshot = {
+    mode: "auto",
+    title: "Shadow + iframe",
+    url: "https://example.test/dashboard",
+    viewport: { width: 1440, height: 900, scrollX: 0, scrollY: 12 },
+    summary: { focused: { uid: "e2", role: "button", label: "Shadow submit" } },
+    diff: {
+      firstSnapshot: false,
+      changes: [{ kind: "textChanged" }, { kind: "title", before: "Old", after: "New" }],
+      added: [{ uid: "e2", role: "button", label: "Shadow submit" }],
+      updated: [{ uid: "e1", before: { label: "Shadow name old" }, after: { label: "Shadow name" } }],
+    },
+    elements: [
+      {
+        uid: "e1",
+        tag: "input",
+        role: "textbox",
+        label: "Shadow name",
+        selector: "#shadow-host input",
+        rect: { x: 10, y: 20, width: 200, height: 32 },
+        context: { uid: "c1", label: "shadow host" },
+      },
+      {
+        uid: "e2",
+        tag: "button",
+        role: "button",
+        label: "Shadow submit",
+        selector: "#shadow-host button",
+        rect: { x: 10, y: 60, width: 120, height: 36 },
+        context: { uid: "c1", label: "shadow host" },
+      },
+      {
+        uid: "e3",
+        tag: "iframe",
+        role: "iframe",
+        label: "Embedded app",
+        selector: "iframe[data-app]",
+        rect: { x: 0, y: 100, width: 640, height: 480 },
+      },
+      {
+        uid: "e4",
+        tag: "a",
+        role: "link",
+        label: "Inside iframe",
+        selector: "a[href='/inside']",
+        rect: { x: 20, y: 120, width: 90, height: 20 },
+        context: { uid: "c2", label: "frame: embedded-app" },
+      },
+    ],
+  };
+
+  const GOLDEN = `# Chrome snapshot (auto)
+Shadow + iframe
+https://example.test/dashboard
+viewport=1440x900 scroll=0,12
+focused: e2 button Shadow submit
+
+## Changed since last snapshot
+- text changed
+- title: Old → New
+- added e2 button Shadow submit
+- updated e1 Shadow name
+
+## Visible actions
+- e1 textbox Shadow name in c1 shadow host @ 10,20 200x32
+- e2 button Shadow submit in c1 shadow host @ 10,60 120x36
+- e3 iframe Embedded app @ 0,100 640x480
+- e4 link Inside iframe in c2 frame: embedded-app @ 20,120 90x20
+
+Tip: use chrome_snapshot({query:'...', mode:'interactive|forms|pageMap|text|changes|full'}) or nearUid to zoom in.`;
+
+  test("shadow-root elements and iframe elements render with context, uid, role and rect", async () => {
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const { client } = recordingClient([shadowIframeSnapshot]);
+    const defs = createVendoredChromeTools({ client });
+    const result = await toolByName(defs, "chrome_snapshot").execute(
+      "id",
+      { mode: "auto" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal((result as { content: Array<{ text: string }> }).content[0].text, GOLDEN);
+  });
+
+  test("the golden output survives a full-mode passthrough (no shadow/iframe loss)", async () => {
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const { client } = recordingClient([{ ...shadowIframeSnapshot, mode: "full" }]);
+    const defs = createVendoredChromeTools({ client });
+    const result = await toolByName(defs, "chrome_snapshot").execute(
+      "id",
+      { mode: "full" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const text = (result as { content: Array<{ text: string }> }).content[0].text;
+    assert.ok(text.includes('"tag": "iframe"'), "full mode keeps the iframe element");
+    assert.ok(text.includes('"label": "Shadow submit"'), "full mode keeps the shadow element");
+  });
+});

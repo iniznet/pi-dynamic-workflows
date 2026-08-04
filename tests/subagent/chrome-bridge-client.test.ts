@@ -100,7 +100,7 @@ describe("ChromeBridgeClient.send", () => {
   });
 
   test("aborting mid-flight propagates to the fetch request", async () => {
-    const { fetchImpl, requests } = fakeFetch([
+    const { requests } = fakeFetch([
       new Response("unused", { status: 500 }), // reached only if abort fails
     ]);
     const client = new ChromeBridgeClient({
@@ -119,6 +119,51 @@ describe("ChromeBridgeClient.send", () => {
     setTimeout(() => controller.abort(), 20);
     await assert.rejects(pending, /aborted/);
     assert.equal(requests.length, 0); // the stubbed fetch never returned a response
+  });
+
+  test("sends the envelope with an application/json content-type header", async () => {
+    const { fetchImpl, requests } = fakeFetch([okResult({ ok: true })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    await client.send("tab.list", {}, 1000);
+    assert.deepEqual(requests[0].init.headers, { "content-type": "application/json" });
+  });
+
+  test("a malformed (non-JSON) response body falls back to a generic bridge error", async () => {
+    const { fetchImpl } = fakeFetch([new Response("<html>proxy error</html>", { status: 200 })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    await assert.rejects(client.send("tab.list", {}, 1000), /Chrome bridge owner HTTP 200/);
+  });
+
+  test("HTTP 500 with a JSON error body surfaces the bridge's own error text", async () => {
+    const { fetchImpl } = fakeFetch([jsonResponse(500, { error: "extension busy" })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    await assert.rejects(client.send("tab.list", {}, 1000), /extension busy/);
+  });
+
+  test("the internal deadline (timeoutMs + 2s) times out when the bridge never answers", async () => {
+    const client = new ChromeBridgeClient({
+      url: "http://127.0.0.1:17318",
+      fetchImpl: (async (_url: unknown, init: unknown) => {
+        await new Promise((_resolve, reject) => {
+          (init as { signal: AbortSignal }).signal.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        });
+        throw new Error("unreachable");
+      }) as unknown as typeof fetch,
+    });
+    // timeoutMs 0 → the internal timer fires at ~2s; the external signal stays clean so
+    // the client must report the owner deadline, not a user abort.
+    await assert.rejects(
+      client.send("page.snapshot", {}, 0),
+      /Timed out waiting for the Chrome bridge owner after 0ms/,
+    );
+  });
+
+  test("{ok:true} with no result resolves undefined", async () => {
+    const { fetchImpl } = fakeFetch([jsonResponse(200, { ok: true })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    assert.equal(await client.send("tab.list", {}, 1000), undefined);
   });
 });
 
