@@ -86,7 +86,7 @@ return await agent(
 
 ## Supported workflow capabilities
 
-The installed extension generates this compact index from its executable capability contract. Read the [workflow authoring guide](docs/workflow-authoring.md) or use the packaged `workflow-authoring` skill for constraints, lifecycle guidance, and adaptable examples; configured route and agent-type values remain environment-specific.
+The installed extension generates this compact index from its executable capability contract. Read the [workflow authoring guide](docs/workflow-authoring.md), the [wayfinder decision-ticket guide](docs/wayfinder.md) (Phase 0 fog clearing and the local `.pi/workflows/map.md` map), or use the packaged `workflow-authoring` skill for constraints, lifecycle guidance, and adaptable examples; configured route and agent-type values remain environment-specific.
 
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |

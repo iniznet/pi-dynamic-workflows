@@ -74,6 +74,20 @@ Persisted runs keep `checkpoints[]` separate from the operation journal (legacy 
 
 Beyond the phase gates above, the package ships the Phase 0–2 planning modules as exported library APIs:
 
-- **Wayfinder (Phase 0)** — `assessPrompt()` replaces a numeric clarity score with a statable-question fog gate (`{ isFoggy, questions[] }`); decision maps persist to `.pi/workflows/map.md` (markdown index) with a `map.json` sidecar, and the ticket lifecycle (`beginSession`, `resolveTicket`/`blockTicket`/`unblockTicket`, one ticket per session) refuses cycle-closing blocking edges and never lets a resolved ticket revert to blocked.
+- **Wayfinder (Phase 0)** — `assessPrompt()` replaces a numeric clarity score with a statable-question fog gate (`{ isFoggy, questions[] }`); decision maps persist to `.pi/workflows/map.md` (markdown index) with a `map.json` sidecar, and the ticket lifecycle (`beginSession`, `resolveTicket`/`blockTicket`/`unblockTicket`, one ticket per session) refuses cycle-closing blocking edges and never lets a resolved ticket revert to blocked. See [Wayfinder — Phase 0 decision tickets](wayfinder.md) for the storage story (the local map satisfies the PRD's "GitHub Issues **or** local" clause), the full lifecycle, and the optional future GitHub Issues branch.
 - **Prewalk (Phase 1)** — `generateBlueprint(codebaseSummary, task)` produces a validated execution blueprint (preconditions / steps / fail-safe procedures / verification tests, capped at 6/8/4/4 items) saved to `.pi/workflows/blueprints/<id>.json`; `loadBlueprint` picks the newest.
 - **Plannotator bridge (Phase 2)** — `createPlannotatorBridge(...)` serves the human approval gate over HTTP (`/sse` updates with heartbeat, `/reviewed` on settle); see the README's runtime reference for usage.
+
+## Phase gating and model-tier contracts
+
+Two PRD-level contracts are worth stating explicitly, because they are easy to read wrong from the capability table alone.
+
+### The single enforced phase gate
+
+Subagent spawning is gated in exactly one place: `assertPhaseGateOpen` inside `agent()`. When a `phaseState` integration is wired, the persisted state machine must be at stage 3 (Phase 3) **and** `humanApproved: true` before any `agent()` call may spawn a subagent; otherwise the call throws `SUBAGENT_SPAWN_BLOCKED` (-31002). The check runs inside the run's limiter so it stays atomic with the agent-count/budget gate, and a journaled cache hit bypasses it (replay never re-spawns). `gateAgentCalls` defaults to `true` whenever a `phaseState` integration is present; without one there is no gate (legacy behavior, covered by a test).
+
+`PhaseGuard.wrapTool` exposes the same check as a library wrapper for embedders that spawn subagents outside `agent()` — but the extension itself does **not** wrap its registered tools with it. The single enforced gate in the product is the one inside `agent()`; `wrapTool` is API surface for third-party callers, not a second enforcement point.
+
+### Tier unions: closed at the routing layer, open at the script boundary
+
+The internal routing contracts are closed unions — `tierNameForTask` / `tierNameForClassification` return exactly `'small' | 'medium' | 'big'`, and the worktree runner types its agent tier the same way. The script-facing `tier` option, however, remains an open string validated by *existence in the configured model tiers*, not by a type-level union: an unknown tier name throws `MODEL_NOT_FOUND` naming the source (the tier and what it resolved to) instead of silently falling back. Typos therefore fail loudly rather than silently degrading routing — but the schema itself is intentionally not narrowed, and that looseness remains a known residual (audit G10).
