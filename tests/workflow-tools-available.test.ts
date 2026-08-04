@@ -380,6 +380,10 @@ describe("workflow extension - control tool availability", () => {
         installExtension(pi);
 
         assert.deepEqual(registeredTools.slice(0, 2), ["workflow", "workflow_control"]);
+        assert.ok(
+          registeredTools.includes("get_workflow_status"),
+          "the PRD-named get_workflow_status tool is registered (audit action 5)",
+        );
         assert.equal(handlers.session_start.length, 1);
         handlers.session_start[0](
           {},
@@ -395,6 +399,10 @@ describe("workflow extension - control tool availability", () => {
 
         assert.ok(activeTools.includes("workflow"));
         assert.ok(activeTools.includes("workflow_control"));
+        assert.ok(
+          activeTools.includes("get_workflow_status"),
+          "get_workflow_status is auto-activated at session_start like the other registered workflow tools",
+        );
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());

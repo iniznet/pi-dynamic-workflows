@@ -1,9 +1,12 @@
+import { join } from "node:path";
 import {
   createCodingTools,
+  defineTool,
   type ExtensionAPI,
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
@@ -39,6 +42,7 @@ import {
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
   WorkflowManager,
+  WorkflowStateManager,
 } from "../src/index.js";
 import { isChromeAuthorized } from "../src/subagent/chrome-bridge-client.js";
 import {
@@ -283,6 +287,16 @@ export default function extension(pi: ExtensionAPI) {
   // rather than crash.
   if (installResultDelivery) installResultDelivery(pi, manager, { loadSettings });
 
+  // Per-cwd persisted phase state machine — the single persistence root for
+  // BOTH the Phase 0/1 pipeline (wayfinder → prewalk, audit action 1) and the
+  // PhaseGuard agent()-gate integration (audit action 2). Sharing one manager
+  // across the two option surfaces is what makes the wayfinder/prewalk stages
+  // and the phase()/checkpoint() transitions record into the SAME
+  // active-state.json under .pi/workflows (validated end-to-end by
+  // tests/prd-runtime-activation.test.ts suites 1+3). The constructor is
+  // side-effect free — nothing is written until a run actually transitions.
+  const workflowStateManager = new WorkflowStateManager(join(cwd, ".pi", "workflows"));
+
   // Register the two tools defensively: a missing/incompatible peer (typebox for
   // the schemas) must disable JUST those tools with a clear diagnostic, not take
   // the whole extension down — manager, storage, scheduler, and the slash-command
@@ -303,8 +317,88 @@ export default function extension(pi: ExtensionAPI) {
       disabledPieces.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  registerToolSafely(() => createWorkflowTool({ cwd, manager, storage, checkpointGate }), "workflow tool");
+  registerToolSafely(
+    () =>
+      createWorkflowTool({
+        cwd,
+        manager,
+        storage,
+        checkpointGate,
+        // Phase 0/1 wiring (audit actions 1+3): the per-cwd persisted state
+        // machine becomes the pipeline's persistence root, so wayfinder →
+        // prewalk fire on EVERY top-level run with the zero-model stub mapper
+        // and persist map.md + plans/<runId>.json — the plan file that makes
+        // /workflows implement reachable (workflow-commands.ts:416 loadRunPlan).
+        pipeline: { stateManager: workflowStateManager },
+        // PhaseGuard wiring (audit action 2): the same machine records
+        // phase()/checkpoint() transitions, but gateAgentCalls stays false so
+        // DEFAULT runs keep the pre-wiring ungated agent() behavior — the gate
+        // is consulted, never applied (wire-cleanup.md §3 coordination note; a
+        // default run left gated would throw SUBAGENT_SPAWN_BLOCKED at the
+        // first agent(), since the machine parks at Phase 2 after prewalk).
+        phaseState: { stateManager: workflowStateManager, gateAgentCalls: false },
+      }),
+    "workflow tool",
+  );
   registerToolSafely(() => createWorkflowControlTool({ manager }), "workflow_control tool");
+  // Audit action 5: the PRD-named get_workflow_status tool — a thin snapshot
+  // reader over the manager's public surface (status enum from the persisted
+  // run record, live counts from the in-memory snapshot). Lifecycle verbs stay
+  // on workflow_control; this is query-only, so it never mutates a run.
+  registerToolSafely(
+    () =>
+      defineTool({
+        name: "get_workflow_status",
+        label: "Get Workflow Status",
+        description:
+          "Get the status of a workflow run by canonical run ID: persisted status, phase, agent counts, token usage, and result. Query-only — use workflow_control for lifecycle verbs (pause/resume/stop).",
+        promptSnippet: "Check the status of a workflow run by ID.",
+        parameters: Type.Object({
+          runId: Type.String({ description: "Canonical workflow run ID." }),
+        }),
+        async execute(_toolCallId, params) {
+          const persisted = manager.listRuns().find((run) => run.runId === params.runId);
+          const snapshot = manager.getSnapshot(params.runId);
+          const details = {
+            runId: params.runId,
+            found: persisted !== undefined || snapshot !== null,
+            status: persisted?.status,
+            currentPhase: persisted?.currentPhase ?? snapshot?.currentPhase,
+            agentCount: snapshot?.agentCount ?? persisted?.agents.length ?? 0,
+          };
+          if (!details.found) {
+            return {
+              content: [{ type: "text", text: `get_workflow_status: run not found: ${params.runId}` }],
+              details,
+            };
+          }
+          const lines = [`run=${params.runId} name=${persisted?.workflowName ?? snapshot?.name ?? "?"}`];
+          if (persisted) {
+            lines.push(
+              `status=${persisted.status}`,
+              `phase=${persisted.currentPhase ?? "-"}`,
+              `agents=${persisted.agents.length} started=${persisted.startedAt} updated=${persisted.updatedAt}`,
+            );
+            if (persisted.durationMs !== undefined) lines.push(`durationMs=${persisted.durationMs}`);
+            if (persisted.tokenUsage?.total !== undefined) lines.push(`tokens=${persisted.tokenUsage.total}`);
+          }
+          if (snapshot) {
+            lines.push(
+              `liveAgentCount=${snapshot.agentCount} done=${snapshot.doneCount} running=${snapshot.runningCount} error=${snapshot.errorCount}`,
+              `currentPhase=${snapshot.currentPhase ?? "-"}`,
+            );
+          }
+          if (persisted?.result !== undefined) {
+            lines.push(`result=${JSON.stringify(persisted.result).slice(0, 200)}`);
+          }
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details,
+          };
+        },
+      }),
+    "get_workflow_status tool",
+  );
   // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
   // definitions are built at start time so the extension load stays side-effect
   // free and the automatic default (host tools in untagged runs, design C) is
