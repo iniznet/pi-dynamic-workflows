@@ -44,7 +44,8 @@ const MAX_TEXT_CHARS = 30_000;
 const MAX_ELEMENTS = 80;
 
 const snapshotModeValues = ["auto", "interactive", "forms", "pageMap", "text", "changes", "full"] as const;
-const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
+/** chrome_tab actions — mirrors pi-chrome's tabActionValues incl. the named-handle registry save/list (contract S2.2). */
+export const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version", "save"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 
@@ -76,6 +77,131 @@ function compactLine(value: unknown, max = 140): string {
 function rectText(rect: any): string {
   if (!rect) return "?";
   return `${rect.x},${rect.y} ${rect.width}x${rect.height}`;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot digests + chrome_diff (contract S3.1). The digest shape mirrors
+// digestFor() in pi-chrome's snapshot_injected.js; diffDigests is pure so the
+// host and vendored chrome_diff stay identical.
+// ---------------------------------------------------------------------------
+
+/** One label row inside a {@link SnapshotDigest}. */
+export interface SnapshotDigestLabel {
+  uid: string;
+  role: string;
+  label: string;
+  disabled?: boolean;
+  value?: string;
+  checked?: boolean;
+}
+
+/** A snapshot digest — the `digest` shape digestFor() produces in snapshot_injected.js. */
+export interface SnapshotDigest {
+  url: string;
+  title: string;
+  textHash: string;
+  focusedUid?: string | null;
+  modalUid?: string | null;
+  labels: SnapshotDigestLabel[];
+}
+
+/** Structured diff produced by {@link diffDigests}; optional fields are present only when changed. */
+export interface SnapshotDigestDiff {
+  url?: { before: string; after: string };
+  title?: { before: string; after: string };
+  textHashChanged: boolean;
+  focusedUid?: { before: string | null; after: string | null };
+  modalUid?: { before: string | null; after: string | null };
+  added: Array<{ uid: string; role: string; label: string }>;
+  removed: Array<{ uid: string; role: string; label: string }>;
+  updated: Array<{
+    uid: string;
+    role: string;
+    label: string;
+    before: SnapshotDigestLabel;
+    after: SnapshotDigestLabel;
+  }>;
+}
+
+const snapshotDigestLabelSchema = Type.Object({
+  uid: Type.String(),
+  role: Type.String(),
+  label: Type.String(),
+  disabled: Type.Optional(Type.Boolean()),
+  value: Type.Optional(Type.String()),
+  checked: Type.Optional(Type.Boolean()),
+});
+
+const snapshotDigestSchema = Type.Object({
+  url: Type.String(),
+  title: Type.String(),
+  textHash: Type.String(),
+  focusedUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  modalUid: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  labels: Type.Array(snapshotDigestLabelSchema),
+});
+
+/** Structural equality of one label row (same uid, any field differs => updated). */
+function labelChanged(a: SnapshotDigestLabel, b: SnapshotDigestLabel): boolean {
+  return (
+    a.role !== b.role ||
+    a.label !== b.label ||
+    (a.disabled ?? false) !== (b.disabled ?? false) ||
+    (a.value ?? "") !== (b.value ?? "") ||
+    (a.checked ?? false) !== (b.checked ?? false)
+  );
+}
+
+/**
+ * Pure diff between two snapshot digests — no bridge, no side effects (contract
+ * S3.1). url/title/textHash/focusedUid/modalUid changes become top-level
+ * fields; labels are grouped into added/removed/updated by uid.
+ */
+export function diffDigests(before: SnapshotDigest, after: SnapshotDigest): SnapshotDigestDiff {
+  const diff: SnapshotDigestDiff = {
+    textHashChanged: before.textHash !== after.textHash,
+    added: [],
+    removed: [],
+    updated: [],
+  };
+  if (before.url !== after.url) diff.url = { before: before.url, after: after.url };
+  if (before.title !== after.title) diff.title = { before: before.title, after: after.title };
+  const beforeFocusedUid = before.focusedUid ?? null;
+  const afterFocusedUid = after.focusedUid ?? null;
+  if (beforeFocusedUid !== afterFocusedUid) diff.focusedUid = { before: beforeFocusedUid, after: afterFocusedUid };
+  const beforeModalUid = before.modalUid ?? null;
+  const afterModalUid = after.modalUid ?? null;
+  if (beforeModalUid !== afterModalUid) diff.modalUid = { before: beforeModalUid, after: afterModalUid };
+  const beforeByUid = new Map(before.labels.map((label) => [label.uid, label]));
+  const afterByUid = new Map(after.labels.map((label) => [label.uid, label]));
+  for (const label of after.labels) {
+    const previous = beforeByUid.get(label.uid);
+    if (!previous) diff.added.push({ uid: label.uid, role: label.role, label: label.label });
+    else if (labelChanged(previous, label)) {
+      diff.updated.push({ uid: label.uid, role: label.role, label: label.label, before: previous, after: label });
+    }
+  }
+  for (const label of before.labels) {
+    if (!afterByUid.has(label.uid)) diff.removed.push({ uid: label.uid, role: label.role, label: label.label });
+  }
+  return diff;
+}
+
+/** Render a {@link SnapshotDigestDiff} as the contract's line format. */
+function formatDigestDiff(diff: SnapshotDigestDiff): string {
+  const lines: string[] = [];
+  if (diff.url) lines.push(`URL changed: ${diff.url.before} -> ${diff.url.after}`);
+  if (diff.title) lines.push(`Title changed: ${diff.title.before} -> ${diff.title.after}`);
+  if (diff.textHashChanged) lines.push("Text content changed");
+  if (diff.focusedUid) {
+    lines.push(`Focused element changed: ${diff.focusedUid.before ?? "none"} -> ${diff.focusedUid.after ?? "none"}`);
+  }
+  if (diff.modalUid) lines.push(`Modal changed: ${diff.modalUid.before ?? "none"} -> ${diff.modalUid.after ?? "none"}`);
+  for (const label of diff.added) lines.push(`+ ${label.role} "${label.label}" (${label.uid})`);
+  for (const label of diff.removed) lines.push(`- ${label.role} "${label.label}" (${label.uid})`);
+  for (const label of diff.updated) lines.push(`~ ${label.role} "${label.label}" (${label.uid})`);
+  if (lines.length === 0) return "No changes detected between the two snapshots.";
+  return lines.join("\n");
 }
 
 function formatChromeSnapshot(snapshot: any): string {
@@ -333,8 +459,13 @@ function withBackground<T extends Record<string, unknown>>(params: T): T {
   return { ...params, foreground: !background } as T;
 }
 
-/** Shared execute-time auth gate + bridge send with host-session tagging. */
-function createBridge(options: VendoredChromeToolsOptions) {
+/**
+ * Shared bridge send with host-session tagging. `authGate` defaults to true:
+ * every bridge action requires the host's shared grant. chrome_launch builds
+ * its bridge with authGate=false and gates explicitly inside the params.url
+ * branch, so its instruction path never runs the auth gate (contract S6).
+ */
+function createBridge(options: VendoredChromeToolsOptions, authGate = true) {
   const client = options.client ?? new ChromeBridgeClient();
   return async (
     action: string,
@@ -343,7 +474,7 @@ function createBridge(options: VendoredChromeToolsOptions) {
     signal?: AbortSignal,
   ): Promise<unknown> => {
     // Auth is the HOST's shared grant; a subagent never mints its own (design §auth).
-    requireChromeAuthorized();
+    if (authGate) requireChromeAuthorized();
     const sessionKey = options.sessionKey?.();
     let wireParams: Record<string, unknown> =
       sessionKey !== undefined && params.sessionKey === undefined ? { ...params, sessionKey } : { ...params };
@@ -371,6 +502,9 @@ function createBridge(options: VendoredChromeToolsOptions) {
  */
 export function createVendoredChromeTools(options: VendoredChromeToolsOptions = {}): ToolDefinition[] {
   const bridge = createBridge(options);
+  // chrome_launch gates auth itself inside its params.url branch (contract S6),
+  // so its bridge wrapper must not double-gate the instruction path.
+  const launchBridge = createBridge(options, false);
   return [
     defineTool({
       name: "chrome_launch",
@@ -380,9 +514,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
       promptSnippet:
         "Show instructions for connecting Pi to the user's existing Chrome profile via the companion extension.",
       parameters: Type.Object({
-        port: Type.Optional(
-          Type.Number({ description: "Ignored. The bundled Chrome extension polls 127.0.0.1:17318." }),
-        ),
         url: Type.Optional(
           Type.String({
             description: "Optional URL to open in the existing Chrome profile after the extension is connected.",
@@ -400,10 +531,11 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
         headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
-        // No auth gate on the instruction path (mirrors pi-chrome: chrome_launch
-        // is the onboarding tool); only an actual tab.new needs the grant.
+        // The auth gate runs ONLY here, on a real tab.new — the instruction path
+        // below never calls the bridge and never gates (contract S6).
         if (params.url) {
-          const result = await bridge("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
+          requireChromeAuthorized();
+          const result = await launchBridge("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
           return {
             content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }],
             details: { result: result as Json },
@@ -429,7 +561,7 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
       name: "chrome_tab",
       label: "Chrome Tab",
       description:
-        "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+        "List, create, activate, close, group, ungroup, inspect, or save named handles for tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=save registers a named handle (name) for the resolved tab so a subagent can find or close its own tabs later; action=list returns the named-handle registry.",
       promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
       parameters: Type.Object({
         action: StringEnum(tabActionValues),
@@ -458,8 +590,23 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
+        name: Type.Optional(
+          Type.String({
+            description: "Handle name for action=save: the named-handle registry entry for the resolved tab.",
+          }),
+        ),
+        sessionKey: Type.Optional(
+          Type.String({
+            description:
+              "Wire-only passthrough (not part of the public API surface): session owner key tagging save/list registry entries. Injected automatically from the host session when omitted.",
+          }),
+        ),
+        subagentId: Type.Optional(
+          Type.String({
+            description:
+              "Wire-only passthrough for subagent isolation: tags saved handles so automation.cleanup closes only this subagent's tabs.",
+          }),
+        ),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const forwarded = { ...params } as typeof params & { groupTitle?: string };
@@ -467,23 +614,50 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
           forwarded.groupTitle = options.sessionGroupTitle?.() ?? params.groupTitle;
         }
         const result = await bridge(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
+        if (params.action === "save") {
+          const handle = (result as { handle?: { name?: string; tabId?: number } }).handle;
+          return {
+            content: [
+              {
+                type: "text",
+                text: handle ? `Saved handle "${handle.name ?? params.name}" -> tab ${handle.tabId}` : safeJson(result),
+              },
+            ],
+            details: { result: result as Json },
+          };
+        }
         if (params.action === "list") {
-          const tabs = result as Array<{
-            id: number;
-            title: string;
-            url: string;
-            active: boolean;
-            windowId: number;
-            group?: { title?: string } | null;
+          if (Array.isArray(result)) {
+            // Legacy tab list — pre-handle-registry service workers return a tabs array.
+            const tabs = result as Array<{
+              id: number;
+              title: string;
+              url: string;
+              active: boolean;
+              windowId: number;
+              group?: { title?: string } | null;
+            }>;
+            const text =
+              tabs
+                .map(
+                  (tab) =>
+                    `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`,
+                )
+                .join("\n") || "No tabs.";
+            return { content: [{ type: "text", text }], details: { tabs } };
+          }
+          // Contract S2.1: tab.list returns the named-handle registry {handles:[...]}.
+          const handles = ((result as { handles?: unknown[] }).handles ?? []) as Array<{
+            name: string;
+            tabId: number;
+            title?: string;
+            url?: string;
           }>;
           const text =
-            tabs
-              .map(
-                (tab) =>
-                  `${tab.id}\t${tab.active ? "*" : " "}\t${tab.group?.title ? `[${tab.group.title}] ` : ""}${tab.title || "(untitled)"}\t${tab.url}`,
-              )
-              .join("\n") || "No tabs.";
-          return { content: [{ type: "text", text }], details: { tabs } };
+            handles
+              .map((handle) => `${handle.name}\t${handle.tabId}\t${handle.title ?? ""}\t${handle.url ?? ""}`)
+              .join("\n") || "No named handles saved.";
+          return { content: [{ type: "text", text }], details: { handles } };
         }
         return { content: [{ type: "text", text: safeJson(result) }], details: { result: result as Json } };
       },
@@ -537,8 +711,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const snapshot = await bridge(
@@ -548,6 +720,22 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
           signal,
         );
         return { content: [{ type: "text", text: formatChromeSnapshot(snapshot) }], details: { snapshot } };
+      },
+    }),
+    defineTool({
+      name: "chrome_diff",
+      label: "Chrome Snapshot Diff",
+      description:
+        "Compare two snapshot digests (before/after) and report what changed between them: URL/title, page text hash, focused/modal element, and added/removed/updated labels. Pure host-side comparison — no bridge call. Pass digests captured from chrome_snapshot; use it for assertion-style steps instead of eyeballing two full snapshots.",
+      promptSnippet:
+        "Compare two Chrome snapshot digests and report added/removed/updated elements plus text/URL/title changes.",
+      parameters: Type.Object({
+        before: snapshotDigestSchema,
+        after: snapshotDigestSchema,
+      }),
+      async execute(_id, params): Promise<ToolTextResult> {
+        const diff = diffDigests(params.before, params.after);
+        return { content: [{ type: "text", text: formatDigestDiff(diff) }], details: { diff } };
       },
     }),
     defineTool({
@@ -571,8 +759,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const snapshot = await bridge(
@@ -608,8 +794,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true (the default), run silently in the background without focusing Chrome; pass false so Chrome focuses + the tab activates and the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         try {
@@ -662,8 +846,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, navigate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const result = await bridge(
@@ -698,8 +880,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, evaluate silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const value = await bridge("page.evaluate", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -746,8 +926,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, click silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const raw = await bridge("page.click", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -787,8 +965,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, type silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const raw = await bridge("page.type", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -835,8 +1011,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, fill silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const raw = await bridge("page.fill", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -885,8 +1059,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, send the key silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const raw = await bridge("page.key", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -915,8 +1087,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
         targetId: Type.Optional(Type.String()),
         urlIncludes: Type.Optional(Type.String()),
         titleIncludes: Type.Optional(Type.String()),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const result = await bridge("page.waitFor", params, (params.timeoutMs ?? 10_000) + 2_000, signal);
@@ -943,8 +1113,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const result = await bridge("page.console.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -974,8 +1142,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const result = await bridge("page.network.list", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -1002,8 +1168,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true, run silently without focusing Chrome. Defaults to on (the session background setting); pass false to focus Chrome so the user can watch.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal): Promise<ToolTextResult> {
         const result = await bridge("page.network.get", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
@@ -1039,8 +1203,6 @@ export function createVendoredChromeTools(options: VendoredChromeToolsOptions = 
               "If true (the default), capture silently without focusing the Chrome window (the target tab is briefly activated within its window for the capture, then restored); pass false to focus Chrome.",
           }),
         ),
-        host: Type.Optional(Type.String()),
-        port: Type.Optional(Type.Number()),
       }),
       async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<ToolTextResult> {
         const format = params.format ?? "png";

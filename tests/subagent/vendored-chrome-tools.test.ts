@@ -11,13 +11,19 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { ChromeBridgeClient, PI_CHROME_AUTH_GLOBAL_KEY } from "../../src/subagent/chrome-bridge-client.js";
-import { createVendoredChromeTools } from "../../src/subagent/vendored-chrome-tools.js";
+import {
+  createVendoredChromeTools,
+  diffDigests,
+  type SnapshotDigest,
+  tabActionValues,
+} from "../../src/subagent/vendored-chrome-tools.js";
 
-/** The pi-chrome v0.15.46 tool names this vendored set must mirror. */
+/** The pi-chrome v0.15.46 tool names this vendored set must mirror (22 incl. chrome_diff). */
 const EXPECTED_NAMES = [
   "chrome_launch",
   "chrome_tab",
   "chrome_snapshot",
+  "chrome_diff",
   "chrome_find",
   "chrome_inspect",
   "chrome_navigate",
@@ -198,6 +204,198 @@ describe("vendored chrome execute", () => {
       toolByName(defs, "chrome_click").execute("id", { uid: "u1" }, undefined, undefined, {} as never),
       /boom/,
     );
+  });
+
+  test("chrome_launch runs the auth gate ONLY on the params.url (tab.new) branch, never on the instruction path", async () => {
+    // No grant + no url: the instruction path must NOT throw the lock message.
+    const { client, sends } = recordingClient([]);
+    const defs = createVendoredChromeTools({ client });
+    const result = await toolByName(defs, "chrome_launch").execute("id", {}, undefined, undefined, {} as never);
+    assert.ok((result as { content: Array<{ text: string }> }).content[0].text.includes("managed by the host"));
+    assert.equal(sends.length, 0, "instruction path never calls the bridge");
+
+    // No grant + url: the real tab.new must be gated.
+    await assert.rejects(
+      toolByName(defs, "chrome_launch").execute("id", { url: "https://x" }, undefined, undefined, {} as never),
+      /Chrome control locked/,
+    );
+
+    // Grant + url: tab.new is sent with host-session tagging, and the gate does not run twice.
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const granted = recordingClient([{ id: 7 }]);
+    const defs2 = createVendoredChromeTools({
+      client: granted.client,
+      sessionKey: () => "session:host-1",
+      sessionGroupTitle: () => "Pi Session: host",
+    });
+    await toolByName(defs2, "chrome_launch").execute("id", { url: "https://x" }, undefined, undefined, {} as never);
+    assert.equal(granted.sends.length, 1);
+    assert.equal(granted.sends[0].action, "tab.new");
+    assert.equal(granted.sends[0].params.sessionKey, "session:host-1");
+    assert.equal(granted.sends[0].params.groupTitle, "Pi Session: host");
+  });
+});
+
+describe("chrome_tab save/list (contract S2.2 named-handle registry)", () => {
+  test("tabActionValues includes save and list for the named-handle registry", () => {
+    assert.deepEqual(tabActionValues, ["list", "new", "activate", "close", "group", "ungroup", "version", "save"]);
+  });
+
+  test("chrome_tab save forwards action, name, subagentId and the auto-injected sessionKey", async () => {
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const { client, sends } = recordingClient([{ ok: true, handle: { name: "login", tabId: 7 } }]);
+    const defs = createVendoredChromeTools({ client, sessionKey: () => "session:host-1" });
+    const result = await toolByName(defs, "chrome_tab").execute(
+      "id",
+      { action: "save", name: "login", subagentId: "sub-1", targetId: "123" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].action, "tab.save");
+    assert.equal(sends[0].params.name, "login");
+    assert.equal(sends[0].params.subagentId, "sub-1");
+    assert.equal(sends[0].params.targetId, "123");
+    assert.equal(sends[0].params.sessionKey, "session:host-1");
+    assert.equal(sends[0].params.joinSessionGroup, undefined, "tab.* actions never join a group");
+    assert.ok(
+      (result as { content: Array<{ text: string }> }).content[0].text.includes('Saved handle "login" -> tab 7'),
+    );
+  });
+
+  test("chrome_tab list forwards the action and formats the handle registry result", async () => {
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const { client, sends } = recordingClient([
+      { handles: [{ name: "login", tabId: 7, title: "Login", url: "https://x" }] },
+    ]);
+    const defs = createVendoredChromeTools({ client });
+    const result = await toolByName(defs, "chrome_tab").execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(sends[0].action, "tab.list");
+    assert.equal(sends[0].params.sessionKey, undefined, "no sessionKey provider, no injection");
+    const text = (result as { content: Array<{ text: string }> }).content[0].text;
+    assert.ok(text.includes("login\t7\tLogin\thttps://x"));
+  });
+
+  test("chrome_tab list still formats legacy array results from pre-registry service workers", async () => {
+    (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
+    const { client, sends } = recordingClient([[{ id: 1, title: "T", url: "https://x", active: true, windowId: 1 }]]);
+    const defs = createVendoredChromeTools({ client });
+    const result = await toolByName(defs, "chrome_tab").execute(
+      "id",
+      { action: "list" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(sends[0].action, "tab.list");
+    assert.ok((result as { content: Array<{ text: string }> }).content[0].text.includes("1\t*\tT\thttps://x"));
+  });
+});
+
+describe("diffDigests + chrome_diff (contract S3.1)", () => {
+  const digest = (overrides: Partial<SnapshotDigest> = {}): SnapshotDigest => ({
+    url: "https://example.test/page",
+    title: "Page",
+    textHash: "hash-1",
+    focusedUid: null,
+    modalUid: null,
+    labels: [],
+    ...overrides,
+  });
+
+  test("identical digests produce an empty diff and the no-change line", async () => {
+    const before = digest();
+    const after = digest();
+    const diff = diffDigests(before, after);
+    assert.equal(diff.textHashChanged, false);
+    assert.equal(diff.url, undefined);
+    assert.equal(diff.title, undefined);
+    assert.equal(diff.focusedUid, undefined);
+    assert.equal(diff.modalUid, undefined);
+    assert.equal(diff.added.length, 0);
+    assert.equal(diff.removed.length, 0);
+    assert.equal(diff.updated.length, 0);
+    const defs = createVendoredChromeTools();
+    const result = await toolByName(defs, "chrome_diff").execute(
+      "id",
+      { before, after },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(
+      (result as { content: Array<{ text: string }> }).content[0].text,
+      "No changes detected between the two snapshots.",
+    );
+  });
+
+  test("reports url/title/text/focus/modal changes and label add/remove/update", () => {
+    const before = digest({
+      url: "https://example.test/a",
+      title: "A",
+      textHash: "h1",
+      focusedUid: "e1",
+      labels: [
+        { uid: "e1", role: "button", label: "Submit" },
+        { uid: "e2", role: "textbox", label: "Name", value: "old" },
+      ],
+    });
+    const after = digest({
+      url: "https://example.test/b",
+      title: "B",
+      textHash: "h2",
+      focusedUid: "e2",
+      modalUid: "m1",
+      labels: [
+        { uid: "e1", role: "button", label: "Submit", disabled: true },
+        { uid: "e3", role: "link", label: "New" },
+      ],
+    });
+    const diff = diffDigests(before, after);
+    assert.deepEqual(diff.url, { before: "https://example.test/a", after: "https://example.test/b" });
+    assert.deepEqual(diff.title, { before: "A", after: "B" });
+    assert.equal(diff.textHashChanged, true);
+    assert.deepEqual(diff.focusedUid, { before: "e1", after: "e2" });
+    assert.deepEqual(diff.modalUid, { before: null, after: "m1" });
+    assert.deepEqual(diff.added, [{ uid: "e3", role: "link", label: "New" }]);
+    assert.deepEqual(diff.removed, [{ uid: "e2", role: "textbox", label: "Name" }]);
+    assert.equal(diff.updated.length, 1);
+    assert.equal(diff.updated[0].uid, "e1");
+    assert.equal(diff.updated[0].before.label, "Submit");
+    assert.equal(diff.updated[0].after.disabled, true);
+  });
+
+  test("chrome_diff renders the contract line vocabulary and passes the structured diff in details", async () => {
+    const before = digest();
+    const after = digest({
+      url: "https://example.test/b",
+      textHash: "h2",
+      labels: [{ uid: "e1", role: "button", label: "Go" }],
+    });
+    const defs = createVendoredChromeTools();
+    const result = (await toolByName(defs, "chrome_diff").execute(
+      "id",
+      { before, after },
+      undefined,
+      undefined,
+      {} as never,
+    )) as {
+      content: Array<{ text: string }>;
+      details: { diff: { url?: { before: string; after: string }; added: Array<{ uid: string }>; updated: unknown[] } };
+    };
+    const text = result.content[0].text;
+    assert.ok(text.includes("URL changed: https://example.test/page -> https://example.test/b"));
+    assert.ok(text.includes("Text content changed"));
+    assert.ok(text.includes('+ button "Go" (e1)'));
+    assert.equal(result.details.diff.url?.after, "https://example.test/b");
+    assert.equal(result.details.diff.added.length, 1);
   });
 });
 

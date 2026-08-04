@@ -167,6 +167,52 @@ describe("ChromeBridgeClient.send", () => {
   });
 });
 
+describe("ChromeBridgeClient.heartbeat", () => {
+  test("POSTs {sessionKey} to <url>/heartbeat and returns true on 2xx", async () => {
+    const { fetchImpl, requests } = fakeFetch([jsonResponse(200, { ok: true })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    const result = await client.heartbeat("session:abc");
+    assert.equal(result, true);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "http://127.0.0.1:17318/heartbeat");
+    assert.equal(requests[0].init.method, "POST");
+    assert.deepEqual(JSON.parse(requests[0].init.body ?? "{}"), { sessionKey: "session:abc" });
+    assert.deepEqual(requests[0].init.headers, { "content-type": "application/json" });
+  });
+
+  test("swallows network failures by default and returns false", async () => {
+    const client = new ChromeBridgeClient({
+      url: "http://127.0.0.1:17318",
+      fetchImpl: (async () => {
+        throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+      }) as unknown as typeof fetch,
+    });
+    assert.equal(await client.heartbeat("session:abc"), false);
+  });
+
+  test("swallows non-ok HTTP responses by default and returns false", async () => {
+    const { fetchImpl } = fakeFetch([new Response("boom", { status: 500 })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    assert.equal(await client.heartbeat("session:abc"), false);
+  });
+
+  test("throwOnError rethrows network failures unchanged", async () => {
+    const client = new ChromeBridgeClient({
+      url: "http://127.0.0.1:17318",
+      fetchImpl: (async () => {
+        throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+      }) as unknown as typeof fetch,
+    });
+    await assert.rejects(client.heartbeat("session:abc", { throwOnError: true }), /fetch failed/);
+  });
+
+  test("throwOnError rethrows non-ok HTTP responses with the status", async () => {
+    const { fetchImpl } = fakeFetch([new Response("boom", { status: 500 })]);
+    const client = new ChromeBridgeClient({ url: "http://127.0.0.1:17318", fetchImpl });
+    await assert.rejects(client.heartbeat("session:abc", { throwOnError: true }), /heartbeat HTTP 500/);
+  });
+});
+
 describe("shared chrome auth grant", () => {
   test("reads pi-chrome's globalThis grant when valid", () => {
     const until = Date.now() + 60_000;
