@@ -28,7 +28,9 @@ import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
+import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
@@ -375,6 +377,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * model-routing.ts, phase budgets, and onPhase events are untouched.
    */
   phaseState?: PhaseStateIntegration;
+  /**
+   * Optional Phase 0/1 pipeline wiring (wayfinder -> prewalk) — see
+   * PhasePipelineOptions. Strictly additive: absent, the run behaves exactly
+   * as before; the PhaseGuard gate on agent() (Phase 3 + human approval) is
+   * untouched.
+   */
+  pipeline?: PhasePipelineOptions;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
@@ -543,6 +552,42 @@ export interface PhaseOptions {
    * transition flushes. Ignored when no state machine is configured.
    */
   stage?: PhaseStage;
+}
+
+/**
+ * Opt-in wiring of the Phase 0/1 pipeline (wayfinder -> prewalk) into a
+ * workflow run's entry — executed BEFORE the script body once per top-level
+ * run. When configured:
+ *
+ * - the run's task prompt is assessed with the wayfinder statable-question
+ *   gate; a foggy prompt persists a decision map to `.pi/workflows/map.md`
+ *   (the local branch of the PRD's "GitHub Issues or local" ticket store);
+ * - the prewalk stage is gated on `wayfinderComplete`: while wayfinder
+ *   decision tickets remain unresolved, no blueprint is produced and the
+ *   flag stays false (tickets resolve session-by-session);
+ * - once wayfinder completes, prewalk generates the "1986 Aircraft Manual"
+ *   blueprint, writes it to `.pi/workflows/plans/<runId>.json` (the path the
+ *   plannotator gate reads), and marks `prewalkComplete` so the Phase 2
+ *   gate opens.
+ *
+ * Strictly additive: absent, the run behaves exactly as before, and the
+ * PhaseGuard gate on agent() (Phase 3 + human approval) is untouched.
+ */
+export interface PhasePipelineOptions {
+  /**
+   * The persisted state machine whose flags gate the pipeline. Falls back to
+   * `phaseState.stateManager` when omitted; when neither is configured the
+   * pipeline is skipped (a run cannot gate what it cannot persist).
+   */
+  stateManager?: WorkflowStateManager;
+  /** Directory for `.pi/workflows` artifacts (default: the run's cwd). */
+  dir?: string;
+  /** Task prompt to assess (default: `meta.description`, else the script). */
+  prompt?: string;
+  /** Codebase summary fed to generateBlueprint (default: a minimal summary). */
+  codebaseSummary?: string;
+  /** Frontier-mapper seam for the decision map (default: the deterministic stub). */
+  mapper?: FrontierMapper;
 }
 
 /**
@@ -823,6 +868,53 @@ export async function runWorkflow<T = unknown>(
     state.logs.push(text);
     logger.log(text);
   };
+
+  /** Minimal codebase summary when the pipeline caller supplies none. */
+  const DEFAULT_PIPELINE_CODEBASE_SUMMARY = "No codebase summary provided to the phase pipeline.";
+
+  // Phase 0/1 pipeline wiring (wayfinder -> prewalk): runs once per TOP-LEVEL
+  // frame before the script body. A nested workflow() inherits options.pipeline
+  // via the spread below, so gating on isTopLevelRun is what stops the pipeline
+  // from re-firing per frame. Pipeline persistence is bookkeeping: a failure is
+  // logged, never allowed to fail an otherwise-runnable script, while the state
+  // machine's Phase 1/2 gates still enforce ordering on every successful run.
+  if (options.pipeline && isTopLevelRun) {
+    const pipelineStateManager = options.pipeline.stateManager ?? phaseStateIntegration?.stateManager;
+    if (pipelineStateManager) {
+      const pipelineDir = options.pipeline.dir ?? baseCwd;
+      const pipelinePrompt = options.pipeline.prompt ?? meta.description ?? script;
+      try {
+        const wayfinder = await runWayfinderStage({
+          stateManager: pipelineStateManager,
+          prompt: pipelinePrompt,
+          dir: pipelineDir,
+          mapper: options.pipeline.mapper,
+          onLog: log,
+        });
+        if (wayfinder.completed) {
+          // Wayfinder -> prewalk: transition with prerequisite enforcement so
+          // the declared wayfinderComplete gate is a real check, not a formality.
+          await pipelineStateManager.transitionTo(1, { enforcePrerequisites: true });
+          await runPrewalkStage({
+            stateManager: pipelineStateManager,
+            task: pipelinePrompt,
+            codebaseSummary: options.pipeline.codebaseSummary ?? DEFAULT_PIPELINE_CODEBASE_SUMMARY,
+            dir: pipelineDir,
+            runId,
+            onLog: log,
+          });
+          // Prewalk -> plannotator gate: prewalkComplete is the Phase 2
+          // prerequisite; once set, the Phase 2 gate is open.
+          await pipelineStateManager.transitionTo(2, { enforcePrerequisites: true });
+          log(`phase pipeline: Phase 2 (plannotator review) gate open for run ${runId}`);
+        }
+      } catch (error) {
+        log(`phase pipeline failed (run continues): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      log("phase pipeline skipped: no state manager configured (pass pipeline.stateManager or phaseState)");
+    }
+  }
 
   /**
    * Guarded host-callback dispatch (M1): every host-invoked callback

@@ -12,6 +12,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { WorkflowStateManager } from "./state-machine.js";
 
 export enum TicketType {
   /** AFK documentation lookup. */
@@ -427,6 +428,96 @@ export async function dispatchTicketResearch(
     () => runtime.agent(buildResearchPrompt(ticket), { label: `wayfinder-research:${ticket.id}`, tier: "small" }),
   ]);
   return { dispatched: true, ticketId: ticket.id, findings };
+}
+
+/**
+ * Decision ticket types that dissolve fog (research / prototype / grilling).
+ * TASK tickets carry the implementation work itself, so they never gate the
+ * wayfinder's own completion — a clear prompt maps to a single task ticket
+ * and the wayfinder step completes immediately.
+ */
+const DECISION_TICKET_TYPES: ReadonlySet<TicketType> = new Set([
+  TicketType.RESEARCH,
+  TicketType.PROTOTYPE,
+  TicketType.GRILLING,
+]);
+
+/**
+ * Whether a decision map's fog is fully dissolved: every decision ticket
+ * (research/prototype/grilling) is resolved. Blocked and in-progress tickets
+ * are unresolved fog by another name, so only "resolved" counts.
+ */
+export function isMapFogResolved(map: DecisionMap): boolean {
+  return map.tickets.every((ticket) => !DECISION_TICKET_TYPES.has(ticket.type) || ticket.status === "resolved");
+}
+
+/** Options for the run-entry Phase 0 stage (see runWayfinderStage). */
+export interface WayfinderStageOptions {
+  /** Persisted phase state machine whose wayfinderComplete flag gates prewalk. */
+  stateManager: WorkflowStateManager;
+  /** The task prompt being assessed (input to the statable-question gate). */
+  prompt: string;
+  /** Directory that receives `.pi/workflows/map.md` + `map.json`. */
+  dir: string;
+  /** Frontier-model mapper seam; defaults to the deterministic stub. */
+  mapper?: FrontierMapper;
+  /** Run-log sink so pipeline steps are visible in the run's logs. */
+  onLog?: (message: string) => void;
+}
+
+/** Outcome of the run-entry Phase 0 stage (see runWayfinderStage). */
+export interface WayfinderStageResult {
+  /** The map in effect after this stage (loaded or freshly created). */
+  map: DecisionMap;
+  /** Whether a decision map was (re)written to disk by this stage. */
+  savedMap: boolean;
+  /** Whether the wayfinder step is complete (fog dissolved) — gates prewalk. */
+  completed: boolean;
+}
+
+/**
+ * Phase 0 stage wired into the workflow run entry: assess the prompt's fog,
+ * persist a decision map, and mark wayfinderComplete once the fog is
+ * dissolved.
+ *
+ * Session-by-session resolution: an existing map whose rootQuestion still
+ * matches the prompt is kept (a previous session's ticket progress survives);
+ * a missing map — or one for a different prompt — is (re)created through the
+ * mapper seam. Completion means every decision ticket is resolved; a clear
+ * prompt therefore completes immediately with its single-task map, while a
+ * foggy prompt blocks prewalk until its tickets are resolved.
+ */
+export async function runWayfinderStage(options: WayfinderStageOptions): Promise<WayfinderStageResult> {
+  const assessment = assessPrompt(options.prompt);
+  options.onLog?.(
+    `wayfinder: prompt assessed ${assessment.isFoggy ? "foggy" : "clear"} (${assessment.questions.length} statable question(s))`,
+  );
+
+  const existing = await loadDecisionMap(options.dir);
+  const mapMatchesPrompt = existing !== null && existing.rootQuestion === options.prompt;
+  let map: DecisionMap;
+  let savedMap = false;
+  if (mapMatchesPrompt && existing) {
+    map = existing;
+  } else {
+    map = await createDecisionMap(options.prompt, { mapper: options.mapper });
+    await saveDecisionMap(map, options.dir);
+    savedMap = true;
+  }
+
+  const completed = isMapFogResolved(map);
+  if (completed) {
+    await options.stateManager.markWayfinderComplete();
+    options.onLog?.("wayfinder complete: fog cleared — Phase 1 (prewalk) may proceed");
+  } else {
+    const pending = map.tickets.filter(
+      (ticket) => DECISION_TICKET_TYPES.has(ticket.type) && ticket.status !== "resolved",
+    );
+    options.onLog?.(
+      `wayfinder pending: ${pending.length} decision ticket(s) unresolved — prewalk stays blocked until they are resolved`,
+    );
+  }
+  return { map, savedMap, completed };
 }
 
 /** Render the decision map as a MARKDOWN index (headings + ticket statuses). */
