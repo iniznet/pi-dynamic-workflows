@@ -17,7 +17,7 @@ import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { coerceArgs } from "./saved-commands.js";
-import { parseWorkflowScript, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
+import { type CheckpointGate, parseWorkflowScript, type WorkflowMeta, type WorkflowRunResult } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
@@ -202,6 +202,12 @@ export interface WorkflowToolOptions {
   defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * Optional visual approve/deny gate for checkpoint(); threaded into every
+   * run this tool starts. Absent → checkpoint() keeps its default headless
+   * behavior (declared default or inline confirm).
+   */
+  checkpointGate?: CheckpointGate;
 }
 
 export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefinition<TSchema, unknown> {
@@ -297,7 +303,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // detached and its result is delivered back into the conversation).
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
-        const resumed = await manager.resume(runId, { script, args: runArgs });
+        const resumed = await manager.resume(runId, { script, args: runArgs, checkpointGate: options.checkpointGate });
         if (!resumed) {
           throw new Error(resumeFailureText(manager, runId));
         }
@@ -332,6 +338,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tokenBudget: params.tokenBudget,
           tools: invocationTools,
           toolset: invocationToolset,
+          checkpointGate: options.checkpointGate,
         });
         return {
           content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
@@ -363,6 +370,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tools: invocationTools,
           toolset: invocationToolset,
           confirm,
+          checkpointGate: options.checkpointGate,
           externalSignal: signal,
           onProgress(live) {
             snapshot = recomputeWorkflowSnapshot(live);

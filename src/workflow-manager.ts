@@ -24,7 +24,13 @@ import {
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
+import {
+  type CheckpointGate,
+  type JournalEntry,
+  parseWorkflowScript,
+  runWorkflow,
+  type WorkflowRunResult,
+} from "./workflow.js";
 import { gitExec, pruneWorktrees } from "./worktree.js";
 
 export interface ManagedRunBase {
@@ -279,6 +285,12 @@ export interface ExecOptions {
   failOnExhaustedAgent?: boolean;
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
+  /**
+   * Optional visual approve/deny gate for checkpoint() (e.g. the plannotator
+   * SSE bridge). Threaded into runWorkflow; absent → checkpoint() keeps its
+   * default headless/confirm behavior. Additive: no existing caller regresses.
+   */
+  checkpointGate?: CheckpointGate;
   /**
    * Whether this run is eligible for auto-resume when it pauses on a provider
    * usage limit. Default-on: omit or pass true to stay eligible, pass false to
@@ -846,6 +858,7 @@ export class WorkflowManager extends EventEmitter {
       agentRetries,
       retryBackoffMs,
       confirm,
+      checkpointGate,
       tools,
       initialTokenUsage,
     } = exec;
@@ -935,6 +948,7 @@ export class WorkflowManager extends EventEmitter {
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,
         confirm,
+        checkpointGate,
         loadSavedWorkflow: this.loadSavedWorkflow,
         resumeJournal,
         resumeFromRunId: resumeJournal ? managed.runId : undefined,

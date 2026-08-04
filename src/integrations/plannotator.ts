@@ -5,10 +5,14 @@
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { WorkflowError, WorkflowErrorCode } from "../errors.js";
+import type { WorkflowStateManager } from "../phases/state-machine.js";
 import { type SafeTimer, safeSetInterval, safeSetTimeout } from "../timing.js";
+import { type BrowserOpenOptions, type BrowserOpenResult, openReviewInBrowser } from "./plannotator-ui/browser-open.js";
+import { renderReviewPage } from "./plannotator-ui/review-page.js";
 
 export interface ReviewPlan {
   id: string;
@@ -18,6 +22,12 @@ export interface ReviewPlan {
   feedback?: string;
   submittedAt: string;
   reviewedAt?: string;
+  /**
+   * Never persisted: attached only to the object returned by the bridge's
+   * submitPlan when the review page could not be auto-opened, so a caller can
+   * surface the manual review URL to the human.
+   */
+  note?: string;
 }
 
 export interface PlannotatorConfig {
@@ -37,6 +47,23 @@ export interface PlannotatorBridge {
   close(): void;
 }
 
+/**
+ * Bridge construction options: {@link PlannotatorConfig} fields plus the
+ * on-demand Phase 2 gate hooks. Source-compatible with `Partial<PlannotatorConfig>`
+ * (existing callers pass `{ port, autoOpenBrowser }` unchanged).
+ */
+export interface PlannotatorBridgeOptions extends Partial<PlannotatorConfig> {
+  /**
+   * Optional persisted phase state machine. On a valid /approve the bridge runs
+   * `approvePlan()` (flips `humanApproved` in active-state.json); a phase
+   * mismatch (APPROVAL_REQUIRED) answers the browser with 409 while the plan
+   * file stays approved. Absent → the bridge is a pure approve/deny gate.
+   */
+  stateManager?: WorkflowStateManager;
+  /** Injectable browser opener (test seam); defaults to openReviewInBrowser. */
+  openBrowser?: (url: string, opts?: BrowserOpenOptions) => Promise<BrowserOpenResult>;
+}
+
 const DEFAULT_CONFIG: PlannotatorConfig = {
   port: 3123,
   autoOpenBrowser: true,
@@ -47,6 +74,13 @@ const DEFAULT_CONFIG: PlannotatorConfig = {
 const POLL_INTERVAL_MS = 250;
 /** Default SSE heartbeat cadence: comfortably under typical proxy idle timeouts (60s+). */
 const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+/** Max POST /approve body: a larger body is a protocol violation, not a review. */
+const MAX_APPROVE_BODY_BYTES = 64 * 1024;
+/** Plan id shape check for /plan and /approve (matches randomUUID output). */
+const PLAN_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Max feedback characters on /approve. */
+const MAX_FEEDBACK_CHARS = 8000;
+const JSON_HEADERS: Record<string, string> = { "Content-Type": "application/json; charset=utf-8" };
 
 function planDir(): string {
   return join(process.cwd(), ".pi", "workflows", "plans");
@@ -160,8 +194,48 @@ export async function submitPlan(blueprint: unknown, _config?: Partial<Plannotat
   };
   const dir = planDir();
   await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, `${plan.id}.json`), JSON.stringify(plan, null, 2), "utf-8");
+  await writePlanAtomic(plan);
   return plan;
+}
+
+/**
+ * Read a request body up to maxBytes. Rejects on overflow (and destroys the
+ * socket) or on a stream error — never buffers unbounded input.
+ */
+function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        reject(new Error(`request body exceeds ${maxBytes} bytes`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
+    req.on("error", reject);
+  });
+}
+
+/**
+ * Atomic replace of a plan file (tmp + rename in the same directory, mirroring
+ * the state-machine write pattern) so the 250ms poller never observes a torn
+ * file: an orphaned tmp is unlinked on failure.
+ */
+async function writePlanAtomic(plan: ReviewPlan): Promise<void> {
+  const dir = planDir();
+  const path = join(dir, `${plan.id}.json`);
+  const tmpPath = `${path}.${randomUUID()}.${process.pid}.tmp`;
+  await writeFile(tmpPath, JSON.stringify(plan, null, 2), "utf-8");
+  try {
+    await rename(tmpPath, path);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 export function waitForApproval(planId: string, timeout?: number, signal?: AbortSignal): Promise<boolean> {
@@ -176,10 +250,14 @@ export async function getPlanStatus(planId: string): Promise<ReviewPlan> {
   return JSON.parse(data) as ReviewPlan;
 }
 
-export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): PlannotatorBridge {
-  const cfg = { ...DEFAULT_CONFIG, ...config };
+export function createPlannotatorBridge(options: PlannotatorBridgeOptions = {}): PlannotatorBridge {
+  const cfg = { ...DEFAULT_CONFIG, ...options };
+  const openBrowserFn = options.openBrowser ?? openReviewInBrowser;
   const emitter = new EventEmitter();
   const pendingWaits = new Set<(error: Error) => void>();
+  // The most recent submitted plan; GET /plan (no query) serves it to the
+  // review page. Cleared on close().
+  let latestPlanId: string | undefined;
   // Registry of open SSE streams. A keep-alive SSE response is never closed by
   // the client's silence alone, so the bridge must track every response to end
   // it on close() and to heartbeat/drop dead clients.
@@ -228,10 +306,143 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
     res.on("error", onClosed);
   };
 
+  const sendJson = (res: ServerResponse, status: number, payload: unknown) => {
+    res.writeHead(status, JSON_HEADERS);
+    res.end(JSON.stringify(payload));
+  };
+
+  /** Resolve the review page URL from the live socket; undefined until bound. */
+  const reviewUrl = (): string | undefined => {
+    const addr = server.address();
+    if (addr === null) return undefined;
+    const port = typeof addr === "object" ? addr.port : cfg.port;
+    return `http://127.0.0.1:${port}/review`;
+  };
+
+  // GET /plan[?planId=] — the review page fetches this without a query and
+  // gets the latest submitted plan; a planId query serves that specific plan.
+  const handleGetPlan = async (_req: IncomingMessage, res: ServerResponse) => {
+    const planIdParam = new URL(_req.url ?? "/", "http://127.0.0.1").searchParams.get("planId");
+    try {
+      if (planIdParam !== null) {
+        if (!PLAN_ID_RE.test(planIdParam)) {
+          sendJson(res, 400, { error: "invalid planId" });
+          return;
+        }
+        const plan = await getPlanStatus(planIdParam);
+        sendJson(res, 200, { plan });
+        return;
+      }
+      if (!latestPlanId) {
+        sendJson(res, 404, { error: "no plan submitted yet" });
+        return;
+      }
+      const plan = await getPlanStatus(latestPlanId);
+      sendJson(res, 200, { plan });
+    } catch {
+      sendJson(res, 404, { error: "plan not found" });
+    }
+  };
+
+  // POST /approve — browser review verdict. Validation ladder runs before any
+  // write: 400 malformed/non-object/missing or bad-UUID planId → 400 unknown
+  // plan → 409 already-decided → 400 oversized feedback. Success persists the
+  // approved plan atomically, emits the SSE update, then (optionally) runs the
+  // state machine hook (a phase-mismatch 409 never rolls back the approved
+  // file — the poll path still delivers the verdict).
+  const handleApprove = async (req: IncomingMessage, res: ServerResponse) => {
+    let body: unknown;
+    try {
+      body = JSON.parse(await readBody(req, MAX_APPROVE_BODY_BYTES));
+    } catch {
+      sendJson(res, 400, { error: "invalid JSON body" });
+      return;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      sendJson(res, 400, { error: "body must be a JSON object" });
+      return;
+    }
+    const planId = (body as { planId?: unknown }).planId;
+    if (typeof planId !== "string" || !PLAN_ID_RE.test(planId)) {
+      sendJson(res, 400, { error: "invalid planId" });
+      return;
+    }
+    const feedback = (body as { feedback?: unknown }).feedback;
+    if (feedback !== undefined && (typeof feedback !== "string" || feedback.length > MAX_FEEDBACK_CHARS)) {
+      sendJson(res, 400, { error: "feedback must be a string under 8000 chars" });
+      return;
+    }
+    let current: ReviewPlan;
+    try {
+      current = await getPlanStatus(planId);
+    } catch {
+      // Unknown planId → 400 (the review page treats any 4xx as terminal).
+      sendJson(res, 400, { error: "unknown plan" });
+      return;
+    }
+    if (current.status !== "pending") {
+      sendJson(res, 409, { error: "plan already decided", status: current.status });
+      return;
+    }
+    const approved: ReviewPlan = {
+      ...current,
+      status: "approved",
+      ...(feedback !== undefined ? { feedback } : {}),
+      reviewedAt: new Date().toISOString(),
+    };
+    try {
+      await writePlanAtomic(approved);
+    } catch {
+      sendJson(res, 500, { error: "could not persist approval" });
+      return;
+    }
+    emitter.emit("update", approved);
+    if (cfg.stateManager) {
+      try {
+        await cfg.stateManager.approvePlan();
+      } catch (error) {
+        if (error instanceof WorkflowError && error.code === WorkflowErrorCode.APPROVAL_REQUIRED) {
+          // Phase guard refused: approvePlan is only valid in Phase 2. The plan
+          // file stays approved, but subagent execution was not unlocked.
+          sendJson(res, 409, { error: "approval not valid in current phase" });
+          return;
+        }
+        sendJson(res, 500, { error: "state machine update failed" });
+        return;
+      }
+    }
+    sendJson(res, 200, { ok: true, planId, status: "approved" });
+  };
+
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (req.url === "/sse") {
+    const method = req.method ?? "GET";
+    const url = req.url ?? "/";
+    if (url === "/approve") {
+      if (method !== "POST") {
+        res.writeHead(405, { Allow: "POST" });
+        res.end();
+        return;
+      }
+      void handleApprove(req, res);
+      return;
+    }
+    if (method !== "GET") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    if (url === "/" || url === "/review") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(renderReviewPage());
+    } else if (url === "/favicon.ico") {
+      // Avoid browser console noise while the page is open.
+      res.writeHead(204);
+      res.end();
+    } else if (url === "/plan" || url.startsWith("/plan?")) {
+      void handleGetPlan(req, res);
+    } else if (url === "/sse") {
       registerSse(req, res);
-    } else if (req.url === "/reviewed") {
+    } else if (url === "/reviewed") {
       // Event-driven review stream: pushes a `reviewed` event to connected
       // clients when a review settles (observed by an active poll). Polling
       // via waitForApproval/getPlanStatus remains the fallback.
@@ -271,7 +482,26 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
   heartbeat.unref();
 
   return {
-    submitPlan: (blueprint: unknown) => submitPlan(blueprint, cfg),
+    submitPlan: async (blueprint: unknown) => {
+      const plan = await submitPlan(blueprint, cfg);
+      latestPlanId = plan.id;
+      if (cfg.autoOpenBrowser) {
+        // Fire-and-forget: a failed/denied launcher must never reject submitPlan.
+        const url = reviewUrl();
+        if (url) {
+          void openBrowserFn(url, { timeoutMs: 10_000 })
+            .then((result) => {
+              if (!result.opened) {
+                // The run continues and polls; surface the manual review URL on
+                // the result so a caller can point the human at the page.
+                plan.note = `Open ${url} to approve the plan`;
+              }
+            })
+            .catch(() => {});
+        }
+      }
+      return plan;
+    },
     waitForApproval: (planId: string, timeout?: number, signal?: AbortSignal) => {
       if (serverError) return Promise.reject(serverError);
       return waitForStatus(planDir(), planId, {
@@ -304,6 +534,7 @@ export function createPlannotatorBridge(config?: Partial<PlannotatorConfig>): Pl
       }
       sseClients.clear();
       sseHandlers.clear();
+      latestPlanId = undefined;
       if (server.listening) {
         server.close();
         // Node >=18.2: force-close the underlying sockets so a client that

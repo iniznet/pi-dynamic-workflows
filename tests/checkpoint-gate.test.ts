@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -124,7 +125,11 @@ async function inTempDir(fn: () => Promise<void>): Promise<void> {
 async function waitForPlanFile(dir: string): Promise<string> {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
-    const files = await readdir(dir).catch(() => [] as string[]);
+    const files = (await readdir(dir).catch(() => [] as string[])).filter(
+      // Atomic writes surface a `<id>.json.<uuid>.<pid>.tmp` sibling first;
+      // only the final plan file is a complete, readable plan.
+      (name) => name.endsWith(".json") && !name.endsWith(".tmp"),
+    );
     if (files.length > 0) return join(dir, files[0]);
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -177,6 +182,60 @@ return await checkpoint('Approve?', { timeoutMs: 300 })`;
       const res = await runWorkflow<boolean>(script, { agent: noopAgent, checkpointGate: bridge, persistLogs: false });
       assert.equal(res.result, false, "a timed-out gate resolves false (deny by default)");
       assert.ok(Date.now() - started >= 250, "the run actually waited for the gate timeout");
+    } finally {
+      bridge.close();
+    }
+  });
+});
+
+/** Reserves an OS-assigned port, frees it, and returns it for a deterministic bind. */
+async function freePort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
+  const address = probe.address();
+  if (address === null || typeof address === "string") throw new Error("unable to allocate a port");
+  const port = address.port;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+test("checkpoint(): approves over HTTP POST /approve (browser-style) end-to-end", async () => {
+  await inTempDir(async () => {
+    const port = await freePort();
+    const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+    try {
+      const script = `export const meta = { name: 'g', description: 'gate' }
+return await checkpoint('Approve plan?', { kind: 'confirm' })`;
+      const run = runWorkflow<boolean>(script, { agent: noopAgent, checkpointGate: bridge, persistLogs: false });
+
+      // The human path: wait for the pending plan, then POST the verdict the
+      // exact way the vendored review page does (GET /plan → POST /approve).
+      const plansDir = join(process.cwd(), ".pi", "workflows", "plans");
+      const planPath = await waitForPlanFile(plansDir);
+      const plan = JSON.parse(await readFile(planPath, "utf-8")) as { id: string };
+
+      const served = await fetch(`http://127.0.0.1:${port}/plan`);
+      assert.equal(served.status, 200);
+      const servedPlan = (await served.json()) as { plan: { id: string } };
+      assert.equal(servedPlan.plan.id, plan.id, "GET /plan serves the pending plan to the review page");
+
+      let res: Response | undefined;
+      for (let attempt = 0; attempt < 50 && !res; attempt++) {
+        try {
+          res = await fetch(`http://127.0.0.1:${port}/approve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ planId: plan.id }),
+          });
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      assert.ok(res, "the bridge accepted the approval request");
+      assert.equal(res.status, 200);
+
+      const result = await run;
+      assert.equal(result.result, true, "the checkpoint resolves true after the browser-style approval");
     } finally {
       bridge.close();
     }

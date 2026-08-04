@@ -16,6 +16,7 @@ import {
   waitForApproval,
   waitForStatus,
 } from "../src/integrations/plannotator.js";
+import { WorkflowStateManager } from "../src/phases/state-machine.js";
 
 describe("plan submission and status", () => {
   let dir: string;
@@ -391,6 +392,211 @@ describe("SSE lifecycle", () => {
         const body = await readUntil(reader, (b) => b.includes("event: reviewed"), 2000);
         assert.ok(body.includes("event: reviewed"), `expected a reviewed SSE event; got: ${JSON.stringify(body)}`);
         assert.ok(body.includes('"status":"approved"'), "the event payload carries the settled status");
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+});
+
+// ─── Browser review surface: /plan + /approve + review page (G3 wire) ────────
+
+/** POST /approve with retries until the bridge server accepts connections. */
+async function postApprove(port: number, body: unknown, attempts = 50): Promise<Response> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fetch(`http://127.0.0.1:${port}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  throw lastError ?? new Error("bridge server did not accept POST /approve");
+}
+
+describe("bridge HTTP review surface", () => {
+  it("serves the vendored review page at / and /review, and a 204 favicon", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        for (const path of ["/", "/review"]) {
+          const res = await fetchRetry(`http://127.0.0.1:${port}${path}`);
+          assert.equal(res.status, 200);
+          assert.match(res.headers.get("content-type") ?? "", /text\/html/);
+          const html = await res.text();
+          assert.ok(html.includes("Approve Plan"), "the page contains the approve button");
+          assert.ok(html.includes("planId"), "the page POSTs the plan id");
+        }
+        const favicon = await fetchRetry(`http://127.0.0.1:${port}/favicon.ico`);
+        assert.equal(favicon.status, 204);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("GET /plan serves the latest submitted plan, and a specific plan by id", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        const first = await bridge.submitPlan({ n: 1 });
+        const second = await bridge.submitPlan({ n: 2 });
+        const latest = (await (await fetchRetry(`http://127.0.0.1:${port}/plan`)).json()) as { plan: ReviewPlan };
+        assert.equal(latest.plan.id, second.id);
+        const byId = (await (await fetchRetry(`http://127.0.0.1:${port}/plan?planId=${first.id}`)).json()) as {
+          plan: ReviewPlan;
+        };
+        assert.equal(byId.plan.id, first.id);
+        const badId = await fetchRetry(`http://127.0.0.1:${port}/plan?planId=nope`);
+        assert.equal(badId.status, 400);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("GET /plan 404s before any plan is submitted", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        const res = await fetchRetry(`http://127.0.0.1:${port}/plan`);
+        assert.equal(res.status, 404);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("POST /approve validates the request ladder and approves the plan file", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false });
+      try {
+        const plan = await bridge.submitPlan({ task: "ladder" });
+        // 405: non-POST to /approve (Allow: POST)
+        const methodRes = await fetchRetry(`http://127.0.0.1:${port}/approve`);
+        assert.equal(methodRes.status, 405);
+        // 400: malformed JSON body
+        let res = await postApprove(port, "not-json");
+        assert.equal(res.status, 400);
+        // 400: missing planId
+        res = await postApprove(port, {});
+        assert.equal(res.status, 400);
+        // 400: bad UUID shape
+        res = await postApprove(port, { planId: "nope" });
+        assert.equal(res.status, 400);
+        // 400: unknown plan
+        res = await postApprove(port, { planId: "00000000-0000-4000-8000-000000000000" });
+        assert.equal(res.status, 400);
+        // 400: oversized feedback
+        res = await postApprove(port, { planId: plan.id, feedback: "x".repeat(8001) });
+        assert.equal(res.status, 400);
+        // 200: happy path persists the approval and satisfies the poller
+        res = await postApprove(port, { planId: plan.id });
+        assert.equal(res.status, 200);
+        const body = (await res.json()) as { ok: boolean; status: string };
+        assert.equal(body.ok, true);
+        assert.equal(body.status, "approved");
+        assert.equal(await bridge.waitForApproval(plan.id, 5000), true);
+        // 409: duplicate approve of an already-decided plan
+        res = await postApprove(port, { planId: plan.id });
+        assert.equal(res.status, 409);
+        const duplicate = (await res.json()) as { status: string };
+        assert.equal(duplicate.status, "approved");
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("POST /approve flips humanApproved via the state machine when at Phase 2", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const stateManager = new WorkflowStateManager(join(process.cwd(), ".pi", "workflows"));
+      await stateManager.transitionTo(1);
+      await stateManager.transitionTo(2);
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false, stateManager });
+      try {
+        const plan = await bridge.submitPlan({ task: "unlock subagents" });
+        const res = await postApprove(port, { planId: plan.id });
+        assert.equal(res.status, 200);
+        const state = await stateManager.getState();
+        assert.equal(state.humanApproved, true, "the approve flips humanApproved in active-state.json");
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("POST /approve answers 409 when the phase guard rejects the approval", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const stateManager = new WorkflowStateManager(join(process.cwd(), ".pi", "workflows"));
+      await stateManager.transitionTo(1); // not Phase 2 → approvePlan refuses
+      const bridge = createPlannotatorBridge({ port, autoOpenBrowser: false, stateManager });
+      try {
+        const plan = await bridge.submitPlan({ task: "guarded" });
+        const res = await postApprove(port, { planId: plan.id });
+        assert.equal(res.status, 409);
+        const onDisk = await bridge.getPlanStatus(plan.id);
+        assert.equal(onDisk.status, "approved", "the plan file stays approved even when the phase guard 409s");
+        const state = await stateManager.getState();
+        assert.equal(state.humanApproved, false);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("honors autoOpenBrowser via the injectable opener (no real spawn)", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      const opened: string[] = [];
+      const bridge = createPlannotatorBridge({
+        port,
+        autoOpenBrowser: true,
+        openBrowser: async (url) => {
+          opened.push(url);
+          return { opened: false, reason: "noop" };
+        },
+      });
+      try {
+        const plan = await bridge.submitPlan({ task: "pop me" });
+        // The opener settles on a microtask; flush it before asserting.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(opened.length, 1, "submitPlan launches the review page");
+        assert.match(opened[0] ?? "", /\/review$/);
+        assert.match(plan.note ?? "", /Open http:\/\/127\.0\.0\.1:\d+\/review to approve/);
+      } finally {
+        bridge.close();
+      }
+    });
+  });
+
+  it("never opens a browser when autoOpenBrowser is false", async () => {
+    await inTempDir(async () => {
+      const port = await freePort();
+      let spawned = false;
+      const bridge = createPlannotatorBridge({
+        port,
+        autoOpenBrowser: false,
+        openBrowser: async () => {
+          spawned = true;
+          return { opened: true };
+        },
+      });
+      try {
+        await bridge.submitPlan({ task: "quiet" });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(spawned, false);
       } finally {
         bridge.close();
       }

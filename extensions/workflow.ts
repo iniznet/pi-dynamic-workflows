@@ -14,9 +14,11 @@ import {
 } from "../src/extension-reload.js";
 import type { SessionManagerLike, SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
 import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
+import type { CheckpointGate } from "../src/index.js";
 import {
   applyEnvSettingsOverride,
   createEffortState,
+  createPlannotatorBridge,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
@@ -221,6 +223,32 @@ export default function extension(pi: ExtensionAPI) {
   // /effort is independent of the manager implementation and can safely
   // survive an extension-version fallback to a fresh manager.
   const effort = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort ?? createEffortState();
+  // G3 wire: lazy plannotator review gate (Phase 2). A run that never calls
+  // checkpoint() starts no server — the facade materializes the real bridge on
+  // the first gated checkpoint and tracks it for dispose. The bridge's default
+  // port (3123) + autoOpenBrowser(true) pop the vendored review page in the
+  // human's browser; waitForApproval polls the plan file until the verdict.
+  let plannotatorBridge: ReturnType<typeof createPlannotatorBridge> | undefined;
+  const checkpointGate: CheckpointGate = {
+    async submitPlan(blueprint) {
+      plannotatorBridge ??= createPlannotatorBridge({ autoOpenBrowser: true });
+      return plannotatorBridge.submitPlan(blueprint);
+    },
+    waitForApproval(planId, timeoutMs, signal) {
+      if (!plannotatorBridge) {
+        return Promise.reject(new Error("plannotator gate is not materialized (submitPlan must run first)"));
+      }
+      return plannotatorBridge.waitForApproval(planId, timeoutMs, signal);
+    },
+    onStatusChange(callback) {
+      if (!plannotatorBridge) {
+        // Subscribed before any checkpoint (no bridge yet): safe no-op. Real
+        // usage subscribes only after submitPlan, so the bridge exists.
+        return () => {};
+      }
+      return plannotatorBridge.onStatusChange?.(callback) ?? (() => {});
+    },
+  };
   const runtime: WorkflowReloadRuntime = {
     cwd,
     extensionVersion: WORKFLOW_EXTENSION_VERSION,
@@ -240,11 +268,12 @@ export default function extension(pi: ExtensionAPI) {
       // Drop the MCP client's cached sessions (no sockets to close — stateless
       // HTTP transport, only cached session ids and tool lists are forgotten).
       mcpToolsManager.disconnectAll();
-      // Cross-slice handoff: an on-demand plannotator review bridge (if this
-      // generation ever creates one) is closed here via its close() — it ends
-      // the tracked SSE responses, settles pending waits, and closes the
-      // review server. The current extension generation owns no bridge
-      // instance, so there is nothing to close today.
+      // G3 gate: close the lazily-materialized plannotator review bridge (if
+      // this generation ever created one). close() is idempotent — it ends the
+      // tracked SSE responses, settles pending waits, and closes the review
+      // server + its sockets — so a reload handoff leaves no orphaned port.
+      plannotatorBridge?.close();
+      plannotatorBridge = undefined;
     },
   };
   // Refresh the delivery holder immediately after claiming the manager. On a
@@ -274,7 +303,7 @@ export default function extension(pi: ExtensionAPI) {
       disabledPieces.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  registerToolSafely(() => createWorkflowTool({ cwd, manager, storage }), "workflow tool");
+  registerToolSafely(() => createWorkflowTool({ cwd, manager, storage, checkpointGate }), "workflow tool");
   registerToolSafely(() => createWorkflowControlTool({ manager }), "workflow_control tool");
   // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
   // definitions are built at start time so the extension load stays side-effect
