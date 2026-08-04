@@ -69,6 +69,19 @@ export interface WorkflowMeta {
   phases?: WorkflowMetaPhase[];
   /** Default model for agents whose phase has no route and that set no model/tier. */
   model?: string;
+  /**
+   * Optional human-approval gate (PRD Task 6 for shipped workflows). When a
+   * TOP-LEVEL script declares `gate: "approve"`, runWorkflow pauses BEFORE the
+   * script body evaluates and publishes the script's meta.description (with the
+   * runId) to options.checkpointGate, waiting for the human verdict — zero agent
+   * work starts until the pause resolves. Approval lets the body run; denial or
+   * timeout completes the run cleanly with `result: false` and a note in the
+   * logs (never a crash). Absent ⇒ ungated, byte-identical behavior. A run with
+   * no gate configured (headless) auto-approves exactly like a headless
+   * checkpoint(), so a gated builtin stays detached/background-safe and no
+   * review server is ever started for it.
+   */
+  gate?: "approve";
 }
 
 /** One cached agent() result, keyed by its deterministic call index. */
@@ -2374,6 +2387,34 @@ export async function runWorkflow<T = unknown>(
     return reply;
   };
 
+  // meta.gate ("approve") — the PRD Task 6 pre-body human-approval pause for
+  // shipped workflows. A TOP-LEVEL script that DECLARES the gate publishes its
+  // meta.description (with the runId) as the plan blueprint and waits for the
+  // human verdict before the body evaluates: zero agent work happens until the
+  // pause resolves. This deliberately reuses the checkpoint() machinery — the
+  // same publish → wait → journal path an in-body checkpoint takes — so the
+  // gate is resume-safe (its reply journals at callIndex 0 and replays on
+  // resume without re-contacting the gate) and records against the persisted
+  // phase machine exactly like a script-authored checkpoint. It is decoupled
+  // from the agent()-spawn gate (gateAgentCalls stays false): the checkpoint
+  // IS the pause. Nested workflow() frames skip it (their meta is the nested
+  // call's own; options are inherited via spread), and a run without a
+  // checkpointGate/confirm auto-approves (checkpoint's headless default), so a
+  // gated builtin stays detached/background-safe and no review server is ever
+  // materialized for an ungated or headless run.
+  let gateDeniedNote: string | undefined;
+  if (isTopLevelRun && meta.gate === "approve") {
+    const approved = await checkpoint(meta.description, { kind: "confirm", default: true });
+    if (!approved) {
+      // Denial or timeout (never an abort: a host abort surfaces via
+      // throwIfAborted inside checkpoint and takes the run's canonical abort
+      // path). Complete cleanly — result false + a visible note — instead of
+      // crashing, so no partial script work can run after a rejected plan.
+      gateDeniedNote = `meta.gate approval was denied or timed out — run ${runId} aborted before any agent work`;
+      log(gateDeniedNote);
+    }
+  }
+
   const runtimeImplementations = {
     agent,
     parallel,
@@ -2445,7 +2486,15 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    // A denied/timed-out meta.gate approval short-circuits the body: the run
+    // completes with `result: false` and the denial note in its logs — no
+    // crash, and none of the script's agent work ever starts. Everything below
+    // (log persist, token usage, teardown) still runs on this path. For every
+    // other script gateDeniedNote is undefined, so the expression is exactly
+    // the pre-existing vm body run (byte-identical).
+    const result = gateDeniedNote
+      ? false
+      : await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
 
     // Persist logs
     const logFile = logger.persist();
@@ -2762,6 +2811,11 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (typeof value.description !== "string" || !value.description.trim())
     throw new Error("meta.description must be a non-empty string");
   if (value.model !== undefined && typeof value.model !== "string") throw new Error("meta.model must be a string");
+  // The gate flag is a closed union today; a typo'd value fails loudly at parse
+  // time instead of silently running ungated.
+  if (value.gate !== undefined && value.gate !== "approve") {
+    throw new Error('meta.gate must be "approve" when set');
+  }
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
     for (const phase of value.phases) {

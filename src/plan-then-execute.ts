@@ -160,7 +160,8 @@ export interface PlanThenExecuteConfig {
 export function generatePlanThenExecuteWorkflow(): string {
   return `export const meta = {
   name: 'plan_then_execute',
-  description: 'Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute',
+  description: 'Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute. Pauses for human approval before starting agent work',
+  gate: 'approve',
   phases: [
     { title: 'Plan' },
     { title: 'Verify' },
