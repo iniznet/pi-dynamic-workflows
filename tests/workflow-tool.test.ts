@@ -489,6 +489,73 @@ return { a, b }`;
   }),
 );
 
+test(
+  "workflow tool: resumeFromRunId forwards run knobs (tokenBudget) to the resumed execution",
+  withToolTempCwd(async (cwd) => {
+    // 'first' spends 100 (journaled), 'second' hangs on its first attempt
+    // (pause point) then spends 60 post-resume, 'third' spends 1 — total 161.
+    // The run STARTS at tokenBudget 150, so the persisted cap would block
+    // 'third' on resume and fail the run. Passing tokenBudget: 1000 through
+    // the tool's resumeFromRunId call must override the cap and complete —
+    // proving the tool forwards the knob and the manager honors the override.
+    let secondAttempts = 0;
+    const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        if (prompt === "first") {
+          options?.onUsage?.({ ...zeroUsage, total: 100 });
+          return "first-result";
+        }
+        if (prompt === "second") {
+          if (++secondAttempts === 1) return new Promise(() => {}); // hang until paused
+          options?.onUsage?.({ ...zeroUsage, total: 60 });
+          return "second-result";
+        }
+        options?.onUsage?.({ ...zeroUsage, total: 1 });
+        return "third-result";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("paused", () => {});
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+
+    const script = `export const meta = { name: 'override_tool', description: 'knob override via tool resume' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+const c = await agent('third', { label: 'third' })
+return { a, b, c }`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { tokenBudget: 150 });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+
+    const res = await tool.execute(
+      "t-override",
+      { script, resumeFromRunId: runId, tokenBudget: 1000 },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const details = res.details as { runId?: string };
+    assert.equal(details.runId, runId, "resumed run keeps the same run id");
+
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const finalRun = manager.getRun(runId);
+    assert.equal(finalRun?.status, "completed", "tool-forwarded tokenBudget override lets the run finish (161 < 1000)");
+    assert.equal(
+      manager.getPersistence().load(runId)?.tokenBudget,
+      1000,
+      "the overridden budget is the run's new persisted cap",
+    );
+  }),
+);
+
 // ─── `name`: reach a saved or built-in workflow without writing a script ───────
 
 const validArgsByBuiltinName: Record<string, unknown> = {

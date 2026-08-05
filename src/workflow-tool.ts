@@ -322,9 +322,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // detached and its result is delivered back into the conversation).
       if (params.resumeFromRunId) {
         const runId = params.resumeFromRunId;
+        // Forward the same run knobs the fresh-run paths accept (raw values:
+        // unset restores the run's persisted start-time knob, explicit overrides
+        // it — manager.resume() resolves that). failOnExhaustedAgent is
+        // DELIBERATELY absent: it is a safety knob frozen at run start — a
+        // resume cannot downgrade it (strict -> lenient), so forwarding it here
+        // would just be a no-op the caller could mistake for an effect.
         const resumed = await manager.resume(runId, {
           script,
           args: runArgs,
+          maxAgents: params.maxAgents,
+          concurrency: params.concurrency,
+          agentRetries: params.agentRetries,
+          agentTimeoutMs: params.agentTimeoutMs,
+          tokenBudget: params.tokenBudget,
           checkpointGate: options.checkpointGate,
           pipeline: options.pipeline,
           phaseState: options.phaseState,

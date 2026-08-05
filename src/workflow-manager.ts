@@ -1889,23 +1889,32 @@ export class WorkflowManager extends EventEmitter {
       // Carry the original opt-out forward across resumes; it's fixed at
       // run-start and persistRun() re-persists it on every subsequent write.
       autoResume: persisted.autoResume,
-      failOnExhaustedAgent: persisted.failOnExhaustedAgent,
       // Carry the compaction opt-in forward across resumes the same way: a run
       // that started compacting keeps compacting (persisted as a boolean).
       compactJournal: persisted.compactJournal === true,
       // Restore start-time execution context: the budget the run started with
       // (legacy runs without one resume unbudgeted — never re-apply the current
       // default to a run that predates it) and the toolset tag executeRun
-      // re-resolves so e.g. a resumed /deep-research keeps its web tools.
-      tokenBudget: persisted.tokenBudget !== undefined ? persisted.tokenBudget : null,
+      // re-resolves so e.g. a resumed /deep-research keeps its web tools. An
+      // EXPLICIT exec override from the caller (the workflow tool forwards
+      // raw params) wins over the persisted value — e.g. raising the cap to
+      // recover a run paused at its usage limit, where spent >= persisted
+      // budget would block the very first agent() call. Unset restores
+      // start-time semantics.
+      tokenBudget:
+        exec.tokenBudget !== undefined
+          ? exec.tokenBudget
+          : persisted.tokenBudget !== undefined
+            ? persisted.tokenBudget
+            : null,
       toolset: persisted.toolset,
-      // Restore the same start-time execution context for the other four
+      // Same explicit-wins-else-persisted rule as tokenBudget for the other four
       // per-run knobs (see ManagedRun doc comments) — same rationale as
       // tokenBudget: never re-resolve against the manager's CURRENT defaults.
       // maxAgents: legacy/never-set runs resume with no cap carried forward
       // (runWorkflow's own MAX_AGENTS_PER_RUN default applies), exactly as if
       // maxAgents had never been passed at all.
-      maxAgents: persisted.maxAgents,
+      maxAgents: exec.maxAgents !== undefined ? exec.maxAgents : persisted.maxAgents,
       // agentTimeoutMs: unlike tokenBudget, a legacy run's real timeout at
       // start was never "no timeout" by omission — it was always
       // this.defaultAgentTimeoutMs, because pre-A1 resume() never threaded
@@ -1916,14 +1925,26 @@ export class WorkflowManager extends EventEmitter {
       // resume behavior. So — deliberately unlike tokenBudget's null
       // fallback — legacy runs resume with the manager's CURRENT default,
       // matching the only semantics such a run ever had.
-      agentTimeoutMs: persisted.agentTimeoutMs !== undefined ? persisted.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      agentTimeoutMs:
+        exec.agentTimeoutMs !== undefined
+          ? exec.agentTimeoutMs
+          : persisted.agentTimeoutMs !== undefined
+            ? persisted.agentTimeoutMs
+            : this.defaultAgentTimeoutMs,
       // concurrency/agentRetries have no "explicit opt-out sentinel" the way
       // tokenBudget's null does — a legacy run without a persisted value falls
       // back to the manager's current values, matching how this execution
       // resolved unset concurrency/agentRetries before this fix ever existed.
-      concurrency: persisted.concurrency !== undefined ? persisted.concurrency : this.concurrency,
-      agentRetries: persisted.agentRetries !== undefined ? persisted.agentRetries : this.defaultAgentRetries,
-      drainTimeoutMs: persisted.drainTimeoutMs,
+      concurrency: exec.concurrency !== undefined ? exec.concurrency : (persisted.concurrency ?? this.concurrency),
+      agentRetries:
+        exec.agentRetries !== undefined ? exec.agentRetries : (persisted.agentRetries ?? this.defaultAgentRetries),
+      drainTimeoutMs: exec.drainTimeoutMs !== undefined ? exec.drainTimeoutMs : persisted.drainTimeoutMs,
+      // failOnExhaustedAgent is a SAFETY knob and stays frozen at run start —
+      // unlike the other knobs there is DELIBERATELY no exec override path:
+      // a run that started strict stays strict, so a recovery resume can never
+      // silently downgrade failure semantics (see the "resume cannot downgrade"
+      // test). The workflow tool therefore does not forward it on resume.
+      failOnExhaustedAgent: persisted.failOnExhaustedAgent,
       // Fresh per-resume: agents (and any prior timing) are rebuilt live as
       // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
       // above); the journal, not this map, is what makes replayed agents cheap.

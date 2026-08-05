@@ -646,6 +646,112 @@ return { a, b, c }`;
 );
 
 test(
+  "explicit tokenBudget override on resume wins over the persisted start-time cap",
+  withTempCwd(async (cwd) => {
+    // 'first' completes (spends 100, journaled). 'second' hangs on its first
+    // attempt (pause point), then on its second attempt (post-resume) spends
+    // 60. 'third' spends 1. Total 161. Started at tokenBudget 150 — so the
+    // PERSISTED cap would block 'third' and fail the run; resuming with an
+    // explicit 1000 must let it complete. This is the usage-limit recovery
+    // move: a run paused at its cap cannot be resumed without raising it.
+    let secondAttempts = 0;
+    const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const agent = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        if (prompt === "first") {
+          options?.onUsage?.({ ...zeroUsage, total: 100 });
+          return "first-result";
+        }
+        if (prompt === "second") {
+          if (++secondAttempts === 1) return new Promise(() => {}); // hang until paused
+          options?.onUsage?.({ ...zeroUsage, total: 60 });
+          return "second-result";
+        }
+        options?.onUsage?.({ ...zeroUsage, total: 1 });
+        return "third-result";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'override_demo', description: 'budget override on resume' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+const c = await agent('third', { label: 'third' })
+return { a, b, c }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { tokenBudget: 150 });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+
+    const paused = manager.getPersistence().load(runId);
+    assert.equal(paused?.tokenBudget, 150, "the start-time cap persists");
+
+    // Explicit override: 1000, not the persisted 150.
+    assert.equal(await manager.resume(runId, { tokenBudget: 1000 }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(resumed?.status, "completed", "raised cap lets the run finish (161 < 1000)");
+    assert.equal(
+      resumed?.tokenBudget,
+      1000,
+      "the explicit resume override becomes the run's new cap, persisted forward",
+    );
+  }),
+);
+
+test(
+  "explicit maxAgents override on resume raises a cap that would otherwise block the next agent",
+  withTempCwd(async (cwd) => {
+    // 'first' completes (journaled). 'second' hangs on its first attempt
+    // (pause point). Start cap maxAgents: 2 — on resume, the replay of
+    // 'first' plus the live 'second' reaches 2, so the persisted cap would
+    // block 'third' (AGENT_LIMIT_EXCEEDED). Resuming with maxAgents: 3 must
+    // let 'third' run and complete.
+    let secondAttempts = 0;
+    const agent = {
+      async run(prompt: string) {
+        if (prompt === "second" && ++secondAttempts === 1) return new Promise(() => {});
+        return `${prompt}-result`;
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'cap_override_demo', description: 'maxAgents override on resume' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+const c = await agent('third', { label: 'third' })
+return { a, b, c }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, { maxAgents: 2 });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+
+    // Explicit override: 3, not the persisted 2.
+    assert.equal(await manager.resume(runId, { maxAgents: 3 }), true);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(resumed?.status, "completed", "raised maxAgents lets 'third' run");
+    assert.equal(resumed?.maxAgents, 3, "the explicit resume override persists forward");
+  }),
+);
+
+test(
   "a retried (failed-then-succeeded) attempt's spend is not lost from the persisted total when the run pauses before completing",
   withTempCwd(async (cwd) => {
     // 'a's first attempt spends 40 tokens then fails with an empty output
