@@ -6,7 +6,7 @@ import { runWorkflow } from "../../../src/workflow.js";
 test("M4: one SCHEMA_NONCOMPLIANCE vote is omitted, the run survives", async () => {
   let call = 0;
   const reviewer = {
-    async run(_prompt: string, o: { schema?: unknown }) {
+    async run(_prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       call++;
       if (call === 1) {
@@ -30,7 +30,7 @@ return await verify('claim', { reviewers: 3, threshold: 0.5 })`;
 
 test("M4: a non-recoverable budget/limit vote still fails the run", async () => {
   const reviewer = {
-    async run(_prompt: string, o: { schema?: unknown }) {
+    async run(_prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
         recoverable: false,
@@ -46,7 +46,7 @@ return await verify('claim', { reviewers: 2 })`;
 test("M4: judgePanel survives a SCHEMA_NONCOMPLIANCE judge and clamps out-of-range scores (L15)", async () => {
   let call = 0;
   const scorer = {
-    async run(_prompt: string, o: { schema?: unknown }) {
+    async run(_prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       call++;
       if (call === 1) {
@@ -69,9 +69,9 @@ return await judgePanel(['first', 'second'], { judges: 3 })`;
 test("L14: verify labels are unique across helper invocations", async () => {
   const labels: string[] = [];
   const reviewer = {
-    async run(_prompt: string, o: { schema?: unknown; label?: string }) {
+    async run(_prompt: string, o?: { schema?: unknown; label?: string }) {
       if (!o?.schema) return "ok";
-      labels.push(o.label ?? "");
+      labels.push(o?.label ?? "");
       return { real: true };
     },
   };

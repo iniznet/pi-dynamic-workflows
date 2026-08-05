@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentUsage } from "../src/agent.js";
+import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -13,8 +13,8 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 /** Agent runner that reports fixed usage so token accounting is exercised. */
 function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
   return {
-    async run(_prompt: string, options: { onUsage?: (u: AgentUsage) => void }) {
-      options.onUsage?.({
+    async run(_prompt: string, options?: AgentRunOptions<any>): Promise<any> {
+      options?.onUsage?.({
         input: 0,
         output: 0,
         cacheRead: 0,
@@ -40,7 +40,7 @@ function deferredAgent() {
     resolve: (value: unknown = "done") => deferredResolve?.(value),
     reject: (err: Error) => deferredReject?.(err),
     runner: {
-      async run(_prompt: string, _options?: { onUsage?: (u: AgentUsage) => void }) {
+      async run(_prompt: string, _options?: AgentRunOptions<any>): Promise<any> {
         return promise;
       },
     },
@@ -168,7 +168,7 @@ test(
         resolves[idx]?.(v);
       },
       runner: {
-        async run(_prompt: string, _options?: { onUsage?: (u: AgentUsage) => void }) {
+        async run(_prompt: string, _options?: AgentRunOptions<any>): Promise<any> {
           const idx = callIdx++;
           return new Promise((resolve) => {
             resolves[idx] = resolve;
@@ -255,7 +255,7 @@ test(
     manager.stop(runId);
 
     assert.ok(stoppedEvent, "stopped event should fire");
-    assert.equal(stoppedEvent?.runId, runId);
+    assert.equal((stoppedEvent as { runId: string } | null)?.runId, runId);
 
     da.resolve("done");
     await promise.catch(() => {});
@@ -299,7 +299,7 @@ test(
     manager.pause(runId);
 
     assert.ok(pausedEvent, "paused event should fire");
-    assert.equal(pausedEvent?.runId, runId);
+    assert.equal((pausedEvent as { runId: string } | null)?.runId, runId);
 
     da.resolve("done");
     await promise.catch(() => {});
@@ -378,7 +378,11 @@ test(
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run should complete successfully");
-    assert.equal(finalRun?.result?.result?.a, "resumed-done", "resumed run should have the agent result");
+    assert.equal(
+      (finalRun?.result?.result as { a: unknown } | undefined)?.a,
+      "resumed-done",
+      "resumed run should have the agent result",
+    );
 
     // The run should also appear in listRuns as completed
     const persisted = manager.listRuns().find((r) => r.runId === runId);
@@ -427,7 +431,7 @@ return { a, b }`;
 
       const finalRun = manager.getRun(runId);
       assert.equal(finalRun?.status, "completed", "resumed multi-agent run should complete");
-      assert.equal(finalRun?.result?.result?.a, "first-result");
+      assert.equal((finalRun?.result?.result as { a: unknown } | undefined)?.a, "first-result");
     }
 
     await origPromise.catch(() => {});
@@ -686,7 +690,7 @@ test(
     await manager.resume(runId);
 
     assert.ok(resumedEvent, "resumed event should fire on resume");
-    assert.equal(resumedEvent?.runId, runId);
+    assert.equal((resumedEvent as { runId: string } | null)?.runId, runId);
 
     da.resolve("done");
     await origPromise.catch(() => {});

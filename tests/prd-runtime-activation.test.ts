@@ -17,6 +17,7 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { validateBlueprint } from "../src/phases/prewalk.js";
 import { WorkflowStateManager } from "../src/phases/state-machine.js";
@@ -302,7 +303,7 @@ describe("tool/manager seam accepts and forwards pipeline/phaseState", () => {
     const fakeHome = await tempDir("prd-manager-home-");
     await withFakeHomeAsync(fakeHome, async () => {
       const stateManager = new WorkflowStateManager(workflowsDir(cwd));
-      const manager = new WorkflowManager({ cwd, agent: noopAgent });
+      const manager = new WorkflowManager({ cwd, agent: noopAgent as unknown as Pick<WorkflowAgent, "run"> });
       const res = await manager.runSync(
         TRIVIAL_SCRIPT,
         {},

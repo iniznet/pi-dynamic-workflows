@@ -27,7 +27,7 @@ test(
     // retried attempt's spend must ALSO land in the persisted breakdown.
     let aAttempts = 0;
     const agent = {
-      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
         if (prompt === "a") {
           aAttempts++;
           if (aAttempts === 1) {

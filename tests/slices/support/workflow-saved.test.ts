@@ -32,7 +32,14 @@ test(
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
     assert.throws(
-      () => storage.save({ name: "bad-script", description: "d", script: "this is not a workflow script" }),
+      () =>
+        storage.save({
+          name: "bad-script",
+          description: "d",
+          script: "this is not a workflow script",
+          location: "project",
+        }),
+
       /Cannot save workflow "bad-script"/,
     );
     assert.equal(
@@ -47,7 +54,7 @@ test(
   "createWorkflowStorage save accepts a valid script (L21)",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    const saved = storage.save({ name: "good-script", description: "d", script: VALID_SCRIPT });
+    const saved = storage.save({ name: "good-script", description: "d", script: VALID_SCRIPT, location: "project" });
     assert.equal(saved.name, "good-script");
     assert.ok(existsSync(join(workflowProjectPaths(cwd).savedDir, "good-script.json")));
   }),

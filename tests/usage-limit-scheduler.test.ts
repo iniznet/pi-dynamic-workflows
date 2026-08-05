@@ -27,8 +27,8 @@ function createFakeClock(startMs = 0) {
       pending.set(id, { fn, ms, armedAt: current });
       return id;
     },
-    clearTimer: (id: number): void => {
-      pending.delete(id);
+    clearTimer: (id: unknown): void => {
+      pending.delete(id as number);
     },
     /** Fire every currently-armed timer, synchronously, in arm order. */
     fireAll(): void {

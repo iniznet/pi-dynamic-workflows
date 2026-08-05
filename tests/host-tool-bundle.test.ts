@@ -69,7 +69,7 @@ function makePi({ toolInfos, registeredTools, noMetadataApi }: MockPiOptions = {
   const api: Record<string, unknown> = {};
   if (!noMetadataApi) api.getAllTools = () => toolInfos ?? [];
   if (registeredTools !== undefined) api.getAllToolDefinitions = () => registeredTools;
-  return api as ExtensionAPI;
+  return api as unknown as ExtensionAPI;
 }
 
 function toolNames(bundle: ReturnType<typeof buildMergedHostTools>): string[] {
@@ -162,7 +162,7 @@ describe("buildMergedHostTools", () => {
       name: "mcp_broken",
       description: "no execute",
       parameters: Type.Object({}),
-    } as ToolDefinition;
+    } as unknown as ToolDefinition;
     const bundle = buildMergedHostTools(
       makePi({
         toolInfos: BUILTIN_TOOL_NAMES.map((name) => fakeInfo(name)),

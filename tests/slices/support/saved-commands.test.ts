@@ -10,21 +10,24 @@ describe("parseCommandArgs positional binding (M11)", () => {
   it("binds positionals to declared params in declaration order before defaults apply", () => {
     // Audit repro: alpha was silently replaced by its default and the user
     // value dumped into `_`.
-    const result = parseCommandArgs("alpha beta", { alpha: { default: "ADEF" }, beta: {} });
+    const result = parseCommandArgs("alpha beta", {
+      alpha: { type: "string", default: "ADEF" },
+      beta: { type: "string" },
+    });
     assert.equal(result.alpha, "alpha", "first positional binds to the first declared param");
     assert.equal(result.beta, "beta", "second positional binds to the second declared param");
     assert.equal(result._, "", "bound positionals are not dumped into _");
   });
 
   it("skips params already satisfied by key=value tokens when binding positionals", () => {
-    const result = parseCommandArgs("alpha=given beta", { alpha: {}, beta: {} });
+    const result = parseCommandArgs("alpha=given beta", { alpha: { type: "string" }, beta: { type: "string" } });
     assert.equal(result.alpha, "given");
     assert.equal(result.beta, "beta");
     assert.equal(result._, "");
   });
 
   it("defaults still fill declared params not satisfied by positionals", () => {
-    const result = parseCommandArgs("alpha", { alpha: {}, gamma: { default: "G" } });
+    const result = parseCommandArgs("alpha", { alpha: { type: "string" }, gamma: { type: "string", default: "G" } });
     assert.equal(result.alpha, "alpha");
     assert.equal(result.gamma, "G");
   });
@@ -36,14 +39,17 @@ describe("parseCommandArgs positional binding (M11)", () => {
   });
 
   it("leaves extra positionals in _", () => {
-    const result = parseCommandArgs("a b c", { alpha: {} });
+    const result = parseCommandArgs("a b c", { alpha: { type: "string" } });
     assert.equal(result.alpha, "a");
     assert.equal(result._, "b c");
   });
 
   it("keeps _raw intact and still throws on missing required params", () => {
-    const result = parseCommandArgs("a=1", { alpha: { default: "ADEF" } });
+    const result = parseCommandArgs("a=1", { alpha: { type: "string", default: "ADEF" } });
     assert.equal(result._raw, "a=1");
-    assert.throws(() => parseCommandArgs("a=1", { required: { required: true } }), /Missing required argument/);
+    assert.throws(
+      () => parseCommandArgs("a=1", { required: { type: "string", required: true } }),
+      /Missing required argument/,
+    );
   });
 });

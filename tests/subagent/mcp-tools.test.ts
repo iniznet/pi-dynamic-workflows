@@ -171,13 +171,17 @@ describe("McpToolsManager", () => {
     const manager = new McpToolsManager({ config: config(mock) });
     const [tool] = await manager.listSubagentTools();
 
-    const result = await tool.execute(
+    const result = (await tool.execute(
       "call-1",
       { code: "<script></script>" } as never,
       undefined,
       undefined,
       undefined as never,
-    );
+    )) as {
+      content: Array<{ type: "text"; text: string }>;
+      details: unknown;
+      isError: boolean;
+    };
     assert.deepEqual(result.details, { issues: [], fixed: true }, "structured content must ride in details");
     assert.equal(result.content[0].type, "text");
     assert.equal(result.content[0].text, '{"issues":[]}');
@@ -206,7 +210,10 @@ describe("McpToolsManager", () => {
     const manager = new McpToolsManager({ config: config(mock) });
     const [tool] = await manager.listSubagentTools();
 
-    const result = await tool.execute("call-2", {} as never, undefined, undefined, undefined as never);
+    const result = (await tool.execute("call-2", {} as never, undefined, undefined, undefined as never)) as unknown as {
+      content: Array<{ type: "text"; text: string }>;
+      isError: boolean;
+    };
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /exploded/);
   });

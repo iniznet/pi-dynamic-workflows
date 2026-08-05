@@ -44,10 +44,12 @@ test("release gate blocks runtime constraint disagreements", () => {
   const tokenBudgetIndex = definition.capabilities.findIndex(({ label }) => label === "tokenBudget");
   const tokenBudget = definition.capabilities[tokenBudgetIndex];
   assert.ok(tokenBudget);
-  definition.capabilities[tokenBudgetIndex] = {
+  const capabilities = [...definition.capabilities];
+  capabilities[tokenBudgetIndex] = {
     ...tokenBudget,
     constraints: ["hard total-token budget with no overshoot"],
   };
+  definition.capabilities = capabilities;
 
   const diagnostics = checkWorkflowRelease({ root: ROOT, definition, publishableFiles: publishableFiles() });
 
@@ -62,7 +64,9 @@ test("release gate blocks runtime constraint disagreements", () => {
 test("release gate names incompatible versions and missing behavior evidence", () => {
   const definition = structuredClone(WORKFLOW_CAPABILITY_DEFINITION);
   definition.versions.content.version = "0.0.0";
-  definition.capabilities[0] = { ...definition.capabilities[0], behaviorEvidence: [] };
+  const capabilities = [...definition.capabilities];
+  capabilities[0] = { ...capabilities[0], behaviorEvidence: [] };
+  definition.capabilities = capabilities;
 
   const diagnostics = checkWorkflowRelease({
     root: ROOT,
@@ -270,11 +274,13 @@ test("release gate names omitted package resources and stale generated surfaces"
 
 test("release gate reports unresolved behavior and reference paths precisely", () => {
   const definition = structuredClone(WORKFLOW_CAPABILITY_DEFINITION);
-  definition.capabilities[0] = {
-    ...definition.capabilities[0],
+  const capabilities = [...definition.capabilities];
+  capabilities[0] = {
+    ...capabilities[0],
     behaviorEvidence: ["tests/does-not-exist.test.ts"],
     staticReference: { path: "skills/workflow-authoring/references/capabilities.md", anchor: "does-not-exist" },
   };
+  definition.capabilities = capabilities;
 
   const diagnostics = checkWorkflowRelease({ root: ROOT, definition, publishableFiles: publishableFiles() });
 

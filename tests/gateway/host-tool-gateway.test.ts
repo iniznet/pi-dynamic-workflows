@@ -246,7 +246,8 @@ test("createGatewayProxiedTools with a stopped gateway resolves to definitions t
   const stoppedDefs = createGatewayProxiedTools(gateway);
   assert.equal(stoppedDefs.length, 1, "stopped gateway still advertises the known tool list");
   await assert.rejects(
-    () => (stoppedDefs[0] as { execute: () => Promise<unknown> }).execute("call-1", {}),
+    () =>
+      (stoppedDefs[0] as unknown as { execute: (id: string, p: unknown) => Promise<unknown> }).execute("call-1", {}),
     (error: unknown) => (error as Error).message === GATEWAY_NOT_RUNNING_MESSAGE,
   );
 });
@@ -261,7 +262,9 @@ test("createGatewayProxiedTools round-trips a call through the running gateway",
   assert.ok(echo, "echo must be exposed once the gateway is running");
 
   const result = (await (
-    echo as { execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }> }
+    echo as unknown as {
+      execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+    }
   ).execute("call-1", { hello: "world" })) as { content: Array<{ type: string; text: string }> };
   assert.strictEqual(result.content[0].text, JSON.stringify({ hello: "world" }));
 });
@@ -297,7 +300,7 @@ test("createGatewayProxiedTools propagates an abort as ProxyAbortError, not an i
 
   const controller = new AbortController();
   const call = (
-    blocking as {
+    blocking as unknown as {
       execute: (id: string, p: unknown, signal: AbortSignal) => Promise<unknown>;
     }
   ).execute("call-1", {}, controller.signal);
@@ -330,7 +333,7 @@ test("a stale/dead socket surfaces an isError result with no unhandledRejection 
     await gateway.stop();
     await new Promise((r) => setTimeout(r, 30));
 
-    const echo = defs.find((d) => d.name === "echo") as {
+    const echo = defs.find((d) => d.name === "echo") as unknown as {
       execute: (
         id: string,
         p: unknown,
@@ -516,7 +519,7 @@ test("connecting to a dead/stale socket must NOT produce an unhandledRejection (
     // The per-call await still surfaces the failure — as an isError result,
     // never as a thrown exception escaping the proxied execute.
     const result = (await (
-      defs[0] as {
+      defs[0] as unknown as {
         execute: (
           id: string,
           p: unknown,

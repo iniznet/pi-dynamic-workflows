@@ -114,7 +114,7 @@ test("a generated workflow is parsed and executed through the real runtime with 
   assert.equal(evidence.failure, null);
   assert.equal(evidence.generatedWorkflow, VALID_WORKFLOW);
   assert.equal(evidence.skillLoadingEvidence.loaded, true);
-  assert.equal(evidence.tokenUsage.total, 150);
+  assert.equal(evidence.tokenUsage?.total, 150);
 });
 
 test("quick evidence requires alpha and beta work to reach the returned result", async () => {

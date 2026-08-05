@@ -28,8 +28,8 @@ function createFakeClock(startMs = 0) {
       pending.set(id, { fn, ms });
       return id;
     },
-    clearTimer: (id: number): void => {
-      pending.delete(id);
+    clearTimer: (id: unknown): void => {
+      pending.delete(id as number);
     },
     fireAll(): void {
       const toFire = [...pending.entries()].sort((a, b) => a[0] - b[0]);

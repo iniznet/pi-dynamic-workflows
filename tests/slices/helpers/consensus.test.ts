@@ -5,7 +5,7 @@ import { runWorkflow } from "../../../src/workflow.js";
 test("consensus: majority group above the threshold agrees", async () => {
   let n = 0;
   const panel = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       n++;
       return { verdict: n !== 1, reasoning: `vote ${n}` };
@@ -33,7 +33,7 @@ return await consensus('the sky is blue', { panelists: 3 })`;
 test("consensus: a recoverable-null vote shrinks the denominator (logged)", async () => {
   let n = 0;
   const panel = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       n++;
       if (n === 2) return null; // this panelist failed recoverably
@@ -65,7 +65,7 @@ return await consensus('agree?', { panelists: 3 })`;
 test("consensus: bounded rounds re-poll until the gate passes", async () => {
   let n = 0;
   const panel = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       n++;
       // Round 1: false, true, true -> 2/3 (< 0.9). Round 2: all true -> 3/3.
@@ -88,7 +88,7 @@ return await consensus('agree?', { panelists: 3, rounds: 3, agreeThreshold: 0.9 
 test("consensus: arbitrator decides after the round budget", async () => {
   let n = 0;
   const panel = {
-    async run(prompt: string, o: { schema?: unknown }) {
+    async run(prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return prompt; // the arbitrator's unschema'd call echoes
       n++;
       // Never unanimous: both rounds land 2/3, and the threshold is 1.0.
@@ -116,7 +116,7 @@ return out`;
 test("consensus: no agreement and no arbitrator returns the disagreement honestly", async () => {
   let n = 0;
   const panel = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       n++;
       return { verdict: n % 2 === 1 };
@@ -143,7 +143,7 @@ return await consensus('split?', { panelists: 3, rounds: 1, agreeThreshold: 1 })
 
 test("consensus: emits quality start/end runtime events", async () => {
   const yesAgent = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       return o?.schema ? { verdict: true } : "ok";
     },
   };

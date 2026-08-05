@@ -39,6 +39,7 @@ test(
       name: "test-wf",
       description: "A test workflow",
       script: "export const meta = { name: 'test', description: 'test' }",
+      location: "project",
     });
     assert.equal(saved.name, "test-wf");
     assert.equal(saved.location, "project");
@@ -60,6 +61,7 @@ test(
         name: "user-wf",
         description: "User workflow",
         script: "export const meta = { name: 'u', description: 'u' }",
+        location: "user",
       },
       "user",
     );
@@ -76,12 +78,14 @@ test(
       name: "shared",
       description: "Project version",
       script: VALID_SCRIPT,
+      location: "project",
     });
     storage.save(
       {
         name: "shared",
         description: "User version",
         script: VALID_SCRIPT,
+        location: "user",
       },
       "user",
     );
@@ -109,6 +113,7 @@ test(
         name: "user-only",
         description: "Only in user",
         script: VALID_SCRIPT,
+        location: "user",
       },
       "user",
     );
@@ -142,6 +147,7 @@ test(
         name: "shared",
         description: "User version",
         script: VALID_SCRIPT,
+        location: "user",
       },
       "user",
     );
@@ -156,9 +162,9 @@ test(
   "createWorkflowStorage list combines project and user workflows sorted by name",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "b-project", description: "b", script: VALID_SCRIPT });
-    storage.save({ name: "a-project", description: "a", script: VALID_SCRIPT });
-    storage.save({ name: "c-user", description: "c", script: VALID_SCRIPT }, "user");
+    storage.save({ name: "b-project", description: "b", script: VALID_SCRIPT, location: "project" });
+    storage.save({ name: "a-project", description: "a", script: VALID_SCRIPT, location: "project" });
+    storage.save({ name: "c-user", description: "c", script: VALID_SCRIPT, location: "user" }, "user");
 
     const list = storage.list();
     assert.equal(list.length, 3);
@@ -181,7 +187,7 @@ test(
   "createWorkflowStorage delete removes project workflow",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "to-delete", description: "d", script: VALID_SCRIPT });
+    storage.save({ name: "to-delete", description: "d", script: VALID_SCRIPT, location: "project" });
     assert.ok(storage.load("to-delete"), "load() should succeed");
     const deleted = storage.delete("to-delete");
     assert.equal(deleted, true);
@@ -201,8 +207,8 @@ test(
   "createWorkflowStorage delete removes from one location only",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "both", description: "p", script: VALID_SCRIPT });
-    storage.save({ name: "both", description: "u", script: VALID_SCRIPT }, "user");
+    storage.save({ name: "both", description: "p", script: VALID_SCRIPT, location: "project" });
+    storage.save({ name: "both", description: "u", script: VALID_SCRIPT, location: "user" }, "user");
     assert.ok(storage.load("both"), "load() should succeed");
     // Delete only from project
     const deleted = storage.delete("both", "project");
@@ -222,6 +228,7 @@ test(
       name: "param-wf",
       description: "Has params",
       script: "export const meta = { name: 'p', description: 'p' }",
+      location: "project",
       parameters: {
         input: { type: "string", description: "Input value", required: true },
         limit: { type: "number", description: "Max results", default: 10 },
@@ -241,7 +248,10 @@ test(
   "createWorkflowStorage rejects path-unsafe workflow names",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    assert.throws(() => storage.save({ name: "../escape", description: "bad", script: "bad" }), /path-safe name/);
+    assert.throws(
+      () => storage.save({ name: "../escape", description: "bad", script: "bad", location: "project" }),
+      /path-safe name/,
+    );
     assert.equal(storage.load("../escape"), null);
     assert.equal(storage.delete("../escape"), false);
     assert.equal(existsSync(join(workflowProjectPaths(cwd).rootDir, "escape.json")), false);
@@ -256,6 +266,7 @@ test(
       name: "check-json",
       description: "desc",
       script: "export const meta = { name: 'c', description: 'c' }",
+      location: "project",
     });
     const filePath = join(workflowProjectPaths(cwd).savedDir, "check-json.json");
     const raw = JSON.parse(readFileSync(filePath, "utf-8"));
@@ -321,7 +332,7 @@ test(
   "createWorkflowStorage save writes atomically (tmp+rename, no leftover .tmp) and leaves a .bak",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "atomic-wf", description: "d", script: VALID_SCRIPT });
+    storage.save({ name: "atomic-wf", description: "d", script: VALID_SCRIPT, location: "project" });
     const path = join(workflowProjectPaths(cwd).savedDir, "atomic-wf.json");
     assert.ok(existsSync(path), "primary written");
     assert.ok(existsSync(`${path}.bak`), ".bak written");
@@ -342,9 +353,11 @@ test(
       },
     });
     const goodStorage = createWorkflowStorage(cwd);
-    goodStorage.save({ name: "crash-wf", description: "good version", script: VALID_SCRIPT });
+    goodStorage.save({ name: "crash-wf", description: "good version", script: VALID_SCRIPT, location: "project" });
 
-    assert.throws(() => storage.save({ name: "crash-wf", description: "new version", script: VALID_SCRIPT }));
+    assert.throws(() =>
+      storage.save({ name: "crash-wf", description: "new version", script: VALID_SCRIPT, location: "project" }),
+    );
 
     // The primary file must be untouched — still the last good save.
     const recovered = goodStorage.load("crash-wf");
@@ -357,7 +370,7 @@ test(
   "createWorkflowStorage load recovers from .bak when the primary is corrupt",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "corrupt-recovery", description: "good", script: VALID_SCRIPT });
+    storage.save({ name: "corrupt-recovery", description: "good", script: VALID_SCRIPT, location: "project" });
     const path = join(workflowProjectPaths(cwd).savedDir, "corrupt-recovery.json");
     writeFileSync(path, "{ truncated by a crash", "utf-8");
 
@@ -371,7 +384,7 @@ test(
   "createWorkflowStorage delete removes the .bak sidecar too",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    storage.save({ name: "del-bak", description: "d", script: VALID_SCRIPT });
+    storage.save({ name: "del-bak", description: "d", script: VALID_SCRIPT, location: "project" });
     const path = join(workflowProjectPaths(cwd).savedDir, "del-bak.json");
     assert.ok(existsSync(`${path}.bak`), ".bak exists before delete");
     storage.delete("del-bak");

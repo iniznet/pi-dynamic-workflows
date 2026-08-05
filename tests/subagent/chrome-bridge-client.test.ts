@@ -16,7 +16,7 @@ import {
   requireChromeAuthorized,
 } from "../../src/subagent/chrome-bridge-client.js";
 
-type WireRequest = { url: string; init: { method?: string; body?: string } };
+type WireRequest = { url: string; init: { method?: string; body?: string; headers?: Record<string, string> } };
 
 /** Records every fetch call; responds per the queued responder list. */
 function fakeFetch(responders: Array<Response | Error>): { fetchImpl: typeof fetch; requests: WireRequest[] } {

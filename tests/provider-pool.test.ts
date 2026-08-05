@@ -111,7 +111,7 @@ test("n-th acquire waits when the provider is at its concurrency cap, then lands
 
   pool.release(first as NonNullable<typeof first>);
   await waiting;
-  assert.equal((second as { provider: string })?.provider, "a");
+  assert.equal((second as unknown as { provider: string } | undefined)?.provider, "a");
   assert.equal(pool.snapshot().entries[0]?.active, 1, "waiter's placement re-counts its own slot");
 });
 
@@ -170,7 +170,7 @@ test("recordLimitEvent cooldown skips a sticky provider: re-acquire waits and la
 
   t.mock.timers.tick(101);
   await retry;
-  assert.equal((retried as { provider: string })?.provider, "a");
+  assert.equal((retried as unknown as { provider: string } | undefined)?.provider, "a");
   assert.equal(pool.snapshot().reservations, 1, "no double-count while waiting out cooldown");
 });
 
@@ -408,7 +408,7 @@ test("acquire returns undefined for a logical model with no pool entries (legacy
 });
 
 test("providers without configured auth are skipped by routing (with a one-time warning)", async (t) => {
-  t.mock.method(console, "warn", () => {});
+  const warnMock = t.mock.method(console, "warn", () => {});
   const { pool } = makePool(
     "m",
     [
@@ -420,5 +420,5 @@ test("providers without configured auth are skipped by routing (with a one-time 
 
   const choice = await pool.acquire("m");
   assert.equal(choice?.provider, "authed", "no-auth provider must never be chosen");
-  assert.equal(console.warn.mock.callCount(), 1);
+  assert.equal(warnMock.mock.callCount(), 1);
 });

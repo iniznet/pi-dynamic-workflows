@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentUsage } from "../src/agent.js";
+import type { AgentUsage, WorkflowAgent } from "../src/agent.js";
 import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -77,7 +77,7 @@ test("createWorkflowTool has renderCall and renderResult", () => {
 });
 
 test("createWorkflowTool promptSnippet describes delegation and optional composition", () => {
-  const snippet = createWorkflowTool().promptSnippet;
+  const snippet = createWorkflowTool().promptSnippet ?? "";
 
   assert.match(snippet, /delegate substantive .* work to subagents/i);
   assert.match(snippet, /optionally composing agent calls/i);
@@ -97,7 +97,7 @@ test("createWorkflowTool keeps permanent guidance to the single upstream gate", 
 });
 
 test("createWorkflowTool permanent guidance omits conditional catalogs and recipes", () => {
-  const all = createWorkflowTool().promptGuidelines.join(" ");
+  const all = (createWorkflowTool().promptGuidelines ?? []).join(" ");
 
   assert.doesNotMatch(all, /Available agentTypes:/i);
   assert.doesNotMatch(all, /currently available models/i);
@@ -138,7 +138,7 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   assert.match(description, /pipeline\(items, \.\.\.stages\).*stages sequentially.*items proceed concurrently/i);
   assert.match(description, /each stage receives.*previousValue.*originalItem.*index/i);
 
-  const guidance = tool.promptGuidelines.join(" ");
+  const guidance = (tool.promptGuidelines ?? []).join(" ");
   assert.doesNotMatch(guidance, /Markdown fences|First statement: export const meta/i);
   assert.doesNotMatch(guidance, /Date\.now\(\)|Math\.random\(\)|new Date\(\)/i);
   assert.doesNotMatch(guidance, /parallel\(\) requires functions, not promises|results in input order/i);
@@ -176,7 +176,7 @@ test("createWorkflowTool keeps background behavior in the parameter schema", () 
   assert.match(description, /Default: true/i);
   assert.match(description, /result is delivered back.*when it finishes/i);
   assert.match(description, /false only when.*result inline.*same turn/i);
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /runs are background by default/i);
+  assert.doesNotMatch((tool.promptGuidelines ?? []).join(" "), /runs are background by default/i);
 });
 
 test("createWorkflowTool schema describes the configured or unbounded timeout", () => {
@@ -231,10 +231,10 @@ test("createWorkflowTool does not add configured model IDs to permanent guidance
   manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "private-model" }]));
   const tool = createWorkflowTool({ cwd: "/tmp", manager });
 
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/private-model/);
+  assert.doesNotMatch((tool.promptGuidelines ?? []).join(" "), /router\/private-model/);
 
   manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "later-private-model" }]));
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/later-private-model/);
+  assert.doesNotMatch((tool.promptGuidelines ?? []).join(" "), /router\/later-private-model/);
 });
 
 // ─── prepareArguments / normalizeWorkflowScript ─────────────────────────────────
@@ -299,7 +299,7 @@ function toolFakeAgent(result: unknown = "ok") {
       options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
       return result;
     },
-  };
+  } as unknown as Pick<WorkflowAgent, "run">;
 }
 
 function deferredToolAgent() {
@@ -313,7 +313,7 @@ function deferredToolAgent() {
       async run() {
         return promise;
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 
@@ -329,7 +329,7 @@ function abortableToolAgent() {
         options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       });
     },
-  };
+  } as unknown as Pick<WorkflowAgent, "run">;
 }
 
 function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
@@ -370,7 +370,7 @@ test(
           { script: resumeToolScript, resumeFromRunId: "no-such-run" },
           undefined,
           undefined,
-          undefined,
+          {} as never,
         ),
       /no run with that ID|not found/i,
     );
@@ -388,7 +388,7 @@ test(
     await promise;
     assert.equal(manager.getRun(runId)?.status, "completed");
     await assert.rejects(
-      () => tool.execute("t2", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, undefined),
+      () => tool.execute("t2", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, {} as never),
       /already completed/i,
     );
   }),
@@ -405,7 +405,7 @@ test(
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(manager.getRun(runId)?.status, "running");
     await assert.rejects(
-      () => tool.execute("t3", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, undefined),
+      () => tool.execute("t3", { script: resumeToolScript, resumeFromRunId: runId }, undefined, undefined, {} as never),
       /still running/i,
     );
     da.resolve("ok");
@@ -418,7 +418,7 @@ test(
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
     const tool = createWorkflowTool({ cwd, manager });
-    const res = await tool.execute("t4", { script: resumeToolScript }, undefined, undefined, undefined);
+    const res = await tool.execute("t4", { script: resumeToolScript }, undefined, undefined, {} as never);
     const details = res.details as { runId?: string; background?: boolean; resumedFrom?: string };
     assert.ok(details.runId, "a new run id should be returned");
     assert.equal(details.background, true);
@@ -450,7 +450,7 @@ test(
           }
           return `ran:${prompt}`;
         },
-      },
+      } as unknown as Pick<WorkflowAgent, "run">,
     });
     manager.on("paused", () => {});
     manager.on("error", () => {});
@@ -470,7 +470,7 @@ const a = await agent('FIRST', { label: 'first' })
 const b = await agent('SECOND-EDITED', { label: 'second' })
 return { a, b }`;
     const seenBefore = seen.length;
-    const res = await tool.execute("t5", { script: v2, resumeFromRunId: runId }, undefined, undefined, undefined);
+    const res = await tool.execute("t5", { script: v2, resumeFromRunId: runId }, undefined, undefined, {} as never);
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);
@@ -480,7 +480,7 @@ return { a, b }`;
     await new Promise((r) => setTimeout(r, 80));
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed");
-    assert.equal(finalRun?.result?.result?.b, "ran:SECOND-EDITED");
+    assert.equal((finalRun?.result?.result as { b?: string } | undefined)?.b, "ran:SECOND-EDITED");
     const during = seen.slice(seenBefore);
     assert.ok(!during.includes("FIRST"), "unchanged agent 1 replays from journal");
     assert.ok(during.includes("SECOND-EDITED"), "edited agent 2 re-runs live");
@@ -514,7 +514,7 @@ test(
         options?.onUsage?.({ ...zeroUsage, total: 1 });
         return "third-result";
       },
-    };
+    } as unknown as Pick<WorkflowAgent, "run">;
     const manager = new WorkflowManager({ cwd, agent });
     manager.on("paused", () => {});
     manager.on("error", () => {});
@@ -538,7 +538,7 @@ return { a, b, c }`;
       { script, resumeFromRunId: runId, tokenBudget: 1000 },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { runId?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
@@ -581,7 +581,7 @@ test(
         { name, args: validArgsByBuiltinName[name] },
         undefined,
         undefined,
-        undefined,
+        {} as never,
       );
       const details = res.details as { runId?: string; background?: boolean };
       const runId = details.runId;
@@ -606,7 +606,7 @@ test(
       { name: "deep-research", args: { question: "what is pi?" } },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { runId?: string };
     const runId = details.runId;
@@ -622,7 +622,7 @@ test(
   withToolTempCwd(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
     const customScript = "export const meta = { name: 'custom_deep_research', description: 'override' }\nreturn 1";
-    storage.save({ name: "deep-research", description: "custom override", script: customScript });
+    storage.save({ name: "deep-research", description: "custom override", script: customScript, location: "project" });
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     manager.on("error", () => {});
     const tool = createWorkflowTool({ cwd, manager, storage });
@@ -632,7 +632,7 @@ test(
       { name: "deep-research", args: { question: "irrelevant here" } },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { runId?: string };
     const runId = details.runId;
@@ -650,7 +650,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     const tool = createWorkflowTool({ cwd, manager });
     await assert.rejects(
-      () => tool.execute("bad-name", { name: "not-a-real-workflow" }, undefined, undefined, undefined),
+      () => tool.execute("bad-name", { name: "not-a-real-workflow" }, undefined, undefined, {} as never),
       /no saved or built-in workflow named "not-a-real-workflow"/,
     );
   }),
@@ -662,7 +662,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     const tool = createWorkflowTool({ cwd, manager });
     await assert.rejects(
-      () => tool.execute("bad-args", { name: "deep-research", args: {} }, undefined, undefined, undefined),
+      () => tool.execute("bad-args", { name: "deep-research", args: {} }, undefined, undefined, {} as never),
       /question/,
     );
   }),
@@ -680,7 +680,7 @@ test(
           { name: "deep-research", args: { question: "q" }, resumeFromRunId: "some-run" },
           undefined,
           undefined,
-          undefined,
+          {} as never,
         ),
       /cannot be combined with `resumeFromRunId`/,
     );
@@ -699,7 +699,7 @@ test(
           { name: "deep-research", script: resumeToolScript, args: { question: "q" } },
           undefined,
           undefined,
-          undefined,
+          {} as never,
         ),
       /cannot be combined with `script`/,
     );
@@ -720,7 +720,7 @@ test(
       { script: resumeToolScript, dryRun: true },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { dryRun?: boolean; name?: string; phases?: string[] };
     assert.equal(details.dryRun, true);
@@ -742,7 +742,7 @@ test(
       { name: "deep-research", args: { question: "what is pi?" }, dryRun: true },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { dryRun?: boolean; name?: string };
     assert.equal(details.dryRun, true);
@@ -763,7 +763,7 @@ test(
           { script: resumeToolScript, dryRun: true, resumeFromRunId: "some-run" },
           undefined,
           undefined,
-          undefined,
+          {} as never,
         ),
       /dryRun.*resumeFromRunId|resumeFromRunId.*dryRun/,
     );
@@ -820,7 +820,7 @@ test(
       { name: "typed", args: { count: "42", verbose: "true" } },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const runId = (res.details as { runId?: string }).runId;
     assert.ok(runId, "run should start");
@@ -837,7 +837,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     const tool = createWorkflowTool({ cwd, manager, storage });
     await assert.rejects(
-      () => tool.execute("typed-2", { name: "typed", args: {} }, undefined, undefined, undefined),
+      () => tool.execute("typed-2", { name: "typed", args: {} }, undefined, undefined, {} as never),
       /Missing required argument: count/,
     );
     assert.equal(manager.listRuns().length, 0, "validation failure must not create a run");
@@ -852,7 +852,7 @@ test(
     const tool = createWorkflowTool({ cwd, manager, storage });
     await assert.rejects(
       () =>
-        tool.execute("typed-3", { name: "typed", args: { count: "not-a-number" } }, undefined, undefined, undefined),
+        tool.execute("typed-3", { name: "typed", args: { count: "not-a-number" } }, undefined, undefined, {} as never),
       /args\.count must be an integer/,
     );
     assert.equal(manager.listRuns().length, 0, "validation failure must not create a run");
@@ -874,7 +874,7 @@ test(
       { script: resumeToolScript, background: false },
       undefined,
       undefined,
-      undefined,
+      {} as never,
     );
     const details = res.details as { runId?: string; agentCount?: number; result?: unknown };
     assert.ok(details.runId, "sync run should produce a run id");
@@ -899,7 +899,7 @@ test(
       { script: resumeToolScript, background: false },
       controller.signal,
       undefined,
-      undefined,
+      {} as never,
     );
     setTimeout(() => controller.abort(), 30);
     await assert.rejects(() => execution, /Workflow was aborted/);
@@ -913,7 +913,7 @@ test(
     manager.on("error", () => {});
     const tool = createWorkflowTool({ cwd, manager });
     await assert.rejects(
-      () => tool.execute("sync-3", { script: noAgentScript, background: false }, undefined, undefined, undefined),
+      () => tool.execute("sync-3", { script: noAgentScript, background: false }, undefined, undefined, {} as never),
       /must call agent\(\) at least once/,
     );
   }),

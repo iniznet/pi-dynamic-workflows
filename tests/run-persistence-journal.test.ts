@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import { buildResumeJournal, journalEntryKey, keepsResumeJournal, upsertJournalEntry } from "../src/run-persistence.js";
 import type { JournalEntry } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -115,7 +116,7 @@ function perCallDeferredAgent() {
           resolves[idx] = resolve;
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 
@@ -174,7 +175,7 @@ test(
         async run() {
           return "ok";
         },
-      },
+      } as unknown as Pick<WorkflowAgent, "run">,
     });
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await promise;
@@ -222,8 +223,16 @@ return { a, b }`;
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed");
-    assert.equal(finalRun?.result?.result?.a, "first-result", "agent 1 replayed from the resume journal");
-    assert.equal(finalRun?.result?.result?.b, "done", "agent 2 ran live after resume");
+    assert.equal(
+      (finalRun?.result as { result?: { a?: string; b?: string } })?.result?.a,
+      "first-result",
+      "agent 1 replayed from the resume journal",
+    );
+    assert.equal(
+      (finalRun?.result as { result?: { a?: string; b?: string } })?.result?.b,
+      "done",
+      "agent 2 ran live after resume",
+    );
     await origPromise.catch(() => {});
   }),
 );

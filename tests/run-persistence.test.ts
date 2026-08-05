@@ -807,7 +807,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     const runsDir = workflowProjectPaths(cwd).runsDir;
     assert.ok(existsSync(join(runsDir, "r1.json")), "primary written");
     assert.ok(existsSync(join(runsDir, "r1.json.bak")), ".bak written");
@@ -826,7 +826,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     // Corrupt the primary; the .bak from the good save should still load.
     writeFileSync(join(workflowProjectPaths(cwd).runsDir, "r1.json"), "{ truncated", "utf-8");
     const loaded = rp.load("r1");
@@ -845,7 +845,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     rp.delete("r1");
     const runsDir = workflowProjectPaths(cwd).runsDir;
     assert.equal(existsSync(join(runsDir, "r1.json")), false);
@@ -865,7 +865,7 @@ test(
       agents: [],
       logs: [],
       tokenUsage: { input: 1, output: 2, total: 3, cost: 0.5, cacheRead: 9, cacheWrite: 4 },
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     const loaded = rp.load("tu");
     assert.equal(loaded?.tokenUsage?.cost, 0.5, "cost survives reload");
     assert.equal(loaded?.tokenUsage?.cacheRead, 9, "cacheRead survives reload");
@@ -958,7 +958,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
 
     writeFileSync(
       join(runsDir, "stale-lock.lock"),
@@ -991,7 +991,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     const lease = rp.acquireRunLease("delete-lock");
     assert.ok(lease, "lease exists before delete");
     rp.delete("delete-lock");
@@ -1011,7 +1011,7 @@ test(
       phases: [],
       agents: [],
       logs: [],
-    } as PersistedRunState);
+    } as unknown as PersistedRunState);
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
     assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
@@ -1071,7 +1071,7 @@ test(
         phases: [],
         agents: [],
         logs: [],
-      }) as PersistedRunState;
+      }) as unknown as PersistedRunState;
     rp.save(run("a", "s1"));
     rp.save(run("b", "s2"));
 
@@ -1541,7 +1541,7 @@ test(
     assert.equal(state?.status, "paused");
     assert.deepEqual(state?.phases, ["Scan"]);
     assert.deepEqual(state?.journal, [{ index: 0, hash: "h0", result: "cached" }]);
-    assert.equal(state?.agents[0]?.result?.ok, true);
+    assert.equal((state?.agents[0]?.result as { ok?: boolean })?.ok, true);
 
     // Resume from the migrated fixture: the CAS status flip must not lose the
     // legacy journal or the persisted data.
@@ -1604,9 +1604,9 @@ test(
 
     const loadedJournal = rp.load(runId);
     assert.ok(!JSON.stringify(loadedJournal).includes(key), "the key is scrubbed from every loaded surface");
-    assert.equal(loadedJournal?.journal?.[0]?.result?.text, "use [REDACTED] for the API");
+    assert.equal((loadedJournal?.journal?.[0]?.result as { text?: string })?.text, "use [REDACTED] for the API");
     assert.equal(loadedJournal?.logs?.[0], "OPENAI_API_KEY=[REDACTED]");
-    assert.equal(loadedJournal?.agents[0]?.result?.key, "[REDACTED]");
+    assert.equal((loadedJournal?.agents[0]?.result as { key?: string })?.key, "[REDACTED]");
     // The in-memory state passed to save() is NOT mutated — only the
     // persisted form is scrubbed.
     assert.ok(
@@ -1632,7 +1632,7 @@ test(
     const rawCompacted = readFileSync(join(workflowProjectPaths(cwd).runsDir, `${runId}.json`), "utf-8");
     assert.ok(!rawCompacted.includes(key), "the key never lands in the compacted state either");
     const loadedCompacted = rp.load(runId);
-    assert.equal(loadedCompacted?.journalCompacted?.results[0]?.key, "[REDACTED]");
+    assert.equal((loadedCompacted?.journalCompacted?.results[0] as { key?: string })?.key, "[REDACTED]");
     assert.equal(loadedCompacted?.journalCompacted?.records.length, 1);
   }),
 );
@@ -1701,7 +1701,7 @@ test(
     const lockBefore = JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string };
     assert.ok(lockBefore.expiresAt, "new leases carry an expiry for bounded-delay reclaim");
 
-    assert.equal(rp.renewRunLease({ ...lease, token: "wrong-token" }), false, "a non-owner cannot renew");
+    assert.equal(rp.renewRunLease?.({ ...lease, token: "wrong-token" }), false, "a non-owner cannot renew");
     assert.equal(renewRunLease(lease, cwd), true, "the owner's heartbeat renews the lease (standalone export)");
 
     const lockAfter = JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string };
@@ -1718,7 +1718,7 @@ test(
     assert.ok(lease);
     for (let i = 0; i < 5; i++) {
       assert.equal(rp.acquireRunLease("live-renewer"), null, "a live, renewed lease must never be evicted");
-      assert.equal(rp.renewRunLease(lease), true, "the owner keeps its heartbeat");
+      assert.equal(rp.renewRunLease?.(lease), true, "the owner keeps its heartbeat");
     }
     assert.equal(rp.acquireRunLease("live-renewer"), null, "still refused after the final renewal");
     rp.releaseRunLease(lease);

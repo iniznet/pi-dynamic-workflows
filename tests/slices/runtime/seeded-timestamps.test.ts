@@ -23,7 +23,7 @@ test(
     const zeroUsage: AgentUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: 0 };
     let bCalls = 0;
     const agent = {
-      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
         options?.onUsage?.({ ...zeroUsage });
         if (prompt === "b") {
           bCalls++;

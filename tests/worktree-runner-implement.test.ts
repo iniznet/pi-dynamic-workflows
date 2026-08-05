@@ -9,6 +9,7 @@ import {
   createWorktreeRunner,
   executeTask,
   type ImplementProtocolResult,
+  type ImplementTaskSpec,
   implementProtocol,
   type RunResult,
   resolveProtocolCommands,
@@ -381,7 +382,10 @@ test("resolveProtocolCommands defaults to npx tsx --test and npx tsc --noEmit", 
 
 test("resolveProtocolCommands precedence: spec > runtime > default", () => {
   const runtime = { testCommand: "node --test all", typecheckCommand: "node --check a.mjs" };
-  const spec = { testCommand: "node --test spec-only", typecheckCommand: "npx svelte-check" };
+  const spec = {
+    testCommand: "node --test spec-only",
+    typecheckCommand: "npx svelte-check",
+  } as ImplementTaskSpec;
   const withSpec = resolveProtocolCommands(runtime, spec, "t.mjs");
   assert.equal(withSpec.testCommand, "node --test spec-only");
   assert.equal(withSpec.typecheckCommand, "npx svelte-check");

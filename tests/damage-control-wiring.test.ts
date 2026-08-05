@@ -223,11 +223,11 @@ describe("subagentDamageControlTools settings matrix", () => {
   test("settings.json round-trips off|readonly|on, drops other strings, and rejects wrong types", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-dw-damage-settings-"));
     try {
-      await withFakeHomeAsync(home, () => {
+      await withFakeHomeAsync(home, async () => {
         const settingsPath = getWorkflowSettingsPath();
         mkdirSync(dirname(settingsPath), { recursive: true });
 
-        for (const mode of ["off", "readonly", "on"]) {
+        for (const mode of ["off", "readonly", "on"] as const) {
           saveWorkflowSettings({ subagentDamageControlTools: mode }, settingsPath);
           assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentDamageControlTools: mode });
         }

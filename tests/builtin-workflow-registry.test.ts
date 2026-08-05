@@ -161,7 +161,7 @@ test(
   withTempCwd((cwd) => {
     const storage = createWorkflowStorage(cwd);
     const customScript = "export const meta = { name: 'custom_deep_research', description: 'override' }\nreturn 1";
-    storage.save({ name: "deep-research", description: "custom override", script: customScript });
+    storage.save({ name: "deep-research", description: "custom override", script: customScript, location: "project" });
 
     const resolved = resolveWorkflowInvocation("deep-research", { question: "q" }, { storage, cwd });
     assert.ok(resolved);

@@ -163,7 +163,7 @@ test("a mid-script tool failure reports the failing operation with the correct s
       if (prompt === "execute") {
         assert.equal(options.scriptLine, 3, "the runner must receive the script line of the failing agent() call");
         sawScriptLine = true;
-        options.onOperations?.([{ line: options.scriptLine ?? 0, ...failing }]);
+        options.onOperations?.([{ ...failing, line: options.scriptLine ?? 0 }]);
         throw new WorkflowError("write failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
       }
       return "plan-ok";

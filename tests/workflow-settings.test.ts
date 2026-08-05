@@ -125,7 +125,7 @@ describe("workflow settings", () => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       // All three mode literals round-trip.
-      for (const mode of ["auto", "on", "off"]) {
+      for (const mode of ["auto", "on", "off"] as const) {
         saveWorkflowSettings({ subagentHostTools: mode }, settingsPath);
         assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentHostTools: mode });
       }
@@ -154,7 +154,7 @@ describe("workflow settings", () => {
       // An allowlist round-trips; blank/non-string entries are dropped and
       // duplicates are collapsed while preserving order.
       saveWorkflowSettings(
-        { subagentTools: ["mcp_svelte_read_resource", "  ", 42, "mcp_svelte_read_resource"] },
+        { subagentTools: ["mcp_svelte_read_resource", "  ", 42 as unknown as string, "mcp_svelte_read_resource"] },
         settingsPath,
       );
       assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentTools: ["mcp_svelte_read_resource"] });

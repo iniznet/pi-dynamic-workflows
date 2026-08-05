@@ -20,7 +20,7 @@ test("M5: changing the session default model invalidates an UNTAGGED call's cach
       return "ok";
     },
   };
-  const journal = makeJournal(RUN_ID);
+  const journal = makeJournal();
   const options = (mainModel: string) => ({
     agent,
     persistLogs: false,
@@ -50,7 +50,7 @@ test("M5: isolation participates in the resume hash — adding isolation invalid
       return "ok";
     },
   };
-  const journal = makeJournal(RUN_ID);
+  const journal = makeJournal();
   const base = {
     agent,
     persistLogs: false,
@@ -80,7 +80,7 @@ test("M5: a tiered call's hash is unaffected by mainModel changes (tierModel alr
       return "ok";
     },
   };
-  const journal = makeJournal(RUN_ID);
+  const journal = makeJournal();
   const tierScript = `export const meta = { name: 'hash_tier', description: 'tier identity' }
 return await agent('tiered', { label: 'x', tier: 'small' })`;
   const tierConfig = () => ({ tiers: { small: "prov/small-model" } });

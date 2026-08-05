@@ -195,7 +195,7 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
  * Classify a provider outage/overload (5xx) from free-form error text.
  *
  * Returns:
- * - "pause": 503/504 (and overload phrase shapes such as Anthropic's 529
+ * - "pause": 503/504/529 (and overload phrase shapes such as Anthropic's
  *   "overloaded_error") — the endpoint is down but will recover on its own,
  *   so the run checkpoints (paused) like a usage limit.
  * - "retry": 500/502 (and gateway phrase shapes) — transient failures that
@@ -217,10 +217,10 @@ export function classifyProviderUnavailable(text: string | undefined): ProviderU
   const status = text.match(/\b(5\d{2})\b/);
   if (status) {
     const code = Number(status[1]);
-    // 503 (Service Unavailable) and 504 (Gateway Timeout) mean the endpoint is
-    // down/overloaded — pause-worthy. Any other 5xx (500/502/529/...) is a
-    // transient failure worth a spaced retry.
-    return code === 503 || code === 504 ? "pause" : "retry";
+    // 503 (Service Unavailable), 504 (Gateway Timeout), and 529 (Overloaded)
+    // mean the endpoint is down/overloaded — pause-worthy. Any other 5xx
+    // (500/502/...) is a transient failure worth a spaced retry.
+    return code === 503 || code === 504 || code === 529 ? "pause" : "retry";
   }
   if (PROVIDER_UNAVAILABLE_PAUSE_PHRASES.test(text)) return "pause";
   if (PROVIDER_UNAVAILABLE_RETRY_PHRASES.test(text)) return "retry";
@@ -416,7 +416,7 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
         resetHint: limit.resetHint,
       });
     }
-    // Provider outages (5xx): 503/504 pause-worthy, 500/502 recoverable. After
+    // Provider outages (5xx): 503/504/529 pause-worthy, 500/502 recoverable. After
     // the limit branch (a 5xx body that ALSO quotes limit phrasing — e.g. a
     // gateway wrapper with "rate limit" inside — keeps the existing usage-limit
     // semantics rather than being reclassified).

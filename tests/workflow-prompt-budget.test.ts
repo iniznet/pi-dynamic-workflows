@@ -144,7 +144,7 @@ async function withRenderedWorkflow(
           systemPrompt: session.agent.state.systemPrompt,
           promptLines: [
             `- workflow: ${workflow.promptSnippet}`,
-            ...workflow.promptGuidelines.map((guideline) => `- ${guideline}`),
+            ...(workflow.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
           ],
           wrappedWorkflow,
         });

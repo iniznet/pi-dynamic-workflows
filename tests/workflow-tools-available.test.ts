@@ -151,7 +151,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     });
 
     // Verify tools were set (with default tools preserved)
-    const toolsWhenActive = mockPi.setActiveTools.mock.calls[0].arguments[0];
+    const toolsWhenActive = mockPi.setActiveTools.mock.calls[0].arguments[0] as string[];
     for (const t of originalTools) {
       assert.ok(toolsWhenActive.includes(t), `"${t}" should be in active tools`);
     }
@@ -330,7 +330,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
         text: `run ${keyword} test`,
       });
 
-      const tools = mockPi.setActiveTools.mock.calls[0]?.arguments[0];
+      const tools = mockPi.setActiveTools.mock.calls[0]?.arguments[0] as unknown as string[] | undefined;
       assert.ok(tools?.includes("bash"), `bash should be available for keyword "${keyword}"`);
       assert.ok(tools?.includes("read"), `read should be available for keyword "${keyword}"`);
       assert.ok(tools?.includes(WORKFLOW_TOOL_NAME), `workflow should be in active tools for keyword "${keyword}"`);

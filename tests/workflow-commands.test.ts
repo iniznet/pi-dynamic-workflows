@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
 import { WorkflowStateManager } from "../src/phases/state-machine.js";
 import { createRunPersistence, loadRunState } from "../src/run-persistence.js";
@@ -42,12 +42,14 @@ function harness(
     registerCommand: (_name: string, opts: { handler: Handler }) => {
       handler = opts.handler;
     },
-    sendMessage:
-      sendMessageImpl ??
-      (async (m, options) => {
+    sendMessage: (sendMessageImpl ??
+      (async (
+        m: { customType?: string; content?: string },
+        options?: { triggerTurn?: boolean; deliverAs?: string },
+      ) => {
         sent.push({ ...m, options });
         if (!options && typeof m.content === "string") printed.push(m.content);
-      }),
+      })) as unknown as ExtensionAPI["sendMessage"],
     getActiveTools: () => [...activeTools],
     setActiveTools: (toolNames: string[]) => {
       activeTools.splice(0, activeTools.length, ...toolNames);
@@ -60,8 +62,8 @@ function harness(
     getRun: () => undefined,
     // The real WorkflowManager extends EventEmitter, so watchRun's attach-first
     // listener registration (L17) requires these on every manager-shaped fixture.
-    on: () => manager,
-    off: () => manager,
+    on: () => manager as WorkflowManager,
+    off: () => manager as WorkflowManager,
     stop: (id: string) => {
       calls.push(`stop:${id}`);
       return true;
@@ -190,7 +192,7 @@ test("/workflows status without id warns", async () => {
 test("registerWorkflowCommands is idempotent (skips when already registered)", () => {
   let registrations = 0;
   const pi: Partial<ExtensionAPI> = {
-    getCommands: () => [{ name: "workflows" }],
+    getCommands: () => [{ name: "workflows" } as SlashCommandInfo],
     registerCommand: () => {
       registrations++;
     },

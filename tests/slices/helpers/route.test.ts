@@ -4,7 +4,7 @@ import { runWorkflow } from "../../../src/workflow.js";
 
 test("route: classification key maps to the matching case", async () => {
   const classifier = {
-    async run(prompt: string, o: { schema?: unknown }) {
+    async run(prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       // Pick the category embedded in the serialized value.
       return { key: /"kind":"(\w+)"/.exec(prompt)?.[1] ?? "none" };
@@ -34,7 +34,7 @@ return out`;
 
 test("route: an out-of-enum classification key dispatches the fallback with reason unknown", async () => {
   const rogue = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       return o?.schema ? { key: "nonexistent" } : "ok";
     },
   };
@@ -80,7 +80,7 @@ return out`;
 test("route: when() guards filter the classification enum and prompt", async () => {
   const prompts: string[] = [];
   const classifier = {
-    async run(prompt: string, o: { schema?: unknown }) {
+    async run(prompt: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       prompts.push(prompt);
       return { key: "a" };

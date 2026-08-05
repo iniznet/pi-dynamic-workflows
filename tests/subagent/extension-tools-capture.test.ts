@@ -18,6 +18,7 @@ import {
   captureEntryTools,
   createExtensionToolsSupplier,
   EXTENSION_TOOL_SOURCES,
+  type ExtensionToolSourceId,
   extensionSourceIdForTool,
   getExtensionToolSourceResults,
   isKnownExtensionToolSourceId,
@@ -71,12 +72,12 @@ describe("captureEntryTools", () => {
 
   test("swallows every other ExtensionAPI member (no throw, no state touched)", () => {
     const entry = (pi: ExtensionAPI) => {
-      pi.registerCommand("x", () => {});
-      pi.registerShortcut("x", () => {});
+      pi.registerCommand("x", { handler: async () => {} });
+      pi.registerShortcut("x", { handler: () => {} });
       pi.on("session_start", () => {});
       pi.setActiveTools(["read"]);
-      void pi.exec("bash", { command: "echo hi" });
-      void pi.sendMessage("hello");
+      void pi.exec("bash", ["echo hi"]);
+      void pi.sendMessage({ customType: "test", content: "hello", display: true });
       const tools = pi.getAllTools();
       assert.deepEqual(tools, []);
       pi.registerTool(fakeTool("web_docs_fetch"));
@@ -119,7 +120,9 @@ describe("resolveEnabledSourceIds", () => {
   });
 
   test("unknown ids in an allowlist are filtered out", () => {
-    assert.deepEqual(resolveEnabledSourceIds(["pi-codegraph", "not-a-source"]), ["pi-codegraph"]);
+    assert.deepEqual(resolveEnabledSourceIds(["pi-codegraph", "not-a-source"] as unknown as ExtensionToolSourceId[]), [
+      "pi-codegraph",
+    ]);
   });
 });
 

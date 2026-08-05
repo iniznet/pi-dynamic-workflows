@@ -26,10 +26,11 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import { createRunPersistence } from "../src/run-persistence.js";
 import { McpToolsManager } from "../src/subagent/mcp-tools.js";
 import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
@@ -37,6 +38,7 @@ import { createWorkflowDamageControlTool, DAMAGE_CONTROL_ACTIONS } from "../src/
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorktree } from "../src/worktree.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture helpers (same pattern as task8-crash-e2e.test.ts)
@@ -65,7 +67,7 @@ function perCallDeferredAgent() {
           resolves[idx] = resolve;
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 
@@ -99,7 +101,7 @@ function abortableDeferredAgent() {
           );
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 
@@ -145,7 +147,7 @@ function initRepo(): string {
 /** Execute a damage-control tool and return its text result. */
 async function dc(manager: WorkflowManager, params: Record<string, unknown>, capabilities?: "readonly" | "full") {
   const tool = createWorkflowDamageControlTool({ manager, cwd: manager.getProjectCwd(), capabilities });
-  const out = await tool.execute("", params);
+  const out = await tool.execute("", params, undefined, undefined, {} as never);
   const text = (out.content as Array<{ type: string; text: string }>)[0]?.text ?? "";
   return { text, details: out.details as Record<string, unknown> };
 }
@@ -242,8 +244,7 @@ test("probe (a): list/status/agents surface a real journaled run", async () => {
       await untilSettled(rp, runId, `run ${runId} never completed after the tail`);
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });
 
@@ -290,8 +291,7 @@ test("probe (b): kill-agent stops ONE agent; the fan-out absorbs it and the run 
       assert.equal(finished?.status, "completed", "a killed agent is never run-fatal by itself");
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });
 
@@ -332,7 +332,7 @@ test("probe (c): recover reclaims a crashed orphan, flips it to paused, and resu
             bRunnerPrompts.push(prompt);
             return "done";
           },
-        },
+        } as unknown as Pick<WorkflowAgent, "run">,
       });
       managerB.on("error", () => {});
       const current = rp.load(runId);
@@ -347,7 +347,7 @@ test("probe (c): recover reclaims a crashed orphan, flips it to paused, and resu
       assert.match(plain(recovered.text), /leaseAction=reclaimed/, "the stale lease was reclaimed");
       assert.match(plain(recovered.text), /statusBefore=running/, "recover starts from the orphan's running state");
       assert.match(plain(recovered.text), /statusAfter=paused/, "the orphan is normalized to paused, never failed");
-      assert.equal(recovered.details.recovery.leaseAction, "reclaimed");
+      assert.equal((recovered.details.recovery as { leaseAction?: string }).leaseAction, "reclaimed");
 
       await until(() => rp.load(runId)?.status === "completed", `recovered run ${runId} never completed`);
 
@@ -363,8 +363,7 @@ test("probe (c): recover reclaims a crashed orphan, flips it to paused, and resu
       assert.ok(!existsSync(join(runsDir, `${runId}.lock`)), "no lease lock is left behind after recover");
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });
 
@@ -383,7 +382,7 @@ test("probe (d): clean dry-runs by default; force acts but never deletes run sta
           async run() {
             return "done";
           },
-        },
+        } as unknown as Pick<WorkflowAgent, "run">,
       });
       manager.on("error", () => {});
       const rp = manager.getPersistence();
@@ -440,8 +439,7 @@ test("probe (d): clean dry-runs by default; force acts but never deletes run sta
       assert.ok(existsSync(runFilePath), "the run state file SURVIVES force clean (never deleted)");
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });
 
@@ -478,7 +476,13 @@ test("probe (e): off gate yields no defs; readonly rejects mutating verbs; full 
       await until(() => da.started() >= 1, `agent 0 of ${runId} never started`);
 
       const readonlyTool = createWorkflowDamageControlTool({ manager, capabilities: "readonly" });
-      const rejected = await readonlyTool.execute("", { action: "kill-agent", runId, agentId: `${runId}:0` });
+      const rejected = await readonlyTool.execute(
+        "",
+        { action: "kill-agent", runId, agentId: `${runId}:0` },
+        undefined,
+        undefined,
+        {} as never,
+      );
       const rejectedText = (rejected.content as Array<{ text: string }>)[0]?.text ?? "";
       assert.match(plain(rejectedText), /result=error/, `readonly kill text: ${rejectedText}`);
       assert.match(plain(rejectedText), /not permitted in readonly mode/, "readonly rejects the kill verb");
@@ -489,7 +493,7 @@ test("probe (e): off gate yields no defs; readonly rejects mutating verbs; full 
         "readonly allowed list is the inspection verbs",
       );
 
-      const okReadonly = await readonlyTool.execute("", { action: "status", runId });
+      const okReadonly = await readonlyTool.execute("", { action: "status", runId }, undefined, undefined, {} as never);
       assert.match(
         plain((okReadonly.content as Array<{ text: string }>)[0]?.text ?? ""),
         /action=status result=ok/,
@@ -510,7 +514,13 @@ test("probe (e): off gate yields no defs; readonly rejects mutating verbs; full 
       for (const verb of DAMAGE_CONTROL_ACTIONS) {
         assert.ok(verbNames.has(verb), `full schema includes verb ${verb}`);
       }
-      const reached = await fullTool.execute("", { action: "kill-agent", runId, agentId: `${runId}:0` });
+      const reached = await fullTool.execute(
+        "",
+        { action: "kill-agent", runId, agentId: `${runId}:0` },
+        undefined,
+        undefined,
+        {} as never,
+      );
       assert.match(
         plain((reached.content as Array<{ text: string }>)[0]?.text ?? ""),
         /result=ok/,
@@ -523,7 +533,6 @@ test("probe (e): off gate yields no defs; readonly rejects mutating verbs; full 
       await untilSettled(rp, runId, `run ${runId} never settled after the kill`);
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });

@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import { reconstructJournal } from "../src/journal-compaction.js";
 import { loadPersistedJournal } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
@@ -67,7 +68,7 @@ function perCallDeferredAgent() {
           resolves[idx] = resolve;
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 

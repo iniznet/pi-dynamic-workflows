@@ -263,7 +263,7 @@ describe("runWorkflow pipeline wiring (G4 + G2)", () => {
       await readFile(join(dir, ".pi", "workflows", "plans", "clear-run.json"), "utf-8"),
     ) as Record<string, unknown>;
     assert.equal(blueprint.title, CLEAR_PROMPT);
-    assert.equal(validateBlueprint(blueprint as Parameters<typeof validateBlueprint>[0]).valid, true);
+    assert.equal(validateBlueprint(blueprint as unknown as Parameters<typeof validateBlueprint>[0]).valid, true);
 
     const state = await readState(dir);
     assert.equal(state.wayfinderComplete, true);

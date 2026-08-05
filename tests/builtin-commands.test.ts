@@ -298,7 +298,7 @@ test("multi-perspective handler notifies (not throws) for a whitespace-only topi
   const { ctx, notified } = makeNotifyCtx();
   // A quoted whitespace-only topic passes the handler's own cheap `!topic`
   // check (non-empty length) but fails the registry's real validation.
-  await assert.doesNotReject(() => handler('"  "', ctx));
+  await assert.doesNotReject(async () => handler('"  "', ctx));
   assert.equal(notified.length, 1, "should notify instead of throwing");
   assert.equal(notified[0].type, "warning");
   assert.match(notified[0].message, /topic/i);
@@ -313,7 +313,7 @@ test("codebase-audit handler notifies (not throws) for a whitespace-only check",
   const { ctx, notified } = makeNotifyCtx();
   // An empty quoted check token passes checks.length === 0 (length is 1) but
   // fails the registry's real validation.
-  await assert.doesNotReject(() => handler('src ""', ctx));
+  await assert.doesNotReject(async () => handler('src ""', ctx));
   assert.equal(notified.length, 1, "should notify instead of throwing");
   assert.equal(notified[0].type, "warning");
   assert.match(notified[0].message, /checks/i);

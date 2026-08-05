@@ -35,10 +35,15 @@ import { join } from "node:path";
 import test, { before } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { parseWorkflowScript } from "../../../src/workflow.js";
+import type { WorkflowManager } from "../../../src/workflow-manager.js";
+import type { WorkflowStorage } from "../../../src/workflow-saved.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "../../helpers/mock-pi.js";
 import * as execMock from "./mocks/child-process-mock.mjs";
 
-let registerBuiltinWorkflows: (pi: ExtensionAPI, opts: { cwd: string; manager: unknown }) => void;
+let registerBuiltinWorkflows: (
+  pi: ExtensionAPI,
+  opts: { cwd: string; manager: WorkflowManager; storage?: WorkflowStorage },
+) => void;
 
 before(async () => {
   const mod = await import("../../../src/builtin-commands.js");
@@ -53,7 +58,7 @@ function makeFakeManager() {
       started.push({ script, args: (args ?? {}) as Record<string, unknown>, exec });
       return { runId: `run-m12-${started.length}`, promise: new Promise(() => {}) };
     },
-  };
+  } as unknown as WorkflowManager;
   return { manager, started };
 }
 

@@ -377,14 +377,14 @@ test("fan-out-and-synthesize example waits for the complete result set and prese
     persistLogs: false,
     onAgentStart: ({ label }) => labels.push(label),
     agent: {
-      async run(prompt: string, options: { label?: string; schema?: unknown }) {
-        if (options.label === "synthesize-complete-set") {
+      async run(prompt: string, options?: { label?: string; schema?: unknown }) {
+        if (options?.label === "synthesize-complete-set") {
           synthesisSawCompleteFanOut = finished.size === work.length;
           assert.match(prompt, /"id":"beta"/);
           assert.match(prompt, /"status":"failed"/);
           return { summary: "complete", coveredIds: ["alpha", "gamma"], failedIds: ["beta"] };
         }
-        const id = options.label?.split(":").at(-1) ?? "unknown";
+        const id = options?.label?.split(":").at(-1) ?? "unknown";
         finished.add(id);
         return id === "beta" ? "" : `result:${id}`;
       },

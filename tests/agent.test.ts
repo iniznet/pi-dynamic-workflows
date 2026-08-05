@@ -1281,6 +1281,20 @@ test("WorkflowAgent.run(): silently truncated output (stopReason length) is CONT
   assert.equal(core.state.callCount, 1, "no nudge prompt may fire after a truncation — the wall is identical");
 });
 
+test("WorkflowAgent.run(): a 'length' stop that still holds a complete answer returns it, never CONTEXT_OVERFLOW", async () => {
+  const core = createFauxCore({
+    provider: "fauxtest-trunc-answered",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  // ONE queued response: the model finished with a complete answer but hit the
+  // max-token ceiling; the answer is usable, so no replay and no nudge may fire.
+  core.setResponses([fauxAssistantMessage("complete final answer", { stopReason: "length" })]);
+
+  const result = await fauxAgentRun(core, "task", { label: "trunc-answered" });
+  assert.equal(result, "complete final answer");
+  assert.equal(core.state.callCount, 1, "a complete answer on a length stop must not trigger a nudge or replay");
+});
+
 test("WorkflowAgent.run(): empty final text recovers via one same-session nudge when the model then answers", async () => {
   const core = createFauxCore({
     provider: "fauxtest-nudge",

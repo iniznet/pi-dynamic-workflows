@@ -20,7 +20,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
 /** An agent that hangs forever — lets a test pause a run mid-flight. */
 function hangingAgent(quick: (prompt: string) => unknown) {
   return {
-    async run(prompt: string, options?: { onUsage?: (u: unknown) => void }) {
+    async run(prompt: string, options?: { onUsage?: (u: unknown) => void }): Promise<any> {
       options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 1, cost: 0 });
       return quick(prompt);
     },

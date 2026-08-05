@@ -141,7 +141,7 @@ export function throwIfContextOverflow(messages: unknown[], label?: string): voi
 /**
  * Detect a provider outage/overload (5xx) recorded as an assistant message with
  * stopReason "error" (the SDK buries it, exactly like usage limits/overflow).
- * Mirrors wrapError's thrown-error classification: 503/504 pause the run
+ * Mirrors wrapError's thrown-error classification: 503/504/529 pause the run
  * (PROVIDER_OVERLOADED, recoverable:false) so it checkpoints and resumes after
  * the endpoint recovers; 500/502 are recoverable (PROVIDER_UNAVAILABLE) so the
  * attempt is retried with backoff before the run fails resumable.
@@ -165,6 +165,33 @@ export function throwIfProviderUnavailable(messages: unknown[], label?: string):
 }
 
 /**
+ * The agent's FINAL answer: assistant text strictly after the last tool result.
+ * Text before the final tool result is stale progress (the agent's last real
+ * action was a tool call, not answering), so it must not count as an answer.
+ * Shared by WorkflowAgent.finalAssistantText and the truncation gate (F20).
+ */
+export function finalAssistantTextOf(messages: unknown[]): string {
+  // Locate the last tool result; only assistant text strictly after it counts.
+  let lastToolResult = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if ((messages[i] as { role?: string } | undefined)?.role === "toolResult") {
+      lastToolResult = i;
+      break;
+    }
+  }
+  for (let i = messages.length - 1; i > lastToolResult; i--) {
+    const message = messages[i] as Partial<AssistantMessage> | undefined;
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+    const text = message.content
+      .filter((part): part is TextContent => part.type === "text")
+      .map((part) => part.text)
+      .join("");
+    if (text.trim()) return text;
+  }
+  return "";
+}
+
+/**
  * Detect silent output truncation: the last assistant message finished with
  * stopReason "length" (max output tokens) and never emitted a final answer.
  * The trajectory is at its output ceiling, so neither a retry nor a same-session
@@ -175,10 +202,18 @@ export function throwIfProviderUnavailable(messages: unknown[], label?: string):
  * stopReason "error" + provider text), this uses the SDK's authoritative
  * stopReason union — a truncation is an overflow even when the provider buried
  * no error text in the transcript.
+ *
+ * F20 gate: a "length" stop whose last message still holds a complete final
+ * answer is a SUCCESSFUL turn that merely hit the output ceiling — throwing
+ * would force a full agent replay for nothing. Only a genuinely empty "length"
+ * turn (no final answer at all) is the unrecoverable wall, and it must still
+ * throw BEFORE the same-session nudge (#135) — the nudge cannot produce more
+ * output than the ceiling that just truncated.
  */
 export function throwIfTruncatedOutput(messages: unknown[], label?: string): void {
   const err = lastAssistantError(messages);
   if (err?.stopReason !== "length") return;
+  if (finalAssistantTextOf(messages).trim()) return;
   throw new WorkflowError(
     "Model output truncated at max tokens before a final answer (stopReason length)",
     WorkflowErrorCode.CONTEXT_OVERFLOW,
@@ -236,10 +271,12 @@ export async function resolveStructuredOutput<T>(
   // A repair re-prompt can itself hit the provider limit (or overflow the context
   // window, or hit a 5xx outage). Surface that as the real (recoverable/
   // checkpointed) cause instead of the misleading non-recoverable
-  // SCHEMA_NONCOMPLIANCE.
-  throwIfProviderLimit(session.messages, options.label);
-  throwIfContextOverflow(session.messages, options.label);
+  // SCHEMA_NONCOMPLIANCE. 5xx is classified before limit phrases (F06) so a
+  // limit-phrased 503/504 stays PROVIDER_OVERLOADED, not a misleading
+  // PROVIDER_USAGE_LIMIT.
   throwIfProviderUnavailable(session.messages, options.label);
+  throwIfContextOverflow(session.messages, options.label);
+  throwIfProviderLimit(session.messages, options.label);
 
   throw new WorkflowError(
     "Subagent did not produce valid structured_output after repair attempts",
@@ -1363,15 +1400,21 @@ export class WorkflowAgent {
       // overflow is buried the same way; detect it first so it settles the run
       // failed+resumable rather than exhausting retries into a silent null. A 5xx
       // outage is buried the same way: 503/504 pause the run, 500/502 retry with
-      // backoff (see throwIfProviderUnavailable).
-      throwIfProviderLimit(session.messages, options.label);
-      throwIfContextOverflow(session.messages, options.label);
+      // backoff (see throwIfProviderUnavailable). The 5xx classifier runs BEFORE
+      // the limit classifier (F06) so a limit-phrased 503/504 — e.g. "503 rate
+      // limit exceeded" — surfaces as PROVIDER_OVERLOADED (the real pause-worthy
+      // cause) rather than a misleading PROVIDER_USAGE_LIMIT; pure limit text
+      // (429/quota/rate) still matches throwIfProviderLimit afterwards.
       throwIfProviderUnavailable(session.messages, options.label);
-      // Silent truncation is an overflow even with no provider error text: the
-      // trajectory hit its output ceiling, so neither a retry nor the nudge below
-      // can recover it. Classified before BOTH the schema branch and the nudge so
-      // a truncated schema agent settles CONTEXT_OVERFLOW (correct guidance: the
-      // context wall) instead of SCHEMA_NONCOMPLIANCE (wrong guidance: the schema).
+      throwIfContextOverflow(session.messages, options.label);
+      throwIfProviderLimit(session.messages, options.label);
+      // Silent truncation with no final answer is an overflow even with no
+      // provider error text: the trajectory hit its output ceiling, so neither a
+      // retry nor the nudge below can recover it. Classified before BOTH the
+      // schema branch and the nudge so a truncated schema agent settles
+      // CONTEXT_OVERFLOW (correct guidance: the context wall) instead of
+      // SCHEMA_NONCOMPLIANCE (wrong guidance: the schema). A "length" stop that
+      // still holds a complete final answer passes the gate (F20) and returns.
       throwIfTruncatedOutput(session.messages, options.label);
 
       if (options.schema) {
@@ -1398,9 +1441,10 @@ export class WorkflowAgent {
         if (options.signal?.aborted) throw new Error("Subagent was aborted");
         // The nudge turn itself can hit a usage limit / overflow / 5xx / truncation
         // — surface that as the real cause, never as a bogus empty-output null.
-        throwIfProviderLimit(session.messages, options.label);
-        throwIfContextOverflow(session.messages, options.label);
+        // 5xx is classified before limit phrases (F06), same as the main path.
         throwIfProviderUnavailable(session.messages, options.label);
+        throwIfContextOverflow(session.messages, options.label);
+        throwIfProviderLimit(session.messages, options.label);
         throwIfTruncatedOutput(session.messages, options.label);
         text = this.finalAssistantText(session.messages);
       }
@@ -1561,23 +1605,6 @@ export class WorkflowAgent {
    * the structured payload out of any assistant message, not only the terminal one.
    */
   private finalAssistantText(messages: unknown[]): string {
-    // Locate the last tool result; only assistant text strictly after it counts.
-    let lastToolResult = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if ((messages[i] as { role?: string } | undefined)?.role === "toolResult") {
-        lastToolResult = i;
-        break;
-      }
-    }
-    for (let i = messages.length - 1; i > lastToolResult; i--) {
-      const message = messages[i] as Partial<AssistantMessage> | undefined;
-      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
-      const text = message.content
-        .filter((part): part is TextContent => part.type === "text")
-        .map((part) => part.text)
-        .join("");
-      if (text.trim()) return text;
-    }
-    return "";
+    return finalAssistantTextOf(messages);
   }
 }

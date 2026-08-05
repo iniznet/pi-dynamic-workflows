@@ -118,14 +118,14 @@ describe("MCPBridge", () => {
     tools = new Map([
       [
         "echo",
-        async (args) => ({
+        async (args: Record<string, unknown>): Promise<ToolCallResult> => ({
           content: JSON.stringify(args),
           isError: false,
         }),
       ],
       [
         "error-tool",
-        async () => ({
+        async (): Promise<ToolCallResult> => ({
           content: "Tool failed",
           isError: true,
         }),
@@ -868,7 +868,7 @@ describe("MCPBridge", () => {
         properties: { hello: { type: "string" } },
       });
       const defResult = (await (
-        echoDef as {
+        echoDef as unknown as {
           execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
         }
       ).execute("call-1", { nested: [1, 2] })) as { content: Array<{ type: string; text: string }> };

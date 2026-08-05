@@ -108,7 +108,7 @@ test("a failed sync run's error carries the resume hint (paused/failed are resum
 
   const tool = createWorkflowTool({ manager: stubManager });
   await assert.rejects(
-    () => tool.execute("t1", { script, background: false }, undefined, undefined, { hasUI: false }),
+    () => tool.execute("t1", { script, background: false }, undefined, undefined, { hasUI: false } as never),
     (err: unknown) => {
       assert.ok(err instanceof WorkflowError, "should stay a WorkflowError");
       assert.match(err.message, /agent blew up/);

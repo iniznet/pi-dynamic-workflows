@@ -61,11 +61,11 @@ test("createStructuredOutputTool execute captures value and marks called", async
     schema: Type.Object({ ok: Type.Boolean() }),
     capture,
   });
-  const result = await tool.execute("call-1", { ok: true });
+  const result = await tool.execute("call-1", { ok: true }, undefined, undefined, undefined as never);
   assert.equal(capture.called, true);
   assert.deepEqual(capture.value, { ok: true });
   assert.ok(result.terminate, "should terminate the agent");
-  assert.equal(result.content[0].text, "Structured output received.");
+  assert.equal((result.content[0] as { type: "text"; text: string }).text, "Structured output received.");
 });
 
 test("createStructuredOutputTool captures complex nested objects", async () => {
@@ -84,7 +84,7 @@ test("createStructuredOutputTool captures complex nested objects", async () => {
     ],
     total: 2,
   };
-  await tool.execute("call-2", data);
+  await tool.execute("call-2", data, undefined, undefined, undefined as never);
   assert.equal(capture.called, true);
   assert.deepEqual(capture.value, data);
 });
@@ -95,7 +95,7 @@ test("createStructuredOutputTool returns details with captured params", async ()
     schema: Type.Object({ x: Type.Number() }),
     capture,
   });
-  const result = await tool.execute("call-3", { x: 42 });
+  const result = await tool.execute("call-3", { x: 42 }, undefined, undefined, undefined as never);
   assert.deepEqual(result.details, { x: 42 });
 });
 

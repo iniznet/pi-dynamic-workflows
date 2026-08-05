@@ -251,7 +251,7 @@ test("the contract rejects a tier string outside the standard vocabulary (G10)",
 test("alignment diagnostics compare declared and observed project globals", () => {
   assert.deepEqual(
     WORKFLOW_CAPABILITY_CONTRACT.diagnoseAlignment({
-      observedProjectGlobals: EXPECTED_RUNTIME_GLOBALS.filter((name) => name !== "agent").concat("accidental"),
+      observedProjectGlobals: [...EXPECTED_RUNTIME_GLOBALS.filter((name) => name !== "agent"), "accidental"],
     }),
     [
       {

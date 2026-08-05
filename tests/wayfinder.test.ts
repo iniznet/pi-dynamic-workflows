@@ -393,9 +393,32 @@ describe("decision map invariants (acyclic blocking graph)", () => {
   it("findCycle detects a hand-built blocking cycle (t1 -> t2 -> t1)", () => {
     const cycle: DecisionMap = {
       rootQuestion: "x",
+      updatedAt: "now",
       tickets: [
-        { id: "t1", type: TicketType.TASK, title: "A", description: "a", blocks: ["t2"] },
-        { id: "t2", type: TicketType.TASK, title: "B", description: "b", blocks: ["t1"] },
+        {
+          id: "t1",
+          type: TicketType.TASK,
+          title: "A",
+          description: "a",
+          status: "open",
+          claims: [],
+          blocks: ["t2"],
+          blockedBy: [],
+          createdAt: "now",
+          updatedAt: "now",
+        },
+        {
+          id: "t2",
+          type: TicketType.TASK,
+          title: "B",
+          description: "b",
+          status: "open",
+          claims: [],
+          blocks: ["t1"],
+          blockedBy: [],
+          createdAt: "now",
+          updatedAt: "now",
+        },
       ],
     };
     assert.deepEqual(findCycle(cycle), ["t1", "t2", "t1"]);
@@ -404,7 +427,21 @@ describe("decision map invariants (acyclic blocking graph)", () => {
   it("findCycle detects a self-blocking ticket", () => {
     const selfBlocked: DecisionMap = {
       rootQuestion: "x",
-      tickets: [{ id: "t1", type: TicketType.TASK, title: "A", description: "a", blocks: ["t1"] }],
+      updatedAt: "now",
+      tickets: [
+        {
+          id: "t1",
+          type: TicketType.TASK,
+          title: "A",
+          description: "a",
+          status: "open",
+          claims: [],
+          blocks: ["t1"],
+          blockedBy: [],
+          createdAt: "now",
+          updatedAt: "now",
+        },
+      ],
     };
     assert.deepEqual(findCycle(selfBlocked), ["t1", "t1"]);
   });
@@ -622,7 +659,7 @@ describe("parallel research dispatch", () => {
       assert.match(String(dispatch.findings[0]), /^answer: /);
     }
     assert.equal(agentCalls.length, 1);
-    assert.match(agentCalls[0], new RegExp(research.question));
+    assert.match(agentCalls[0], new RegExp(research.question ?? ""));
   });
 
   it("builds a research prompt from the ticket question and claims", async () => {

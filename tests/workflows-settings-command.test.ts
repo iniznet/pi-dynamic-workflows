@@ -87,9 +87,12 @@ describe("registerWorkflowSettingsCommand", () => {
   it("offers status/paths argument completions filtered by prefix", () => {
     const { pi, commands } = makeCommandRegistryPi();
     registerWorkflowSettingsCommand(pi);
-    const completions = commands[0]?.getArgumentCompletions?.("st") ?? [];
+    const firstCommand = commands[0] as unknown as {
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+    };
+    const completions = firstCommand?.getArgumentCompletions?.("st") ?? [];
     assert.deepEqual(completions, [{ value: "status", label: "status" }]);
-    const emptyPrefix = commands[0]?.getArgumentCompletions?.("") ?? [];
+    const emptyPrefix = firstCommand?.getArgumentCompletions?.("") ?? [];
     assert.deepEqual(
       emptyPrefix.map((c: { value: string }) => c.value),
       ["status", "paths"],

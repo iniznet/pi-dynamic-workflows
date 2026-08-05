@@ -31,6 +31,25 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Poll a run's status until it reaches `status` or the deadline passes (same pattern as journal-compaction-persist.test.ts). */
+async function waitForStatus(
+  manager: WorkflowManager,
+  runId: string,
+  status: string,
+  deadlineMs = 3000,
+): Promise<string | undefined> {
+  const deadline = Date.now() + deadlineMs;
+  let current: string | undefined;
+  while (Date.now() < deadline) {
+    current = manager.getRun(runId)?.status;
+    if (current === status) return current;
+    await sleep(25);
+  }
+  return current;
+}
+
 /**
  * Run `fn` with an isolated HOME and a scripted faux provider registered on a
  * test-scoped ModelRuntime — no real credentials are touched and no network
@@ -146,10 +165,12 @@ return { a, b }`;
     // Budget refills: agent 2 now succeeds. Resume replays agent 1 from the journal.
     setResponses([fauxAssistantMessage("second-result-text", { stopReason: "stop" })]);
     assert.equal(await manager.resume(runId), true, "the paused run is resumable");
-    await new Promise((r) => setTimeout(r, 100));
 
+    // Resume triggers background replay; poll instead of sleeping so slow machines
+    // don't race the completion assert.
+    const status = await waitForStatus(manager, runId, "completed");
+    assert.equal(status, "completed", "resumed run completes once the limit clears");
     const done = manager.getRun(runId);
-    assert.equal(done?.status, "completed", "resumed run completes once the limit clears");
     assert.equal((done?.result?.result as { a?: string })?.a, "first-result-text", "agent 1 replayed from journal");
     assert.equal((done?.result?.result as { b?: string })?.b, "second-result-text", "agent 2 ran live after refill");
   }));

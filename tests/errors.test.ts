@@ -50,12 +50,14 @@ describe("classifyProviderLimit", () => {
 });
 
 describe("classifyProviderUnavailable", () => {
-  it("classifies 503/504 status codes as pause-worthy", () => {
+  it("classifies 503/504/529 status codes as pause-worthy", () => {
     for (const text of [
       "503 status code (no body)",
       "504 status code (no body)",
+      "529 status code (no body)",
       "503 Service Unavailable",
       "HTTP 504: Gateway Timeout",
+      "HTTP 529: Overloaded",
     ]) {
       assert.equal(classifyProviderUnavailable(text), "pause", `should pause: ${text}`);
     }

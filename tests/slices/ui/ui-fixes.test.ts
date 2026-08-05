@@ -12,6 +12,7 @@ import test, { mock } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { registerWorkflowCommands } from "../../../src/workflow-commands.js";
 import type { WorkflowManager } from "../../../src/workflow-manager.js";
+import type { WorkflowStorage } from "../../../src/workflow-saved.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // M6 — corrupt-data guards: persisted `agents` that is not an array must never
@@ -131,7 +132,7 @@ test("watchRun prints a truthful header per final event (M7)", async () => {
       doneCount: 0,
       errorCount: 0,
     };
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    const manager = new EventEmitter() as unknown as EventEmitter & {
       getRun: (id: string) => unknown;
       getSnapshot: () => unknown;
       listRuns: () => unknown[];
@@ -214,7 +215,7 @@ test("/workflows save does not overwrite when the user declines the confirm (M13
     },
     list: () => [],
     delete: () => true,
-  };
+  } as unknown as WorkflowStorage;
   let handler: ((a: string, c: ExtensionCommandContext) => Promise<void>) | undefined;
   const pi = {
     getCommands: () => [],
@@ -273,7 +274,7 @@ test("/workflows save proceeds when the user accepts the overwrite confirm (M13)
     },
     list: () => saved.map((w) => ({ name: w.name })),
     delete: () => true,
-  };
+  } as unknown as WorkflowStorage;
   const pi = {
     getCommands: () => [],
     registerCommand: (_n: string, o: { handler: (a: string, c: ExtensionCommandContext) => Promise<void> }) => {
@@ -389,7 +390,7 @@ test("/workflows ui in a no-UI host prints an explicit unavailable message (L24)
 
 test("installResultDelivery notifies and logs when sendMessage throws (L22)", async () => {
   const { installResultDelivery } = await import("../../../src/task-panel.js");
-  const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+  const manager = new EventEmitter() as unknown as EventEmitter & {
     getRun: (id: string) => unknown;
   };
   const run = {

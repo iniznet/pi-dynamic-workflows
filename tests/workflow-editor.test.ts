@@ -646,7 +646,7 @@ describe("installWorkflowKeywordArming", () => {
       },
     } as unknown as ExtensionAPI;
 
-    savedTools = [];
+    savedTools = [] as string[];
     mod.installWorkflowKeywordArming(pi2, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler as
@@ -657,7 +657,7 @@ describe("installWorkflowKeywordArming", () => {
     // Invoke with non-trigger text — should NOT save tools
     const resultNonTrigger = inputHandler?.({ source: "interactive", text: "hello world" });
     assert.deepEqual(resultNonTrigger, { action: "continue" }, "non-trigger input should return continue");
-    assert.deepEqual(savedTools, [], "tools should not change for non-trigger input");
+    assert.deepEqual(savedTools, [] as string[], "tools should not change for non-trigger input");
 
     // Invoke with trigger text — should save and add WORKFLOW_TOOL_NAME
     const resultTrigger = inputHandler?.({ source: "interactive", text: "run a workflow test" });

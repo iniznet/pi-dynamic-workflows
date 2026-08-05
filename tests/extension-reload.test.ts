@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
@@ -28,7 +29,7 @@ function deferredAgent() {
           pending.set(index, { resolve });
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 

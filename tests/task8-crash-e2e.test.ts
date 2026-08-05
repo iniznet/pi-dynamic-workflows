@@ -24,16 +24,18 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { WorkflowAgent } from "../src/agent.js";
 import { createRunPersistence } from "../src/run-persistence.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorktree } from "../src/worktree.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "./helpers/mock-pi.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 const TWO_AGENT_SCRIPT = `export const meta = { name: 'crash_recovery', description: 'crash e2e' }
 const a = await agent('first', { label: 'a' })
@@ -55,7 +57,7 @@ function perCallDeferredAgent() {
           resolves[idx] = resolve;
         });
       },
-    },
+    } as unknown as Pick<WorkflowAgent, "run">,
   };
 }
 
@@ -148,7 +150,7 @@ test("task8 e2e: a crashed journaled run is recovered to paused, resumes from th
             bRunnerPrompts.push(prompt);
             return "done";
           },
-        },
+        } as unknown as Pick<WorkflowAgent, "run">,
       });
       managerB.on("error", () => {});
 
@@ -204,7 +206,6 @@ test("task8 e2e: a crashed journaled run is recovered to paused, resumes from th
       );
     });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(repo, fakeHome);
   }
 });

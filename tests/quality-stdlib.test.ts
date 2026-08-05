@@ -4,7 +4,7 @@ import { runWorkflow } from "../src/workflow.js";
 
 // Fake agents return a schema-shaped object when a schema is requested.
 const yesAgent = {
-  async run(_p: string, o: { schema?: unknown }) {
+  async run(_p: string, o?: { schema?: unknown }) {
     return o?.schema ? { real: true } : "ok";
   },
 };
@@ -22,7 +22,7 @@ test("verify(): below threshold → not real", async () => {
   // 1 yes / 2 no with threshold 0.75 → not real.
   let n = 0;
   const mixed = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       n++;
       return { real: n === 1 };
@@ -74,7 +74,7 @@ return await verify('claim', { reviewers: 3, threshold: 0.5, lens: ['source', 'l
 
 test("judgePanel(): picks the highest-mean-score attempt", async () => {
   const scorer = {
-    async run(p: string, o: { schema?: unknown }) {
+    async run(p: string, o?: { schema?: unknown }) {
       if (!o?.schema) return "ok";
       return { score: /WIN/.test(p) ? 0.9 : 0.1 };
     },
@@ -181,7 +181,7 @@ return await loopUntilDry({ round: () => { throw new Error('author bug') } })`,
 
 test("completenessCheck(): returns the critic's structured verdict", async () => {
   const critic = {
-    async run(_p: string, o: { schema?: unknown }) {
+    async run(_p: string, o?: { schema?: unknown }) {
       return o?.schema ? { complete: false, missing: ["x"] } : "ok";
     },
   };

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
+import type { AgentHistoryEntry } from "../src/agent-history.js";
 import type { WorkflowSnapshot } from "../src/display.js";
 import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState } from "../src/run-persistence.js";
@@ -458,7 +459,7 @@ test("a null/primitive element in a corrupt agent history doesn't crash the deta
         prompt: "do it",
         status: "error",
         history: [
-          null as unknown as { role: string; kind: string; text: string },
+          null as unknown as AgentHistoryEntry,
           { role: "tool", kind: "toolResult", toolName: "read", text: "ok" },
         ],
       },
@@ -1101,7 +1102,7 @@ test("restarting a run with a corrupt persisted script notifies an error instead
   await Promise.resolve();
 
   assert.ok(capturedComponent, "openWorkflowNavigator should have produced a component");
-  assert.doesNotThrow(() => capturedComponent?.handleInput("r"), "restart must not throw/crash the overlay");
+  assert.doesNotThrow(() => capturedComponent?.handleInput?.("r"), "restart must not throw/crash the overlay");
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].type, "error");
@@ -1154,10 +1155,16 @@ test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifi
     getRun: () => undefined,
   } as unknown as WorkflowManager;
   const storage = {
-    list: () => [{ name: "flaky", description: "", location: "project", path: "/x", savedAt: "2025-01-01" }],
+    list: () => [
+      { name: "flaky", description: "", script: "", location: "project" as const, path: "/x", savedAt: "2025-01-01" },
+    ],
     delete: () => {
       throw new Error("EACCES: permission denied, unlink '/x'");
     },
+    save: () => {
+      throw new Error("save not exercised in this test");
+    },
+    load: () => null,
   };
 
   openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui, { storage }).catch(() => {});
@@ -1166,7 +1173,7 @@ test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifi
 
   const component = getComponent();
   assert.ok(component, "openWorkflowNavigator should have produced a component");
-  assert.doesNotThrow(() => component?.handleInput("x"), "deleteSaved must not throw/crash the overlay");
+  assert.doesNotThrow(() => component?.handleInput?.("x"), "deleteSaved must not throw/crash the overlay");
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].type, "error");
@@ -1196,7 +1203,7 @@ test("stopping a run whose manager.stop throws (cold-run lease/persistence failu
 
   const component = getComponent();
   assert.ok(component, "openWorkflowNavigator should have produced a component");
-  assert.doesNotThrow(() => component?.handleInput("x"), "stop must not throw/crash the overlay");
+  assert.doesNotThrow(() => component?.handleInput?.("x"), "stop must not throw/crash the overlay");
 
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].type, "error");

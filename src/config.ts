@@ -2,12 +2,12 @@
  * Configuration constants for pi-dynamic-workflows.
  */
 
-import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
-import { isKnownExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 // Provider-pool env override: provider-pool-config.ts is a runtime leaf (it
 // only imports types from provider-pool.ts, which imports from errors.ts), so
 // this value import never creates a cycle back into config.ts.
 import { PROVIDER_POOL_ENV_VAR, providerPoolFromEnv } from "./gateway/provider-pool-config.js";
+import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
+import { isKnownExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 // Type-only to avoid a runtime import cycle: workflow-settings.ts imports value
 // bindings (MAX_AGENT_RETRIES, ...) from this module, so importing its type is
 // erased at compile time and never re-enters it at load.

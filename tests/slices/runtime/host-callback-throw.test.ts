@@ -77,7 +77,7 @@ test(
   "M1: a throwing manager EventEmitter listener does not abort the execution",
   withTempCwd(async (cwd) => {
     const agent = {
-      async run(_prompt: string, options: { onUsage?: (u: AgentUsage) => void }) {
+      async run(_prompt: string, options: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
         options?.onUsage?.({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, cost: 0 });
         return "ok";
       },

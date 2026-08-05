@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { WorkflowSnapshot } from "../src/display.js";
+import { WorkflowErrorCode } from "../src/errors.js";
 import type { PersistedRunState, RunLeaseInfo, RunStatus } from "../src/run-persistence.js";
 import {
   allowedDamageControlActions,
@@ -46,7 +47,14 @@ function run(overrides: Partial<PersistedRunState> = {}): PersistedRunState {
     agents: [
       { id: 1, label: "active", prompt: "a", status: "running", tokens: 30, callId: "dc-unit-1:0" },
       { id: 2, label: "queued", prompt: "b", status: "queued" },
-      { id: 3, label: "failed", prompt: "c", status: "error", error: "boom", errorCode: "AGENT_EXECUTION_ERROR" },
+      {
+        id: 3,
+        label: "failed",
+        prompt: "c",
+        status: "error",
+        error: "boom",
+        errorCode: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      },
       { id: 4, label: "done", prompt: "d", status: "done", tokens: 10 },
       { id: 5, label: "skipped", prompt: "e", status: "skipped" },
     ],
@@ -54,8 +62,10 @@ function run(overrides: Partial<PersistedRunState> = {}): PersistedRunState {
     startedAt: "2026-07-14T00:00:00.000Z",
     updatedAt: "2026-07-14T00:00:01.000Z",
     tokenUsage: { input: 20, output: 10, total: 30 },
-    journal: [{ index: 0, callId: "dc-unit-1:0", args: { prompt: "a" }, result: "first" }],
-    checkpoints: [{ taskId: "checkpoint-1", state: { done: ["a"] } }],
+    journal: [{ index: 0, hash: "dc-unit-1:0", result: "first" }],
+    checkpoints: [
+      { runId: "dc-unit-1", taskId: "checkpoint-1", status: "done", timestamp: "2026-07-14T00:00:00.500Z" },
+    ],
     agentRetries: 2,
     ...overrides,
   };

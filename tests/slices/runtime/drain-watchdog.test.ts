@@ -27,7 +27,7 @@ test(
     // lease so a later process can resume/re-run.
     const neverSettles = {
       async run() {
-        return new Promise(() => {});
+        return new Promise<never>(() => {});
       },
     };
     const manager = new WorkflowManager({ cwd, agent: neverSettles });

@@ -21,7 +21,7 @@ test(
   "L3: the external-signal abort listener is removed once the execution settles",
   withTempCwd(async (cwd) => {
     const agent = {
-      async run() {
+      async run(): Promise<any> {
         return "ok";
       },
     };

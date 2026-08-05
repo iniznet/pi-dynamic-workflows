@@ -53,6 +53,12 @@ function agent(
 
 // ─── Module loading helpers ─────────────────────────────────────────────────
 
+/** Shape of the pi-tui widget factory passed to ui.setWidget (test-side mock). */
+type WidgetFactory = (
+  tui: unknown,
+  theme: { fg: (color: string, text: string) => string; bold: (text: string) => string },
+) => { render: (width: number) => string[] };
+
 async function loadDisplay() {
   return import("../src/display.js");
 }
@@ -442,7 +448,7 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     assert.equal(setWidget.mock.callCount(), 2, "update must re-register widget (invalidation signal)");
 
     // Extract the re-registered factory and verify it renders the latest snapshot
-    const [, factory2] = setWidget.mock.calls[1].arguments;
+    const factory2 = setWidget.mock.calls[1].arguments[1] as WidgetFactory;
     assert.equal(typeof factory2, "function", "factory must be a function");
     const comp2 = factory2(null, { fg: (_c, t) => t, bold: (t) => t });
     assert.equal(typeof comp2.render, "function", "factory must produce a component with render()");
@@ -465,7 +471,7 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
     assert.equal(setWidget.mock.callCount(), 3, "complete must re-register widget (invalidation signal)");
 
     // Verify the post-complete factory also renders updated content
-    const [, factory3] = setWidget.mock.calls[2].arguments;
+    const factory3 = setWidget.mock.calls[2].arguments[1] as WidgetFactory;
     const comp3 = factory3(null, { fg: (_c, t) => t, bold: (t) => t });
     const lines3 = comp3.render(80);
     assert.ok(
@@ -930,7 +936,12 @@ describe("TUI rendering has no markdown syntax", () => {
     // If snapshot.name is missing, the function should still produce
     // a Text component without crashing
     assert.doesNotThrow(() => {
-      tool.renderResult(resultWithMarkdown as never, { isPartial: false }, theme as never);
+      tool.renderResult?.(
+        resultWithMarkdown as never,
+        { isPartial: false, expanded: false },
+        theme as never,
+        undefined as never,
+      );
     });
   });
 });

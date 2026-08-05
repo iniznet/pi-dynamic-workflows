@@ -7,7 +7,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 
 type TaskPanelModule = {
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
-  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
+  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown, opts?: unknown) => void;
 };
 
 // Loaded once before all tests
@@ -21,7 +21,7 @@ before(async () => {
 
 describe("installResultDelivery", () => {
   function createMockManager(run?: unknown, runsDir?: string) {
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    const manager = new EventEmitter() as InstanceType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
       getPersistence?: () => { getRunsDir: () => string };
       __deliveryInstalled?: boolean;
@@ -87,7 +87,7 @@ describe("installResultDelivery", () => {
     mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
     manager.emit("complete", { runId: "test-run-1" });
 
-    const calls = (pi as unknown as { _calls: { content: string }[] })._calls;
+    const calls = (pi as unknown as { _calls: { content: string; customType?: string }[] })._calls;
     assert.equal(calls.length, 1);
     assert.equal(calls[0].customType, "workflow-result");
     assert.ok(calls[0].content.includes("All tests passed"), "should contain All tests passed");
@@ -440,7 +440,7 @@ describe("installResultDelivery", () => {
 
 describe("installTaskPanel", () => {
   it("registers a widget named workflow-tasks with belowEditor placement", () => {
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    const manager = new EventEmitter() as InstanceType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
       listRuns: () => unknown[];
     };
@@ -462,7 +462,7 @@ describe("installTaskPanel", () => {
   });
 
   it("passes the render width through to the task panel", () => {
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    const manager = new EventEmitter() as InstanceType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
       listRuns: () => unknown[];
     };
@@ -806,7 +806,7 @@ describe("installTaskPanel mode selection", () => {
   const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
   function activeManager() {
-    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+    const manager = new EventEmitter() as InstanceType<typeof EventEmitter> & {
       getRun: (id: string) => unknown;
       listRuns: () => unknown[];
     };

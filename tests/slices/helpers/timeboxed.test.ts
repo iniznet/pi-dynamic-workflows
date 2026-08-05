@@ -39,7 +39,11 @@ const out = await timeboxed(async (ctx) => {
   return { result: r, remainingNonNegative: ctx.remaining() >= 0 }
 }, { maxElapsedMs: 60_000 })
 return out`;
-  const res = await runWorkflow<{ result: unknown; timedOut: boolean; remainingNonNegative: boolean }>(script, {
+  const res = await runWorkflow<{
+    result: { remainingNonNegative: boolean };
+    timedOut: boolean;
+    remainingNonNegative: boolean;
+  }>(script, {
     agent: echoAgent,
     persistLogs: false,
   });
