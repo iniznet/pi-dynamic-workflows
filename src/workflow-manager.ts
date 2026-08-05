@@ -11,6 +11,8 @@ import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./di
 import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
 import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
+import { DEFAULT_MAX_LOG_ENTRIES, pushBoundedLog } from "./logger.js";
+import { createMemoizedLoadModelTierConfig } from "./model-tier-config.js";
 import {
   buildResumeJournal,
   createRunPersistence,
@@ -89,6 +91,8 @@ export interface ManagedRunBase {
    * the journal's resolved segments into a compact summary and persists it
    * only when reconstruction QA reproduces the original byte-identically
    * (failed-QA summaries are discarded; the original journal is kept).
+   * F19: compaction + QA only run on lifecycle-settle writes (persistRun);
+   * throttled progress writes persist the raw journal.
    */
   compactJournal?: boolean;
   /**
@@ -1071,6 +1075,12 @@ export class WorkflowManager extends EventEmitter {
         // Otherwise runWorkflow mints an ephemeral `run-<ts>` id and the sync
         // path would surface a non-resumable id to the model.
         runId: managed.runId,
+        // F15: per-run memoized model-tiers loader (mtime/size-guarded) so the
+        // resume-replay hash's per-agent() config read stops re-parsing the
+        // file on every call (up to 1000x/run). Nested workflow() frames
+        // inherit this same memo via runWorkflow's spread options; the file is
+        // run-frozen by design.
+        loadTierConfig: createMemoizedLoadModelTierConfig(),
         agent: this.agent,
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
@@ -1155,7 +1165,10 @@ export class WorkflowManager extends EventEmitter {
           this.schedulePersist(managed);
         },
         onLog: (message) => {
-          managed.snapshot.logs.push(message);
+          // Bounded like the logger's own ring (pushBoundedLog): snapshot.logs
+          // is re-serialized in full on every persist, so an unbounded array
+          // would grow the persisted file without bound per long run.
+          pushBoundedLog(managed.snapshot.logs, message);
           this.emitLive(managed, "log", { runId: managed.runId, message });
           progress();
         },
@@ -1721,7 +1734,11 @@ export class WorkflowManager extends EventEmitter {
     if (this.persistTimers.has(managed.runId)) return; // already scheduled; the trailing write reads live state
     const timer = setTimeout(() => {
       this.persistTimers.delete(managed.runId);
-      this.writeRunToDisk(managed);
+      // F19: throttled progress writes are the FAST path — persist the raw
+      // journal only. Compaction + reconstruction QA (several full-journal
+      // stringifies) run exclusively at lifecycle settle boundaries via
+      // persistRun(); the final settled state always compacts again.
+      this.writeRunToDisk(managed, false);
     }, WorkflowManager.PERSIST_THROTTLE_MS);
     // A pending progress persist should never keep the process alive on its own.
     timer.unref?.();
@@ -1748,10 +1765,23 @@ export class WorkflowManager extends EventEmitter {
       clearTimeout(timer);
       this.persistTimers.delete(managed.runId);
     }
-    this.writeRunToDisk(managed);
+    // F19: lifecycle-settle writes (start, pause/resume/stop, complete, error,
+    // force-release) are the compaction boundaries — see writeRunToDisk.
+    this.writeRunToDisk(managed, true);
   }
 
-  private writeRunToDisk(managed: ManagedRun) {
+  /**
+   * The sole choke point for every disk write (both persistRun()'s direct
+   * calls and schedulePersist()'s deferred timer funnel through here).
+   * F19: `compact` gates the opt-in compaction + reconstruction-QA work — it
+   * is true only at lifecycle settle boundaries (persistRun); the throttled
+   * fast path writes the raw journal. When compaction is enabled and QA
+   * passes, the compacted summary REPLACES the plain journal on disk, so the
+   * byte-identity guarantee (a summary is never persisted unless it
+   * reconstructs to the exact original) is unchanged — a fast-path raw write
+   * simply defers the fold to the next settle boundary.
+   */
+  private writeRunToDisk(managed: ManagedRun, compact = true) {
     // The sole choke point for every disk write (both persistRun()'s direct
     // calls and schedulePersist()'s deferred timer funnel through here) — skip
     // silently when `managed` is no longer the current entry for its runId
@@ -1790,10 +1820,14 @@ export class WorkflowManager extends EventEmitter {
       // passing the gate. A summary that does not actually shrink the journal
       // (nothing foldable / everything verbatim) is also skipped — persisting a
       // larger "compaction" buys nothing. The positional deltaKey scheme
-      // (`${runId}:${callIndex}`) is untouched in both forms.
+      // (`${runId}:${callIndex}`) is untouched in both forms. F19: this block
+      // runs only when `compact` is set — the throttled fast path (schedule-
+      // Persist) skips it and persists the raw journal; the next lifecycle
+      // settle boundary re-folds the full in-memory journal from scratch, so
+      // the QA gate and its byte-identity guarantee are unchanged.
       let journal: PersistedRunState["journal"];
       let journalCompacted: PersistedRunState["journalCompacted"];
-      if (keepJournal && managed.compactJournal === true) {
+      if (compact && keepJournal && managed.compactJournal === true) {
         const summary = compactJournal(managed.journal);
         const qa = verifyJournalCompaction(summary, managed.journal);
         if (qa.ok && JSON.stringify(summary).length <= JSON.stringify(managed.journal).length) {
@@ -2068,7 +2102,10 @@ export class WorkflowManager extends EventEmitter {
       snapshot: {
         name: persisted.workflowName,
         phases: persisted.phases ?? [],
-        logs: persisted.logs ?? [],
+        // Seed the live snapshot's logs bounded to the same cap: a run
+        // persisted before the ring-buffer existed could carry >1000 entries,
+        // and every resume persist re-serializes the whole array.
+        logs: (persisted.logs ?? []).slice(-DEFAULT_MAX_LOG_ENTRIES),
         agents: [],
         agentCount: 0,
         runningCount: 0,

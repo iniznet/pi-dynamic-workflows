@@ -42,6 +42,7 @@ import {
   resolveTierModel,
 } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { type SafeTimer, safeSetTimeout } from "./timing.js";
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -305,16 +306,19 @@ export async function resolveStructuredOutput<T>(
  * Prompt-aware tier default for the no-tiers-config fallback: classify the
  * task from its prompt and pick the fitting tier out of the available models
  * spread into defaults (see buildDefaultTierConfig). Degrades to mainModel
- * when the registry is empty or unavailable.
+ * when the registry is empty or unavailable. `defaults` is an optional
+ * precomputed tier map (F23: memoized per registry identity) that skips the
+ * registry scan + rank sort when the caller already has one cached.
  */
 export function resolvePromptAwareTier(
   prompt: string,
   mainModel: string | undefined,
   availableModels: readonly RankableModel[],
+  defaults?: ModelTierConfig,
 ): string | undefined {
-  const defaults = buildDefaultTierConfig(mainModel, availableModels);
+  const tierConfig = defaults ?? buildDefaultTierConfig(mainModel, availableModels);
   const tier = tierNameForTask("runtime", prompt);
-  return resolveTierModel(tier, defaults, mainModel) ?? mainModel;
+  return resolveTierModel(tier, tierConfig, mainModel) ?? mainModel;
 }
 
 export function resolveAgentModelSpec(
@@ -324,6 +328,10 @@ export function resolveAgentModelSpec(
   onTierWithoutConfig?: (tier: string) => void,
   prompt?: string,
   listModels: () => readonly RankableModel[] = listAvailableModels,
+  // F23: memoized default-tier builder keyed by (registry identity, mainModel).
+  // When provided, the prompt-aware fallback reuses the cached rank instead of
+  // re-scanning + re-sorting the full registry on every run().
+  buildDefaults?: (mainModel: string | undefined) => ModelTierConfig,
 ): string | undefined {
   if (options.model) return options.model;
   const config = loadConfig();
@@ -335,7 +343,7 @@ export function resolveAgentModelSpec(
     // stay distinct instead of both collapsing onto mainModel.
     if (!config) {
       onTierWithoutConfig?.(options.tier);
-      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels());
+      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel));
     }
     // An "inherit:main" configured tier resolves to the session's main model
     // INSIDE resolveTierModel (PRD Task 3) — passing mainModel through is what
@@ -538,6 +546,51 @@ export function listAvailableModels(registry?: ModelRegistry): RankableModel[] {
 export function listAvailableModelSpecs(registry?: ModelRegistry): string[] {
   return listAvailableModels(registry).map((model) => model.spec);
 }
+
+/**
+ * F23: memoized default-tier config keyed by (registry identity, mainModel).
+ * The fresh-install prompt-aware path (no model-tiers.json configured) rebuilt
+ * and re-ranked the full available-model list on every run() — a full registry
+ * scan + capability sort per agent call. The registry object is a stable
+ * reference for a run's lifetime (the shared modelRegistry flows through every
+ * agent), so a WeakMap keyed on it never leaks and never serves stale output:
+ * the default map depends only on the registry's model catalog, which is fixed
+ * for the registry's lifetime.
+ */
+const defaultTierConfigByRegistry = new WeakMap<ModelRegistry, Map<string, ModelTierConfig>>();
+
+function memoizedDefaultTierConfig(mainModel: string | undefined, registry: ModelRegistry): ModelTierConfig {
+  let byMain = defaultTierConfigByRegistry.get(registry);
+  if (!byMain) {
+    byMain = new Map();
+    defaultTierConfigByRegistry.set(registry, byMain);
+  }
+  const key = mainModel ?? "";
+  let config = byMain.get(key);
+  if (!config) {
+    config = buildDefaultTierConfig(mainModel, listAvailableModels(registry));
+    byMain.set(key, config);
+  }
+  return config;
+}
+
+/**
+ * F21: live onHistory snapshots walk only this many trailing messages instead
+ * of the whole transcript on every session event. The fit caps output at the
+ * history DEFAULT_MAX_ENTRIES (40) entries; a 3x tail guarantees the last 40
+ * entries stay covered even when a message produces no entry. The final
+ * per-run emit (run()'s finally) still walks the full transcript for an exact
+ * end state.
+ */
+const HISTORY_TAIL_MESSAGES = 120;
+
+/**
+ * F12: grace period after an abort before a run-owned session is force-
+ * disposed. Long enough for a responsive session to settle its abort through
+ * the normal finally path; bounded so a signal-ignoring subagent's session
+ * cannot leak until process exit.
+ */
+const SECOND_CHANCE_DISPOSE_MS = 10_000;
 
 /**
  * Emitted at most once per process: when an agent asks for a tier but no
@@ -883,6 +936,13 @@ export class WorkflowAgent {
   private readonly excludeTools: string[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
   private readonly persistAgentSessions: boolean;
+  /**
+   * F22: the persist session dir is instance-fixed (keyed by this.cwd), so the
+   * write probe (2 syscalls) runs once per WorkflowAgent instead of once per
+   * run() call (2 syscalls x up to 1000 agents/run). Only set on success — a
+   * failed probe retries next run(), preserving the per-run degrade behavior.
+   */
+  private sessionDirWritableProbed = false;
   private readonly instructions?: string;
   private readonly mainModel?: string;
   /** Shared registry from the host session, when provided. */
@@ -1085,7 +1145,12 @@ export class WorkflowAgent {
     if (!this.persistAgentSessions) return SessionManager.inMemory();
     try {
       const manager = SessionManager.create(this.cwd);
-      this.assertSessionDirWritable(manager.getSessionDir());
+      // The probe is 2 sync syscalls and the dir is fixed for this instance's
+      // lifetime — run it once, not on every run() (F22).
+      if (!this.sessionDirWritableProbed) {
+        this.assertSessionDirWritable(manager.getSessionDir());
+        this.sessionDirWritableProbed = true;
+      }
       warnPersistSecretsOnce(manager.getSessionDir());
       return manager;
     } catch (error) {
@@ -1163,6 +1228,10 @@ export class WorkflowAgent {
       // module-level disk fallback and could pick a model absent from the
       // injected registry (routing-budgets:i3).
       () => listAvailableModels(modelRegistry),
+      // F23: reuse the per-registry default-tier rank across run() calls
+      // instead of re-scanning + re-ranking the full registry on every agent
+      // (fresh-install path, no model-tiers.json).
+      (main) => memoizedDefaultTierConfig(main, modelRegistry),
     );
 
     // Provider pool: consult BEFORE model resolution so the session binds the
@@ -1250,6 +1319,10 @@ export class WorkflowAgent {
     // Tool-call traces for THIS run, collected from the session's tool events
     // in execution order. Pinned to the owning agent() call's script line.
     const operations: PendingOperationTrace[] = [];
+    // F18: toolCallId → trace index for O(1) end-event lookup instead of a
+    // linear scan per tool-call end (O(n^2) over a long tool-heavy session).
+    // Per-run, so it never leaks across runs; the array still owns order.
+    const operationsByToolCallId = new Map<string, PendingOperationTrace>();
     // Resolves once the first-edit swap gate's model change settles (if the
     // gate fired this run); awaited in the finally so the swap is deterministic
     // by the time run() settles.
@@ -1340,12 +1413,14 @@ export class WorkflowAgent {
     // subscription so concurrent tool batches stay in one event stream.
     const removeToolListener = session.subscribe((event) => {
       if (event.type === "tool_execution_start") {
-        operations.push({
+        const trace: PendingOperationTrace = {
           toolCallId: event.toolCallId,
           line: options.scriptLine ?? 0,
           op: event.toolName,
           outcome: "running",
-        });
+        };
+        operations.push(trace);
+        operationsByToolCallId.set(event.toolCallId, trace);
         if (this.sessionHandoff && !this.handoffSwapped && this.handoffToolFilter(event.toolName)) {
           // First file-edit tool call: open the gate. Execution mode begins
           // (planning guidance pruned) and the model swap runs detached, awaited
@@ -1360,7 +1435,7 @@ export class WorkflowAgent {
           });
         }
       } else if (event.type === "tool_execution_end") {
-        const trace = operations.find((t) => t.toolCallId === event.toolCallId);
+        const trace = operationsByToolCallId.get(event.toolCallId);
         if (trace) {
           trace.outcome = event.isError ? `error: ${summarizeToolError(event.result)}` : "ok";
         }
@@ -1370,18 +1445,54 @@ export class WorkflowAgent {
     let removeAbortListener: (() => void) | undefined;
     let removeHistoryListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
+    /** F21: last observed message count — an unchanged length means no new content. */
+    let lastHistoryLength = -1;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
       if (!options.onHistory) return;
+      // Most session events (tool_execution_start/end, model events) do NOT
+      // append a message; skip the full compaction+emit when nothing grew.
+      if (session.messages.length === lastHistoryLength) return;
       const now = Date.now();
       if (now - lastHistoryEmit < 250) return;
       lastHistoryEmit = now;
-      emitHistory();
+      lastHistoryLength = session.messages.length;
+      // Live progress snapshot: walk only the recent tail, not the whole
+      // transcript on every event (the fit keeps only the last entries).
+      options.onHistory?.(compactAgentHistory(session.messages.slice(-HISTORY_TAIL_MESSAGES)));
+    };
+
+    // F12: second-chance dispose safety net. When a workflow-level timeout (or
+    // any abort) fires but the subagent ignores the abort — a hung tool call or
+    // a non-abortable provider stream — session.prompt never settles and the
+    // finally never runs, leaking the session (listeners, timers, resources)
+    // until process exit. The abort handler arms a bounded timer that
+    // force-disposes the run-owned session; run() settling first cancels it,
+    // and disposeRunSession's guard skips a double-dispose.
+    const runOwnsSession = !(reuseHandoff || (this.sessionHandoff && options.handoff === true));
+    let secondChanceTimer: SafeTimer | undefined;
+    let sessionDisposed = false;
+    const disposeRunSession = () => {
+      if (sessionDisposed) return;
+      sessionDisposed = true;
+      try {
+        session.dispose();
+      } catch {
+        // best-effort teardown; never mask the run result
+      }
     };
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
-        const onAbort = () => void session.abort();
+        const onAbort = () => {
+          void session.abort();
+          // F12: give a responsive session its normal settle path; force-
+          // dispose only after the grace period, and only run-owned sessions
+          // (a handoff session survives run() and close() owns its teardown).
+          if (runOwnsSession && !sessionDisposed) {
+            secondChanceTimer = safeSetTimeout(() => disposeRunSession(), SECOND_CHANCE_DISPOSE_MS).unref();
+          }
+        };
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
@@ -1510,9 +1621,14 @@ export class WorkflowAgent {
         }
       }
       // Handoff sessions survive run() so the next handoff call can continue
-      // the trajectory; every other session is disposed as before.
-      if (!(reuseHandoff || (this.sessionHandoff && options.handoff === true))) {
-        session.dispose();
+      // the trajectory; every other session is disposed as before. The guard is
+      // shared with the F12 second-chance timer: a force-dispose that raced a
+      // settling run must never be applied twice, and a pending timer is
+      // cancelled since the normal path is about to dispose anyway.
+      secondChanceTimer?.clear();
+      secondChanceTimer = undefined;
+      if (runOwnsSession) {
+        disposeRunSession();
       }
       removeToolListener();
     }

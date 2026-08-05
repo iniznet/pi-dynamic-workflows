@@ -8,7 +8,21 @@ import { redactText } from "./run-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 /** Max log entries retained in memory (a ring buffer; persisted logs are not capped). */
-const DEFAULT_MAX_LOG_ENTRIES = 1000;
+export const DEFAULT_MAX_LOG_ENTRIES = 1000;
+
+/**
+ * Ring-buffer one entry onto a bounded string array, dropping the oldest
+ * entries beyond `cap` (default {@link DEFAULT_MAX_LOG_ENTRIES}). Mirrors the
+ * logger's own in-memory cap so sibling log surfaces (run-result logs,
+ * managed-run snapshot logs) stay bounded the same way. Unlike the logger's
+ * shift()-then-push, splice-based pruning also bounds an over-cap seed (e.g. a
+ * log array persisted before the cap existed), so the bound holds even when
+ * no new entry is pushed.
+ */
+export function pushBoundedLog(logs: string[], message: string, cap = DEFAULT_MAX_LOG_ENTRIES): void {
+  if (logs.length >= cap) logs.splice(0, logs.length - cap + 1);
+  logs.push(message);
+}
 
 // ---------------------------------------------------------------------------
 // Redaction (L8)
@@ -94,8 +108,7 @@ export function createWorkflowLogger(options: WorkflowLoggerOptions = {}): Workf
     const entry = `[${timestamp}] [${level}] ${safeMessage}`;
     // Ring buffer: drop the oldest entry once the cap is hit, so the array
     // (and every getLogs() copy) stays bounded however long the run lives.
-    if (logs.length >= maxEntries) logs.shift();
-    logs.push(entry);
+    pushBoundedLog(logs, entry, maxEntries);
     try {
       options.onLog?.(safeMessage);
     } catch {

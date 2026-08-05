@@ -144,7 +144,12 @@ interface EntryState {
 /** Per-provider cooldown + rolling TPM window state. */
 interface ProviderMetrics {
   cooldownUntil: number;
+  /** Rolling TPM window entries in timestamp order; same-ms spends are aggregated. */
   tpmTokens: Array<{ at: number; tokens: number }>;
+  /** Incremental sum of non-evicted entries in `tpmTokens` (lazy-pruned). */
+  tpmSum: number;
+  /** Eviction pointer: index of the first entry still inside the window. */
+  tpmHead: number;
 }
 
 /** A live (unreleased) acquisition, keyed by id and optionally by stickyKey. */
@@ -304,8 +309,14 @@ export class ProviderPool {
   recordSpend(provider: string, outputTokens: number): void {
     if (!Number.isFinite(outputTokens) || outputTokens <= 0) return;
     const metrics = this.providerMetricsFor(provider);
-    metrics.tpmTokens.push({ at: Date.now(), tokens: outputTokens });
-    this.pruneTpm(metrics);
+    const now = Date.now();
+    this.pruneTpm(metrics, now);
+    // Same-ms spends merge into one entry so the window grows with wall-clock
+    // seconds rather than recordSpend call volume.
+    const last = metrics.tpmTokens[metrics.tpmTokens.length - 1];
+    if (last && last.at === now) last.tokens += outputTokens;
+    else metrics.tpmTokens.push({ at: now, tokens: outputTokens });
+    metrics.tpmSum += outputTokens;
   }
 
   /**
@@ -686,15 +697,24 @@ export class ProviderPool {
   private measuredTpm(provider: string): number {
     const metrics = this.providerMetricsFor(provider);
     this.pruneTpm(metrics);
-    let sum = 0;
-    for (const entry of metrics.tpmTokens) sum += entry.tokens;
-    return sum;
+    return metrics.tpmSum;
   }
 
-  private pruneTpm(metrics: ProviderMetrics): void {
-    const cutoff = Date.now() - this.config.defaultTpmWindowMs;
-    while (metrics.tpmTokens.length > 0 && metrics.tpmTokens[0].at <= cutoff) {
-      metrics.tpmTokens.shift();
+  /**
+   * Lazily evict window entries with a head pointer (no O(n) shift per call)
+   * while keeping `tpmSum` correct, and compact the array once the evicted
+   * prefix dominates it (amortized O(1) over a window's lifetime).
+   */
+  private pruneTpm(metrics: ProviderMetrics, now: number = Date.now()): void {
+    const cutoff = now - this.config.defaultTpmWindowMs;
+    const tokens = metrics.tpmTokens;
+    while (metrics.tpmHead < tokens.length && tokens[metrics.tpmHead].at <= cutoff) {
+      metrics.tpmSum -= tokens[metrics.tpmHead].tokens;
+      metrics.tpmHead += 1;
+    }
+    if (metrics.tpmHead >= 64 && metrics.tpmHead * 2 >= tokens.length) {
+      tokens.splice(0, metrics.tpmHead);
+      metrics.tpmHead = 0;
     }
   }
 
@@ -721,13 +741,13 @@ export class ProviderPool {
   private tpmUnblockTime(provider: string, cap: number): number | undefined {
     const metrics = this.providerMetricsFor(provider);
     this.pruneTpm(metrics);
-    const sum = metrics.tpmTokens.reduce((total, entry) => total + entry.tokens, 0);
-    if (sum < cap) return undefined;
+    if (metrics.tpmSum < cap) return undefined;
     // Tokens are pushed in timestamp order. Removing the k oldest tokens
     // (running -= tokens[k]) brings the sum under cap exactly when token k
     // exits the window.
-    let running = sum;
-    for (const entry of metrics.tpmTokens) {
+    let running = metrics.tpmSum;
+    for (let i = metrics.tpmHead; i < metrics.tpmTokens.length; i++) {
+      const entry = metrics.tpmTokens[i];
       running -= entry.tokens;
       if (running < cap) return entry.at + this.config.defaultTpmWindowMs;
     }
@@ -805,7 +825,7 @@ export class ProviderPool {
   private providerMetricsFor(provider: string): ProviderMetrics {
     let metrics = this.providerMetrics.get(provider);
     if (!metrics) {
-      metrics = { cooldownUntil: 0, tpmTokens: [] };
+      metrics = { cooldownUntil: 0, tpmTokens: [], tpmSum: 0, tpmHead: 0 };
       this.providerMetrics.set(provider, metrics);
     }
     return metrics;

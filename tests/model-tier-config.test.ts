@@ -562,6 +562,51 @@ describe("model-tier-config", () => {
     });
   });
 
+  describe("createMemoizedLoadModelTierConfig", () => {
+    it("reads the file once and serves the cached value across calls", async () => {
+      const { createMemoizedLoadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-memo-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      const config = { tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5" } };
+      writeFileSync(cfgPath, JSON.stringify(config), "utf-8");
+      const load = createMemoizedLoadModelTierConfig(cfgPath);
+      const first = load();
+      const second = load();
+      const third = load();
+      assert.deepEqual(first, config);
+      assert.deepEqual(second, config);
+      assert.deepEqual(third, config);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("re-reads when the file's mtime/size changes and serves the new value", async () => {
+      const { createMemoizedLoadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-memo-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      writeFileSync(cfgPath, '{"tiers": {"small": "gpt-4.1-mini"}}', "utf-8");
+      const load = createMemoizedLoadModelTierConfig(cfgPath);
+      assert.deepEqual(load(), { tiers: { small: "gpt-4.1-mini" } });
+      // Same bytes, same value — still cached, no error.
+      assert.deepEqual(load(), { tiers: { small: "gpt-4.1-mini" } });
+      // Changed content → mtime/size differ → the memo must refresh.
+      writeFileSync(cfgPath, '{"tiers": {"small": "gpt-5", "big": "gpt-6"}}', "utf-8");
+      assert.deepEqual(load(), { tiers: { small: "gpt-5", big: "gpt-6" } });
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("mirrors loadModelTierConfig's null for a missing file, and observes a file that appears later", async () => {
+      const { createMemoizedLoadModelTierConfig } = await loadModule();
+      const tmpDir = mkdtempSync(join(tmpdir(), "mtc-memo-"));
+      const cfgPath = join(tmpDir, "model-tiers.json");
+      const load = createMemoizedLoadModelTierConfig(cfgPath);
+      assert.equal(load(), null, "no file → null, like the raw loader");
+      assert.equal(load(), null, "still no file → still null");
+      writeFileSync(cfgPath, '{"tiers": {"small": "gpt-4.1-mini"}}', "utf-8");
+      assert.deepEqual(load(), { tiers: { small: "gpt-4.1-mini" } }, "file appearing mid-run is observed");
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+  });
+
   describe("sortedTierNames", () => {
     it("returns names sorted: small < medium < big", async () => {
       const { sortedTierNames } = await loadModule();

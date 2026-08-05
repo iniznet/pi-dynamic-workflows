@@ -22,7 +22,7 @@ export const TIER_INHERIT_MAIN = "inherit:main";
  * concrete provider/model id.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { listAvailableModels } from "./agent.js";
@@ -289,6 +289,48 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
   } catch {
     return null;
   }
+}
+
+/**
+ * Per-run memoized wrapper around `loadModelTierConfig`, used by the
+ * resume-replay identity hash (workflow.ts) which resolves the tier→model
+ * signature on EVERY agent() call — the raw loader pays existsSync +
+ * readFileSync + JSON.parse per call, i.e. up to 1000 blocking sync reads per
+ * run. This wrapper keeps ONE parsed copy per run: each call is a single cheap
+ * statSync; the file is re-read+parsed only when its mtime/size changed.
+ *
+ * The config file is run-frozen by design, but the mtime/size guard keeps a
+ * LONG (multi-hour interactive) run honest if the user edits the file
+ * mid-run, while staying far cheaper than re-parsing on every call. Scope is
+ * exactly one run: callers (workflow-manager, workflow.ts) create it at run
+ * start, so two runs get two independent memos and a config change between
+ * runs is always observed fresh. Mirrors the per-instance memoization
+ * precedent in WorkflowAgent.loadTierConfig (agent.ts), extended with the
+ * stat guard.
+ */
+export function createMemoizedLoadModelTierConfig(configPath?: string): () => ModelTierConfig | null {
+  const path = configPath ?? getModelTierConfigPath();
+  let cached: { mtimeMs: number; size: number; value: ModelTierConfig | null } | undefined;
+  return () => {
+    let mtimeMs = -1;
+    let size = -1;
+    try {
+      const stat = statSync(path);
+      mtimeMs = stat.mtimeMs;
+      size = stat.size;
+    } catch {
+      // File absent/unreadable: drop any stale cache so a file that appears
+      // mid-run is observed, then mirror loadModelTierConfig's null result.
+      cached = undefined;
+      return null;
+    }
+    if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+      return cached.value;
+    }
+    const value = loadModelTierConfig(path);
+    cached = { mtimeMs, size, value };
+    return value;
+  };
 }
 
 /**

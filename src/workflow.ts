@@ -26,10 +26,10 @@ import {
 } from "./config.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
-import { createWorkflowLogger } from "./logger.js";
+import { createWorkflowLogger, pushBoundedLog } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
 import { providerFromCanonicalSpec } from "./model-spec.js";
-import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import { createMemoizedLoadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
@@ -808,6 +808,14 @@ export async function runWorkflow<T = unknown>(
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
   const agentRegistry = options.agentRegistry ?? loadAgentRegistry(baseCwd);
+  // Per-run memoized model-tiers loader for the resume-replay identity hash:
+  // resolveRoutingModelSignature reads the config on EVERY agent() call, so
+  // the raw disk loader (existsSync + readFileSync + JSON.parse) would block
+  // the event loop up to 1000x/run. Cache once per run (mtime/size-guarded,
+  // see createMemoizedLoadModelTierConfig); the file is run-frozen by design.
+  // A caller-provided loader (tests, workflow-manager's per-run memo) always
+  // wins. Nested workflow() frames inherit the same memo via the spread below.
+  const loadTierConfig = options.loadTierConfig ?? createMemoizedLoadModelTierConfig();
 
   // Initialize logger
   const logger = createWorkflowLogger({
@@ -929,7 +937,10 @@ export async function runWorkflow<T = unknown>(
 
   const log = (message: string) => {
     const text = String(message);
-    state.logs.push(text);
+    // Bounded like the logger's own ring (see pushBoundedLog): a run can emit
+    // tens of thousands of lines, and state.logs is returned in full in the
+    // run result — an unbounded array would leak memory per long run.
+    pushBoundedLog(state.logs, text);
     logger.log(text);
   };
 
@@ -1175,7 +1186,7 @@ export async function runWorkflow<T = unknown>(
       agentDef,
       modelSpec,
       options.mainModel,
-      options.loadTierConfig ?? loadModelTierConfig,
+      loadTierConfig,
     );
     const callHash = hashAgentCall(
       prompt,
@@ -1851,6 +1862,9 @@ export async function runWorkflow<T = unknown>(
       const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
       const child = await runWorkflow(childScript, {
         ...options,
+        // Share the parent frame's per-run tier-config memo so the whole run
+        // tree reads+parses model-tiers.json at most once.
+        loadTierConfig,
         args: childArgs,
         sharedRuntime: shared,
         // Propagate the parent's store so nested agents share the same key-value space.
