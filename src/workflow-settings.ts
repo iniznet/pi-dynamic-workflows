@@ -114,6 +114,20 @@ export interface WorkflowSettings {
    * and subagentChromeTools.
    */
   subagentExtensionTools?: "off" | "on" | ExtensionToolSourceId[];
+  /**
+   * Damage-control tools for subagents (design: tasks/damage-control-recovery/
+   * DESIGN.md §6): the `workflow_damage_control` toolset (list/status/agents/
+   * pause/resume/stop/kill-agent/recover/clean) exposed to workflow subagents.
+   * "off" (default) keeps the supplier undefined — no defs anywhere, zero
+   * cost; "readonly" gives subagents the inspection verbs only (list/status/
+   * agents/clean); "on" gives the full verb set. The tool name
+   * `workflow_damage_control` can always be denied via settings.excludeSubagentTools.
+   * Deliberately NOT part of subagentExtensionTools: that setting grants
+   * web/docs research tools, while damage control is kill/pause/recover power
+   * over the active workflow — a separate, explicit gate (chrome-tools
+   * precedent).
+   */
+  subagentDamageControlTools?: "off" | "readonly" | "on";
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -161,6 +175,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // same style as subagentTools. normalizeSettings accepts only the exact
   // literal "on"/"off" and drops other strings.
   subagentExtensionTools: ["string", "array"],
+  // Same lenient drop-on-violation style as subagentChromeTools: any string
+  // passes the type schema; normalizeSettings accepts only "off"/"readonly"/"on"
+  // and drops anything else (default off = no defs anywhere).
+  subagentDamageControlTools: ["string"],
 };
 
 /**
@@ -372,6 +390,13 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (raw.subagentChromeTools === "on" || raw.subagentChromeTools === "off") {
     settings.subagentChromeTools = raw.subagentChromeTools;
+  }
+  if (
+    raw.subagentDamageControlTools === "off" ||
+    raw.subagentDamageControlTools === "readonly" ||
+    raw.subagentDamageControlTools === "on"
+  ) {
+    settings.subagentDamageControlTools = raw.subagentDamageControlTools;
   }
   if (raw.subagentExtensionTools === "on" || raw.subagentExtensionTools === "off") {
     settings.subagentExtensionTools = raw.subagentExtensionTools;

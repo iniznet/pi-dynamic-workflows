@@ -55,6 +55,16 @@ export interface SubagentToolsAssemblerOptions {
    * (no defs anywhere, mirroring the chrome gate).
    */
   extensionTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  /**
+   * Damage-control tool defs (damage-control-recovery DESIGN.md §6): the
+   * `workflow_damage_control` def, closed over the live WorkflowManager.
+   * Resolved lazily per assemble(); the supplier is undefined when the
+   * setting is off (no defs anywhere, mirroring the chrome/extension gates).
+   * A dedicated slot instead of the extension-tools capture pipeline because
+   * capture binds static entry defs — damage control must act on the CURRENT
+   * ACTIVE run, so its def needs the live manager.
+   */
+  damageControlTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   /** Extra tool names to deny (wired from settings.excludeSubagentTools). */
   excludeTools?: string[];
 }
@@ -84,12 +94,22 @@ function filterExtensionTools(defs: ToolDefinition[], excludeTools: string[]): T
   return defs.filter((def) => !isExcludedHostTool(def.name, excludeTools));
 }
 
+/**
+ * Damage-control defs minus the always-denied/excluded names. The supplier is
+ * the setting gate (off → undefined → no defs); this only strips user-denied
+ * tool names, so `excludeSubagentTools` can always veto workflow_damage_control.
+ */
+function filterDamageControlTools(defs: ToolDefinition[], excludeTools: string[]): ToolDefinition[] {
+  return defs.filter((def) => !isExcludedHostTool(def.name, excludeTools));
+}
+
 export class SubagentToolsAssembler {
   private readonly mode: SubagentToolsMode;
   private readonly hostTools: () => Promise<ToolDefinition[]> | ToolDefinition[];
   private readonly mcpTools: McpToolsManager;
   private readonly chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private readonly extensionTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  private readonly damageControlTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private readonly excludeTools: string[];
 
   constructor(options: SubagentToolsAssemblerOptions) {
@@ -98,27 +118,32 @@ export class SubagentToolsAssembler {
     this.mcpTools = options.mcpTools;
     this.chromeTools = options.chromeTools;
     this.extensionTools = options.extensionTools;
+    this.damageControlTools = options.damageControlTools;
     this.excludeTools = options.excludeTools ?? [];
   }
 
   /**
    * The merged default toolset for untagged runs: host bundle + MCP tools
    * (mode-filtered) + vendored chrome tools (auth-gated by the supplier) +
-   * captured extension tools (setting-gated by the supplier). Never throws —
-   * MCP failures degrade to host-only tools.
+   * captured extension tools (setting-gated by the supplier) + damage-control
+   * tools (setting-gated by the supplier). Never throws — MCP failures
+   * degrade to host-only tools, and suppliers are expected to swallow their
+   * own failures (the damage-control supplier yields [] on a missing module).
    */
   async assemble(): Promise<ToolDefinition[]> {
-    const [host, mcp, chrome, extension] = await Promise.all([
+    const [host, mcp, chrome, extension, damageControl] = await Promise.all([
       this.hostTools(),
       this.mcpTools.listSubagentTools(),
       this.chromeTools?.() ?? [],
       this.extensionTools?.() ?? [],
+      this.damageControlTools?.() ?? [],
     ]);
     const merged = [
       ...host,
       ...filterMcpTools(mcp, this.mode, this.excludeTools),
       ...filterChromeTools(chrome, this.excludeTools),
       ...filterExtensionTools(extension, this.excludeTools),
+      ...filterDamageControlTools(damageControl, this.excludeTools),
     ];
     // First-wins dedupe by name across every source (defensive: no collision
     // among current sources, but a future supplier could overlap).
@@ -163,5 +188,16 @@ export class SubagentToolsAssembler {
   async extensionToolsOnly(): Promise<ToolDefinition[]> {
     const extension = (await this.extensionTools?.()) ?? [];
     return filterExtensionTools(extension, this.excludeTools);
+  }
+
+  /**
+   * Damage-control tools only (the "damage-control-tools" named toolset).
+   * Resolved per call so it reflects the CURRENT setting gate — with the
+   * supplier undefined (setting off) this resolves to [] (script intent
+   * recorded, no tools).
+   */
+  async damageControlToolsOnly(): Promise<ToolDefinition[]> {
+    const damageControl = (await this.damageControlTools?.()) ?? [];
+    return filterDamageControlTools(damageControl, this.excludeTools);
   }
 }

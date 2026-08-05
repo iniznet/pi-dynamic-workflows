@@ -211,6 +211,16 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     defaultDisplay: "off",
     envVar: WORKFLOW_ENV_VARS.subagentExtensionTools,
   },
+  {
+    key: "subagentDamageControlTools",
+    type: "enum",
+    label: "Subagent damage control tools",
+    help: "workflow_damage_control for subagents: off (default, no defs anywhere), readonly (inspection verbs only — list/status/agents/clean), or on (full verb set: pause/resume/stop/kill-agent/recover). Deniable per-run via settings.excludeSubagentTools. A separate gate from subagentExtensionTools — kill/pause/recover power is not research-tool access.",
+    options: ["off", "readonly", "on"],
+    group: "Advanced",
+    defaultDisplay: "off",
+    envVar: WORKFLOW_ENV_VARS.subagentDamageControlTools,
+  },
 ];
 
 /** The four groups in render order, derived from the registry so they can never drift. */

@@ -54,6 +54,35 @@ import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler
 import { createVendoredChromeTools } from "../src/subagent/vendored-chrome-tools.js";
 import { guardWorktreeWriteConflicts } from "../src/workflow-status.js";
 
+/**
+ * Lazy handle for the damage-control tool factory (design:
+ * tasks/damage-control-recovery/DESIGN.md §3.1/§6.2). Loaded at module scope
+ * via a variable-specifier dynamic import so a missing/failed module disables
+ * JUST the workflow_damage_control tool with a diagnostic (H4) instead of
+ * failing the whole extension at import time — the same lazy-peer boundary
+ * workflow-control-tool.ts uses for typebox. The declared surface is the
+ * slice-B-relevant subset of the module's public contract (the factory's
+ * ToolDefinition is widened to the registerToolSafely surface type).
+ */
+interface WorkflowDamageControlModule {
+  createWorkflowDamageControlTool(options: {
+    manager: WorkflowManager;
+    cwd?: string;
+    capabilities?: "readonly" | "full";
+  }): ToolDefinition<any, any, any>;
+}
+
+const DAMAGE_CONTROL_MODULE_SPECIFIER = "../src/workflow-damage-control.js";
+let createWorkflowDamageControlTool: WorkflowDamageControlModule["createWorkflowDamageControlTool"] | undefined;
+try {
+  const damageControlModule = (await import(DAMAGE_CONTROL_MODULE_SPECIFIER)) as WorkflowDamageControlModule;
+  createWorkflowDamageControlTool = damageControlModule.createWorkflowDamageControlTool;
+} catch {
+  // Deferred: registerToolSafely reports the diagnostic; the subagent supplier
+  // yields no defs. This branch only runs if the module is missing or fails to
+  // evaluate — a first-party module, so never in practice.
+}
+
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and /workflows command. Pi loads
   // a fresh extension factory for /reload, so explicitly claim the old live
@@ -173,6 +202,31 @@ export default function extension(pi: ExtensionAPI) {
   // anywhere, including the "extension-tools" toolset.
   const extensionToolsMode = settings.subagentExtensionTools ?? "off";
   const extensionToolsSupplier = createExtensionToolsSupplier(extensionToolsMode);
+  // SUBAGENT DAMAGE-CONTROL TOOLS: the workflow_damage_control toolset
+  // (design: tasks/damage-control-recovery/DESIGN.md §6). Gated by
+  // `subagentDamageControlTools` exactly like chrome/extension: "off" →
+  // undefined supplier → NO defs anywhere, including the
+  // "damage-control-tools" named toolset (zero cost, lazy guarantee intact).
+  // "readonly" gives subagents the inspection verbs only (list/status/agents/
+  // clean); "on" gives the full verb set. The def closes over the LIVE manager
+  // created below, so subagent calls act on the CURRENT ACTIVE run — which is
+  // why this cannot ride the extension-tools capture pipeline (capture binds
+  // static entry defs, not a live manager). A missing module (H4) yields no
+  // defs and never throws out of assemble().
+  const damageControlMode = settings.subagentDamageControlTools ?? "off";
+  const damageControlSupplier =
+    damageControlMode === "off"
+      ? undefined
+      : () => {
+          if (!createWorkflowDamageControlTool) return Promise.resolve([]);
+          return Promise.resolve([
+            createWorkflowDamageControlTool({
+              manager,
+              cwd,
+              capabilities: damageControlMode === "readonly" ? "readonly" : "full",
+            }),
+          ]);
+        };
   const subagentToolsAssembler = new SubagentToolsAssembler({
     mode: settings.subagentTools ?? "all",
     // The host bundle baseline (coding + proxied host + web tools) is owned by
@@ -181,6 +235,7 @@ export default function extension(pi: ExtensionAPI) {
     mcpTools: mcpToolsManager,
     chromeTools: chromeToolsSupplier,
     extensionTools: extensionToolsSupplier,
+    damageControlTools: damageControlSupplier,
     excludeTools: settings.excludeSubagentTools,
   });
   const gatewayManagerOptions = {
@@ -210,6 +265,11 @@ export default function extension(pi: ExtensionAPI) {
       // mode, including "off". With subagentExtensionTools off the supplier
       // is undefined → [] (script intent recorded, no tools).
       "extension-tools": () => subagentToolsAssembler.extensionToolsOnly(),
+      // Damage-control-only toolset: the workflow_damage_control def
+      // (mode-gated: readonly/full capabilities). Works in every host-tools
+      // mode, including "off". With subagentDamageControlTools off the
+      // supplier is undefined → [] (script intent recorded, no tools).
+      "damage-control-tools": () => subagentToolsAssembler.damageControlToolsOnly(),
     },
   };
   // The gateway is created per extension generation; a /reload hands the old
@@ -398,6 +458,17 @@ export default function extension(pi: ExtensionAPI) {
         },
       }),
     "get_workflow_status tool",
+  );
+  // Audit: workflow_damage_control — the damage-control + recovery toolset
+  // (design: tasks/damage-control-recovery/DESIGN.md): list/status/agents/
+  // pause/resume/stop/kill-agent/recover/clean with session-scoped mutating
+  // verbs, dry-run-default clean, and journal-prefix recovery. Registered
+  // through the same defensive registerToolSafely boundary as the tools above
+  // so a missing/failed module disables JUST this tool with a diagnostic (H4)
+  // — manager, storage, scheduler, and the slash-command surface keep working.
+  registerToolSafely(
+    () => (createWorkflowDamageControlTool ? createWorkflowDamageControlTool({ manager, cwd }) : undefined),
+    "workflow_damage_control tool",
   );
   // P2-1 WIRE: lazy gateway command — starts MCPBridge on demand only. Tool
   // definitions are built at start time so the extension load stays side-effect

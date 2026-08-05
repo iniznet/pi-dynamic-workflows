@@ -31,7 +31,7 @@ import type { WorkflowSettings } from "./workflow-settings.js";
 export type SubagentToolsMode = "all" | string[];
 
 /** Tool source classification shown in the listing. */
-export type SubagentToolSource = "builtin" | "proxied-host" | "web" | "mcp" | "chrome" | "extension";
+export type SubagentToolSource = "builtin" | "proxied-host" | "web" | "mcp" | "chrome" | "extension" | "damage-control";
 
 /** Tool allow status shown in the listing. */
 export type SubagentToolStatus =
@@ -72,6 +72,8 @@ export interface SubagentToolsListingInput {
   extensionToolsMode: "off" | "on" | ExtensionToolSourceId[];
   /** Per-source capture results (disabled sources report "not-enabled"). */
   extensionToolSources: CapturedSourceResult[];
+  /** Effective subagentDamageControlTools mode ("off" default | "readonly" | "on"). Optional so pre-existing call sites (and the command tests' listing() helper) keep compiling — the renderer treats an absent value as "off". */
+  damageControlMode?: "off" | "readonly" | "on";
 }
 
 /** The executable coding builtins (createCodingTools) — host-bundle sources. */
@@ -109,6 +111,7 @@ const HOST_SOURCE_NAMES = new Set([...BUILTIN_HOST_TOOLS, ...BUILTIN_READONLY_TO
 
 /** Classify an assembled tool's source by its name. */
 export function classifyToolSource(name: string): SubagentToolSource {
+  if (name === "workflow_damage_control") return "damage-control";
   if (name.startsWith("mcp_")) return "mcp";
   if (CHROME_TOOLS.has(name)) return "chrome";
   if (WEB_TOOLS.has(name)) return "web";
@@ -129,6 +132,7 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
   for (const name of input.assembledToolNames) {
     const isMcp = name.startsWith("mcp_");
     const isChrome = CHROME_TOOLS.has(name);
+    const isDamageControl = name === "workflow_damage_control";
     rows.push({
       name,
       source: classifyToolSource(name),
@@ -140,7 +144,9 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
             ? "from mcp.json (subagentTools=all)"
             : isChrome
               ? "vendored chrome defs (subagentChromeTools=on)"
-              : undefined,
+              : isDamageControl
+                ? "workflow_damage_control defs (subagentDamageControlTools=readonly/on)"
+                : undefined,
     });
   }
 
@@ -181,6 +187,20 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
           input.chromeToolsMode === "off"
             ? "subagentChromeTools is off — set settings.subagentChromeTools=on to expose vendored chrome tools"
             : "no active /chrome authorize grant — chrome tools attach once the host session authorizes",
+      });
+    } else if (info.name === "workflow_damage_control") {
+      // A damage-control host tool not in the assembled set: the setting is
+      // off (default — no defs anywhere, lazy guarantee) or the name was
+      // excluded from this run's toolset. Mirror the chrome branch: a
+      // recoverable state, reported truthfully, never metadata-only.
+      rows.push({
+        name: info.name,
+        source: "damage-control",
+        status: "available-if-enabled",
+        note:
+          (input.damageControlMode ?? "off") === "off"
+            ? "subagentDamageControlTools is off — set settings.subagentDamageControlTools=readonly (inspection verbs only) or on (full verb set) to expose workflow_damage_control"
+            : "workflow_damage_control defs hidden from this run's toolset (settings.excludeSubagentTools or dedupe)",
       });
     } else if (EXPECTED_EXTENSION_TOOL_NAMES.has(info.name)) {
       // A host-registered extension tool (supi-web / pi-codegraph) not in the
@@ -272,6 +292,10 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
   lines.push(
     `- Extension tools: **${renderExtensionToolsMode(input.extensionToolsMode)}** (${input.extensionToolsMode === "off" ? "captured defs hidden — set settings.subagentExtensionTools=on to capture supi-web + pi-codegraph tools" : "captured in-process from installed sources; per-source status below"})`,
   );
+  const damageControlMode = input.damageControlMode ?? "off";
+  lines.push(
+    `- Damage control tools: **${damageControlMode}** (${damageControlMode === "off" ? "workflow_damage_control defs hidden — set settings.subagentDamageControlTools=readonly (inspection verbs only) or on (full verb set) to expose them" : damageControlMode === "readonly" ? "readonly — subagents get inspection verbs only (list/status/agents/clean); mutating verbs return a capability error" : "on — subagents get the full verb set (pause/resume/stop/kill-agent/recover)"})`,
+  );
   const alwaysDenied = DEFAULT_EXCLUDED_SUBAGENT_TOOLS.join(", ");
   const deniedSettings =
     input.excludeTools.length > 0 ? `; settings.excludeSubagentTools: ${input.excludeTools.join(", ")}` : "";
@@ -351,6 +375,7 @@ export function registerWorkflowSubagentToolsCommand(
         chromeGranted: options.getChromeGranted(),
         extensionToolsMode: settings.subagentExtensionTools ?? "off",
         extensionToolSources,
+        damageControlMode: settings.subagentDamageControlTools ?? "off",
       });
       // fallback: a host without sendMessage still surfaces the rows via the
       // notify channel; ctx.cwd keeps the listing project-scoped.

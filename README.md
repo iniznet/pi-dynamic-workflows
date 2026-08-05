@@ -222,6 +222,12 @@ The `web_fetch_md`/`web_docs_*` tools from the supi-web extension and the `codeg
 
 Opt in with `"subagentExtensionTools": "on"` in `settings.json` (or `PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS=on`); an allowlist form (`["supi-web"]` / `["pi-codegraph"]`) limits capture to the listed sources. The default is `off` (no captured defs anywhere). Two sources are supported today — supi-web (`web_fetch_md`, `web_docs_search`, `web_docs_fetch`) and pi-codegraph (8 × `codegraph_*`) — with a per-source expected-name allowlist that filters anything unexpected. Sources whose executors are host-coupled to main-session state (rpiv-todo's todo store, pi-vcc's session-file search) are intentionally **not** captured. A script can request the captured set alone with `toolset: "extension-tools"` (setting-gated like the default merge). `/workflows-subagent-tools` lists each extension tool's true status: `allowed` when assembled, `available-if-enabled` with the exact recovery step (setting off / source allowlisted out), or `unavailable` with the source's one-line failure.
 
+### Subagent damage-control tools
+
+`workflow_damage_control` (the damage-control + recovery toolset: `list` / `status` / `agents` / `pause` / `resume` / `stop` / `kill-agent` / `recover` / `clean`) is registered on the host for the main agent and can additionally be handed to workflow subagents through a dedicated gate — deliberately **separate** from `subagentExtensionTools`, because damage control is kill/pause/recover power over the active workflow, not research-tool access (the same privilege-separation precedent as chrome tools).
+
+Opt in with `"subagentDamageControlTools": "readonly"` (inspection verbs only: `list`/`status`/`agents`/`clean`; mutating verbs return a capability error) or `"on"` (full verb set) in `settings.json` (or `PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS=readonly` / `=on`). The default is `off` (no defs anywhere — the supplier stays undefined, zero runtime cost, lazy guarantee intact). The tool name `workflow_damage_control` can always be denied per-run via `excludeSubagentTools`. Because the def closes over the live `WorkflowManager`, subagent calls act on the **current active workflow**; mutating verbs stay session-scoped and `clean` stays dry-run by default. A script can request the set alone with `toolset: "damage-control-tools"` (setting-gated like the chrome/extension toolsets). `/workflows-subagent-tools` lists the tool's true status: `allowed` when assembled, or `available-if-enabled` with the exact recovery step (setting off).
+
 Agent details use a compact summary by default: completed agents show their final result, while active agents show the prompt and two latest history events. Press `enter` to open the full syntax-highlighted pager. In the pager, use `j/k` or `↑/↓` for lines, `PgUp/PgDn` for pages, `g/G` for the ends, and `t` to toggle live tail mode.
 
 The detailed panel adds a live per-run `~$/s` estimate (output price × token rate), a spend-vs-budget bar when `tokenBudget` is set, and a session-aggregate 'estimated spend across N active runs' line. The `/workflows status` final snapshot reports the truthful state — 'Workflow failed' / 'Workflow stopped' / 'Workflow paused (resumable)' — never a generic 'completed'. Navigator delete/stop/overwrite actions confirm via `ui.confirm`.
@@ -395,6 +401,7 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `subagentTools` | `PI_WORKFLOW_SUBAGENT_TOOLS` | `all` (default) / comma-separated `mcp_*` allowlist / empty = none |
 | `subagentChromeTools` | `PI_WORKFLOW_SUBAGENT_CHROME_TOOLS` | `off` (default) / `on` |
 | `subagentExtensionTools` | `PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS` | `off` (default) / `on` / source allowlist (e.g. `["supi-web"]`) |
+| `subagentDamageControlTools` | `PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS` | `off` (default) / `readonly` / `on` |
 
 Unparseable, out-of-range, or unknown values are silently ignored (the same leniency the settings-file normalization applies), so a misconfigured CI env can never crash the extension — it just falls back to the file value. Example:
 

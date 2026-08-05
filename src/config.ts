@@ -103,6 +103,7 @@ export const WORKFLOW_ENV_VARS = {
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
   subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
   subagentExtensionTools: "PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS",
+  subagentDamageControlTools: "PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS",
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -200,6 +201,14 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   const subagentChromeTools = env[WORKFLOW_ENV_VARS.subagentChromeTools]?.trim();
   if (subagentChromeTools === "on" || subagentChromeTools === "off") {
     settings.subagentChromeTools = subagentChromeTools;
+  }
+  const subagentDamageControlTools = env[WORKFLOW_ENV_VARS.subagentDamageControlTools]?.trim();
+  if (
+    subagentDamageControlTools === "off" ||
+    subagentDamageControlTools === "readonly" ||
+    subagentDamageControlTools === "on"
+  ) {
+    settings.subagentDamageControlTools = subagentDamageControlTools;
   }
   const subagentExtensionTools = env[WORKFLOW_ENV_VARS.subagentExtensionTools]?.trim();
   if (subagentExtensionTools === "on" || subagentExtensionTools === "off") {
