@@ -50,7 +50,7 @@ const FINAL_EVENT_STATUS: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | clean | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list | ui] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | clean | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -341,10 +341,15 @@ export function registerWorkflowCommands(
           }
           const runs = manager.listRuns();
           if (!runs.length) {
-            await print("No workflow runs yet. Start one with a background workflow (background: true).");
+            // F54a: plain language, no tool-schema syntax (background: true).
+            await print("No workflow runs yet. Start one with /workflows run <prompt> or mention 'workflow'.");
             return;
           }
-          await print(["Workflow runs:", ...runs.map(summarizeRun), "", USAGE].join("\n"));
+          // F53: the bare `/workflows` command (no args) carries the usage line;
+          // an explicit `list` prints just the runs — no 11-verb block every time.
+          const listLines = ["Workflow runs:", ...runs.map(summarizeRun)];
+          if (parts.length === 0) listLines.push("", USAGE);
+          await print(listLines.join("\n"));
           return;
         }
         case "watch":

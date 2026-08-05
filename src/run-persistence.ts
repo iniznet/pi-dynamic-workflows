@@ -28,7 +28,7 @@ export interface PersistedAgentState {
   label: string;
   phase?: string;
   prompt: string;
-  status: "queued" | "running" | "done" | "error" | "skipped";
+  status: "running" | "done" | "error" | "skipped";
   result?: unknown;
   /** Compact result written by releases before full agent results were retained. */
   resultPreview?: string;

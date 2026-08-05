@@ -33,7 +33,9 @@ import { createMemoizedLoadModelTierConfig, type ModelTierConfig, resolveTierMod
 import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
+import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import { safeSetTimeout } from "./timing.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from "./worktree.js";
@@ -233,7 +235,7 @@ export type WorkflowRuntimeEvent =
   | { type: "control-attempt"; helper: "retry" | "gate"; attempt: number; accepted: boolean };
 
 /** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
-export interface WorkflowAgentRunner {
+interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
   /**
    * Optional teardown the workflow layer calls when the top-level run frame
@@ -562,7 +564,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
-export interface CheckpointOptions {
+interface CheckpointOptions {
   /** Reply used when no UI is available (headless/background) and headless != "abort". */
   default?: unknown;
   /** Headless behavior: "default" (take `default`/true) or "abort" (throw). Default "default". */
@@ -1210,7 +1212,7 @@ export async function runWorkflow<T = unknown>(
     // identity model). Composing the run's own runId (unique per top-level
     // run AND per nested run, see `${runId}-nested${++shared.nestedCallSeq}`
     // below) with callIndex makes the key unique across the whole store.
-    const deltaKey = `${runId}:${callIndex}`;
+    const deltaKey = journalEntryKey(runId, callIndex);
 
     // Reserve the agent slot synchronously — atomic with the limit/budget gate
     // above (no await in between) — so a parallel() fan-out can't all observe the
@@ -1491,7 +1493,7 @@ export async function runWorkflow<T = unknown>(
               handoff: chainHandoff,
               onSwap: (info) => {
                 log(
-                  `first-edit swap: execution mode on session ${info.sessionId} ` +
+                  `${info.reason} swap: execution mode on session ${info.sessionId} ` +
                     `(${info.fromModel ?? "?"} → ${info.toModel ?? "?"})`,
                 );
               },
@@ -2525,7 +2527,7 @@ export async function runWorkflow<T = unknown>(
     const callIndex = state.callSeq++;
     const callHash = hashCheckpoint(promptText, checkpointOptions);
     // Namespaced by runId like agent()'s deltaKey — see JournalEntry.runId.
-    const journalKey = `${runId}:${callIndex}`;
+    const journalKey = journalEntryKey(runId, callIndex);
     const cached = options.resumeJournal?.get(journalKey);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
@@ -3223,7 +3225,7 @@ function normalizeRetryBackoffMs(value: unknown): number {
  * capped at 8× base so a long retry chain never stalls the run. Pure function
  * so the schedule is unit-testable without timers.
  */
-export function retryBackoffDelayMs(baseMs: number, attempt: number): number {
+function retryBackoffDelayMs(baseMs: number, attempt: number): number {
   return Math.min(baseMs * 2 ** (attempt - 1), baseMs * 8);
 }
 
@@ -3243,10 +3245,10 @@ function backoffSleep(ms: number, signals: ReadonlyArray<AbortSignal | undefined
       for (const s of signals) s?.removeEventListener("abort", finish);
       resolve();
     };
-    const timer = setTimeout(finish, ms);
+    const timer = safeSetTimeout(finish, ms).unref();
     for (const s of signals) {
       if (s?.aborted) {
-        clearTimeout(timer);
+        timer.clear();
         finish();
         return;
       }

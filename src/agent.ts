@@ -22,7 +22,7 @@ import { applyToolPolicy } from "./agent-registry.js";
 import {
   classifyContextOverflow,
   classifyProviderLimit,
-  classifyProviderUnavailable,
+  providerUnavailableWorkflowError,
   WorkflowError,
   WorkflowErrorCode,
 } from "./errors.js";
@@ -142,7 +142,8 @@ export function throwIfContextOverflow(messages: unknown[], label?: string): voi
 /**
  * Detect a provider outage/overload (5xx) recorded as an assistant message with
  * stopReason "error" (the SDK buries it, exactly like usage limits/overflow).
- * Mirrors wrapError's thrown-error classification: 503/504/529 pause the run
+ * Shares the pause/retry construction with wrapError's thrown-error path via
+ * providerUnavailableWorkflowError (F24): 503/504/529 pause the run
  * (PROVIDER_OVERLOADED, recoverable:false) so it checkpoints and resumes after
  * the endpoint recovers; 500/502 are recoverable (PROVIDER_UNAVAILABLE) so the
  * attempt is retried with backoff before the run fails resumable.
@@ -150,19 +151,8 @@ export function throwIfContextOverflow(messages: unknown[], label?: string): voi
 export function throwIfProviderUnavailable(messages: unknown[], label?: string): void {
   const err = lastAssistantError(messages);
   if (err?.stopReason !== "error") return;
-  const cls = classifyProviderUnavailable(err.errorMessage);
-  if (cls === "pause") {
-    throw new WorkflowError(err.errorMessage ?? "Provider overloaded", WorkflowErrorCode.PROVIDER_OVERLOADED, {
-      recoverable: false,
-      agentLabel: label,
-    });
-  }
-  if (cls === "retry") {
-    throw new WorkflowError(err.errorMessage ?? "Provider unavailable", WorkflowErrorCode.PROVIDER_UNAVAILABLE, {
-      recoverable: true,
-      agentLabel: label,
-    });
-  }
+  const unavailable = providerUnavailableWorkflowError(err.errorMessage, label);
+  if (unavailable) throw unavailable;
 }
 
 /**
@@ -211,7 +201,7 @@ export function finalAssistantTextOf(messages: unknown[]): string {
  * throw BEFORE the same-session nudge (#135) — the nudge cannot produce more
  * output than the ceiling that just truncated.
  */
-export function throwIfTruncatedOutput(messages: unknown[], label?: string): void {
+function throwIfTruncatedOutput(messages: unknown[], label?: string): void {
   const err = lastAssistantError(messages);
   if (err?.stopReason !== "length") return;
   if (finalAssistantTextOf(messages).trim()) return;
@@ -892,10 +882,10 @@ export function subagentExcludedTools(extra?: string[], sessionExclude?: string[
  * the first such call, then the gate opens and execution mode (model swap +
  * planning-context pruning) begins.
  */
-export const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write"]);
+const FILE_EDIT_TOOL_NAMES = new Set(["edit", "write"]);
 
 /** Default swap-gate trigger predicate: any file-mutating coding tool call. */
-export function isFileEditTool(toolName: string): boolean {
+function isFileEditTool(toolName: string): boolean {
   return FILE_EDIT_TOOL_NAMES.has(toolName);
 }
 
@@ -914,7 +904,7 @@ const PLANNING_GUIDANCE =
  * string for an operation trace's `outcome` field. Never includes raw file
  * contents or secrets — only a truncated text snippet from the tool result.
  */
-export function summarizeToolError(result: unknown): string {
+function summarizeToolError(result: unknown): string {
   if (!result || typeof result !== "object") return String(result ?? "unknown tool error").slice(0, 200);
   const content = (result as { content?: Array<{ type?: string; text?: string }> }).content;
   if (!Array.isArray(content)) return "tool error";

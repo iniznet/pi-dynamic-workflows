@@ -43,7 +43,7 @@ export interface BuiltinWorkflowInvocation {
   toolset?: string;
 }
 
-export interface BuiltinWorkflowDescriptor {
+interface BuiltinWorkflowDescriptor {
   /** Also the slash-command name (without the leading `/`). */
   name: string;
   description: string;

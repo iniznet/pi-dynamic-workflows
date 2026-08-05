@@ -219,7 +219,7 @@ test("registerBuiltinWorkflows creates handlers with expected structure", () => 
 
   const codeReviewCmd = commands.find((c) => c.name === "code-review");
   assert.ok(codeReviewCmd, "code-review should be registered");
-  assert.ok(codeReviewCmd.description?.includes("Multi-angle"), "should describe the multi-angle review");
+  assert.ok(codeReviewCmd.description?.includes("finders"), "should describe the parallel finders review");
   assert.equal(typeof codeReviewCmd.handler, "function");
 });
 

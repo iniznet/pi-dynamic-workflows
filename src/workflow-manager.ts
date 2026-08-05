@@ -43,7 +43,7 @@ import type { KillAgentResult } from "./workflow-damage-control.js";
 import { reconcileAgentAfterKill } from "./workflow-damage-control.js";
 import { gitExec, pruneWorktrees } from "./worktree.js";
 
-export interface ManagedRunBase {
+interface ManagedRunBase {
   runId: string;
   snapshot: WorkflowSnapshot;
   result?: WorkflowRunResult;

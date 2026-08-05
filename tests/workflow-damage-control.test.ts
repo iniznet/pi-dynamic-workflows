@@ -46,7 +46,7 @@ function run(overrides: Partial<PersistedRunState> = {}): PersistedRunState {
     currentPhase: "Inspect",
     agents: [
       { id: 1, label: "active", prompt: "a", status: "running", tokens: 30, callId: "dc-unit-1:0" },
-      { id: 2, label: "queued", prompt: "b", status: "queued" },
+      { id: 2, label: "spare", prompt: "b", status: "skipped" },
       {
         id: 3,
         label: "failed",
@@ -245,7 +245,7 @@ test("summarizeRunDeep folds phase, journal, checkpoints, lease, config, counts,
   assert.equal(summary.logs, 1, "live snapshot logs win over persisted");
   assert.equal(summary.resultPresent, false);
   // Counts come from the LIVE snapshot's agents when one is present.
-  assert.deepEqual(summary.counts, { total: 1, done: 0, running: 1, queued: 0, error: 0, skipped: 0 });
+  assert.deepEqual(summary.counts, { total: 1, done: 0, running: 1, error: 0, skipped: 0 });
   // tokenTotal = max(live fresh+cacheRead, persisted, agent aggregate)
   assert.ok(summary.tokenTotal >= 90, `tokenTotal=${summary.tokenTotal} should reflect the live breakdown`);
 });

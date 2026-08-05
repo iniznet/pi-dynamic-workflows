@@ -452,18 +452,24 @@ export function renderPanelDetailed(
       sessionCost += spentCost;
       sessionCostKnownRuns++;
     }
+    // Line 1: durable per-run facts (progress, phase, tokens, cost, budget bar).
+    // Line 2 (dim): live rates. The 7-segment cram pushed tok/s and ~$/s past
+    // fitLine's right-truncation on narrow overlays, so the rates get their own
+    // line where the truncation tail can no longer swallow the progress facts.
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
       fmtTokenSegment(runUsage, fmtTokensShort),
       spentCost !== undefined ? (finalizedCost !== undefined ? fmtCost(spentCost) : `~${fmtCost(spentCost)}`) : "",
-      rate > 0 ? `${Math.round(rate)} tok/s` : "",
-      cps !== undefined ? `~${fmtCost(cps)}/s` : "",
       formatBudgetBar(spentTokens, r.tokenBudget),
     ]
       .filter(Boolean)
       .join(" · ");
     out.push(`  ${icon} ${theme.bold(r.workflowName)}  ${dim(meta)}`);
+    const liveRates = [rate > 0 ? `${Math.round(rate)} tok/s` : "", cps !== undefined ? `~${fmtCost(cps)}/s` : ""]
+      .filter(Boolean)
+      .join(" · ");
+    if (liveRates) out.push(dim(`  ${liveRates}`));
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 

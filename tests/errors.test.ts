@@ -4,12 +4,36 @@ import {
   classifyContextOverflow,
   classifyProviderLimit,
   classifyProviderUnavailable,
+  formatErrorCode,
   isProviderOverloaded,
   isProviderUsageLimit,
   WorkflowError,
   WorkflowErrorCode,
   wrapError,
 } from "../src/errors.js";
+
+describe("formatErrorCode", () => {
+  it("names legacy numeric codes instead of printing the raw number", () => {
+    assert.equal(
+      formatErrorCode(WorkflowErrorCode.PHASE_TRANSITION_INVALID),
+      "PHASE_TRANSITION_INVALID (invalid phase transition)",
+    );
+    assert.equal(
+      formatErrorCode(WorkflowErrorCode.SUBAGENT_SPAWN_BLOCKED),
+      "SUBAGENT_SPAWN_BLOCKED (subagent spawn blocked)",
+    );
+    assert.equal(formatErrorCode(WorkflowErrorCode.APPROVAL_REQUIRED), "APPROVAL_REQUIRED (human approval required)");
+    assert.ok(
+      !formatErrorCode(WorkflowErrorCode.APPROVAL_REQUIRED).includes("-31003"),
+      "raw numeric value must not leak",
+    );
+  });
+
+  it("passes string members through unchanged (they already read as their names)", () => {
+    assert.equal(formatErrorCode(WorkflowErrorCode.AGENT_TIMEOUT), "AGENT_TIMEOUT");
+    assert.equal(formatErrorCode(WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED), "TOKEN_BUDGET_EXHAUSTED");
+  });
+});
 
 describe("classifyProviderLimit", () => {
   it("matches the documented provider usage/quota/rate-limit wordings", () => {

@@ -4,7 +4,7 @@ import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import type { WorkflowMeta } from "./workflow.js";
 
-export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
+export type WorkflowAgentStatus = "running" | "done" | "error" | "skipped";
 
 export interface WorkflowAgentSnapshot {
   id: number;
@@ -119,7 +119,7 @@ export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnap
  * "fresh". `fmt` adapts the number style per surface (compact in panels, full in
  * the print view).
  */
-export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number) => string): string {
+function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number) => string): string {
   const f = fmt(fresh) || "0";
   return cacheRead > 0 ? `${f} tok · ${fmt(cacheRead)} cached` : `${f} tok`;
 }
@@ -259,13 +259,12 @@ function agentTokenCell(agent: WorkflowAgentSnapshot, theme: ThemeLike): string 
   return segment ? theme.fg("dim", ` [${segment}]`) : "";
 }
 
-export function renderWorkflowLines(
-  snapshot: WorkflowSnapshot,
-  options: WorkflowDisplayOptions = {},
-  theme: ThemeLike = NO_THEME,
-): string[] {
-  const maxAgents = options.maxAgents ?? 8;
-  const showResultPreviews = options.showResultPreviews ?? false;
+/**
+ * "(X/Y done[, N running | , M errors] · tokens · cost)" — the count suffix
+ * shared by the widget header and the text/delivery header, so the merged
+ * delivery header (F51) never drifts from the widget's identity line.
+ */
+function workflowCountsSuffix(snapshot: WorkflowSnapshot): string {
   const state =
     snapshot.errorCount > 0
       ? `, ${snapshot.errorCount} errors`
@@ -277,9 +276,17 @@ export function renderWorkflowLines(
   const costInfo = usage?.cost ? ` · ${fmtCost(usage.cost)}` : "";
   const segment = fmtTokenSegment(tokenFigures(usage), fmtFull);
   const tokenInfo = `${segment ? ` · ${segment}` : ""}${costInfo}`;
-  const lines = [
-    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
-  ];
+  return `(${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`;
+}
+
+export function renderWorkflowLines(
+  snapshot: WorkflowSnapshot,
+  options: WorkflowDisplayOptions = {},
+  theme: ThemeLike = NO_THEME,
+): string[] {
+  const maxAgents = options.maxAgents ?? 8;
+  const showResultPreviews = options.showResultPreviews ?? false;
+  const lines = [`${theme.bold(`◆ Workflow: ${snapshot.name}`)} ${workflowCountsSuffix(snapshot)}`];
 
   const phaseNames = snapshot.phases.length
     ? snapshot.phases
@@ -317,7 +324,7 @@ export function renderWorkflowLines(
 
   const unphased = snapshot.agents.filter((agent) => !rendered.has(agent));
   if (unphased.length) {
-    lines.push(theme.fg("accent", "  Unphased"));
+    lines.push(theme.fg("accent", "  No phase"));
     for (const agent of unphased.slice(-maxAgents)) {
       const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
       lines.push(
@@ -330,7 +337,7 @@ export function renderWorkflowLines(
 }
 
 export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
-  return [workflowFinalHeader(completed ? "completed" : "running"), ...renderWorkflowLines(snapshot)].join("\n");
+  return renderWorkflowStatusText(snapshot, completed ? "completed" : "running");
 }
 
 /**
@@ -357,9 +364,16 @@ export function workflowFinalHeader(status: string): string {
   }
 }
 
-/** Render a snapshot with a truthful final-status header (see {@link workflowFinalHeader}). */
+/**
+ * Render a snapshot with a truthful final-status header (see {@link workflowFinalHeader}).
+ * ONE header (F51): the final status is folded into the identity line —
+ * "Workflow completed: <name> (X/Y done…)" — instead of stacking
+ * "Workflow completed" over the widget's "◆ Workflow: <name>" line.
+ */
 export function renderWorkflowStatusText(snapshot: WorkflowSnapshot, status: string): string {
-  return [workflowFinalHeader(status), ...renderWorkflowLines(snapshot)].join("\n");
+  const lines = renderWorkflowLines(snapshot);
+  lines[0] = `${workflowFinalHeader(status)}: ${snapshot.name} ${workflowCountsSuffix(snapshot)}`;
+  return lines.join("\n");
 }
 
 // ─── Live cost-meter math (task-panel detailed mode) ──────────────────────────
@@ -415,8 +429,6 @@ function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
 
 export function statusIcon(status: WorkflowAgentStatus): string {
   switch (status) {
-    case "queued":
-      return "○";
     case "running":
       return "●";
     case "done":

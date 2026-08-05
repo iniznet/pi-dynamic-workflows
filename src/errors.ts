@@ -129,6 +129,24 @@ export enum WorkflowErrorCode {
   APPROVAL_REQUIRED = -31003,
 }
 
+/**
+ * Human-facing labels for the legacy numeric WorkflowErrorCode aliases
+ * (-31001..-31003): the raw numbers mean nothing to a reader, so rendered
+ * failure rows show the enum name plus a short gloss instead of the literal
+ * value. String members (e.g. "AGENT_TIMEOUT") already read as their names and
+ * pass through untouched.
+ */
+const NUMERIC_ERROR_CODE_LABELS: Partial<Record<WorkflowErrorCode, string>> = {
+  [WorkflowErrorCode.PHASE_TRANSITION_INVALID]: "PHASE_TRANSITION_INVALID (invalid phase transition)",
+  [WorkflowErrorCode.SUBAGENT_SPAWN_BLOCKED]: "SUBAGENT_SPAWN_BLOCKED (subagent spawn blocked)",
+  [WorkflowErrorCode.APPROVAL_REQUIRED]: "APPROVAL_REQUIRED (human approval required)",
+};
+
+/** Render a WorkflowErrorCode for display, naming legacy numeric codes instead of raw numbers. */
+export function formatErrorCode(code: WorkflowErrorCode): string {
+  return NUMERIC_ERROR_CODE_LABELS[code] ?? String(code);
+}
+
 /** Classified workflow failure with recoverability and optional agent/provider context. */
 export class WorkflowError extends Error {
   readonly code: WorkflowErrorCode;
@@ -191,6 +209,10 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
 }
 
+const PROVIDER_UNAVAILABLE_PAUSE_PHRASES =
+  /overloaded|service unavailable|temporarily unavailable|server busy|maintenance|gateway timeout|upstream_request_timeout/i;
+const PROVIDER_UNAVAILABLE_RETRY_PHRASES = /bad gateway/i;
+
 /**
  * Classify a provider outage/overload (5xx) from free-form error text.
  *
@@ -206,13 +228,7 @@ export function isProviderUsageLimit(error: unknown): error is WorkflowError {
  * messages like "503 status code (no body)"); phrase shapes cover providers
  * that return descriptive text instead of a code.
  */
-export type ProviderUnavailableClass = "pause" | "retry";
-
-const PROVIDER_UNAVAILABLE_PAUSE_PHRASES =
-  /overloaded|service unavailable|temporarily unavailable|server busy|maintenance|gateway timeout|upstream_request_timeout/i;
-const PROVIDER_UNAVAILABLE_RETRY_PHRASES = /bad gateway/i;
-
-export function classifyProviderUnavailable(text: string | undefined): ProviderUnavailableClass | undefined {
+export function classifyProviderUnavailable(text: string | undefined): "pause" | "retry" | undefined {
   if (!text) return undefined;
   const status = text.match(/\b(5\d{2})\b/);
   if (status) {
@@ -224,6 +240,31 @@ export function classifyProviderUnavailable(text: string | undefined): ProviderU
   }
   if (PROVIDER_UNAVAILABLE_PAUSE_PHRASES.test(text)) return "pause";
   if (PROVIDER_UNAVAILABLE_RETRY_PHRASES.test(text)) return "retry";
+  return undefined;
+}
+
+/**
+ * Shared construction of the 5xx pause/retry mapping (F24): the single place a
+ * provider outage/overload text becomes a WorkflowError, so wrapError's thrown-
+ * error path and throwIfProviderUnavailable's recorded-message path can never
+ * diverge. Returns undefined when the text is not a 5xx condition (callers
+ * gate on the return before acting). The fallback wordings are load-bearing
+ * for provider-limit classification — do not rephrase.
+ */
+export function providerUnavailableWorkflowError(text: string | undefined, label?: string): WorkflowError | undefined {
+  const cls = classifyProviderUnavailable(text);
+  if (cls === "pause") {
+    return new WorkflowError(text ?? "Provider overloaded", WorkflowErrorCode.PROVIDER_OVERLOADED, {
+      recoverable: false,
+      agentLabel: label,
+    });
+  }
+  if (cls === "retry") {
+    return new WorkflowError(text ?? "Provider unavailable", WorkflowErrorCode.PROVIDER_UNAVAILABLE, {
+      recoverable: true,
+      agentLabel: label,
+    });
+  }
   return undefined;
 }
 
@@ -328,11 +369,6 @@ export function classifyContextOverflow(text: string | undefined): boolean {
   return CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(text));
 }
 
-/** Report whether an unknown failure is a context-overflow WorkflowError. */
-export function isContextOverflowError(error: unknown): error is WorkflowError {
-  return isWorkflowError(error) && error.code === WorkflowErrorCode.CONTEXT_OVERFLOW;
-}
-
 /**
  * Standard JS error names a workflow SCRIPT can throw directly. These can never
  * be SDK/API-layer failures, so their messages must not be classified as
@@ -420,19 +456,8 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
     // the limit branch (a 5xx body that ALSO quotes limit phrasing — e.g. a
     // gateway wrapper with "rate limit" inside — keeps the existing usage-limit
     // semantics rather than being reclassified).
-    const unavailable = classifyProviderUnavailable(error.message);
-    if (unavailable === "pause") {
-      return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_OVERLOADED, {
-        recoverable: false,
-        agentLabel: context?.agentLabel,
-      });
-    }
-    if (unavailable === "retry") {
-      return new WorkflowError(error.message, WorkflowErrorCode.PROVIDER_UNAVAILABLE, {
-        recoverable: true,
-        agentLabel: context?.agentLabel,
-      });
-    }
+    const providerUnavailable = providerUnavailableWorkflowError(error.message, context?.agentLabel);
+    if (providerUnavailable) return providerUnavailable;
   }
 
   return new WorkflowError(

@@ -633,8 +633,8 @@ describe("renderPanelDetailed", () => {
           model: "anthropic/claude-haiku-4-5",
         },
         { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
-        { id: 3, label: "scan_middleware", status: "queued", phase: "Scan" },
-        { id: 4, label: "cross_check", status: "queued", phase: "Review" },
+        { id: 3, label: "scan_middleware", status: "skipped", phase: "Scan" },
+        { id: 4, label: "cross_check", status: "skipped", phase: "Review" },
       ],
       // Only `cost` is read from the run-level aggregate (it lands when the run ends).
       tokenUsage: { total: 0, input: 0, output: 0, cost: 0.02 },
@@ -763,8 +763,8 @@ describe("renderPanelDetailed", () => {
       "running agent row",
     );
     assert.ok(
-      lines.some((l) => l.includes("[3] ○ scan_middleware")),
-      "queued agent row",
+      lines.some((l) => l.includes("[3] - scan_middleware")),
+      "not-yet-started agent row",
     );
   });
 

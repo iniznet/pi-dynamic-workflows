@@ -28,7 +28,7 @@ function fakeMeta(
 function agent(
   id: number,
   label: string,
-  status: "queued" | "running" | "done" | "error" | "skipped",
+  status: "running" | "done" | "error" | "skipped",
   phase?: string,
   opts?: {
     resultPreview?: string;
@@ -172,7 +172,7 @@ describe("renderWorkflowText", () => {
     const snap = createWorkflowSnapshot(fakeMeta("t", "d", []));
     snap.agents = [agent(1, "orphan", "done")] as never[];
     const text = renderWorkflowLines(snap).join("\n");
-    assert.ok(text.includes("Unphased"), "should show unphased section");
+    assert.ok(text.includes("No phase"), "should show no-phase section");
     assert.ok(text.includes("orphan"), "should contain orphan");
   });
 
@@ -822,7 +822,7 @@ describe("recomputeWorkflowSnapshot", () => {
     const { createWorkflowSnapshot, recomputeWorkflowSnapshot } = await loadDisplay();
     const snap = createWorkflowSnapshot({ name: "t", description: "d" } as never);
     snap.agents = [
-      { id: 1, label: "a", prompt: "p", status: "queued" },
+      { id: 1, label: "a", prompt: "p", status: "skipped" },
       { id: 2, label: "b", prompt: "p", status: "running" },
       { id: 3, label: "c", prompt: "p", status: "done" },
       { id: 4, label: "d", prompt: "p", status: "error" },

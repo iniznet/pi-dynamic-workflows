@@ -33,7 +33,6 @@ import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: "·",
-  queued: "·",
   running: "◆",
   paused: "⏸",
   completed: "✓",
@@ -609,6 +608,16 @@ const LW_MIN = 14;
 const RW_MIN = 24;
 const GAP_NM = 2; // min spaces between agent name and model columns
 
+/**
+ * Short run id for list rows (~10 chars): the canonical `run-<base36-ms>-<seq>`
+ * id crowds narrow overlays, so lists show the prefix plus a unique tail; the
+ * full id always stays in the run detail header (twoPaneHeader).
+ */
+function shortRunId(runId: string): string {
+  if (runId.length <= 10) return runId;
+  return `${runId.slice(0, 4)}${runId.slice(-6)}`;
+}
+
 /** Compact token count: 842, 35k, 35.7k, 1.3M (trailing .0 trimmed). */
 function compactTokens(t: number): string {
   if (!t || t <= 0) return "0";
@@ -639,7 +648,6 @@ function phaseStatusColor(p: { done: number; total: number }, agents: AgentRow[]
 
 const AGENT_STATUS_GLYPH: Record<string, string> = {
   running: "●",
-  queued: "○",
   pending: "○",
   paused: "·",
   done: "✓",
@@ -653,7 +661,6 @@ const AGENT_STATUS_GLYPH: Record<string, string> = {
 /** Glyph color per agent status — color reinforces the glyph, never the only signal (M15). */
 const AGENT_STATUS_COLOR: Record<string, string> = {
   running: "warning",
-  queued: "dim",
   pending: "dim",
   paused: "dim",
   done: "success",
@@ -1091,7 +1098,8 @@ function renderNavigatorFrame(
     lines.push(theme.bold(`Workflows${range}`));
 
     if (total === 0) {
-      lines.push(dim("  No runs yet. Start one with a background workflow."));
+      // F54b: plain-language how-to — no tool-schema syntax, no dead reassurance.
+      lines.push(dim("  No runs yet. Start one with /workflows run <prompt> or mention 'workflow'."));
     }
     for (let i = win.start; i < windowEnd(); i++) {
       if (i === runs.length && runs.length > 0 && saved.length > 0) lines.push(dim("  ── saved ──"));
@@ -1101,7 +1109,7 @@ function renderNavigatorFrame(
         const icon = STATUS_ICON[r.status] ?? "?";
         const tok = fmtTokenSegment(r, pad);
         const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
-        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${shortRunId(r.runId)} · ${r.status} · ${meta}`)}`));
       } else {
         const w = saved[i - runs.length];
         if (!w) continue;
@@ -1232,9 +1240,12 @@ function twoPaneHeader(
     fresh += p.fresh;
     cacheRead += p.cacheRead;
   }
-  // Line 0 — name (accent + bold), truncated to width if needed.
-  const nameText = truncateToWidth(name, width, ELLIPSIS, false);
-  const line0 = theme.fg("accent", theme.bold(nameText));
+  // Line 0 — name (accent + bold) + full runId (dim). The full id lives here
+  // (list rows show only the short form) so it always stays reachable; the
+  // name truncates to make room rather than the id.
+  const idSuffix = `  ${runId}`;
+  const nameText = truncateToWidth(name, Math.max(1, width - visibleWidth(idSuffix)), ELLIPSIS, false);
+  const line0 = theme.fg("accent", theme.bold(nameText)) + theme.fg("dim", idSuffix);
 
   // Line 1 — left status, right summary.
   const headerSegment = fmtTokenSegment({ fresh, cacheRead }, compactTokens);

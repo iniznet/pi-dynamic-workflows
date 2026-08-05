@@ -16,7 +16,7 @@ function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRu
     currentPhase: "Inspect",
     agents: [
       { id: 1, label: "active scan", prompt: "scan", status: status === "running" ? "running" : "done", tokens: 30 },
-      { id: 2, label: "queued check", prompt: "check", status: "queued" },
+      { id: 2, label: "done check", prompt: "check", status: "done" },
       { id: 3, label: "failed check", prompt: "fail", status: "error" },
       { id: 4, label: "optional check", prompt: "optional", status: "skipped" },
     ],
@@ -108,7 +108,7 @@ test("list and status return stable lifecycle and observability fields", async (
   const listed = await execute(manager, { action: "list" });
   assert.match(text(listed), /^action=list result=ok runs=1\n/);
   assert.match(text(listed), /runId=audit-abc123 name="audit" status=running phase="Inspect"/);
-  assert.match(text(listed), /total=4 done=0 running=1 queued=1 error=1 skipped=1/);
+  assert.match(text(listed), /total=4 done=1 running=1 error=1 skipped=1/);
   assert.match(text(listed), /active="active scan" tokens=30/);
   assert.deepEqual(listed.details, {
     action: "list",
@@ -119,7 +119,7 @@ test("list and status return stable lifecycle and observability fields", async (
         workflowName: "audit",
         status: "running",
         phase: "Inspect",
-        counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
+        counts: { total: 4, done: 1, running: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
       },

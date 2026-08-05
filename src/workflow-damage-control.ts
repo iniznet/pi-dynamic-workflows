@@ -149,7 +149,6 @@ export interface DeepRunSummary {
     total: number;
     done: number;
     running: number;
-    queued: number;
     error: number;
     skipped: number;
   };
@@ -1010,7 +1009,6 @@ function countAgents(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "status">
     total: agents.length,
     done: agents.filter((agent) => agent.status === "done").length,
     running: agents.filter((agent) => agent.status === "running").length,
-    queued: agents.filter((agent) => agent.status === "queued").length,
     error: agents.filter((agent) => agent.status === "error").length,
     skipped: agents.filter((agent) => agent.status === "skipped").length,
   };
@@ -1018,12 +1016,12 @@ function countAgents(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "status">
 
 function formatListLine(summary: DeepRunSummary): string {
   const counts = summary.counts;
-  return `runId=${summary.runId} name=${quote(summary.workflowName)} status=${summary.status} phase=${quote(summary.phase ?? "-")} total=${counts.total} done=${counts.done} running=${counts.running} queued=${counts.queued} error=${counts.error} skipped=${counts.skipped} tokens=${summary.tokenTotal}`;
+  return `runId=${summary.runId} name=${quote(summary.workflowName)} status=${summary.status} phase=${quote(summary.phase ?? "-")} total=${counts.total} done=${counts.done} running=${counts.running} error=${counts.error} skipped=${counts.skipped} tokens=${summary.tokenTotal}`;
 }
 
 function formatDeepRunLine(summary: DeepRunSummary): string {
   const counts = summary.counts;
-  return `runId=${summary.runId} name=${quote(summary.workflowName)} status=${summary.status} phase=${quote(summary.phase ?? "-")} live=${summary.live} total=${counts.total} done=${counts.done} running=${counts.running} queued=${counts.queued} error=${counts.error} skipped=${counts.skipped} tokens=${summary.tokenTotal} journal=${summary.journal.entries} compacted=${summary.journal.compacted} checkpoints=${summary.checkpoints.total} lease=${summary.lease ? (summary.lease.reclaimable ? "reclaimable" : "held") : "none"} logs=${summary.logs} result=${summary.resultPresent ? "present" : "absent"}`;
+  return `runId=${summary.runId} name=${quote(summary.workflowName)} status=${summary.status} phase=${quote(summary.phase ?? "-")} live=${summary.live} total=${counts.total} done=${counts.done} running=${counts.running} error=${counts.error} skipped=${counts.skipped} tokens=${summary.tokenTotal} journal=${summary.journal.entries} compacted=${summary.journal.compacted} checkpoints=${summary.checkpoints.total} lease=${summary.lease ? (summary.lease.reclaimable ? "reclaimable" : "held") : "none"} logs=${summary.logs} result=${summary.resultPresent ? "present" : "absent"}`;
 }
 
 function formatAgentLine(agent: AgentSummary): string {

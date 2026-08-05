@@ -9,7 +9,12 @@ import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "../src/c
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
-import { backgroundStartedText, createWorkflowTool, WORKFLOW_GATE_GUIDELINE } from "../src/workflow-tool.js";
+import {
+  backgroundStartedText,
+  createWorkflowTool,
+  formatCompletedResultText,
+  WORKFLOW_GATE_GUIDELINE,
+} from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
@@ -42,6 +47,43 @@ test("backgroundStartedText tells the user it auto-continues and they can wait",
   assert.match(text, /continues automatically|resume the conversation/i);
   assert.match(text, /other things/i);
   assert.match(text, /\/workflows status abc-123/);
+});
+
+// ─── formatCompletedResultText ─────────────────────────────────────────────────
+
+test("formatCompletedResultText truncates oversized result dumps with a pointer to the full value", () => {
+  const big = { findings: [{ text: "x".repeat(5_000) }] };
+  const result = {
+    meta: { name: "fanout", description: "d" },
+    result: big,
+    logs: [],
+    phases: [],
+    agentCount: 3,
+    durationMs: 120,
+    runId: "fanout-1",
+    tokenUsage: { input: 10, output: 5, total: 15, cost: 0 },
+  };
+  const text = formatCompletedResultText(result);
+  assert.ok(text.includes("result truncated"), "truncation must be announced");
+  assert.ok(text.includes("/workflows status fanout-1"), "truncation note points at the persisted run");
+  assert.ok(text.length < 8_000, "the inline dump must not carry the whole oversized result");
+});
+
+test("formatCompletedResultText maps legacy numeric failure codes to their names", () => {
+  const result = {
+    meta: { name: "fanout", description: "d" },
+    result: { ok: true },
+    logs: [],
+    phases: [],
+    agentCount: 1,
+    durationMs: 120,
+    runId: "fanout-1",
+    failedAgents: [{ label: "a1", error: "blocked", errorCode: WorkflowErrorCode.APPROVAL_REQUIRED }],
+    tokenUsage: { input: 10, output: 5, total: 15, cost: 0 },
+  };
+  const text = formatCompletedResultText(result);
+  assert.ok(!text.includes("-31003"), "raw numeric code must not leak into the failure row");
+  assert.ok(text.includes("APPROVAL_REQUIRED (human approval required)"), "numeric code renders as its label");
 });
 
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
@@ -121,11 +163,8 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   assert.match(description, /nesting.*one level.*parent run's concurrency, agent, and token limits/i);
   assert.match(
     description,
-    /Optional quality helpers include verify\(\), judgePanel\(\), loopUntilDry\(\), and completenessCheck\(\)/i,
+    /Optional helpers.*verify\(\), judgePanel\(\), loopUntilDry\(\), completenessCheck\(\).*retry\(\), gate\(\).*budget.*workflow-authoring skill/i,
   );
-  assert.match(description, /Optional control helpers include retry\(\) and gate\(\)/i);
-  assert.match(description, /budget exposes total, spent\(\), and remaining\(\)/i);
-  assert.match(description, /phase\('Name', \{ budget: N \}\).*phase token limit/i);
   assert.match(description, /optional `agentType` option.*named user or project definition/i);
   assert.match(description, /bind tools, a model, and role instructions/i);
   assert.match(description, /name and purpose.*provided in context/i);

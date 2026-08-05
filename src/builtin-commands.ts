@@ -18,6 +18,7 @@ import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
+import { backgroundStartedNotify } from "./workflow-notify.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 
 const execFileAsync = promisify(execFile);
@@ -79,12 +80,9 @@ function startBackground(
 ): void {
   try {
     const { runId } = manager.startInBackground(script, args, exec ?? {});
-    ctx.ui.notify(
-      `/${name} running in the background (${runId}) — watch the task panel or /workflows; the report is posted here when it finishes.`,
-      "info",
-    );
+    ctx.ui.notify(backgroundStartedNotify(name, runId), "info");
   } catch (error) {
-    ctx.ui.notify(`${name} failed to start: ${error instanceof Error ? error.message : error}`, "error");
+    ctx.ui.notify(`/${name} failed to start: ${error instanceof Error ? error.message : error}`, "error");
   }
 }
 
@@ -192,8 +190,7 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "code-review")) {
     pi.registerCommand("code-review", {
-      description:
-        "Multi-angle parallel code review: 7 specialized finders (correctness, reuse, simplification, efficiency, altitude) + verify pass → ranked findings",
+      description: "Review a diff or PR with parallel specialized finders, then verify and rank findings",
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("code-review", args, ctx)) return;
         const input = args.trim();

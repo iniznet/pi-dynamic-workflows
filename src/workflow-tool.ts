@@ -13,7 +13,7 @@ import {
   tokenFigures,
   type WorkflowSnapshot,
 } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { formatErrorCode, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { coerceArgs } from "./saved-commands.js";
@@ -70,16 +70,15 @@ const workflowToolSchema = Type?.Object({
       description: [
         "Raw JavaScript workflow script, with no Markdown fences. Required unless `name` is given.",
         "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. With multiple phases, call phase('Exact Title') before each phase's work or set `phase` in the agent options.",
-        "Use `await workflow(savedName, childArgs)` to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
-        "Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck().",
-        "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
+        "Saved workflows: await workflow(savedName, childArgs) runs a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
+        "Optional helpers: verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), and budget — see the workflow-authoring skill for usage, limits, and examples.",
         "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
         "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
-        "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+        "Core API: phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
         "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
         "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
         "On failure or pause, resume with resumeFromRunId instead of starting a new run.",
-      ].join(" "),
+      ].join("\n"),
     }),
   ),
   name: Type.Optional(
@@ -493,6 +492,22 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 }
 
 /**
+ * Cap on the pretty-printed result dump in completed-run text. The delivery
+ * path truncates the whole message far lower anyway, so a huge inline dump is
+ * pure token burn; the full value always survives in the tool details and (when
+ * present) the persisted run.
+ */
+const RESULT_DUMP_MAX_CHARS = 4_000;
+
+/** Pretty-print a completed run's result, truncated at RESULT_DUMP_MAX_CHARS with a pointer to the full value. */
+function formatResultDump(result: unknown, runId?: string): string {
+  const dump = JSON.stringify(result, null, 2);
+  if (dump.length <= RESULT_DUMP_MAX_CHARS) return dump;
+  const runRef = runId ? ` (or /workflows status ${runId})` : "";
+  return `${dump.slice(0, RESULT_DUMP_MAX_CHARS)}\n… (result truncated — full value is in the tool details${runRef})`;
+}
+
+/**
  * The tool result text for a COMPLETED run. Deliberately carries no resume
  * hint: a completed run cannot be resumed (its journal is dropped on
  * completion), so advertising resumeFromRunId here would mislead the model
@@ -514,13 +529,16 @@ export function formatCompletedResultText(result: WorkflowRunResult): string {
   const failures = result.failedAgents?.length
     ? `\n\n## ⚠ Agent failures (${result.failedAgents.length}/${result.agentCount})\n` +
       result.failedAgents
-        .map((f) => `- **${f.label}**${f.nested ? ` (nested in ${f.nested})` : ""}: ${f.errorCode} — ${f.error}`)
+        .map(
+          (f) =>
+            `- **${f.label}**${f.nested ? ` (nested in ${f.nested})` : ""}: ${formatErrorCode(f.errorCode)} — ${f.error}`,
+        )
         .join("\n") +
       "\n\nThese agents did not produce results. Do NOT treat this output as complete: edit the workflow (e.g. raise agentRetries, shorten the failing agent's prompt, or use a larger-context model) and re-run, or pass failOnExhaustedAgent to have the run fail resumable instead of completing silently."
     : "";
 
   const formattedResult =
-    result.result !== undefined ? `\n\`\`\`json\n${JSON.stringify(result.result, null, 2)}\n\`\`\`` : "";
+    result.result !== undefined ? `\n\`\`\`json\n${formatResultDump(result.result, result.runId)}\n\`\`\`` : "";
 
   return `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}${failures}\n\n## Result${formattedResult}`;
 }
@@ -572,12 +590,8 @@ export function backgroundStartedText(name: string, runId: string): string {
   return [
     `Workflow "${name}" started in the background.`,
     `Run ID: ${runId}`,
-    "It keeps running on its own. When it finishes, the result is delivered back",
-    "here and the conversation continues automatically — the user does not need to",
-    "do anything. Tell the user they can simply wait here for it to finish (it will",
-    "resume the conversation by itself), or keep chatting / working on other things",
-    "in the meantime; either way the result will come back to this conversation.",
-    `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
+    "It keeps running on its own — the result is delivered back here and the conversation continues automatically, so the user can simply wait here or keep working on other things.",
+    `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
     // Deliberately no resume hint here: the run is still "running" at this point,
     // and resume() only accepts paused/failed runs (M18). The failed/paused
     // paths carry the hint instead.

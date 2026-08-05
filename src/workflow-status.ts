@@ -30,10 +30,10 @@ export interface FileLock {
 }
 
 /** Default time-to-live for a file lock in ms: stale holders can be reclaimed after this. */
-export const DEFAULT_LOCK_TTL_MS = 300000;
+const DEFAULT_LOCK_TTL_MS = 300000;
 
 /** Options for acquireFileLock's bounded wait on a live (unexpired) holder. */
-export interface AcquireFileLockOptions {
+interface AcquireFileLockOptions {
   /**
    * Keep polling for the lock when a live holder owns it. 0/omitted fails fast
    * (the historical behavior); a positive value bounds the total wait.
@@ -202,6 +202,11 @@ export async function acquireFileLock(
 }
 
 /**
+ * @internal
+ *
+ * Deliberately kept exported for library/test callers — see the lock-primitives
+ * note at src/index.ts:383-393 ("no live claimer yet").
+ *
  * Extend a lock's TTL so a still-working holder is not reclaimed as stale
  * (the holder must refresh before expiry). Refuses to renew a lock owned by a
  * different runId, and rotates the owner token so a concurrent reclaimer that
@@ -323,7 +328,7 @@ export async function checkFileConflict(
 export const WORKFLOW_WRITE_TOOL_NAMES: readonly string[] = ["edit", "write"];
 
 /** How long an edit may queue behind a live worktree holder before blocking. */
-export const DEFAULT_WORKTREE_CONFLICT_WAIT_MS = 5000;
+const DEFAULT_WORKTREE_CONFLICT_WAIT_MS = 5000;
 
 /** Stable machine-readable code carried by the structured block error. */
 export const WORKTREE_CONFLICT_BLOCK_CODE = "FILE_LOCKED_BY_WORKTREE";
@@ -346,7 +351,7 @@ export interface WorktreeWriteGuardOptions {
 }
 
 /** Structured JSON tool-error payload naming the conflicting worktree run/task. */
-export interface WorktreeConflictBlockPayload {
+interface WorktreeConflictBlockPayload {
   error: "file_locked_by_worktree";
   code: string;
   filePath: string;
@@ -359,7 +364,7 @@ export interface WorktreeConflictBlockPayload {
  * Build the structured block payload for a claimed file. Pure and deterministic
  * so tests can assert on the exact shape without driving a real lock.
  */
-export function buildWorktreeConflictBlockError(
+function buildWorktreeConflictBlockError(
   filePath: string,
   conflict: { runId?: string; taskId?: string },
 ): WorktreeConflictBlockPayload {

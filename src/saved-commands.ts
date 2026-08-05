@@ -6,6 +6,7 @@
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
+import { backgroundStartedNotify } from "./workflow-notify.js";
 import type { SavedWorkflow, WorkflowParameterSpec, WorkflowParameters, WorkflowStorage } from "./workflow-saved.js";
 
 /** Argument tokens that ask for help instead of running the workflow. */
@@ -201,10 +202,7 @@ export function registerSavedWorkflow(
           // and installResultDelivery posts the result back into the
           // conversation on completion — sending it here too would duplicate it.
           const { runId } = manager.startInBackground(wf.script, parseCommandArgs(args, wf.parameters));
-          ctx.ui.notify(
-            `/${wf.name} running in the background (${runId}) — watch the task panel or /workflows; the result is posted here when it finishes.`,
-            "info",
-          );
+          ctx.ui.notify(backgroundStartedNotify(wf.name, runId), "info");
           return;
         }
         // Fallback: inline runWorkflow (foreground, no TUI tracking, blocks).

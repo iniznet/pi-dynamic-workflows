@@ -52,7 +52,7 @@ export interface WorkflowSettingsField {
 }
 
 /**
- * The 13 settings rows, in UI render order. Bounds/options/defaults are the
+ * The 17 settings rows, in UI render order. Bounds/options/defaults are the
  * verified load-path semantics: normalizeSettings (ws:233-298), the cfg env
  * clamps (cfg:130-166), and the documented runtime fallbacks.
  */
@@ -156,8 +156,8 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
   {
     key: "deliveredResultMaxChars",
     type: "number",
-    label: "Delivered result max chars",
-    help: "Char cap on the background-run JSON-dump fallback, clamped to [1, 1,000,000]. String results and verdict/report/summary/synthesis fields are never truncated.",
+    label: "Result preview length",
+    help: "Char cap on the delivered-result preview, clamped to [1, 1,000,000]. Full string results and verdict/report/summary/synthesis fields are never truncated.",
     min: 1,
     max: 1_000_000,
     group: "Advanced",

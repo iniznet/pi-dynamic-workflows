@@ -68,7 +68,6 @@ export interface WorkflowControlRunDetails {
     total: number;
     done: number;
     running: number;
-    queued: number;
     error: number;
     skipped: number;
   };
@@ -244,7 +243,6 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
     total: agents.length,
     done: agents.filter((agent) => agent.status === "done").length,
     running: agents.filter((agent) => agent.status === "running").length,
-    queued: agents.filter((agent) => agent.status === "queued").length,
     error: agents.filter((agent) => agent.status === "error").length,
     skipped: agents.filter((agent) => agent.status === "skipped").length,
   };
@@ -252,7 +250,7 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
 }
 
 function quote(value: string): string {
