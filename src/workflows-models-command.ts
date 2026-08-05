@@ -24,6 +24,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { listAvailableModelSpecs, listAvailableModels } from "./agent.js";
+import type { ProviderPoolSnapshot } from "./gateway/provider-pool.js";
 import {
   formatModelSpecWithThinking,
   type ModelThinkingLevel,
@@ -39,9 +40,19 @@ import {
 } from "./model-tier-config.js";
 
 /**
+ * Optional accessors threaded from the extension runtime. The provider pool
+ * is manager-owned, so the command never constructs one itself — it only
+ * renders whatever snapshot the caller exposes (design §Files).
+ */
+export interface WorkflowModelsCommandOptions {
+  /** Live provider-pool snapshot; absent (or no active pool) → section omitted. */
+  getProviderPool?: () => ProviderPoolSnapshot | undefined;
+}
+
+/**
  * Register the `/workflows-models` command with Pi.
  */
-export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
+export function registerWorkflowModelsCommand(pi: ExtensionAPI, options?: WorkflowModelsCommandOptions): void {
   /**
    * Menu separator row (L26). The host `ui.select` API only accepts plain
    * strings — there is no disabled/header item type — so separators are inert
@@ -83,6 +94,27 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI): void {
         const preview = formatTierCostPreview(config, availableModels());
         if (preview) menuOptions.push(...preview.split("\n"));
         menuOptions.push(MENU_SEPARATOR);
+
+        // Live pool view explains why parallel agents may be throttled or
+        // queued, so it belongs next to the tier/cost preview, not in the
+        // editor (the pool is manager-owned; this menu is read-only).
+        const poolSnapshot = options?.getProviderPool?.();
+        if (poolSnapshot?.enabled && poolSnapshot.entries.length > 0) {
+          const now = Date.now();
+          menuOptions.push("Provider pool");
+          for (const entry of poolSnapshot.entries) {
+            const cooldown =
+              entry.cooldownUntil !== undefined && entry.cooldownUntil > now
+                ? ` · cooldown ${Math.ceil((entry.cooldownUntil - now) / 1000)}s`
+                : "";
+            menuOptions.push(
+              `  ${entry.provider.padEnd(12)} ${entry.modelId}  ${entry.active}/${entry.concurrency} · w${entry.weight}${cooldown}`,
+            );
+          }
+          if (poolSnapshot.waiting > 0) {
+            menuOptions.push(`  ${poolSnapshot.waiting} queued · ${poolSnapshot.reservations} reserved`);
+          }
+        }
 
         menuOptions.push("Reset to defaults");
         menuOptions.push(dirty ? "Save and exit" : "Exit");

@@ -318,9 +318,9 @@ Model tiers live at `~/.pi/workflows/model-tiers.json` and accept Pi CLI-style t
 }
 ```
 
-Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible.
+Use `/workflows-models` to edit them interactively. Without a config, the extension ranks authenticated models by capability hints and assigns distinct models when possible. To route one logical model across several authenticated providers with per-provider concurrency caps and run-sticky routing, see the provider pool section below.
 
-Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures.
+Omitted `tokenBudget` and `agentTimeoutMs` values use configured `defaultTokenBudget` and `defaultAgentTimeoutMs` settings; without them, runs are unlimited and have no hard per-agent timeout. Add per-run or per-agent values when you need explicit gates. `concurrency` is clamped to 16; `agentRetries` retries only recoverable failures. Run-level `concurrency` (and `defaultConcurrency`) stays the master run limiter; the provider pool layers per-provider caps under it.
 
 Newer run options: `drainTimeoutMs` (default 60 s) waits for un-awaited `agent()` calls after the script finishes, then aborts stragglers; `maxNestedWorkflowDepth` (default 1, clamp 1–8) caps workflow-in-workflow nesting; `preRunTypecheck` (default off) soft-fails `tsc --noEmit` before launch and never blocks when a toolchain is missing.
 
@@ -333,6 +333,57 @@ Defaults live in `~/.pi/workflows/settings.json`; `defaultTokenBudget` is a soft
 A schema-less agent that finishes its turn without any final text (a tool-call or thinking-only ending) is recovered in-session: the runner re-prompts the same session once asking for the final answer, and only declares the recoverable `AGENT_EMPTY_OUTPUT` failure if that nudge is also empty. The nudge is far cheaper than the workflow-level retry, which re-runs the whole agent from scratch; per call, `emptyOutputNudge: false` pins the legacy immediate-throw behavior. Silently truncated output (`stopReason: "length"`) is never nudged or retried — it is classified `CONTEXT_OVERFLOW` (non-recoverable), so the run settles failed with its journal preserved and `resumeFromRunId` re-runs only the overflowing agent with a fresh session. Some models occasionally end on a tool call on an otherwise-fine first attempt; if a fleet is built on one of them, set `agentRetries: 1-2` rather than treating an isolated empty output as a failed run.
 
 Pausing and resuming a run keeps the limits it started with — `maxAgents`, `agentTimeoutMs`, `concurrency`, and `agentRetries` carry over instead of falling back to defaults, and `tokenBudget` tracking is cumulative across the pause, so a run can't reset its spend by pausing and resuming.
+
+</details>
+
+<details>
+<summary><strong>Provider pool (multi-provider load balancing)</strong></summary>
+
+Parallel subagents fan out and can hit a single provider's TPM / concurrent-request limit before the run finishes. The provider pool mixes two or more providers serving the same logical model: each `agent()` acquires ONE provider endpoint up front (weighted routing, per-provider concurrency caps), and that pinned choice never changes for the session.
+
+Configure it under a `providerPool` key in `~/.pi/workflows/settings.json` (or via the `PI_WORKFLOW_PROVIDER_POOL` full-JSON environment override — see the environment-variable table below):
+
+```jsonc
+{
+  "providerPool": {
+    "enabled": true,
+    "whenSaturated": "wait",
+    "saturationWaitTimeoutMs": 300000,
+    "defaultTpmWindowMs": 60000,
+    "models": {
+      "deepseek-v4-flash": {
+        "deepseek":  { "modelId": "deepseek-v4-flash",          "concurrency": 2, "weight": 3, "tpm": 400000 },
+        "openrouter": { "modelId": "deepseek/deepseek-v4-flash", "concurrency": 2, "weight": 1, "tpm": 800000 },
+        "providerC": { "modelId": "vendor/deepseek-v4-flash",   "concurrency": 1, "weight": 1 }
+      }
+    }
+  }
+}
+```
+
+`models` maps a logical model id (the one tiers/routing select) to per-provider entries:
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `modelId` | The registry model id this provider serves for the logical model — required when the alias differs (e.g. `deepseek/deepseek-v4-flash` on OpenRouter) | the logical model id |
+| `concurrency` | Max concurrent agents on this provider endpoint | 1 |
+| `weight` | Proportional routing weight: the pool picks `min(active / weight)` among free providers, so a 3×-weighted provider takes ~3× the load without being hammered first | 1 |
+| `tpm` | Manual output-TPM cap over `defaultTpmWindowMs` — the primary TPM gate (measured TPM feeds the auto-cooldown) | none |
+| `cooldownMs` | Cooldown a provider enters after a recorded 429/limit event | 60000 |
+
+Top-level keys: `enabled` (off → legacy single-resolution behavior; default true), `whenSaturated` (`"wait"` FIFO-queues saturated acquires, abort-aware, default — or `"fail"`, which throws a `PROVIDER_SATURATED` error that is non-recoverable when the whole pool is saturated, so the run checkpoints/pauses like a usage limit, and recoverable when only the run's pinned provider is hot, so the retry lands elsewhere), `saturationWaitTimeoutMs` (wait budget for a saturated acquire; 0 = wait forever, default 300000), `defaultTpmWindowMs` (rolling window for the TPM gate, default 60000). Providers referenced must already have auth configured; a provider without auth is skipped at acquire with a one-time log.
+
+**Run-sticky routing.** The provider is chosen ONCE when a fresh subagent session starts, and the bound model never changes for that session — a subagent stays on its provider until it finishes, so trajectory continuity and provider-side prompt caching stay warm and no mid-run model swap happens. Retries of a failed agent re-acquire the SAME provider (the reservation holds its slot during backoff; `release` is idempotent). Handoff sessions bypass the pool entirely: their model is already bound and is never swapped or re-counted.
+
+**Behavior matrix:**
+
+| Situation | Without pool | With pool |
+| --- | --- | --- |
+| 8 parallel agents, caps 2/2/1 | all on one provider → 429 → pause whole run | spread 2/2/1, queue the rest; no 429 |
+| Provider A 429s mid-fanout | run pauses, resume replays | A enters cooldown; new agents route B/C; the stuck agent retries A (warm cache) then A is skipped |
+| Two providers, same model | manual pinning, no failover | logical model → weighted routing, per-provider caps |
+| Handoff session | model persists | bypassed — never swapped |
+| All providers capped | 429 → pause | FIFO wait (or fail-fast → existing pause+resume) |
 
 </details>
 
@@ -394,6 +445,7 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `defaultAgentTimeoutMs` | `PI_WORKFLOW_DEFAULT_AGENT_TIMEOUT_MS` | positive integer; `null` or empty disables |
 | `defaultTokenBudget` | `PI_WORKFLOW_DEFAULT_TOKEN_BUDGET` | positive integer; `null` or empty cancels a global budget |
 | `defaultConcurrency` | `PI_WORKFLOW_DEFAULT_CONCURRENCY` | integer 1–16 |
+| `providerPool` | `PI_WORKFLOW_PROVIDER_POOL` | full JSON override — see provider pool above |
 | `defaultAgentRetries` | `PI_WORKFLOW_DEFAULT_AGENT_RETRIES` | integer 0–3 |
 | `progressPanelMode` | `PI_WORKFLOW_PROGRESS_PANEL_MODE` | `compact` / `detailed` |
 | `progressPanelMaxAgents` | `PI_WORKFLOW_PROGRESS_PANEL_MAX_AGENTS` | integer 1–1000 |

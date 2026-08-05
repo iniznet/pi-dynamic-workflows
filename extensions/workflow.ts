@@ -17,11 +17,12 @@ import {
 } from "../src/extension-reload.js";
 import type { SessionManagerLike, SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
 import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
-import type { CheckpointGate } from "../src/index.js";
+import type { CheckpointGate, ProviderPool } from "../src/index.js";
 import {
   applyEnvSettingsOverride,
   createEffortState,
   createPlannotatorBridge,
+  createProviderPoolFromConfig,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
@@ -516,7 +517,7 @@ export default function extension(pi: ExtensionAPI) {
   // with the explicit /workflows run <prompt> manual trigger. It is part of the
   // reload handoff so /reload does not silently turn the selected effort off.
   registerWorkflowCommands?.(pi, manager, { storage, cwd, effort });
-  registerWorkflowModelsCommand?.(pi);
+  registerWorkflowModelsCommand?.(pi, { getProviderPool: () => manager.getProviderPool()?.snapshot() });
   registerWorkflowSettingsCommand?.(pi);
   // Effective-subagent-toolset listing: per-tool source + allow status, MCP
   // servers, and the host tools that cannot reach subagents on 0.83.0
@@ -537,6 +538,9 @@ export default function extension(pi: ExtensionAPI) {
   // time. Installed once (guarded below) inside session_start alongside the
   // other per-session installers.
   let armingInstalled = false;
+  // One-line startup notice for an active provider pool, logged at most once
+  // per extension activation (session_start can re-fire on session switch).
+  let providerPoolNoticeShown = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
     if (pausedForVersionChange > 0) {
@@ -554,6 +558,32 @@ export default function extension(pi: ExtensionAPI) {
     // manager's registry lazily, so tool-registry refreshes from here on
     // advertise the shared registry's models.
     manager.setModelRegistry(ctx.modelRegistry);
+    // Build the shared provider pool (settings + this session's registry) and
+    // hand it to the manager so subagent runs route through it (design:
+    // tasks/provider-load-balance/design.md). Re-attached on every
+    // session_start: /reload keeps the manager but re-fires session_start with
+    // a fresh registry, so the pool follows the current session's models. The
+    // pool has no shutdown method — pending waiters abort via the per-run
+    // acquire signal (agent.ts) — so there is nothing to tear down at
+    // session_shutdown. ctx.signal (per-turn, aborts at turn end) is NOT wired
+    // here: a pool built with a dead turn signal would reject every later
+    // acquire as "shut down".
+    const pool: ProviderPool | undefined = settings.providerPool
+      ? createProviderPoolFromConfig(settings.providerPool, ctx.modelRegistry)
+      : undefined;
+    if (pool) {
+      manager.setProviderPool(pool);
+      if (!providerPoolNoticeShown) {
+        const snapshot = pool.snapshot();
+        const providerCount = new Set(snapshot.entries.map((entry) => entry.provider)).size;
+        console.warn(
+          `[workflow] Provider pool active: ${snapshot.entries.length} endpoint(s) across ${providerCount} provider(s), saturation=${snapshot.whenSaturated}, waitTimeoutMs=${snapshot.saturationWaitTimeoutMs}`,
+        );
+        providerPoolNoticeShown = true;
+      }
+    } else {
+      manager.setProviderPool(undefined);
+    }
     // Capture the real session manager for the host-tool bridge context (bash's
     // PI_SESSION_ID/PI_SESSION_FILE env). The provider is re-resolved per call,
     // so both already-built and future bundles adopt it immediately;

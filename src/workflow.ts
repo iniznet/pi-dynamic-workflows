@@ -25,8 +25,10 @@ import {
   MAX_RETRY_BACKOFF_MS,
 } from "./config.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import type { ProviderPool } from "./gateway/provider-pool.js";
 import { createWorkflowLogger } from "./logger.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { providerFromCanonicalSpec } from "./model-spec.js";
 import { loadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
 import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
@@ -244,6 +246,15 @@ export interface WorkflowAgentRunner {
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: WorkflowAgentRunner;
+  /**
+   * Provider pool (design: tasks/provider-load-balance/design.md): per-provider
+   * concurrency caps + run-sticky provider routing. Threaded into every agent()
+   * call of this run (AgentRunOptions.providerPool + poolStickyKey=deltaKey);
+   * the pool is owned by the extension runtime (created from settings.providerPool
+   * in extensions/workflow.ts) and registered on the WorkflowManager, which
+   * passes it here. Absent → legacy single-resolution behavior.
+   */
+  providerPool?: ProviderPool;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
   /**
@@ -1307,9 +1318,49 @@ export async function runWorkflow<T = unknown>(
         return tokens;
       };
 
+      // Provider pool settlement state (see the attempt finally below): the
+      // call's reservation is released at the FINAL attempt only — a recoverable
+      // retry-continue must keep it so the pool stays accurate during backoff
+      // (the sticky re-acquire reuses the same provider without re-counting).
+      // `settledErrorCode` is captured in the catch so the finally can teach the
+      // pool about 429/overload/unavailable events without holding the error
+      // object (out of scope there).
+      let poolRetryPending = false;
+      let settledErrorCode: WorkflowErrorCode | undefined;
+      const settleProviderPool = () => {
+        const pool = options.providerPool;
+        if (!pool) return;
+        // Idempotent: no-op when this call never acquired (unconfigured model,
+        // handoff reuse, or an acquire that failed before reserving a slot).
+        pool.release(deltaKey);
+        // Provider from the settled model spec (canonical `provider/model` —
+        // the first path segment is the provider even when the model id carries
+        // a vendor slash, e.g. openrouter's "deepseek/x").
+        const provider = displayModel ? providerFromCanonicalSpec(displayModel) : undefined;
+        if (!provider) return;
+        // Output tokens from the FINAL attempt's real session usage (onUsage);
+        // a non-reporting provider yields no entry (recordSpend drops <=0).
+        const outputTokens = usage?.output;
+        if (typeof outputTokens === "number" && outputTokens > 0) {
+          pool.recordSpend(provider, outputTokens);
+        }
+        // 429/usage-limit + 5xx overload/unavailable → the provider enters its
+        // automatic cooldown so NEW agents route elsewhere; already-running
+        // agents are unaffected (their reservations stay).
+        if (
+          settledErrorCode === WorkflowErrorCode.PROVIDER_USAGE_LIMIT ||
+          settledErrorCode === WorkflowErrorCode.PROVIDER_OVERLOADED ||
+          settledErrorCode === WorkflowErrorCode.PROVIDER_UNAVAILABLE
+        ) {
+          pool.recordLimitEvent(provider);
+        }
+      };
+
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
+          poolRetryPending = false;
+          settledErrorCode = undefined;
           // This attempt's tool-call traces; the successful attempt's traces are
           // journaled, a failed attempt's traces surface the failing operation.
           let operations: OperationTrace[] = [];
@@ -1377,6 +1428,12 @@ export async function runWorkflow<T = unknown>(
               model: modelSpec,
               tier: agentOptions.tier,
               modelRegistry: options.modelRegistry,
+              // Provider pool: the run's pool + this call's sticky key (the
+              // deltaKey) — retry attempts re-acquire the same pinned provider;
+              // settlement (release/spend/limit-event) happens at the final
+              // attempt below, never on recoverable retry-continue.
+              providerPool: options.providerPool,
+              poolStickyKey: deltaKey,
               toolNames: agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
               // Typed operation traces: the script line of THIS call (the
@@ -1482,6 +1539,7 @@ export async function runWorkflow<T = unknown>(
             }
 
             const workflowError = wrapError(error, { agentLabel: label });
+            settledErrorCode = workflowError.code;
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
             const tokens = recordTokens(null);
             // This attempt's store writes must not survive it — a failed
@@ -1530,6 +1588,9 @@ export async function runWorkflow<T = unknown>(
                 await backoffSleep(delayMs, [options.signal, shared.runFatalController.signal]);
                 throwIfAborted();
               }
+              // This attempt is continuing as a retry: keep the pool reservation
+              // (settled only at the final attempt, see settleProviderPool).
+              poolRetryPending = true;
               continue;
             }
 
@@ -1578,6 +1639,11 @@ export async function runWorkflow<T = unknown>(
             // Drop this attempt's damage-control handle; a later attempt (or a
             // later agent call) re-registers under the same call id if needed.
             agentKillChannel?.killControllers.delete(deltaKey);
+            // Provider pool settlement at this call's FINAL attempt only: a
+            // retry-continue skips it (poolRetryPending), keeping the sticky
+            // reservation live during backoff. Settles on success, exhausted
+            // failure, non-recoverable error, abort, and kill alike.
+            if (!poolRetryPending) settleProviderPool();
           }
         }
         return null;

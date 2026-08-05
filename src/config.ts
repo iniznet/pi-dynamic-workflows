@@ -4,6 +4,10 @@
 
 import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 import { isKnownExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
+// Provider-pool env override: provider-pool-config.ts is a runtime leaf (it
+// only imports types from provider-pool.ts, which imports from errors.ts), so
+// this value import never creates a cycle back into config.ts.
+import { PROVIDER_POOL_ENV_VAR, providerPoolFromEnv } from "./gateway/provider-pool-config.js";
 // Type-only to avoid a runtime import cycle: workflow-settings.ts imports value
 // bindings (MAX_AGENT_RETRIES, ...) from this module, so importing its type is
 // erased at compile time and never re-enters it at load.
@@ -104,6 +108,9 @@ export const WORKFLOW_ENV_VARS = {
   subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
   subagentExtensionTools: "PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS",
   subagentDamageControlTools: "PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS",
+  // Full-JSON override (see providerPoolFromEnv) — headless/CI channel for the
+  // same `providerPool` key that settings.json carries under "workflows".
+  providerPool: PROVIDER_POOL_ENV_VAR,
 } as const satisfies Record<keyof WorkflowSettings, string>;
 
 type EnvSource = Record<string, string | undefined>;
@@ -227,6 +234,8 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
     ];
     if (ids.length) settings.subagentExtensionTools = ids;
   }
+  const providerPool = providerPoolFromEnv(env);
+  if (providerPool !== undefined) settings.providerPool = providerPool;
   return settings;
 }
 

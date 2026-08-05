@@ -27,7 +27,12 @@ import {
   WorkflowErrorCode,
 } from "./errors.js";
 import { tierNameForTask } from "./model-routing.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import {
+  canonicalModelSpec,
+  formatModelSpecWithThinking,
+  resolveModelSpecWithThinking,
+  splitModelSpecThinking,
+} from "./model-spec.js";
 import {
   buildDefaultTierConfig,
   formatTierFallbackNotice,
@@ -310,6 +315,31 @@ export function resolveAgentModelSpec(
   return undefined;
 }
 
+/**
+ * Derive the provider pool's logical model key from a resolved model spec: the
+ * spec minus a leading provider prefix and minus any :thinking suffix (the
+ * caller already split that off via {@link splitModelSpecThinking}). Tiers and
+ * phase routing select the LOGICAL id; the pool config maps that logical id to
+ * each provider's real modelId alias. The provider prefix is matched against
+ * the registry's known providers (same disambiguation as
+ * resolveModelSpecWithThinking), so an aggregator-style id like
+ * "openrouter/deepseek/x" keeps its vendor segment while "openai/gpt-5.5"
+ * collapses to "gpt-5.5". A spec whose first segment is not a known provider
+ * (e.g. a bare "accounts/fireworks/models/x") is returned unchanged; an
+ * unmapped logical key makes the pool's acquire() return undefined and this
+ * run falls back to legacy single-resolution.
+ */
+function logicalModelKey(spec: string, registry: ModelRegistry): string {
+  const slashIndex = spec.indexOf("/");
+  if (slashIndex !== -1) {
+    const provider = spec.slice(0, slashIndex).trim().toLowerCase();
+    if (registry.getAll().some((model) => model.provider.toLowerCase() === provider)) {
+      return spec.slice(slashIndex + 1);
+    }
+  }
+  return spec;
+}
+
 export interface WorkflowAgentOptions {
   cwd?: string;
   /** Extra tools available to the subagent in addition to the structured output tool. */
@@ -576,6 +606,26 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * unauthenticated) weights. When omitted, the session default applies.
    */
   model?: string;
+  /**
+   * Optional provider pool consulted at the model-resolution step, BEFORE the
+   * model is bound to the session. Acquire pins this run to ONE pooled
+   * provider for its whole life (sticky), routing by per-provider concurrency
+   * caps + weights; the chosen provider's real modelId replaces the caller's
+   * spec (thinking level re-applied). A model with no pool entries makes
+   * acquire() return undefined and this run falls back to legacy resolution.
+   * Handoff continuations bypass the pool entirely — their model is already
+   * bound and must never be swapped. The workflow layer owns release/spend/
+   * limit-event accounting at final settlement.
+   */
+  providerPool?: import("./gateway/provider-pool.js").ProviderPool;
+  /**
+   * Sticky key shared across every retry attempt of the same agent (the run's
+   * deltaKey): the pool keeps the SAME provider pin across attempts so
+   * provider-side prompt caching stays warm, and release only happens at the
+   * run's final attempt. When omitted, each attempt re-balances. Only
+   * meaningful with `providerPool`.
+   */
+  poolStickyKey?: string;
   /**
    * Model tier name (e.g. "small", "medium", "big"). The contract's standard
    * vocabulary is the closed union `"small" | "medium" | "big"` (PRD Task 3);
@@ -1064,7 +1114,7 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(
+    let modelSpec = resolveAgentModelSpec(
       options,
       this.mainModel,
       () => this.loadTierConfig(),
@@ -1077,6 +1127,32 @@ export class WorkflowAgent {
       // injected registry (routing-budgets:i3).
       () => listAvailableModels(modelRegistry),
     );
+
+    // Provider pool: consult BEFORE model resolution so the session binds the
+    // POOLED provider. The logical key is the resolved spec with any provider
+    // prefix and :thinking suffix stripped (tiers/routing select the logical
+    // id; the pool maps it to per-provider modelId aliases). A choice
+    // overrides the caller's spec with `<provider>/<modelId>` (thinking level
+    // re-applied), so the pool's caps + auth decide the concrete endpoint.
+    // Handoff continuations bypass the pool: their model is already bound and
+    // must never be swapped (acquire would re-count/rebind). Acquire errors
+    // (abort, PROVIDER_SATURATED) propagate unchanged — the workflow layer
+    // owns release/spend/limit-event accounting at final settlement.
+    const poolHandoffContinuation =
+      this.sessionHandoff &&
+      options.handoff === true &&
+      this.handoffSession !== undefined &&
+      !this.handoffSessionClosed;
+    if (options.providerPool && !poolHandoffContinuation && modelSpec) {
+      const { modelSpec: logicalSpec, thinkingLevel } = splitModelSpecThinking(modelSpec);
+      const choice = await options.providerPool.acquire(logicalModelKey(logicalSpec, modelRegistry), {
+        stickyKey: options.poolStickyKey,
+        signal: options.signal,
+      });
+      if (choice) {
+        modelSpec = formatModelSpecWithThinking(`${choice.provider}/${choice.modelId}`, thinkingLevel);
+      }
+    }
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
     // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.

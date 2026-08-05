@@ -8,6 +8,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+// Type-only: provider-pool-config.ts is a runtime leaf that never re-enters
+// workflow-settings.ts, so importing its type is erased at compile time.
+import type { ProviderPoolSettingsInput } from "./gateway/provider-pool-config.js";
 import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 import { EXTENSION_TOOL_SOURCES } from "./subagent/extension-tools-capture.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
@@ -128,6 +131,17 @@ export interface WorkflowSettings {
    * precedent).
    */
   subagentDamageControlTools?: "off" | "readonly" | "on";
+  /**
+   * Provider pool (design: tasks/provider-load-balance/design.md): per-provider
+   * concurrency caps + run-sticky provider routing for workflow subagents.
+   * Raw settings object — the deep value-level normalization is deliberate
+   * here (drop-on-violation, exactly like the other settings) and lives in
+   * src/gateway/provider-pool-config.ts's `normalizeProviderPoolConfig`, which
+   * the pool factory (`createProviderPoolFromConfig`) runs over this value at
+   * construction. Absent (or normalizing to an empty map) → no pool → legacy
+   * single-resolution behavior.
+   */
+  providerPool?: ProviderPoolSettingsInput;
 }
 
 /** A runtime type tag for schema checks (distinguishes array/null from object). */
@@ -179,6 +193,10 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // passes the type schema; normalizeSettings accepts only "off"/"readonly"/"on"
   // and drops anything else (default off = no defs anywhere).
   subagentDamageControlTools: ["string"],
+  // Any object passes the type schema; value-level leniency (unknown keys,
+  // wrong-typed values, invalid entries) is applied later by
+  // normalizeProviderPoolConfig when the pool factory constructs the pool.
+  providerPool: ["object"],
 };
 
 /**
@@ -397,6 +415,12 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     raw.subagentDamageControlTools === "on"
   ) {
     settings.subagentDamageControlTools = raw.subagentDamageControlTools;
+  }
+  if (raw.providerPool && typeof raw.providerPool === "object" && !Array.isArray(raw.providerPool)) {
+    // Raw pass-through: deep validation happens in provider-pool-config.ts's
+    // normalizeProviderPoolConfig (drop-on-violation), which the pool factory
+    // runs at construction — this layer only enforces the "object" shape.
+    settings.providerPool = raw.providerPool as ProviderPoolSettingsInput;
   }
   if (raw.subagentExtensionTools === "on" || raw.subagentExtensionTools === "off") {
     settings.subagentExtensionTools = raw.subagentExtensionTools;

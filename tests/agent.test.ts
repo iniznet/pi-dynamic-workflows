@@ -18,6 +18,7 @@ import {
   WorkflowAgent,
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { createProviderPoolFromConfig, type ProviderPool } from "../src/gateway/provider-pool.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig, RankableModel } from "../src/model-tier-config.js";
 import { runWorkflow } from "../src/workflow.js";
@@ -1731,4 +1732,236 @@ test("runWorkflow retries a thrown 500 (PROVIDER_UNAVAILABLE) with backoff, then
   );
   assert.equal(result.result, "ok");
   assert.equal(calls, 2, "the 500 attempt must be retried, not swallowed as a null");
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Provider pool — runner-level routing (tasks/provider-load-balance)
+// ═══════════════════════════════════════════════════════════════════════
+
+type FauxPoolCore = ReturnType<typeof createFauxCore>;
+
+/**
+ * Poll a predicate every ~5ms until it passes or the deadline (ms) elapses.
+ * Throws on timeout so a stalled pool acquire fails loudly, not by hang.
+ */
+async function pollUntil(
+  predicate: () => boolean | Promise<boolean>,
+  deadlineMs = 5_000,
+  what = "condition",
+): Promise<void> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+/**
+ * Runner-level harness for the provider pool: two faux providers ("pool-a",
+ * "pool-b") serve the SAME logical model id "faux-model" on ONE runtime, each
+ * capped at 1 concurrent run, behind a single ProviderPool. Which provider
+ * served a run is observable via each core's `state.callCount`; which provider
+ * holds a slot via `pool.snapshot()`. Acquires wait FIFO when saturated and
+ * time out after `saturationWaitTimeoutMs` so a wrongly-blocked run fails fast.
+ */
+async function fauxPoolHarness(
+  run: (h: {
+    cwd: string;
+    coreA: FauxPoolCore;
+    coreB: FauxPoolCore;
+    registry: ModelRegistry;
+    pool: ProviderPool;
+    agent: WorkflowAgent;
+  }) => Promise<void>,
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-pool-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-pool-cwd-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      const coreA = createFauxCore({
+        provider: "pool-a",
+        models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+      });
+      const coreB = createFauxCore({
+        provider: "pool-b",
+        models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+      });
+      for (const core of [coreA, coreB]) {
+        runtime.registerProvider(core.provider, {
+          name: "Faux Test",
+          baseUrl: "http://127.0.0.1:9/faux",
+          apiKey: "faux-dummy-key-not-used",
+          api: core.api,
+          streamSimple: core.streamSimple as never,
+          models: core.models.map((m) => ({
+            id: m.id,
+            name: m.name ?? m.id,
+            reasoning: false,
+            input: ["text"] as ("text" | "image")[],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: m.contextWindow ?? 128000,
+            maxTokens: m.maxTokens ?? 4096,
+          })),
+        });
+      }
+      const registry = new ModelRegistry(runtime);
+      const pool = createProviderPoolFromConfig(
+        {
+          enabled: true,
+          whenSaturated: "wait",
+          saturationWaitTimeoutMs: 2_000,
+          models: {
+            "faux-model": {
+              "pool-a": { concurrency: 1, weight: 1 },
+              "pool-b": { concurrency: 1, weight: 1 },
+            },
+          },
+        },
+        registry,
+      );
+      assert.ok(pool, "the two-provider pool must be constructible");
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      await run({ cwd, coreA, coreB, registry, pool, agent });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+test("provider pool: cap-1 two-provider pool spreads parallel agents across both providers", async () => {
+  await fauxPoolHarness(async ({ cwd, coreA, coreB, pool, registry }) => {
+    // Two parallel agents = two WorkflowAgent instances sharing the pool (the
+    // real parallel() fan-out shape). Hold pool-a mid-run via a gated response
+    // so agent 1 provably holds its slot (active=1, still streaming) when
+    // agent 2 starts; agent 2 must take the only free provider (pool-b)
+    // instead of piling onto the capped one.
+    const agent1 = new WorkflowAgent({ cwd, modelRegistry: registry });
+    const agent2 = new WorkflowAgent({ cwd, modelRegistry: registry });
+    let releaseAgentOne!: () => void;
+    const agentOneGate = new Promise<void>((resolve) => (releaseAgentOne = resolve));
+    coreA.setResponses([
+      async () => {
+        await agentOneGate;
+        return fauxAssistantMessage("pool-a-answer", { stopReason: "stop" });
+      },
+    ]);
+    coreB.setResponses([fauxAssistantMessage("pool-b-answer", { stopReason: "stop" })]);
+
+    const first = agent1.run("task", { label: "spread-1", model: "pool-a/faux-model", providerPool: pool });
+    await pollUntil(
+      () => pool.snapshot().entries.some((entry) => entry.provider === "pool-a" && entry.active > 0),
+      5_000,
+      "agent 1 to acquire its provider slot",
+    );
+
+    const second = await agent2.run("task", { label: "spread-2", model: "pool-a/faux-model", providerPool: pool });
+    assert.equal(second, "pool-b-answer", "agent 2 must be routed to the only free provider");
+    assert.equal(coreB.state.callCount, 1, "agent 2 was served by pool-b");
+    // coreA's count is 1 here — agent 1's OWN request is still in-flight on the
+    // gated response (faux callCount increments at stream start, not at stream
+    // end). The guard is that agent 2 added nothing on top of it.
+    assert.equal(coreA.state.callCount, 1, "agent 2 must not pile onto the capped provider");
+
+    releaseAgentOne();
+    const firstResult = await first;
+    assert.equal(firstResult, "pool-a-answer", "agent 1 was served by pool-a");
+    assert.equal(coreA.state.callCount, 1);
+    assert.equal(coreB.state.callCount, 1, "the two-agent burst spread one run per provider");
+  });
+});
+
+test("provider pool: sticky retry (same poolStickyKey) re-acquires the SAME provider", async () => {
+  await fauxPoolHarness(async ({ coreA, coreB, pool, agent }) => {
+    coreA.setResponses([
+      fauxAssistantMessage("sticky-first", { stopReason: "stop" }),
+      fauxAssistantMessage("sticky-retry", { stopReason: "stop" }),
+    ]);
+    coreB.setResponses([fauxAssistantMessage("other-agent", { stopReason: "stop" })]);
+
+    const resolved: string[] = [];
+    const first = await agent.run("task", {
+      label: "sticky-1",
+      model: "pool-a/faux-model",
+      providerPool: pool,
+      poolStickyKey: "sticky-run-1",
+      onModelResolved: (spec) => resolved.push(spec),
+    });
+    assert.equal(first, "sticky-first");
+    assert.ok(resolved[0].startsWith("pool-a/"), "first attempt pins pool-a");
+    // agent.run() does NOT release (the workflow layer settles at the final
+    // attempt), so the reservation still holds pool-a's slot after this run.
+
+    const other = await agent.run("task", {
+      label: "sticky-other",
+      model: "pool-a/faux-model",
+      providerPool: pool,
+    });
+    assert.equal(other, "other-agent");
+    assert.equal(coreB.state.callCount, 1);
+    assert.equal(coreA.state.callCount, 1, "the interleaved agent must route around the pinned provider");
+
+    const retry = await agent.run("task", {
+      label: "sticky-retry",
+      model: "pool-a/faux-model",
+      providerPool: pool,
+      poolStickyKey: "sticky-run-1",
+      onModelResolved: (spec) => resolved.push(spec),
+    });
+    assert.equal(retry, "sticky-retry");
+    assert.equal(coreA.state.callCount, 2, "the retry was served by the SAME provider (pool-a)");
+    assert.ok(resolved[1].startsWith("pool-a/"), "sticky re-acquire keeps the pinned provider");
+    assert.equal(coreB.state.callCount, 1, "pool-b stays reserved for other runs only");
+
+    const held = pool.snapshot().entries.find((entry) => entry.provider === "pool-a");
+    assert.equal(held?.active, 1, "sticky re-acquire must not re-count the held slot");
+  });
+});
+
+test("provider pool: handoff-session continuation bypasses the pool", async () => {
+  await fauxPoolHarness(async ({ cwd, coreA, coreB, registry, pool }) => {
+    const handoffAgent = new WorkflowAgent({ cwd, modelRegistry: registry, sessionHandoff: true });
+    try {
+      coreA.setResponses([
+        fauxAssistantMessage("handoff-first", { stopReason: "stop" }),
+        fauxAssistantMessage("handoff-continue", { stopReason: "stop" }),
+      ]);
+      coreB.setResponses([fauxAssistantMessage("handoff-wrong", { stopReason: "stop" })]);
+
+      // Root of the chain: NOT a continuation → consults the pool → pool-a;
+      // its reservation (poolStickyKey) keeps pool-a capped afterwards.
+      const first = await handoffAgent.run("task", {
+        label: "handoff-1",
+        model: "pool-a/faux-model",
+        handoff: true,
+        providerPool: pool,
+        poolStickyKey: "handoff-chain",
+      });
+      assert.equal(first, "handoff-first");
+      assert.equal(coreA.state.callCount, 1);
+
+      // A recorded 429/limit event cools pool-a down. If the continuation
+      // consulted the pool, its sticky re-acquire would wait out the cooldown
+      // and hit the saturation timeout; the bypass must proceed untouched on
+      // the already-bound provider.
+      pool.recordLimitEvent("pool-a");
+      const started = Date.now();
+      const second = await handoffAgent.run("task", {
+        label: "handoff-2",
+        model: "pool-a/faux-model",
+        handoff: true,
+        providerPool: pool,
+        poolStickyKey: "handoff-chain",
+      });
+      const elapsed = Date.now() - started;
+      assert.equal(second, "handoff-continue");
+      assert.ok(elapsed < 1_500, `continuation must not wait on the pool cooldown (took ${elapsed}ms)`);
+      assert.equal(coreA.state.callCount, 2, "continuation stays on the already-bound provider");
+      assert.equal(coreB.state.callCount, 0, "pool-b is never consulted for a handoff continuation");
+    } finally {
+      handoffAgent.close();
+    }
+  });
 });

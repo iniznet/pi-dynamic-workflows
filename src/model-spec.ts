@@ -70,6 +70,19 @@ export function canonicalModelSpec(model: Model<Api>): string {
 }
 
 /**
+ * Extract the provider from a canonical `provider/model` spec. The first path
+ * segment is always the provider — even when the model id itself carries a
+ * vendor slash (e.g. openrouter's "deepseek/x"). Returns undefined for a spec
+ * with no "/".
+ */
+export function providerFromCanonicalSpec(spec: string): string | undefined {
+  const slashIndex = spec.indexOf("/");
+  if (slashIndex === -1) return undefined;
+  const provider = spec.slice(0, slashIndex).trim().toLowerCase();
+  return provider || undefined;
+}
+
+/**
  * Split a stored tier spec for display/editing. Exact known model specs win, so
  * model ids that legitimately contain colons are not mistaken for thinking.
  */

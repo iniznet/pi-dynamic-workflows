@@ -25,7 +25,7 @@ import type { WorkflowSettings } from "./workflow-settings.js";
 export type WorkflowSettingsFieldGroup = "Trigger" | "Execution" | "Progress" | "Advanced";
 
 /** How a settings row is edited/parsed. */
-export type WorkflowSettingsFieldType = "boolean" | "number" | "string" | "enum" | "string[]";
+export type WorkflowSettingsFieldType = "boolean" | "number" | "string" | "enum" | "string[]" | "object";
 
 /** Where the interactive editor writes a partial save. */
 export type SettingsScope = "global" | "project";
@@ -221,6 +221,18 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     defaultDisplay: "off",
     envVar: WORKFLOW_ENV_VARS.subagentDamageControlTools,
   },
+  {
+    // Nested JSON config consumed by the provider pool (see provider-pool-config.ts).
+    // Editable as a JSON blob in the TUI/dialog tiers; the PI_WORKFLOW_PROVIDER_POOL
+    // env var is the full-JSON headless/CI override.
+    key: "providerPool",
+    type: "object",
+    label: "Provider pool",
+    help: "Per-model provider routing for parallel subagents: per-provider concurrency caps, weights, TPM gates, and cooldowns. JSON object, or set the PI_WORKFLOW_PROVIDER_POOL env var.",
+    group: "Advanced",
+    defaultDisplay: "(unset)",
+    envVar: WORKFLOW_ENV_VARS.providerPool,
+  },
 ];
 
 /** The four groups in render order, derived from the registry so they can never drift. */
@@ -252,6 +264,12 @@ export function fieldDisplayValue(field: WorkflowSettingsField, value: unknown):
       return String(value);
     case "string[]":
       return Array.isArray(value) ? value.join(", ") : String(value);
+    case "object":
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
   }
 }
 
@@ -329,6 +347,21 @@ export function parseFieldInput(
         .map((name) => name.trim())
         .filter((name) => name.length > 0);
       return { ok: true, value: names };
+    }
+    case "object": {
+      // The providerPool row: the value is a nested JSON object (settings.json
+      // shape), so the editor accepts a JSON blob and the save path writes it
+      // through unchanged. Empty input is rejected — clear it via settings.json.
+      if (raw.trim() === "") return { ok: false, error: "must be a JSON object" };
+      try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return { ok: true, value: parsed };
+        }
+        return { ok: false, error: 'must be a JSON object, e.g. { "enabled": true, "models": {} }' };
+      } catch {
+        return { ok: false, error: "must be valid JSON" };
+      }
     }
   }
 }

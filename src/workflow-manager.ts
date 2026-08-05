@@ -9,6 +9,7 @@ import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-ag
 import { usageComponentsTotal, type WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import type { ProviderPool } from "./gateway/provider-pool.js";
 import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
 import {
   buildResumeJournal,
@@ -559,6 +560,8 @@ export class WorkflowManager extends EventEmitter {
   private mainModel?: string;
   /** The host Pi session's model registry, shared with subagents. */
   private modelRegistry?: ModelRegistry;
+  /** The host Pi session's provider pool, shared with subagents. */
+  private providerPool?: ProviderPool;
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
@@ -678,6 +681,19 @@ export class WorkflowManager extends EventEmitter {
    */
   getModelRegistry(): ModelRegistry | undefined {
     return this.modelRegistry;
+  }
+
+  /** Set the host session's provider pool so subagents route through it. */
+  setProviderPool(pool: ProviderPool | undefined): void {
+    this.providerPool = pool;
+  }
+
+  /**
+   * Expose the host session's provider pool to integrations sharing this
+   * manager. Workflow execution reads the same pool internally.
+   */
+  getProviderPool(): ProviderPool | undefined {
+    return this.providerPool;
   }
 
   /**

@@ -62,6 +62,31 @@ export {
 } from "./gateway/host-tool-gateway.js";
 // ─── Universal Host Tool IPC Gateway (Task 1) ──────────────────────────────
 export { MCPBridge } from "./gateway/mcp-bridge.js";
+// ─── Provider pool (per-provider concurrency + run-sticky routing) ──────────
+export type {
+  ProviderChoice,
+  ProviderPoolConfig,
+  ProviderPoolEntry,
+  ProviderPoolOptions,
+  ProviderPoolSnapshot,
+  ProviderPoolSnapshotEntry,
+} from "./gateway/provider-pool.js";
+export { createProviderPoolFromConfig, ProviderPool } from "./gateway/provider-pool.js";
+export type {
+  ProviderPoolEntryInput,
+  ProviderPoolModelInput,
+  ProviderPoolSettingsInput,
+} from "./gateway/provider-pool-config.js";
+export {
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_SATURATION_WAIT_TIMEOUT_MS,
+  DEFAULT_TPM_WINDOW_MS,
+  DEFAULT_WHEN_SATURATED,
+  normalizeProviderPoolConfig,
+  PROVIDER_POOL_ENV_VAR,
+  parseProviderPoolEnvJson,
+  providerPoolFromEnv,
+} from "./gateway/provider-pool-config.js";
 export type {
   MCPBridgeOptions,
   MCPProxyClientOptions,

@@ -161,12 +161,14 @@ function prefillValue(field: WorkflowSettingsField, model: SettingsFormModel): s
   const raw = model.draft[field.key];
   if (raw === undefined || raw === null) return "";
   if (field.type === "string[]") return (raw as string[]).join(", ");
+  if (field.type === "object") return JSON.stringify(raw);
   return String(raw);
 }
 
 function submenuHint(field: WorkflowSettingsField): string {
   if (field.type === "string") return "single word, no leading / or spaces";
   if (field.type === "string[]") return "comma-separated tool names";
+  if (field.type === "object") return "JSON object — see README (Provider pool)";
   const range =
     field.min !== undefined && field.max !== undefined
       ? ` between ${field.min} and ${field.max}`

@@ -48,7 +48,7 @@ function expectError(key: keyof WorkflowSettings, raw: string): string {
 describe("FIELD_REGISTRY completeness", () => {
   it("has exactly one entry per WorkflowSettings key, mirroring WORKFLOW_ENV_VARS", () => {
     const registryKeys = FIELD_REGISTRY.map((field) => field.key);
-    assert.equal(registryKeys.length, 16, "registry must hold one row per settings key");
+    assert.equal(registryKeys.length, 17, "registry must hold one row per settings key");
     assert.deepEqual(
       new Set(registryKeys),
       new Set(Object.keys(WORKFLOW_ENV_VARS)),

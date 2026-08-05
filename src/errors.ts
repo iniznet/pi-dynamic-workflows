@@ -69,6 +69,17 @@ export enum WorkflowErrorCode {
    */
   PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE",
   /**
+   * The provider pool could not place the agent on any configured provider:
+   * every candidate is at its concurrency cap, TPM cap, or in a 429-induced
+   * cooldown. Recoverability follows the pool's saturation semantics: when the
+   * ENTIRE pool is saturated this is non-recoverable — the run checkpoints/
+   * pauses like a usage limit (nothing frees up by re-routing); when only the
+   * run's sticky (pinned) provider is capped/cooling down while other
+   * providers are free it IS recoverable, so the attempt loop retries with
+   * backoff and lands once the cap frees.
+   */
+  PROVIDER_SATURATED = "PROVIDER_SATURATED",
+  /**
    * Run-level failure raised by the manager when agents returned null (exhausted
    * recoverable retries or parallel-absorbed item failures) and the run opted into
    * strict completion (failOnExhaustedAgent). Settles the run failed — resumable,
