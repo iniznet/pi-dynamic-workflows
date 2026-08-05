@@ -214,7 +214,11 @@ export default function extension(pi: ExtensionAPI) {
   // static entry defs, not a live manager). A missing module (H4) yields no
   // defs and never throws out of assemble().
   const damageControlMode = settings.subagentDamageControlTools ?? "off";
-  const damageControlSupplier =
+  // Explicit return type breaks the inference cycle: the arrow closes over
+  // `manager` (declared below), and `manager`'s options reference the
+  // assembler that consumes this supplier — without the annotation TS infers
+  // implicit-any straight through the loop (TS7022/7023/7024).
+  const damageControlSupplier: (() => ToolDefinition[] | Promise<ToolDefinition[]>) | undefined =
     damageControlMode === "off"
       ? undefined
       : () => {
@@ -282,7 +286,7 @@ export default function extension(pi: ExtensionAPI) {
   const pausedForVersionChange = runtimeClaim.versionMismatch
     ? pauseStrandedWorkflowRuntime(runtimeClaim.versionMismatch)
     : 0;
-  const manager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...gatewayManagerOptions });
+  const manager: WorkflowManager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...gatewayManagerOptions });
   if (previousRuntime) manager.reconfigureAfterReload(gatewayManagerOptions);
   // /effort is independent of the manager implementation and can safely
   // survive an extension-version fallback to a fresh manager.
