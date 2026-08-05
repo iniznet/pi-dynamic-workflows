@@ -375,8 +375,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * code depends on). M26: the payload is the FULL breakdown (AgentUsage
    * shape) — never a scalar — so the persisted aggregate keeps the invariant
    * `total === input+output+cacheRead+cacheWrite` across retries.
+   * Second arg: the call's deltaKey (`${runId}:${callIndex}`) — added so a
+   * caller (WorkflowManager) can persist per-call retry spend in a ledger and
+   * refund it on resume when the call is re-run (F03: a pause landing
+   * mid-retry must not charge the same failed attempt twice).
    */
-  onRetrySpend?: (spend: AgentUsage) => void;
+  onRetrySpend?: (spend: AgentUsage, callId: string) => void;
   /** Internal: shared runtime inherited by a nested workflow() call. */
   sharedRuntime?: SharedRuntime;
   /**
@@ -1326,6 +1330,16 @@ export async function runWorkflow<T = unknown>(
       // pool about 429/overload/unavailable events without holding the error
       // object (out of scope there).
       let poolRetryPending = false;
+      // F11: output-token spend of failed-and-retried attempts, accumulated
+      // during the attempt loop and settled TOGETHER with the final attempt's
+      // output at settleProviderPool — the pool's rolling TPM window must see a
+      // retried provider's FULL output, not just the final attempt's, or it is
+      // under-counted for fairness. Accumulate-and-settle (not per-attempt
+      // recordSpend) is what keeps this idempotent across pause/resume: a call
+      // settles at most once per execution, and an interrupted mid-retry call
+      // never settles — so the pre-pause attempts are never charged to the pool
+      // twice (the F03 double-count guard).
+      let retryOutputTokens = 0;
       let settledErrorCode: WorkflowErrorCode | undefined;
       const settleProviderPool = () => {
         const pool = options.providerPool;
@@ -1338,10 +1352,13 @@ export async function runWorkflow<T = unknown>(
         // a vendor slash, e.g. openrouter's "deepseek/x").
         const provider = displayModel ? providerFromCanonicalSpec(displayModel) : undefined;
         if (!provider) return;
-        // Output tokens from the FINAL attempt's real session usage (onUsage);
-        // a non-reporting provider yields no entry (recordSpend drops <=0).
-        const outputTokens = usage?.output;
-        if (typeof outputTokens === "number" && outputTokens > 0) {
+        // Output tokens from the FINAL attempt's real session usage (onUsage),
+        // plus the output of every failed-and-retried attempt accumulated in
+        // the attempt loop (F11 — a retried provider was previously
+        // under-counted in the pool's TPM fairness window); a non-reporting
+        // provider yields no entry (recordSpend drops <=0).
+        const outputTokens = (usage?.output ?? 0) + retryOutputTokens;
+        if (outputTokens > 0) {
           pool.recordSpend(provider, outputTokens);
         }
         // 429/usage-limit + 5xx overload/unavailable → the provider enters its
@@ -1367,6 +1384,15 @@ export async function runWorkflow<T = unknown>(
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
+          // F07: whether THIS attempt actually entered agentRunner.run. The
+          // catch's kill gate only folds the prompt-estimate into the run
+          // aggregate when the attempt really ran — a queued kill throws at the
+          // gate below before any token could be consumed, so charging it would
+          // inflate live shared.spent with spend the persisted aggregate (built
+          // from onAgentEnd/onRetrySpend) never mirrors. Reset per attempt: a
+          // retried call's later attempt may legitimately enter the runner even
+          // though an earlier one was killed while queued.
+          let attemptEnteredRunner = false;
           try {
             throwIfAborted();
             // Queued-kill gate: damage control marked this call id before this
@@ -1418,6 +1444,11 @@ export async function runWorkflow<T = unknown>(
               onRunFatal = () => agentController.abort();
               shared.runFatalController.signal.addEventListener("abort", onRunFatal, { once: true });
             }
+            // F07: the attempt is now inside agentRunner.run — the kill gates
+            // below must treat it as having consumed (or at least reserved the
+            // right to consume) tokens; a queued kill threw at the gate above
+            // and never reaches here.
+            attemptEnteredRunner = true;
             const runPromise = agentRunner.run(prompt, {
               label,
               // Identifiable name for persisted sessions (persistAgentSessions).
@@ -1528,10 +1559,18 @@ export async function runWorkflow<T = unknown>(
             // attempt's partial store writes and fold its spend into the run
             // aggregate exactly like the failure path below, so a killed agent's
             // writes never leak into the live store (visible to concurrent
-            // siblings) or a resume replay.
+            // siblings) or a resume replay. (F07: a kill that landed while this
+            // call was still QUEUED never entered agentRunner.run — see the
+            // queued gate above — so its spend fold below is skipped.)
             if (agentKillChannel?.killedCallIds.has(deltaKey)) {
               store.discardDelta(deltaKey);
-              recordTokens(null);
+              // F07: fold the attempt's spend into the run aggregate ONLY if it
+              // actually entered agentRunner.run — an in-flight kill consumed
+              // (at least estimated) tokens, but a kill that landed while the
+              // call was still queued never ran, so charging the prompt
+              // estimate would make live shared.spent exceed what the persisted
+              // aggregate (onAgentEnd/onRetrySpend) ever records.
+              if (attemptEnteredRunner) recordTokens(null);
               throw new WorkflowError("agent killed by workflow damage control", WorkflowErrorCode.AGENT_KILLED, {
                 recoverable: true,
                 agentLabel: label,
@@ -1578,7 +1617,13 @@ export async function runWorkflow<T = unknown>(
                 total: tokens,
                 cost: attemptUsage?.cost ?? 0,
               };
-              safeCallback("onRetrySpend", options.onRetrySpend, retrySpend);
+              safeCallback("onRetrySpend", options.onRetrySpend, retrySpend, deltaKey);
+              // F11: count this failed attempt's output in the call's pool
+              // spend (settled once at the final attempt, see
+              // settleProviderPool) so a retried provider's TPM window sees it.
+              if (typeof attemptUsage?.output === "number" && attemptUsage.output > 0) {
+                retryOutputTokens += attemptUsage.output;
+              }
               // Exponential backoff before the next attempt: a provider mid-outage
               // gets spaced retries instead of an immediate hammer. Abort-aware — a
               // pause/stop/Esc or a sealed run fate during the wait bails out and

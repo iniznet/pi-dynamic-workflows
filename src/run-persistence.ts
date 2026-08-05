@@ -89,6 +89,18 @@ export interface PersistedRunState {
     cacheWrite?: number;
   };
   /**
+   * F03: per-call ledger of RETRIED-attempt spend, keyed by the call's
+   * deltaKey (`${runId}:${callIndex}` — the same key the journal's
+   * resume-replay map uses). Every entry was ALSO folded into tokenUsage
+   * (via onRetrySpend → accumulateTokenUsage), so this is pure bookkeeping:
+   * it lets resume() refund the retry-spend of calls that will be RE-RUN
+   * live (an interrupted call has a ledger entry but no journal entry),
+   * keeping a failed attempt charged exactly once across a pause/resume
+   * boundary instead of twice (see WorkflowManager.resume). Absent on runs
+   * that never retried (JSON-dropped like compactJournal).
+   */
+  retryLedger?: Record<string, AgentUsage>;
+  /**
    * Cached agent/checkpoint results for resume, keyed by deterministic call
    * index. `runId` namespaces `index` (a nested workflow() call restarts its
    * own callSeq at 0) — absent on journals persisted before that namespacing

@@ -311,6 +311,53 @@ test("runWorkflow routes models: explicit opts.model > phase model > default", a
   assert.deepEqual(seen, ["explicit-model", "phase-a-model", undefined]);
 });
 
+test("F11: a retried call settles the FULL output spend (failed attempts + final) into the provider pool", async () => {
+  let calls = 0;
+  const recorded: Array<{ provider: string; tokens: number }> = [];
+  const pool = {
+    acquire: async () => ({ provider: "p", modelId: "m", endpoint: "e" }),
+    release: () => {},
+    recordSpend: (provider: string, tokens: number) => recorded.push({ provider, tokens }),
+    recordLimitEvent: () => {},
+  } as unknown as import("../src/gateway/provider-pool.js").ProviderPool;
+
+  const script = `export const meta = { name: 'f11_pool', description: 'pool spend' }
+const a = await agent('work', { label: 'a' })
+return a`;
+
+  const result = await runWorkflow(script, {
+    agent: {
+      async run(
+        _prompt: string,
+        options?: { onUsage?: (u: AgentUsage) => void; onModelResolved?: (id: string) => void },
+      ) {
+        options?.onModelResolved?.("p/m");
+        calls++;
+        if (calls === 1) {
+          // Failed-and-retried attempt: 40 output tokens (reporting provider).
+          options?.onUsage?.({ input: 10, output: 40, cacheRead: 0, cacheWrite: 0, total: 50, cost: 0 });
+          return ""; // recoverable empty output -> retried
+        }
+        // Final attempt: 25 output tokens.
+        options?.onUsage?.({ input: 10, output: 25, cacheRead: 0, cacheWrite: 0, total: 35, cost: 0 });
+        return "ok";
+      },
+    },
+    agentRetries: 1,
+    retryBackoffMs: 0,
+    providerPool: pool,
+    persistLogs: false,
+  });
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2, "the call should have been retried once");
+  assert.deepEqual(
+    recorded,
+    [{ provider: "p", tokens: 65 }],
+    "the pool must see the retried attempt's 40 output tokens plus the final attempt's 25 (F11)",
+  );
+});
+
 test("runWorkflow plumbs opts.tier through to the agent with correct precedence", async () => {
   // Regression guard: tier must reach WorkflowAgent.run() (it was previously
   // dropped). Precedence: explicit model > tier > phase model.

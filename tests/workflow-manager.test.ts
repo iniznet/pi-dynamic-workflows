@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AgentUsage, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { DEFAULT_RUN_LEASE_TTL_MS } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -801,6 +802,174 @@ return { a, b }`;
       65,
       "the persisted total must include the failed-then-retried attempt's 40 tokens, not just the final attempt's 25",
     );
+  }),
+);
+
+test(
+  "F03: a retry-spend double-count across pause/resume is refunded, so the tokenBudget cap is not tripped early",
+  withTempCwd(async (cwd) => {
+    // 'a' fails its FIRST attempt of each execution (empty output -> recoverable
+    // -> retried, spending 40) and succeeds on its second attempt (spending 25).
+    // The pause lands while 'a's second attempt of the FIRST execution hangs, so
+    // the pre-pause persisted total (40) has NO journal entry for 'a' — the
+    // resume replays nothing for it and re-runs the call live. Without the F03
+    // refund the resumed seed would be 40 and the re-run would charge 40+25
+    // again (40+40+25+100 = 205) — tripping the 180 budget on 'c'. With the
+    // refund the seed is 40-40 = 0, the re-run charges 40+25 once, and the total
+    // is 40+25+100+1 = 166 < 180: completed, not TOKEN_BUDGET_EXHAUSTED.
+    let aCalls = 0;
+    const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const agent: Pick<WorkflowAgent, "run"> = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
+        if (prompt === "a") {
+          aCalls++;
+          if (aCalls === 1) {
+            options?.onUsage?.({ ...zeroUsage, total: 40 });
+            return ""; // recoverable empty output -> retried
+          }
+          if (aCalls === 2) return new Promise(() => {}); // first execution's attempt 2 hangs -> pause point
+          if (aCalls === 3) {
+            options?.onUsage?.({ ...zeroUsage, total: 40 });
+            return ""; // resumed execution's attempt 1 fails again -> retried
+          }
+          options?.onUsage?.({ ...zeroUsage, total: 25 });
+          return "a-result";
+        }
+        if (prompt === "b") {
+          options?.onUsage?.({ ...zeroUsage, total: 100 });
+          return "b-result";
+        }
+        options?.onUsage?.({ ...zeroUsage, total: 1 });
+        return "c-result";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'f03_refund_demo', description: 'retry double-count' }
+const a = await agent('a', { label: 'a' })
+const b = await agent('b', { label: 'b' })
+const c = await agent('c', { label: 'c' })
+return { a, b, c }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      tokenBudget: 180,
+      agentRetries: 1,
+      retryBackoffMs: 0,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && aCalls < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10)); // let attempt 2 hang
+    assert.equal(aCalls, 2, "'a' should have failed once and be hanging on its retry before pausing");
+    assert.equal(manager.pause(runId), true);
+
+    const paused = manager.getPersistence().load(runId);
+    assert.equal(paused?.status, "paused");
+    assert.equal(paused?.tokenUsage?.total, 40, "pre-pause retry spend is persisted");
+    assert.equal(
+      paused?.retryLedger?.[`${runId}:0`]?.total,
+      40,
+      "the per-call retry ledger records the interrupted call's attempt spend (F03)",
+    );
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 400 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(
+      resumed?.tokenUsage?.total,
+      166,
+      "the retry spend is charged exactly once across the pause/resume boundary (40+25+100+1)",
+    );
+    assert.equal(resumed?.status, "completed", "the 180 budget must NOT trip early on the refunded retry spend");
+    assert.equal(
+      (resumed?.result as { a?: string })?.a,
+      "a-result",
+      "the re-run of the interrupted call produces its result",
+    );
+  }),
+);
+
+test(
+  "F03: refunding an interrupted call preserves the journaled spend of an earlier completed sibling",
+  withTempCwd(async (cwd) => {
+    // 'y' completes first (100, journaled); 'x' then fails its first attempt of
+    // each execution (40, recoverable -> retried) and hangs on the second — the
+    // pause point. Pre-pause aggregate is 140 (y's 100 + x's 40) with a ledger
+    // entry only for x. The F03 refund must subtract ONLY x's interrupted spend
+    // (seed 140-40 = 100): y's journaled 100 is preserved (it replays from the
+    // journal charging 0), and the resumed run charges x once (40+25) plus z (1)
+    // — 166, within the 200 budget. Without the refund the seed would be 140 and
+    // x's re-run would push the total to 206, tripping the cap on z.
+    let xCalls = 0;
+    const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const agent: Pick<WorkflowAgent, "run"> = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
+        if (prompt === "y") {
+          options?.onUsage?.({ ...zeroUsage, total: 100 });
+          return "y-result";
+        }
+        if (prompt === "x") {
+          xCalls++;
+          if (xCalls === 1) {
+            options?.onUsage?.({ ...zeroUsage, total: 40 });
+            return ""; // recoverable empty output -> retried
+          }
+          if (xCalls === 2) return new Promise(() => {}); // first execution's attempt 2 hangs -> pause point
+          if (xCalls === 3) {
+            options?.onUsage?.({ ...zeroUsage, total: 40 });
+            return ""; // resumed execution's attempt 1 fails again -> retried
+          }
+          options?.onUsage?.({ ...zeroUsage, total: 25 });
+          return "x-result";
+        }
+        options?.onUsage?.({ ...zeroUsage, total: 1 });
+        return "z-result";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'f03_preserve_demo', description: 'refund keeps journaled spend' }
+const y = await agent('y', { label: 'y' })
+const x = await agent('x', { label: 'x' })
+const z = await agent('z', { label: 'z' })
+return { x, y, z }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      tokenBudget: 200,
+      agentRetries: 1,
+      retryBackoffMs: 0,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && xCalls < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10)); // let x's attempt 2 hang
+    assert.equal(manager.pause(runId), true);
+
+    const paused = manager.getPersistence().load(runId);
+    assert.equal(paused?.status, "paused");
+    assert.equal(paused?.tokenUsage?.total, 140, "pre-pause aggregate includes y's spend and x's retry spend");
+    assert.equal(
+      paused?.retryLedger?.[`${runId}:1`]?.total,
+      40,
+      "only the interrupted call (x, call index 1) has a ledger entry",
+    );
+    assert.equal(paused?.retryLedger?.[`${runId}:0`], undefined, "the completed sibling y has no ledger entry");
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 400 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const resumed = manager.getPersistence().load(runId);
+    assert.equal(resumed?.tokenUsage?.total, 166, "y's journaled 100 survives the refund (100+40+25+1)");
+    assert.equal(resumed?.status, "completed", "the 200 budget must not trip on a refunded interrupted call");
   }),
 );
 
@@ -2117,5 +2286,101 @@ test(
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd });
     assert.equal(manager.stop("does-not-exist"), false);
+  }),
+);
+
+test(
+  "F01: a running execution renews its lease heartbeat so a run outliving the TTL is never evicted",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner, leaseRenewIntervalMs: 5 });
+    const pers = manager.getPersistence();
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript, undefined);
+    promise.catch(() => {});
+    const lockPath = join(pers.getRunsDir(), `${runId}.lock`);
+
+    // Wait until the execution owns its lock file.
+    for (let i = 0; i < 200 && !existsSync(lockPath); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(existsSync(lockPath), "the running execution holds its lease lock");
+    const initialExpiry = Date.parse((JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string }).expiresAt);
+
+    // Let several heartbeat ticks fire (5ms interval) and assert the expiry was
+    // pushed forward past the original TTL window — without the heartbeat the
+    // lock's expiresAt never moves.
+    await new Promise((r) => setTimeout(r, 35));
+    const renewedExpiry = Date.parse((JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string }).expiresAt);
+    assert.ok(
+      renewedExpiry > initialExpiry,
+      "the heartbeat pushed the lease expiry forward (without it, the lock never changes)",
+    );
+    assert.ok(
+      renewedExpiry > Date.now() + DEFAULT_RUN_LEASE_TTL_MS - 1_000,
+      "renewal resets the expiry to a full fresh TTL from the renewal instant",
+    );
+
+    // The run is still alive and owned; it completes normally once the agent
+    // resolves, and the settle releases the lease.
+    assert.equal(manager.getRun(runId)?.status, "running", "the heartbeating run is still executing");
+    da.resolve("done");
+    const result = await promise;
+    assert.equal(result.runId, runId, "the run completed");
+    assert.equal(manager.getRun(runId)?.status, "completed", "the run settled completed after the agent resolved");
+    assert.equal(existsSync(lockPath), false, "the lease is released when the execution settles");
+  }),
+);
+
+test(
+  "F02: stop's persisted fallback re-validates status UNDER the lease — a concurrent completion is never flipped back to aborted",
+  withTempCwd(async (cwd) => {
+    // A run persisted as "running" that this fresh manager never loaded into
+    // memory (cold-start simulation, same setup as the other cold-start stop
+    // tests).
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const pers = manager.getPersistence();
+    const runId = "cold-start-stop-toctou-1";
+    pers.save({
+      runId,
+      workflowName: "cold_start_stop_toctou",
+      script: oneAgentScript,
+      args: undefined,
+      status: "running",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Simulate the TOCTOU: stop()'s first (advisory) load sees "running", but
+    // a "concurrent process" completes the run before the post-lease
+    // re-validation — the second load must see "completed" and refuse,
+    // releasing the lease, without overwriting the freshest state.
+    const originalLoad = pers.load.bind(pers);
+    let loads = 0;
+    pers.load = (id: string) => {
+      loads++;
+      const state = originalLoad(id);
+      if (loads >= 2 && state) return { ...state, status: "completed" as const };
+      return state;
+    };
+
+    let stoppedEvent = false;
+    manager.on("stopped", () => {
+      stoppedEvent = true;
+    });
+
+    assert.equal(manager.stop(runId), false, "stop refuses once the post-lease state is completed");
+    assert.equal(stoppedEvent, false, "no 'stopped' event fired for the refused stop");
+    assert.ok(loads >= 2, "stop re-loaded the state under the lease (F02)");
+
+    // The lease acquired during the refused stop was released again.
+    const lease = pers.acquireRunLease(runId);
+    assert.ok(lease, "the refused stop released its lease");
+    if (lease) pers.releaseRunLease(lease);
+
+    // The on-disk state is untouched (still the originally-written "running" —
+    // our simulated completion was only visible to stop's re-load, not written).
+    assert.equal(originalLoad(runId)?.status, "running", "the freshest on-disk state is unchanged");
   }),
 );

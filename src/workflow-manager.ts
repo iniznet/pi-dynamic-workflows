@@ -6,7 +6,7 @@ import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { usageComponentsTotal, type WorkflowAgent } from "./agent.js";
+import { type AgentUsage, usageComponentsTotal, type WorkflowAgent } from "./agent.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
@@ -14,6 +14,7 @@ import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js
 import {
   buildResumeJournal,
   createRunPersistence,
+  DEFAULT_RUN_LEASE_TTL_MS,
   generateRunId,
   journalEntryKey,
   keepsResumeJournal,
@@ -24,6 +25,7 @@ import {
   type RunLeaseState,
   type RunPersistence,
   type RunStatus,
+  renewRunLease,
 } from "./run-persistence.js";
 import {
   type AgentKillChannel,
@@ -187,6 +189,17 @@ export interface ManagedRunBase {
    * no live abort, persisted reconciliation only.
    */
   agentKills?: AgentKillChannel;
+  /**
+   * F03: per-call ledger of RETRIED-attempt spend for the CURRENT execution,
+   * keyed by the call's deltaKey (`${runId}:${callIndex}`). Seeded from the
+   * persisted ledger on resume() — minus the entries refunded at seed time
+   * (see retrySpendToRefund / resume()) — and appended to by onRetrySpend;
+   * writeRunToDisk persists it (JSON-dropped when empty). Lets a resume
+   * exclude from its spend seed the retry-spend of calls it will RE-RUN live,
+   * so a pause landing mid-retry never charges the same failed attempt twice
+   * against the run's tokenBudget (the A2 seed logic).
+   */
+  retryLedger: Record<string, AgentUsage>;
 }
 
 /** Statuses a run can rest in while it is NOT executing (lease released). */
@@ -419,6 +432,15 @@ export interface WorkflowManagerOptions {
    * run in `runs` forever. Exposed for tests (core-orchestration:i5).
    */
   settleWatchdogMs?: number;
+  /**
+   * How often a running execution renews its exclusive cross-process lease
+   * (see renewRunLease in run-persistence.ts). Defaults to one third of
+   * DEFAULT_RUN_LEASE_TTL_MS, so a run that outlives the 30-minute TTL is
+   * never evicted by the bounded-delay reclaim while it is genuinely
+   * executing. Exposed for tests that want to observe the heartbeat without
+   * waiting out the full TTL (F01).
+   */
+  leaseRenewIntervalMs?: number;
 }
 
 /** Options that a fresh extension generation may safely refresh on a live
@@ -482,6 +504,52 @@ const DEFAULT_SETTLE_WATCHDOG_MS = 30_000;
  */
 function journalSideKey(entry: JournalEntry): string {
   return journalEntryKey(entry.runId ?? "", entry.index);
+}
+
+/**
+ * F03: aggregate the retry-spend ledger of calls that a resume will RE-RUN
+ * live, so that spend can be refunded from the resume's spend seed (see
+ * resume()). A call with a ledger entry but NO journal entry was interrupted
+ * mid-retry: its failed-attempt spend is folded into the persisted
+ * tokenUsage (via onRetrySpend → accumulateTokenUsage) but its result was
+ * never journaled, so the replay misses and the call re-runs from scratch,
+ * charging those attempts again — the seed would otherwise count them twice
+ * and trip the tokenBudget cap early. A call WITH a journal entry replays
+ * from the journal (charging 0) and keeps its spend. Matching uses the same
+ * resume-time key buildResumeJournal uses (`journalEntryKey(entry.runId ??
+ * frameRunId, entry.index)`), which is exactly the deltaKey shape
+ * (`${runId}:${callIndex}`) the ledger is keyed by — including nested
+ * workflow() frames, whose own runId namespaces both sides. Returns the
+ * aggregate breakdown to subtract and the refunded keys (the caller clears
+ * those from the seeded ledger so it stays consistent with the aggregate it
+ * refunds against across repeated pause/resume cycles); undefined when
+ * nothing needs refunding.
+ */
+function retrySpendToRefund(
+  frameRunId: string,
+  journal: JournalEntry[],
+  ledger: Record<string, AgentUsage> | undefined,
+): { refund: AgentUsage; refundedKeys: Set<string> } | undefined {
+  if (!ledger) return undefined;
+  const journaledKeys = new Set(journal.map((entry) => journalEntryKey(entry.runId ?? frameRunId, entry.index)));
+  let refund: AgentUsage | undefined;
+  const refundedKeys = new Set<string>();
+  for (const [key, spend] of Object.entries(ledger)) {
+    if (journaledKeys.has(key)) continue;
+    refundedKeys.add(key);
+    refund ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+    refund.input += spend.input ?? 0;
+    refund.output += spend.output ?? 0;
+    refund.cacheRead += spend.cacheRead ?? 0;
+    refund.cacheWrite += spend.cacheWrite ?? 0;
+    refund.cost += spend.cost ?? 0;
+    // Mirror accumulateTokenUsage's M26 handling: a breakdown-less ledger
+    // entry (provider reported a scalar, or an estimate was used) contributes
+    // its scalar; the aggregate's total is the component sum by construction.
+    const components = usageComponentsTotal(spend);
+    refund.total += components > 0 ? components : (spend.total ?? 0);
+  }
+  return refund ? { refund, refundedKeys } : undefined;
 }
 
 /**
@@ -549,8 +617,15 @@ export class WorkflowManager extends EventEmitter {
   private maxTerminalRunsInMemory: number;
   /** How long an aborted execution may take to settle (see armSettleWatchdog). */
   private settleWatchdogMs: number;
+  /** How often a running execution renews its lease (see armLeaseHeartbeat). */
+  private leaseRenewIntervalMs: number;
   /** Pending settle watchdogs keyed by runId — see armSettleWatchdog. */
   private settleWatchdogs = new Map<string, { timer: ReturnType<typeof setTimeout>; managed: ManagedRun }>();
+  /**
+   * Active lease heartbeats keyed by runId — see armLeaseHeartbeat. One per
+   * executing run; cleared when its execution settles (disarmLeaseHeartbeat).
+   */
+  private leaseHeartbeats = new Map<string, { timer: ReturnType<typeof setTimeout>; managed: ManagedRun }>();
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -590,6 +665,8 @@ export class WorkflowManager extends EventEmitter {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
     this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
+    this.leaseRenewIntervalMs =
+      options.leaseRenewIntervalMs ?? Math.max(1_000, Math.floor(DEFAULT_RUN_LEASE_TTL_MS / 3));
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
     this.opportunisticWorktreePrune();
@@ -758,6 +835,7 @@ export class WorkflowManager extends EventEmitter {
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      retryLedger: {},
     };
 
     this.runs.set(runId, managed);
@@ -878,6 +956,7 @@ export class WorkflowManager extends EventEmitter {
       background: false,
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      retryLedger: {},
     };
   }
 
@@ -976,6 +1055,12 @@ export class WorkflowManager extends EventEmitter {
     // preserved exactly.
     const agentKills: AgentKillChannel = { killedCallIds: new Set(), killControllers: new Map() };
     managed.agentKills = agentKills;
+    // Lease heartbeat (F01): this execution owns the run's exclusive lease —
+    // keep renewing it so a run that outlives DEFAULT_RUN_LEASE_TTL_MS is never
+    // evicted by the bounded-delay reclaim. Disarmed in the finally below when
+    // the execution settles (success or failure); a pause()/stop() that already
+    // released the lease makes later ticks no-op via the status/isCurrent gates.
+    this.armLeaseHeartbeat(managed);
     try {
       const result = await runWorkflow(script, {
         cwd: this.cwd,
@@ -1021,8 +1106,28 @@ export class WorkflowManager extends EventEmitter {
         // shared.spent/tokenUsage, but onAgentEnd never sees a retried
         // (non-final) attempt — fold it into the same persisted aggregate here
         // so a run paused after a retry doesn't under-count against the budget.
-        onRetrySpend: (spend) => {
+        onRetrySpend: (spend, callId) => {
           this.accumulateTokenUsage(managed, spend.total, spend);
+          // F03: keep the per-call retry ledger (see ManagedRun.retryLedger) so
+          // a later pause/resume can refund the spend of calls that re-run —
+          // the persisted total includes this spend, and without the ledger a
+          // resume would charge the same failed attempt twice.
+          const prior = managed.retryLedger[callId];
+          managed.retryLedger[callId] = prior
+            ? {
+                input: prior.input + (spend.input ?? 0),
+                output: prior.output + (spend.output ?? 0),
+                cacheRead: prior.cacheRead + (spend.cacheRead ?? 0),
+                cacheWrite: prior.cacheWrite + (spend.cacheWrite ?? 0),
+                total: prior.total + spend.total,
+                cost: prior.cost + (spend.cost ?? 0),
+              }
+            : { ...spend };
+          // F13: notify progress listeners like the other spend paths
+          // (onAgentEnd/onTokenUsage call progress() after accumulating) so a
+          // retried attempt's spend doesn't sit invisible in memory until the
+          // next unrelated event or the settle persist.
+          progress();
         },
         onAgentJournal: (entry) => {
           // O(1) upsert via the journalIndex side-index (see its doc comment):
@@ -1292,6 +1397,8 @@ export class WorkflowManager extends EventEmitter {
       if (onExternalAbort && externalSignal) {
         externalSignal.removeEventListener("abort", onExternalAbort);
       }
+      // The execution settled — stop renewing its lease (see armLeaseHeartbeat).
+      this.disarmLeaseHeartbeat(managed);
     }
   }
 
@@ -1493,6 +1600,70 @@ export class WorkflowManager extends EventEmitter {
     if (existing?.managed !== managed) return;
     clearTimeout(existing.timer);
     this.settleWatchdogs.delete(managed.runId);
+  }
+
+  /**
+   * Lease heartbeat (F01): renew the run's exclusive lease periodically so a
+   * long-running execution never loses it to the bounded-delay reclaim (see
+   * DEFAULT_RUN_LEASE_TTL_MS) — a second process could otherwise acquire the
+   * same runId mid-run and execute it concurrently, and clean/recover could
+   * normalize a live run to paused. Armed by executeRun() on every start and
+   * resume (the single choke point for all three start paths) and disarmed in
+   * its finally, so the timer is scoped exactly to the execution that owns
+   * the lease. Mirrors armSettleWatchdog's identity-checked bookkeeping: a
+   * superseded execution's heartbeat can never renew (or re-arm for) a newer
+   * execution of the same runId. The timer is unref'd so a pending heartbeat
+   * never keeps the process alive on its own.
+   */
+  private armLeaseHeartbeat(managed: ExecutingRun): void {
+    const existing = this.leaseHeartbeats.get(managed.runId);
+    if (existing?.managed === managed) return; // already armed for this execution
+    if (existing) clearTimeout(existing.timer); // superseded execution's heartbeat — replace it
+    const timer = setTimeout(() => {
+      this.leaseHeartbeatTick(managed);
+    }, this.leaseRenewIntervalMs);
+    timer.unref?.();
+    this.leaseHeartbeats.set(managed.runId, { timer, managed });
+  }
+
+  /** Cancel a pending heartbeat — called only by the exact execution it was armed for. */
+  private disarmLeaseHeartbeat(managed: ManagedRun): void {
+    const existing = this.leaseHeartbeats.get(managed.runId);
+    if (existing?.managed !== managed) return;
+    clearTimeout(existing.timer);
+    this.leaseHeartbeats.delete(managed.runId);
+  }
+
+  /**
+   * Heartbeat tick: re-arm for the next tick, then push the lease's expiry
+   * forward (see renewRunLease). No-ops when the run is no longer the current
+   * entry for its runId (settled/superseded/evicted) or no longer executing
+   * (pause()/stop() already flipped the status and released the lease — renew
+   * would return false against the deleted lock and only log a spurious
+   * warning). A renewal failure (lease lost to a reclaim, or a filesystem
+   * error) is best-effort: the run keeps executing and its own failure paths
+   * still settle it normally — the heartbeat is the bounded-delay reclaim's
+   * counterpart, not a liveness enforcement.
+   */
+  private leaseHeartbeatTick(managed: ExecutingRun): void {
+    try {
+      if (!this.isCurrent(managed) || this.leaseHeartbeats.get(managed.runId)?.managed !== managed) return;
+      if (managed.status !== "running") {
+        this.disarmLeaseHeartbeat(managed);
+        return;
+      }
+      this.armLeaseHeartbeat(managed);
+      const renewed = this.persistence.renewRunLease?.(managed.lease) ?? renewRunLease(managed.lease, this.cwd);
+      if (!renewed) {
+        console.warn(`[workflow-manager] run ${managed.runId} lost its lease (renewRunLease returned false)`);
+      }
+    } catch (error) {
+      console.warn(
+        `[workflow-manager] lease heartbeat for run ${managed.runId} threw: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**
@@ -1716,6 +1887,10 @@ export class WorkflowManager extends EventEmitter {
               cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
             }
           : undefined,
+        // F03 retry ledger (see ManagedRun.retryLedger). JSON-dropped when
+        // empty so a default run's persisted file stays byte-identical to the
+        // pre-fix shape (same pattern as compactJournal).
+        retryLedger: Object.keys(managed.retryLedger).length > 0 ? managed.retryLedger : undefined,
         startedAt: managed.startedAt.toISOString(),
         updatedAt: new Date().toISOString(),
         completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
@@ -1822,24 +1997,57 @@ export class WorkflowManager extends EventEmitter {
     const script = editedScript ?? persisted.script;
     const args = overrideArgs !== undefined ? overrideArgs : persisted.args;
 
-    // Normalize the persisted total-at-pause once: PersistedRunState.tokenUsage
-    // has optional cost/cacheRead/cacheWrite (legacy runs may lack them), but
-    // both the seeded snapshot and initialTokenUsage need concrete numbers.
-    const priorTokenUsage = persisted.tokenUsage
-      ? {
-          input: persisted.tokenUsage.input,
-          output: persisted.tokenUsage.output,
-          total: persisted.tokenUsage.total,
-          cost: persisted.tokenUsage.cost ?? 0,
-          cacheRead: persisted.tokenUsage.cacheRead ?? 0,
-          cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
-        }
-      : undefined;
-
     // The run's resume journal in normalized (de-compacted) form, computed
     // ONCE and reused for the in-memory seed, the upsert side-index, and the
     // resume-replay map below (see loadPersistedJournal).
     const persistedJournal = loadPersistedJournal(persisted);
+
+    // F03: refund the retry-spend of calls that this resume will RE-RUN live.
+    // A call with a retry-ledger entry but no journal entry was interrupted
+    // mid-retry — its failed-attempt spend was folded into the persisted
+    // tokenUsage (via onRetrySpend → accumulateTokenUsage) but its result was
+    // never journaled, so the replay misses and the call re-runs from scratch,
+    // charging those same attempts again. Refunding them from the seed keeps a
+    // failed attempt charged EXACTLY ONCE across the pause/resume boundary
+    // (the persisted total would otherwise count it twice, tripping the hard
+    // tokenBudget cap early). A call WITH a journal entry replays from the
+    // journal (charging 0) and keeps its spend. Refunded calls' ledger entries
+    // are also cleared from the seeded ledger so it stays consistent with the
+    // aggregate it refunds against across repeated pause/resume cycles.
+    const refundState = retrySpendToRefund(runId, persistedJournal, persisted.retryLedger);
+    const seededRetryLedger = { ...(persisted.retryLedger ?? {}) };
+    if (refundState) {
+      for (const key of refundState.refundedKeys) delete seededRetryLedger[key];
+    }
+
+    // Normalize the persisted total-at-pause once: PersistedRunState.tokenUsage
+    // has optional cost/cacheRead/cacheWrite (legacy runs may lack them), but
+    // both the seeded snapshot and initialTokenUsage need concrete numbers.
+    // F03: the F03 refund above is subtracted here, component-wise (clamped at
+    // zero), so BOTH the seeded snapshot and the fresh SharedRuntime's spend
+    // counter exclude the retry-spend of calls that will re-run.
+    const priorTokenUsage = persisted.tokenUsage
+      ? (() => {
+          const base = {
+            input: persisted.tokenUsage.input,
+            output: persisted.tokenUsage.output,
+            total: persisted.tokenUsage.total,
+            cost: persisted.tokenUsage.cost ?? 0,
+            cacheRead: persisted.tokenUsage.cacheRead ?? 0,
+            cacheWrite: persisted.tokenUsage.cacheWrite ?? 0,
+          };
+          const refund = refundState?.refund;
+          if (!refund) return base;
+          return {
+            input: Math.max(0, base.input - refund.input),
+            output: Math.max(0, base.output - refund.output),
+            total: Math.max(0, base.total - refund.total),
+            cost: Math.max(0, base.cost - refund.cost),
+            cacheRead: Math.max(0, base.cacheRead - refund.cacheRead),
+            cacheWrite: Math.max(0, base.cacheWrite - refund.cacheWrite),
+          };
+        })()
+      : undefined;
 
     // L4: seed per-agent timestamps from the persisted agents[] by call id so
     // REPLAYED (cache-hit) agents report their ORIGINAL startedAt/endedAt
@@ -1953,6 +2161,7 @@ export class WorkflowManager extends EventEmitter {
       agentTimestamps: new Map(),
       agentsById: new Map(),
       seededAgentTimestamps,
+      retryLedger: seededRetryLedger,
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -2051,7 +2260,15 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     try {
-      this.persistence.save({ ...persisted, status: "aborted", updatedAt: new Date().toISOString() });
+      // F02 (stop TOCTOU): the pre-lease load above was advisory only — a
+      // concurrent process may have completed/aborted this run between that
+      // read and the lease acquisition. Re-load UNDER the lease and
+      // re-validate before marking it aborted (mirrors resume()'s M23
+      // pattern), so a completed run can never be flipped back to "aborted"
+      // by a stale stop() using the pre-lease snapshot.
+      const fresh = this.persistence.load(runId);
+      if (!fresh || (fresh.status !== "running" && fresh.status !== "paused")) return false;
+      this.persistence.save({ ...fresh, status: "aborted", updatedAt: new Date().toISOString() });
     } finally {
       this.persistence.releaseRunLease(lease);
     }
