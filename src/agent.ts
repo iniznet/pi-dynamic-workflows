@@ -159,6 +159,28 @@ export function throwIfProviderUnavailable(messages: unknown[], label?: string):
   }
 }
 
+/**
+ * Detect silent output truncation: the last assistant message finished with
+ * stopReason "length" (max output tokens) and never emitted a final answer.
+ * The trajectory is at its output ceiling, so neither a retry nor a same-session
+ * nudge can succeed — classified CONTEXT_OVERFLOW (non-recoverable) so the run
+ * settles failed with its journal preserved and resume() re-runs only the
+ * overflowing agent with a fresh session, instead of burning a full retry into
+ * the identical wall (#135). Unlike throwIfContextOverflow (which gates on
+ * stopReason "error" + provider text), this uses the SDK's authoritative
+ * stopReason union — a truncation is an overflow even when the provider buried
+ * no error text in the transcript.
+ */
+export function throwIfTruncatedOutput(messages: unknown[], label?: string): void {
+  const err = lastAssistantError(messages);
+  if (err?.stopReason !== "length") return;
+  throw new WorkflowError(
+    "Model output truncated at max tokens before a final answer (stopReason length)",
+    WorkflowErrorCode.CONTEXT_OVERFLOW,
+    { recoverable: false, agentLabel: label },
+  );
+}
+
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
 export interface StructuredSession {
   prompt(text: string): Promise<void>;
@@ -650,6 +672,18 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * behavior).
    */
   handoff?: boolean;
+  /**
+   * When the model finishes its turn with no final assistant text (a tool-call
+   * ending or a thinking-only finish), re-prompt the SAME session once asking
+   * for the final answer before declaring AGENT_EMPTY_OUTPUT. A same-session
+   * nudge is far cheaper than the workflow-level retry, which re-runs the
+   * entire agent from scratch. Only text emitted after the nudge is accepted;
+   * an empty nudge still throws AGENT_EMPTY_OUTPUT (recoverable). Silently
+   * truncated output (stopReason "length") is never nudged — it is classified
+   * CONTEXT_OVERFLOW before this option is consulted. Default true. Set false
+   * to pin the legacy immediate-throw behavior.
+   */
+  emptyOutputNudge?: boolean;
   /**
    * Called once, when this run's first-edit swap gate fires — i.e. the first
    * file-edit tool call observed in the handoff session. Carries the model
@@ -1257,6 +1291,12 @@ export class WorkflowAgent {
       throwIfProviderLimit(session.messages, options.label);
       throwIfContextOverflow(session.messages, options.label);
       throwIfProviderUnavailable(session.messages, options.label);
+      // Silent truncation is an overflow even with no provider error text: the
+      // trajectory hit its output ceiling, so neither a retry nor the nudge below
+      // can recover it. Classified before BOTH the schema branch and the nudge so
+      // a truncated schema agent settles CONTEXT_OVERFLOW (correct guidance: the
+      // context wall) instead of SCHEMA_NONCOMPLIANCE (wrong guidance: the schema).
+      throwIfTruncatedOutput(session.messages, options.label);
 
       if (options.schema) {
         return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
@@ -1268,7 +1308,26 @@ export class WorkflowAgent {
       // Text emitted before it is stale progress (the agent's last real action was
       // a tool call) — accepting it would report an incomplete run as successful
       // and suppress the AGENT_EMPTY_OUTPUT retry (#111).
-      const text = this.finalAssistantText(session.messages);
+      let text = this.finalAssistantText(session.messages);
+      if (!text.trim() && options.emptyOutputNudge !== false) {
+        // Same-session recovery nudge (#135): an empty final message is usually a
+        // model that ended its turn on a tool call or a thinking-only finish, not
+        // a real failure. One cheap follow-up prompt recovers it in place — far
+        // cheaper than the workflow-level retry, which re-runs the ENTIRE agent
+        // from scratch. Only text emitted AFTER the nudge is accepted, so an empty
+        // nudge still throws AGENT_EMPTY_OUTPUT below (recoverable).
+        await session.prompt(
+          "Your last turn ended without a final answer. Produce your final answer now as plain text — a concise summary of what you did and the result. Do not call any tools.",
+        );
+        if (options.signal?.aborted) throw new Error("Subagent was aborted");
+        // The nudge turn itself can hit a usage limit / overflow / 5xx / truncation
+        // — surface that as the real cause, never as a bogus empty-output null.
+        throwIfProviderLimit(session.messages, options.label);
+        throwIfContextOverflow(session.messages, options.label);
+        throwIfProviderUnavailable(session.messages, options.label);
+        throwIfTruncatedOutput(session.messages, options.label);
+        text = this.finalAssistantText(session.messages);
+      }
       if (!text.trim()) {
         throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
           recoverable: true,

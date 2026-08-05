@@ -1216,6 +1216,124 @@ test("agent() in workflow treats empty text output as a recoverable failure", as
   assert.equal(end?.recoverable, true);
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// AGENT_EMPTY_OUTPUT recovery — same-session nudge + truncation (#135)
+// ═══════════════════════════════════════════════════════════════════
+
+/** Run a REAL WorkflowAgent against a faux (no-network) provider. */
+async function fauxAgentRun(
+  core: ReturnType<typeof createFauxCore>,
+  prompt: string,
+  options: AgentRunOptions<any> = {},
+): Promise<unknown> {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-empty-nudge-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-empty-nudge-cwd-"));
+  try {
+    let outcome: unknown;
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider(core.provider, {
+        name: "Faux Test",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      outcome = await agent.run(prompt, options);
+    });
+    return outcome;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+test("WorkflowAgent.run(): silently truncated output (stopReason length) is CONTEXT_OVERFLOW, never nudged", async () => {
+  const core = createFauxCore({
+    provider: "fauxtest-trunc",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  // ONE queued response: if the runner nudged (or retried) after the truncation,
+  // the second prompt would consume a missing response and fail differently.
+  core.setResponses([fauxAssistantMessage("", { stopReason: "length" })]);
+
+  await assert.rejects(
+    () => fauxAgentRun(core, "task", { label: "trunc" }),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.CONTEXT_OVERFLOW &&
+      error.recoverable === false &&
+      /truncated at max tokens/.test(error.message),
+    "truncated output must settle CONTEXT_OVERFLOW (non-recoverable), not AGENT_EMPTY_OUTPUT",
+  );
+  assert.equal(core.state.callCount, 1, "no nudge prompt may fire after a truncation — the wall is identical");
+});
+
+test("WorkflowAgent.run(): empty final text recovers via one same-session nudge when the model then answers", async () => {
+  const core = createFauxCore({
+    provider: "fauxtest-nudge",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  core.setResponses([
+    fauxAssistantMessage("", { stopReason: "stop" }),
+    fauxAssistantMessage("nudged final answer", { stopReason: "stop" }),
+  ]);
+
+  const result = await fauxAgentRun(core, "task", { label: "nudge-ok" });
+  assert.equal(result, "nudged final answer");
+  assert.equal(core.state.callCount, 2, "exactly one nudge prompt on top of the original turn");
+});
+
+test("WorkflowAgent.run(): an empty nudge still throws AGENT_EMPTY_OUTPUT (recoverable)", async () => {
+  const core = createFauxCore({
+    provider: "fauxtest-nudge-empty",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  core.setResponses([
+    fauxAssistantMessage("", { stopReason: "stop" }),
+    fauxAssistantMessage("", { stopReason: "stop" }),
+  ]);
+
+  await assert.rejects(
+    () => fauxAgentRun(core, "task", { label: "nudge-still-empty" }),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT &&
+      error.recoverable === true,
+    "an empty nudge must surface AGENT_EMPTY_OUTPUT exactly as before",
+  );
+  assert.equal(core.state.callCount, 2, "the nudge ran once and was itself empty");
+});
+
+test("WorkflowAgent.run(): emptyOutputNudge:false pins the legacy immediate-throw behavior", async () => {
+  const core = createFauxCore({
+    provider: "fauxtest-nudge-off",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  core.setResponses([fauxAssistantMessage("", { stopReason: "stop" })]);
+
+  await assert.rejects(
+    () => fauxAgentRun(core, "task", { label: "nudge-off", emptyOutputNudge: false }),
+    (error: unknown) =>
+      error instanceof WorkflowError &&
+      error.code === WorkflowErrorCode.AGENT_EMPTY_OUTPUT &&
+      error.recoverable === true,
+    "emptyOutputNudge:false must throw AGENT_EMPTY_OUTPUT without a follow-up prompt",
+  );
+  assert.equal(core.state.callCount, 1, "no nudge prompt may fire with emptyOutputNudge:false");
+});
+
 test("agent() in workflow reports non-recoverable errors before throwing", async () => {
   const failer = {
     async run() {
