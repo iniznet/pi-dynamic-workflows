@@ -121,6 +121,31 @@ export interface JournalEntry {
 }
 
 /**
+ * Damage-control kill channel: the per-run handle `kill-agent` uses to stop
+ * ONE agent() call by its runtime call id (`${runId}:${callIndex}`, the same
+ * deltaKey SharedStore and the journal use). Created by WorkflowManager's
+ * executeRun and threaded into runWorkflow via WorkflowRunOptions; absent from
+ * any execution that didn't opt in (direct runWorkflow embeds) → the kill
+ * gates below are no-ops and today's behavior is preserved exactly.
+ *
+ * Contract (see the attempt-loop gates in agent()):
+ *  - `killedCallIds` is the committed kill set — a call id in it is never
+ *    started (queued kill) and, if its attempt was already in flight, the
+ *    attempt settles as an AGENT_KILLED item error, never a retry.
+ *  - `killControllers` maps a call id to its CURRENT attempt's AbortController
+ *    so an in-flight kill can abort the live subagent session. Registered at
+ *    attempt setup, removed in the attempt's finally. The manager adds the id
+ *    to killedCallIds BEFORE aborting, so the attempt's catch sees the kill
+ *    and reports AGENT_KILLED instead of a generic abort.
+ */
+export interface AgentKillChannel {
+  /** Call ids (deltaKeys) that damage control has marked killed for this run. */
+  killedCallIds: Set<string>;
+  /** Live per-attempt AbortControllers, keyed by call id (deltaKey). */
+  killControllers: Map<string, AbortController>;
+}
+
+/**
  * Global resources shared across a run and any workflow() nested inside it, so
  * the 16-concurrent / 1000-total caps and the token budget hold across nesting
  * instead of each level getting its own limiter and counters.
@@ -439,6 +464,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     cacheRead?: number;
     cacheWrite?: number;
   }) => void;
+  /**
+   * Damage-control kill channel (workflow_damage_control kill-agent): a
+   * per-run handle the MANAGER owns so an external kill request can abort ONE
+   * agent() call (by its deltaKey call id) without touching the run controller
+   * — the rest of the run continues. Absent → today's behavior exactly (no
+   * kill surface, no overhead). Threaded into nested workflow() frames via the
+   * `...options` spread so a kill can target a call inside a nested run too.
+   */
+  agentKillChannel?: AgentKillChannel;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -736,6 +770,8 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body, bodyLineToScriptLine } = parseWorkflowScript(script);
+  // Damage-control kill channel (absent on direct embeds → gates are no-ops).
+  const agentKillChannel = options.agentKillChannel;
   // Per-phase model routing from meta.phases[].model, with meta.model as the default.
   const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
@@ -1282,6 +1318,21 @@ export async function runWorkflow<T = unknown>(
           let onRunFatal: (() => void) | undefined;
           try {
             throwIfAborted();
+            // Queued-kill gate: damage control marked this call id before this
+            // attempt started — never run it. AGENT_KILLED is recoverable so
+            // parallel()/pipeline() absorb the item (a killed agent is never
+            // run-fatal by itself); the gate THROWS before the retry branch, so
+            // a killed call is never retried either.
+            if (agentKillChannel?.killedCallIds.has(deltaKey)) {
+              // No writes could have landed (the call never ran) — discard is a
+              // cheap no-op that keeps a stale pending delta from leaking if
+              // this call somehow wrote earlier in the run.
+              store.discardDelta(deltaKey);
+              throw new WorkflowError("agent killed by workflow damage control", WorkflowErrorCode.AGENT_KILLED, {
+                recoverable: true,
+                agentLabel: label,
+              });
+            }
             // This agent's own fan-out already breached maxAgents while this
             // call sat queued behind the limiter; bail before spending on the
             // real API call instead of draining the whole reserved queue.
@@ -1298,6 +1349,14 @@ export async function runWorkflow<T = unknown>(
             // winds down instead of running to completion on a doomed run. Both
             // links are torn down per attempt in finally so listeners don't accrue.
             const agentController = new AbortController();
+            // Damage-control handle: register this attempt's controller under the
+            // call id so kill-agent can abort it mid-flight. Also honor a kill
+            // that landed between the queued-gate above and this registration
+            // (abort immediately; the catch's kill gate reports AGENT_KILLED).
+            if (agentKillChannel) {
+              agentKillChannel.killControllers.set(deltaKey, agentController);
+              if (agentKillChannel.killedCallIds.has(deltaKey)) agentController.abort();
+            }
             if (isAborted()) {
               agentController.abort();
             } else {
@@ -1403,6 +1462,24 @@ export async function runWorkflow<T = unknown>(
             return result;
           } catch (error) {
             if (isAborted()) throw error;
+            // In-flight kill gate: this attempt's agent was aborted by damage
+            // control (kill-agent aborted its controller) — surface the distinct
+            // AGENT_KILLED item error instead of the raw abort so it is never
+            // retried and fan-outs absorb it. Checked BEFORE wrapError, which
+            // would otherwise classify the abort as a recoverable WORKFLOW_ABORTED
+            // and put the killed call through the retry branch. Roll back the
+            // attempt's partial store writes and fold its spend into the run
+            // aggregate exactly like the failure path below, so a killed agent's
+            // writes never leak into the live store (visible to concurrent
+            // siblings) or a resume replay.
+            if (agentKillChannel?.killedCallIds.has(deltaKey)) {
+              store.discardDelta(deltaKey);
+              recordTokens(null);
+              throw new WorkflowError("agent killed by workflow damage control", WorkflowErrorCode.AGENT_KILLED, {
+                recoverable: true,
+                agentLabel: label,
+              });
+            }
 
             const workflowError = wrapError(error, { agentLabel: label });
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
@@ -1498,6 +1575,9 @@ export async function runWorkflow<T = unknown>(
             // run (#109 hygiene).
             if (onExternalAbort) externalSignal?.removeEventListener("abort", onExternalAbort);
             if (onRunFatal) shared.runFatalController.signal.removeEventListener("abort", onRunFatal);
+            // Drop this attempt's damage-control handle; a later attempt (or a
+            // later agent call) re-registers under the same call id if needed.
+            agentKillChannel?.killControllers.delete(deltaKey);
           }
         }
         return null;

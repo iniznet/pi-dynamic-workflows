@@ -238,6 +238,14 @@ export interface RunPersistence {
    * use the standalone renewRunLease() when an instance may not provide it.
    */
   renewRunLease?(lease: RunLease): boolean;
+  /**
+   * Read a run's current lease WITHOUT acquiring it — the read-only view
+   * damage-control `clean`/`recover` use to classify a run's ownership
+   * (reclaimable vs owned-elsewhere) and to report stale-lease candidates.
+   * Returns null when the run holds no lease at all. Optional so existing mock
+   * implementations keep typechecking — mirroring updateRunState?/renewRunLease?.
+   */
+  getLeaseInfo?(runId: string): RunLeaseInfo | null;
   /** Get runs directory path. */
   getRunsDir(): string;
 }
@@ -245,6 +253,27 @@ export interface RunPersistence {
 export interface RunLease {
   runId: string;
   token: string;
+}
+
+/**
+ * Read-only snapshot of a run's lease state (see getLeaseInfo?). Derived from
+ * the lock file without mutating it: pid liveness + TTL expiry + age-based
+ * staleness compose into `reclaimable`, the same predicate acquireRunLease
+ * uses to decide whether a stale lock may be replaced.
+ */
+export interface RunLeaseInfo {
+  runId: string;
+  pid: number;
+  startedAt: string;
+  expiresAt?: string;
+  /** Whether the lease owner's pid is currently alive on this host. */
+  alive: boolean;
+  /** Whether the lease's TTL expiry has passed (bounded-delay reclaim). */
+  expired: boolean;
+  /** Whether the lease is older than MAX_RUN_LEASE_AGE_MS (L2 staleness). */
+  staleByAge: boolean;
+  /** !alive || expired || staleByAge — the exact predicate acquireRunLease uses. */
+  reclaimable: boolean;
 }
 
 /**
@@ -857,6 +886,24 @@ export function createRunPersistence(
       } catch {
         return false;
       }
+    },
+
+    getLeaseInfo(runId: string): RunLeaseInfo | null {
+      const lock = readLock(runId);
+      if (!lock) return null;
+      const alive = pidIsAlive(lock.pid);
+      const expired = leaseIsExpired(lock);
+      const staleByAge = leaseIsStaleByAge(lock);
+      return {
+        runId: lock.runId,
+        pid: lock.pid,
+        startedAt: lock.startedAt,
+        expiresAt: lock.expiresAt,
+        alive,
+        expired,
+        staleByAge,
+        reclaimable: !alive || expired || staleByAge,
+      };
     },
 
     getRunsDir(): string {

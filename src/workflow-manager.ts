@@ -25,6 +25,7 @@ import {
   type RunStatus,
 } from "./run-persistence.js";
 import {
+  type AgentKillChannel,
   type CheckpointGate,
   type JournalEntry,
   type PhasePipelineOptions,
@@ -33,6 +34,8 @@ import {
   runWorkflow,
   type WorkflowRunResult,
 } from "./workflow.js";
+import type { KillAgentResult } from "./workflow-damage-control.js";
+import { reconcileAgentAfterKill } from "./workflow-damage-control.js";
 import { gitExec, pruneWorktrees } from "./worktree.js";
 
 export interface ManagedRunBase {
@@ -175,6 +178,14 @@ export interface ManagedRunBase {
    * Seeded from persisted.checkpoints on resume().
    */
   checkpoints: RunCheckpoint[];
+  /**
+   * Damage-control kill channel for this execution (workflow_damage_control
+   * kill-agent). Created by executeRun, cast onto the managed run, and threaded
+   * into runWorkflow; absent until the first execution starts (and absent on
+   * direct runWorkflow embeds). killAgent() feature-detects this — no channel,
+   * no live abort, persisted reconciliation only.
+   */
+  agentKills?: AgentKillChannel;
 }
 
 /** Statuses a run can rest in while it is NOT executing (lease released). */
@@ -940,10 +951,20 @@ export class WorkflowManager extends EventEmitter {
         externalSignal.addEventListener("abort", onExternalAbort, { once: true });
       }
     }
+    // Damage-control kill channel (workflow_damage_control kill-agent): owned
+    // by THIS execution — created fresh per start/resume so a stale channel
+    // from a superseded execution can never abort a newer one. Exposed on the
+    // managed run (ManagedRunBase.agentKills) and threaded into runWorkflow;
+    // killAgent() feature-detects it — absent on direct runWorkflow embeds,
+    // where the kill gates in workflow.ts are no-ops and today's behavior is
+    // preserved exactly.
+    const agentKills: AgentKillChannel = { killedCallIds: new Set(), killControllers: new Map() };
+    managed.agentKills = agentKills;
     try {
       const result = await runWorkflow(script, {
         cwd: this.cwd,
         args,
+        agentKillChannel: agentKills,
         // Use the managed run's persisted id as the workflow runId so the value
         // returned in result.runId matches the id that listRuns()/resume() use.
         // Otherwise runWorkflow mints an ephemeral `run-<ts>` id and the sync
@@ -1999,6 +2020,152 @@ export class WorkflowManager extends EventEmitter {
     }
     this.emit("stopped", { runId });
     return true;
+  }
+
+  /**
+   * Terminate ONE subagent of a run (workflow_damage_control kill-agent).
+   *
+   * Resolution: `agentId` matches a live-snapshot agents[].id/callId first
+   * (the in-process snapshot is authoritative for live runs and is populated
+   * at attempt start, whereas the PERSISTED agents[] may not be written yet —
+   * nothing has completed in a fresh run), then the persisted inventory
+   * (`${runId}:${callIndex}`, the same deltaKey the journal/SharedStore use)
+   * for cross-process runs. Live runs in THIS process get a live abort when
+   * the run carries the agentKills channel (executeRun): the call id is
+   * committed to killedCallIds FIRST (so the attempt-loop kill gates report
+   * AGENT_KILLED and never retry), then the attempt's AbortController is
+   * aborted when one is registered. State reconciliation always lands via CAS
+   * (updateRunState?) using the pure reconcileAgentAfterKill flip
+   * (status→error, error→"killed via workflow_damage_control",
+   * errorCode→AGENT_KILLED, recoverable→false); when the persisted inventory
+   * has not been written yet, the live snapshot entry is adopted into it so
+   * the kill mark survives the run's next write cycle. Cross-process runs get
+   * persisted-only reconciliation (liveAborted:false) — the owning process
+   * sees the mark on its next write.
+   */
+  async killAgent(runId: string, agentId: string): Promise<KillAgentResult> {
+    const persisted = this.persistence.load(runId);
+    if (!persisted) {
+      return {
+        ok: false,
+        reason: "run not found",
+        runId,
+        agentId,
+        found: false,
+        liveAborted: false,
+        reconciled: false,
+        snapshotUpdated: false,
+      };
+    }
+    const managed = this.runs.get(runId);
+    const matches = (candidate: { id: number; callId?: string }) =>
+      String(candidate.id) === agentId || (candidate.callId ?? journalEntryKey(runId, candidate.id)) === agentId;
+    // Live snapshot first (authoritative, populated at attempt start), then
+    // the persisted inventory (a run whose agents[] was never written — no
+    // agent completed yet — only resolves via the live snapshot).
+    const liveAgent = managed?.snapshot.agents.find(matches);
+    const agent = liveAgent ?? persisted.agents.find(matches);
+    if (!agent) {
+      return {
+        ok: false,
+        reason: "agent not found",
+        runId,
+        agentId,
+        found: false,
+        liveAborted: false,
+        reconciled: false,
+        snapshotUpdated: false,
+      };
+    }
+    const callId = agent.callId ?? journalEntryKey(runId, agent.id);
+
+    // Live abort: commit the kill BEFORE aborting so the attempt's catch sees
+    // the kill gate and reports AGENT_KILLED instead of a generic abort.
+    let liveAborted = false;
+    const channel = managed?.agentKills;
+    if (channel) {
+      channel.killedCallIds.add(callId);
+      const controller = channel.killControllers.get(callId);
+      if (controller) {
+        controller.abort();
+        liveAborted = true;
+      }
+    }
+
+    // State reconciliation (always, via CAS when the persistence provides it).
+    let outcome = { found: false, alreadyTerminal: false, changed: false };
+    let reconciled = false;
+    const adoptLiveAgent = (state: PersistedRunState) => {
+      if (!liveAgent) return;
+      const known = state.agents.some((candidate) => candidate.id === liveAgent.id);
+      if (!known) {
+        // The persisted inventory has not been written yet — carry the live
+        // entry so the AGENT_KILLED mark survives the run's next write cycle.
+        state.agents.push({
+          id: liveAgent.id,
+          callId: liveAgent.callId ?? journalEntryKey(runId, liveAgent.id),
+          label: liveAgent.label,
+          phase: liveAgent.phase,
+          prompt: liveAgent.prompt,
+          status: liveAgent.status,
+          tokens: liveAgent.tokens,
+          model: liveAgent.model,
+        });
+      }
+    };
+    const cas = this.persistence.updateRunState;
+    if (cas) {
+      const updated = cas(runId, (state) => {
+        adoptLiveAgent(state);
+        outcome = reconcileAgentAfterKill(state, agentId);
+      });
+      reconciled = updated !== null;
+    } else {
+      const current = this.persistence.load(runId);
+      if (current) {
+        adoptLiveAgent(current);
+        outcome = reconcileAgentAfterKill(current, agentId);
+        this.persistence.save(current);
+        reconciled = true;
+      }
+    }
+
+    // Live snapshot: mark the matching in-memory agent the same way so the
+    // task panel / status verb reflect the kill immediately.
+    let snapshotUpdated = false;
+    if (managed) {
+      const snap = managed.snapshot.agents.find(
+        (candidate) =>
+          (candidate.callId ?? journalEntryKey(runId, candidate.id)) === callId || String(candidate.id) === agentId,
+      );
+      if (snap && snap.status !== "error" && snap.status !== "done" && snap.status !== "skipped") {
+        snap.status = "error";
+        snap.error = "killed via workflow_damage_control";
+        snap.errorCode = WorkflowErrorCode.AGENT_KILLED;
+        snap.recoverable = false;
+        const timestamps = managed.agentTimestamps.get(snap.id);
+        if (timestamps) timestamps.endedAt = timestamps.endedAt ?? new Date().toISOString();
+        snapshotUpdated = true;
+      }
+    }
+
+    this.emit("agentKilled", { runId, agentId, callId, liveAborted });
+    return {
+      ok: outcome.found,
+      runId,
+      agentId,
+      callId,
+      found: outcome.found,
+      alreadyTerminal: outcome.alreadyTerminal,
+      liveAborted,
+      reconciled: reconciled && outcome.found,
+      snapshotUpdated,
+    };
+  }
+
+  /** The project cwd this manager was constructed with (damage-control clean repo resolution). */
+  getProjectCwd(): string {
+    return this.cwd;
   }
 
   /**

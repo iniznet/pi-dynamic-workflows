@@ -89,6 +89,14 @@ export enum WorkflowErrorCode {
   MODEL_NOT_FOUND = "MODEL_NOT_FOUND",
   /** Agent execution failed. */
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
+  /**
+   * The agent was terminated by an explicit workflow_damage_control kill-agent
+   * request — a user-directed, per-agent cancellation, never a provider/script
+   * condition. Deliberately NOT retried by the attempt loop (the kill gate
+   * throws before the retry branch); fan-outs (parallel/pipeline) absorb the
+   * item and the rest of the run continues.
+   */
+  AGENT_KILLED = "AGENT_KILLED",
   /** Run state persistence failed. */
   PERSISTENCE_ERROR = "PERSISTENCE_ERROR",
   /** Unknown error. */

@@ -189,6 +189,7 @@ export type {
   PersistedRunState,
   RunCheckpoint,
   RunCheckpointState,
+  RunLeaseInfo,
   RunPersistence,
   RunStatus,
 } from "./run-persistence.js";
@@ -277,6 +278,32 @@ export type {
 } from "./workflow-control-tool.js";
 
 export { createWorkflowControlTool } from "./workflow-control-tool.js";
+export type {
+  AgentSummary,
+  CleanCandidate,
+  CleanReport,
+  DamageControlAction,
+  DamageControlCapabilities,
+  DamageControlInput,
+  DeepRunSummary,
+  KillAgentResult,
+  RecoveryClassification,
+  RecoveryOutcome,
+  WorkflowDamageControlToolOptions,
+} from "./workflow-damage-control.js";
+export {
+  allowedDamageControlActions,
+  classifyRecoveryAction,
+  collectCleanCandidates,
+  createWorkflowDamageControlTool,
+  DAMAGE_CONTROL_ACTIONS,
+  DAMAGE_CONTROL_READONLY_ACTIONS,
+  formatDamageControlText,
+  normalizeDamageControlInput,
+  reconcileAgentAfterKill,
+  summarizeAgents,
+  summarizeRunDeep,
+} from "./workflow-damage-control.js";
 export {
   type ArmReason,
   buildArmedWorkflowPrompt,
