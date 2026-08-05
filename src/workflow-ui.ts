@@ -401,7 +401,10 @@ export class NavigatorState {
   private pageSize = 1;
 
   private top(): StackFrame {
-    return this.stack[this.stack.length - 1];
+    const frame = this.stack[this.stack.length - 1];
+    // stack is seeded at construction; pop() refuses to empty it
+    if (frame === undefined) throw new Error("NavigatorState stack underflow");
+    return frame;
   }
   get kind(): ViewKind {
     return this.top().kind;
@@ -898,6 +901,10 @@ function renderPhasesAgents(
       continue;
     }
     const p = phases[idx];
+    if (p === undefined) {
+      left.push(" ".repeat(leftInner));
+      continue;
+    }
     const selected = !inAgents && idx === state.cursor;
     const ag = agentsOf(p.title);
     let row = leftPhaseRow(p, idx, selected, ag, leftInner, theme);
@@ -921,7 +928,12 @@ function renderPhasesAgents(
         continue;
       }
       const selected = inAgents && idx === state.cursor;
-      let row = rightAgentRow(agents[idx], selected, modelColStart, rightInner, theme);
+      const agent = agents[idx];
+      if (agent === undefined) {
+        right.push(" ".repeat(rightInner));
+        continue;
+      }
+      let row = rightAgentRow(agent, selected, modelColStart, rightInner, theme);
       if (k === bodyRows - 1 && rightRows.more) {
         row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), rightInner, "", true);
       }
@@ -994,7 +1006,12 @@ function renderSinglePane(
         out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
         continue;
       }
-      let row = rightAgentRow(agents[idx], idx === state.cursor, modelColStart, innerW, theme);
+      const agent = agents[idx];
+      if (agent === undefined) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
+      let row = rightAgentRow(agent, idx === state.cursor, modelColStart, innerW, theme);
       if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
       out.push(bc(BX.v) + row + bc(BX.v));
     }
@@ -1009,6 +1026,10 @@ function renderSinglePane(
         continue;
       }
       const p = phases[idx];
+      if (p === undefined) {
+        out.push(bc(BX.v) + " ".repeat(innerW) + bc(BX.v));
+        continue;
+      }
       let row = leftPhaseRow(p, idx, idx === state.cursor, [], innerW, theme);
       if (k === rows - 1 && win.more) row = truncateToWidth(theme.fg("dim", `  ${ELLIPSIS}`), innerW, "", true);
       out.push(bc(BX.v) + row + bc(BX.v));

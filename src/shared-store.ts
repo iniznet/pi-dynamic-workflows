@@ -54,21 +54,50 @@ export const DEFAULT_STORE_LIMITS: Required<SharedStoreLimits> = {
   ttlMs: 0,
 };
 
+/**
+ * One write in a key's shadow history (see `SharedStore.writeHistory`). Each
+ * entry records who wrote the value and when, so a failed attempt's rollback
+ * can find the last value NOT written by that attempt.
+ */
+interface WriteHistoryEntry {
+  /** The deltaKey that wrote this value; `undefined` for unattributed writes. */
+  writer: string | undefined;
+  /** Monotonic per-store write sequence number — the write's position in order. */
+  seq: number;
+  /** The value that was written. */
+  value: unknown;
+}
+
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
   // Per-agent write deltas for delta-journaling; keyed by a run-unique
   // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
   // sharing this store can't collide on a bare callIndex.
   private readonly agentDeltas = new Map<string, Record<string, unknown>>();
-  // Pre-write shadow values for the CURRENT delta-key's in-progress writes,
-  // so a failed retry attempt's mutations can be rolled back (see
-  // `discardDelta`) instead of leaking into the live store or a later
-  // successful attempt's recorded delta. Populated lazily by `trackPut` (only
-  // the first write to a given key within the current delta window is
-  // shadowed — later writes to the same key within the same attempt are
-  // already covered by that first shadow) and cleared whenever the delta is
-  // finalized, either way, via `commitDelta`/`discardDelta`.
-  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
+  // Per-key shadow history for rollback (see `discardDelta`): the most recent
+  // value written to a key by EACH writer, in last-write order. A writer is a
+  // deltaKey (for `trackPut` writes) or `undefined` (for unattributed writes
+  // via `put`/`applyDelta`/`restore`). Keeping the whole per-key write trail —
+  // not just a single snapshot of the pre-window value — is what lets a failed
+  // attempt's rollback restore the last value NOT written by that attempt,
+  // even when a concurrent sibling's write landed BETWEEN the attempt's own
+  // writes to the same key (the A/B/A interleave: a sibling's write must never
+  // be erased by the failed attempt's rollback). A writer's history entry is
+  // REPLACED (not appended) when it writes the key again, so the trail stays
+  // bounded by the number of distinct writers and every entry is always that
+  // writer's LATEST value — the only one a later rollback could ever target.
+  // Committed writes stay in the trail as a permanent baseline; discarded
+  // writes are removed when rolled back.
+  private readonly writeHistory = new Map<string, WriteHistoryEntry[]>();
+  private writeSeq = 0;
+  // Monotonic per-store commit ordinal, assigned in commitDeltaOrdered. Because
+  // the counter lives on the ONE store instance that a parent run and every
+  // nested workflow() frame share, the ordinals order every committed delta in
+  // the run tree by real completion time (E2's commit-order replay). Seeded
+  // from the resume journal on resume so ordinals stay monotonic across
+  // pause/resume cycles (a fresh store would otherwise restart at 0 and tie
+  // with — or sort before — earlier entries).
+  private commitSeqCounter = 0;
   private readonly limits: Required<SharedStoreLimits>;
   // JSON-size (bytes) per key, so eviction accounting never re-serializes a
   // value just to evict it.
@@ -136,6 +165,27 @@ export class SharedStore {
   }
 
   /**
+   * Record a write in the key's shadow history. Keeps at most one entry per
+   * writer: a writer's previous entry is dropped when it writes the key again,
+   * so the trail stays ordered by last-write time and bounded by the number of
+   * distinct writers of the key (see `writeHistory`).
+   */
+  private recordHistory(key: string, writer: string | undefined, value: unknown): void {
+    let history = this.writeHistory.get(key);
+    if (!history) {
+      history = [];
+      this.writeHistory.set(key, history);
+    }
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].writer === writer) {
+        history.splice(i, 1);
+        break;
+      }
+    }
+    history.push({ writer, seq: this.writeSeq++, value });
+  }
+
+  /**
    * Write `key` -> `value` WITHOUT invoking the size/count guardrails (and so
    * WITHOUT evicting anything). Used only to UNDO a prior write — a rollback
    * is contractually an "undo", never a new bounded write, so it must never
@@ -160,6 +210,10 @@ export class SharedStore {
   }
 
   private removeKey(key: string): void {
+    // The key's live state is gone (eviction / TTL expiry / rollback delete), so
+    // its whole write trail is stale too — dropping it prevents a later window
+    // from restoring a value that no longer exists anywhere (see `discardDelta`).
+    this.writeHistory.delete(key);
     if (!this.map.has(key)) return;
     this.map.delete(key);
     this.totalBytes -= this.bytesByKey.get(key) ?? 0;
@@ -183,6 +237,7 @@ export class SharedStore {
     this.totalBytes += bytes - oldBytes;
     this.bytesByKey.set(key, bytes);
     this.setExpiry(key);
+    this.recordHistory(key, undefined, value);
   }
 
   /**
@@ -194,24 +249,11 @@ export class SharedStore {
   trackPut(key: string, value: unknown, deltaKey: string): void {
     const bytes = this.assertWriteFits(key, value);
     const oldBytes = this.bytesByKey.get(key) ?? 0;
-    let priors = this.priorValues.get(deltaKey);
-    if (!priors) {
-      priors = new Map();
-      this.priorValues.set(deltaKey, priors);
-    }
-    // Only shadow the value from BEFORE this delta window started writing to
-    // this key — a second write to the same key within the same attempt must
-    // not overwrite the shadow with its own (already-in-window) value.
-    if (!priors.has(key)) {
-      priors.set(
-        key,
-        this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
-      );
-    }
     this.map.set(key, value);
     this.totalBytes += bytes - oldBytes;
     this.bytesByKey.set(key, bytes);
     this.setExpiry(key);
+    this.recordHistory(key, deltaKey, value);
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = {};
@@ -241,12 +283,40 @@ export class SharedStore {
   /**
    * Extract and clear the write delta accumulated for `deltaKey`.
    * Called after an agent completes to get the set of keys it wrote.
+   * The committed writes stay in the shadow history as a permanent baseline:
+   * a sibling that fails LATER rolls back to this attempt's final value.
    */
   commitDelta(deltaKey: string): Record<string, unknown> {
     const delta = this.agentDeltas.get(deltaKey) ?? {};
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
     return delta;
+  }
+
+  /**
+   * Commit `deltaKey`'s accumulated writes and tag them with a monotonic
+   * per-store commit ordinal — the delta's position in the store's commit
+   * (completion) order. Each successful call consumes the NEXT ordinal, so
+   * ordinals order deltas exactly as the run completed them, even across
+   * parent and nested workflow() frames sharing this store. Resume replay
+   * sorts replayed deltas by this ordinal to reconstruct the same store the
+   * live run ended with instead of a callSeq-order reconstruction (E2).
+   */
+  commitDeltaOrdered(deltaKey: string): { delta: Record<string, unknown>; seq: number } {
+    const delta = this.commitDelta(deltaKey);
+    return { delta, seq: this.commitSeqCounter++ };
+  }
+
+  /**
+   * Resume only: continue the commit-ordinal counter AFTER `maxSeq` (the
+   * highest ordinal in the resume journal), so a run resumed more than once
+   * keeps ordinals strictly increasing across the whole history — a fresh
+   * store starts at 0, which would tie with (or sort before) already-journaled
+   * ordinals and corrupt commit-order replay on the second resume. Raises-only
+   * (never lowers), so re-seeding the shared store from a nested frame's own
+   * resumeJournal view is idempotent.
+   */
+  seedCommitSeq(maxSeq: number): void {
+    this.commitSeqCounter = Math.max(this.commitSeqCounter, maxSeq + 1);
   }
 
   /**
@@ -260,37 +330,70 @@ export class SharedStore {
    * state while being absent from the journaled delta that resume replay
    * reconstructs from, leaving live execution and replay permanently
    * inconsistent. Each key touched during this delta window is restored to
-   * whatever it held immediately before the window started (or deleted, if
-   * it did not exist yet) — never to some other attempt's or caller's value.
+   * the last value NOT written by this attempt — the value a sibling or
+   * caller left in place, or the pre-window value, or deleted if the key did
+   * not exist before this window wrote it.
    *
-   * Per-key guard: a key is only rolled back if the store STILL holds this
-   * attempt's own last write to it (checked with `Object.is` against the
-   * value recorded in `delta`). If a concurrently-running sibling (a
-   * different `deltaKey`, e.g. another agent in the same parallel() batch)
-   * legitimately overwrote the same key AFTER this attempt wrote it but
-   * BEFORE it failed, that sibling's write is left untouched — rolling back
-   * unconditionally would silently erase a live, unrelated write that this
-   * attempt never made and has no business undoing.
+   * Rollback consults the key's shadow HISTORY (`writeHistory`), not a single
+   * pre-window snapshot: if a concurrently-running sibling (a different
+   * `deltaKey`, e.g. another agent in the same parallel() batch) legitimately
+   * wrote the same key BETWEEN this attempt's own writes (the A/B/A
+   * interleave), the rollback restores the sibling's value — rolling back to
+   * the pre-window snapshot instead would silently erase a live, unrelated
+   * write this attempt never made and has no business undoing.
+   *
+   * Per-key guards: a key is only rolled back when (a) the trail's last write
+   * is this attempt's own (a sibling that overwrote the key AFTER this
+   * attempt's last write already left the live value in the state this
+   * rollback would produce — nothing to do), and (b) the store still holds
+   * that value (a key evicted under cap pressure or expired is left absent
+   * rather than resurrected).
    *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
   discardDelta(deltaKey: string): void {
     const delta = this.agentDeltas.get(deltaKey);
     if (!delta) return;
-    const priors = this.priorValues.get(deltaKey);
     for (const key of Object.keys(delta)) {
-      // Someone else already overwrote this key since our last write to it —
-      // leave their write in place instead of clobbering it with our rollback.
-      if (!Object.is(this.map.get(key), delta[key])) continue;
-      const prior = priors?.get(key);
-      if (prior?.existed) {
-        this.restoreKey(key, prior.value);
+      const history = this.writeHistory.get(key);
+      if (!history || history.length === 0) continue;
+      // The trail's last entry is the most recent write to this key. If a
+      // concurrent sibling overwrote it AFTER this attempt's last write, the
+      // last entry is theirs, not ours — the live value already IS the last
+      // value this attempt did not write, so there is nothing to roll back.
+      const top = history[history.length - 1];
+      if (top.writer !== deltaKey) continue;
+      // If the store no longer holds this attempt's write (the key was
+      // evicted under cap pressure or expired since), the key's live state
+      // has been purged — leave it absent and drop its whole trail, so a
+      // later window cannot restore a value that no longer exists anywhere.
+      if (!Object.is(this.map.get(key), top.value)) {
+        this.writeHistory.delete(key);
+        continue;
+      }
+      // Restore the last value NOT written by this attempt — some sibling's
+      // write, a caller's (unattributed) write, or the pre-window value — or
+      // delete the key when every write in the trail was this attempt's.
+      let target: WriteHistoryEntry | undefined;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].writer !== deltaKey) {
+          target = history[i];
+          break;
+        }
+      }
+      if (target) {
+        // `top` is this attempt's single trail entry (at most one per writer),
+        // always the last element — pop it so the trail ends at the restored
+        // value, matching the live state the rollback produces.
+        history.splice(history.indexOf(top), 1);
+        this.restoreKey(key, target.value);
       } else {
+        // Every write in the trail was this attempt's — the key did not exist
+        // before this window. `removeKey` also drops the now-empty trail.
         this.removeKey(key);
       }
     }
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
   }
 
   /**
@@ -309,12 +412,16 @@ export class SharedStore {
   /**
    * Replace all entries with a snapshot (for full resets).
    * Prefer `applyDelta` for resume replay — see journal integration above.
+   * The shadow history is cleared too: a full reset makes every prior write
+   * trail meaningless (a later rollback's `Object.is` guard would skip any
+   * key whose live value now comes from the snapshot anyway).
    */
   restore(snap: Record<string, unknown>): void {
     this.map.clear();
     this.totalBytes = 0;
     this.bytesByKey.clear();
     this.expiresAt.clear();
+    this.writeHistory.clear();
     for (const [k, v] of Object.entries(snap)) {
       this.put(k, v);
     }
@@ -324,10 +431,11 @@ export class SharedStore {
   dispose(): void {
     this.map.clear();
     this.agentDeltas.clear();
-    this.priorValues.clear();
+    this.writeHistory.clear();
     this.bytesByKey.clear();
     this.expiresAt.clear();
     this.totalBytes = 0;
+    this.commitSeqCounter = 0;
   }
 }
 

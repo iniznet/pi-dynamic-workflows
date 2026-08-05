@@ -115,6 +115,17 @@ export interface PersistedRunState {
     result: unknown;
     storeDelta?: Record<string, unknown>;
     /**
+     * Monotonic per-store commit ordinal captured when this call's store delta
+     * was committed in the ORIGINAL run (see SharedStore.commitDeltaOrdered):
+     * the delta's position in the run's real completion order. Resume replay
+     * applies replayed deltas sorted by this ordinal instead of in callSeq
+     * order, so parallel same-key writers reconstruct the same final store the
+     * live run ended with. Absent on journals persisted before this field
+     * existed — those replay in callSeq order (the pre-fix behavior, kept for
+     * resume integrity). JSON-dropped when undefined.
+     */
+    storeCommitSeq?: number;
+    /**
      * Typed operation traces for this call (one entry per tool call, pinned to
      * the owning agent() call's script line). Absent on legacy journals — the
      * resume path treats a missing field exactly like a missing storeDelta:
@@ -219,9 +230,20 @@ export interface PersistedRunState {
   autoResumeAttempts?: number;
 }
 
+export interface RunPersistenceSaveOptions {
+  /**
+   * Throttled progress write (E4): persist ONLY the run's journal delta to
+   * the append-only `.jdelta` sidecar instead of re-serializing the full run
+   * state (O(n^2) as the journal grows). The primary file is written at the
+   * next boundary (pause/checkpoint/failed/complete) or periodic full
+   * checkpoint. Only valid for resumable statuses; ignored otherwise.
+   */
+  fastPath?: boolean;
+}
+
 export interface RunPersistence {
   /** Save current run state. */
-  save(state: PersistedRunState): void;
+  save(state: PersistedRunState, opts?: RunPersistenceSaveOptions): void;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
@@ -401,6 +423,12 @@ const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "fai
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
   maxTerminalRunsOnDisk?: number;
+  /**
+   * Override DEFAULT_JOURNAL_DELTA_CHECKPOINT_BYTES (tests; advanced tuning):
+   * the sidecar byte size at which a fast-path write folds into a full
+   * checkpoint instead of appending.
+   */
+  journalDeltaCheckpointBytes?: number;
 }
 
 /**
@@ -428,6 +456,7 @@ export function createRunPersistence(
   const _unlinkSync = fs.unlinkSync;
   const _writeFileSync = fs.writeFileSync;
   const maxTerminalRunsOnDisk = options?.maxTerminalRunsOnDisk ?? DEFAULT_MAX_TERMINAL_RUNS_ON_DISK;
+  const journalDeltaCheckpointBytes = options?.journalDeltaCheckpointBytes ?? DEFAULT_JOURNAL_DELTA_CHECKPOINT_BYTES;
 
   const paths = workflowProjectPaths(cwd);
   const runsDir = paths.runsDir;
@@ -442,6 +471,20 @@ export function createRunPersistence(
   const primaryLockPath = (runId: string) => lockPath(runsDir, runId);
   const legacyLockPath = (runId: string) => lockPath(legacyRunsDir, runId);
   const candidateRunPaths = (runId: string) => [primaryRunPath(runId), legacyRunPath(runId)];
+
+  // E4: the append-only journal-delta sidecar next to the primary run file.
+  const journalDeltaPath = (runId: string) => `${primaryRunPath(runId)}${JOURNAL_DELTA_SUFFIX}`;
+
+  // E4: per-instance memory of which journal entries are already on disk
+  // (folded into the primary AND/OR appended to the sidecar), keyed by the
+  // deltaKey (`${runId}:${index}`). Entry objects are stored BY REFERENCE —
+  // the manager's journal array keeps the same objects between saves, and an
+  // in-place replacement swaps in a new object, so reference inequality is an
+  // exact, O(1) per-entry replacement detector (no deep compares on the hot
+  // path). Cold-start (empty map) is self-correcting: the first fast-path
+  // save sees the whole journal as delta, hits the checkpoint threshold, and
+  // folds — matching the boundary write that precedes every fast write.
+  const foldedByRun = new Map<string, Map<string, JournalEntry>>();
 
   const pidIsAlive = (pid: number): boolean => {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -561,7 +604,21 @@ export function createRunPersistence(
     for (const path of fileStateCache.keys()) {
       if (!seenPaths.has(path)) fileStateCache.delete(path);
     }
-    return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    // E4: list() must present the same merged view load() does — a run whose
+    // journal deltas live in the `.jdelta` sidecar shows its full journal here
+    // too (status/list consumers read the persisted run directly, not the
+    // live in-memory overlay). The cached state is cloned on merge so the
+    // cache itself is never mutated. Runs without a sidecar pass through.
+    const merged = [...byRunId.values()].map((state) => {
+      const delta = readJournalDelta(state.runId);
+      if (delta.length === 0) return state;
+      return {
+        ...state,
+        journal: mergeJournalEntries(loadPersistedJournal(state), delta),
+        journalCompacted: undefined,
+      };
+    });
+    return merged.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   };
 
   // Bound the number of terminal (completed/failed/aborted) runs kept on
@@ -586,7 +643,7 @@ export function createRunPersistence(
     for (const path of candidateRunPaths(runId)) {
       const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
       // Best-effort cleanup of the sidecar files alongside the primary.
-      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId), `${path}${JOURNAL_DELTA_SUFFIX}`]) {
         unlinkIfExistsSafe(fs, sidecar);
         fileStateCache.delete(sidecar);
       }
@@ -594,6 +651,48 @@ export function createRunPersistence(
       fileStateCache.delete(path);
     }
     return deleted;
+  };
+
+  // ── E4: append-only journal-delta sidecar (fast-path writes) ─────────────
+
+  // Read the journal-delta sidecar leniently: a missing OR corrupt sidecar is
+  // [] — a torn delta silently degrades to "nothing new since the last fold"
+  // (those calls re-run live on resume), which is the same degradation the
+  // plain-journal cap already accepts; it never corrupts replay.
+  const readJournalDelta = (runId: string): JournalEntry[] => {
+    try {
+      // Avoid an ENOENT syscall on the hot list()/parse path: an absent
+      // sidecar is "nothing new since the last fold", not an error.
+      if (!_existsSync(journalDeltaPath(runId))) return [];
+      const raw = _readFileSync(journalDeltaPath(runId), "utf-8");
+      const parsed = JSON.parse(raw) as unknown;
+      return Array.isArray(parsed) ? (parsed as JournalEntry[]) : [];
+    } catch {
+      return [];
+    }
+  };
+
+  // Raw sidecar text (null when absent) for the cross-process fold guard —
+  // a full write folds + clears the sidecar only when its bytes match what
+  // the write merged (see casWrite).
+  const readJournalDeltaText = (runId: string): string | null => {
+    try {
+      // Absent sidecar → null without probing readFileSync (ENOENT) on the
+      // hot list()/parse path; the caller treats null as "no pending delta".
+      if (!_existsSync(journalDeltaPath(runId))) return null;
+      return _readFileSync(journalDeltaPath(runId), "utf-8");
+    } catch {
+      return null;
+    }
+  };
+
+  // Write the sidecar atomically (tmp + rename): a torn in-place write would
+  // silently drop journal deltas on crash-recovery.
+  const writeJournalDelta = (runId: string, entries: JournalEntry[]): void => {
+    ensureDir();
+    const path = journalDeltaPath(runId);
+    _writeFileSync(`${path}.tmp`, JSON.stringify(entries));
+    _renameSync(`${path}.tmp`, path);
   };
 
   // ── Compare-and-swap persistence (core-orchestration:f3/i2) ──────────────
@@ -613,11 +712,24 @@ export function createRunPersistence(
 
   // Freshest on-disk state: primary first, then .bak — a corrupt primary
   // doesn't lose the run (readJsonWithBackupRecovery), and the result is
-  // always migrated to the current schema.
+  // always migrated to the current schema. E4: journal deltas appended since
+  // the last fold live in the `.jdelta` sidecar — replay them on top so every
+  // consumer (load(), the CAS base) sees the full journal. A compacted
+  // primary that also has deltas materializes to the plain journal (resume
+  // replay must see the deltas); with no deltas the compacted form is
+  // preserved exactly as persisted.
   const parseFreshest = (runId: string): PersistedRunState | null => {
     for (const path of candidateRunPaths(runId)) {
       const raw = readJsonWithBackupRecovery<unknown>(fs, path);
-      if (raw !== null) return migrateRunState(raw);
+      if (raw !== null) {
+        const state = migrateRunState(raw);
+        const delta = readJournalDelta(runId);
+        if (delta.length > 0) {
+          state.journal = mergeJournalEntries(loadPersistedJournal(state), delta);
+          state.journalCompacted = undefined;
+        }
+        return state;
+      }
     }
     return null;
   };
@@ -691,30 +803,41 @@ export function createRunPersistence(
   const CAS_MAX_ATTEMPTS = 8;
 
   /**
-   * The CAS core every write funnels through (save(), updateRunState()):
-   * re-read the freshest on-disk snapshot, apply `produce` to it, write
-   * atomically (tmp + rename), and verify the write landed — retrying on any
-   * concurrent modification detected between the read and the rename. A stale
-   * in-memory snapshot can no longer overwrite a newer on-disk journal or a
-   * concurrently-added checkpoint, because the mutation is always re-applied
-   * to the snapshot that is CURRENT at write time. Cross-process writers
-   * converge the same way: the writer whose rename lands second re-reads the
-   * first writer's content, merges, and rewrites. Bounded retries — under
-   * sustained contention the loop falls back to one final converged write
-   * (re-read + re-merge against the freshest snapshot) rather than verifying
-   * it landed, so a run is never failed forever while still preserving merges.
+   * The CAS core every full write funnels through (save() boundary writes,
+   * updateRunState()): re-read the freshest on-disk snapshot, apply `produce`
+   * to it, write atomically (tmp + rename), and verify the write landed —
+   * retrying on any concurrent modification detected between the read and the
+   * rename. A stale in-memory snapshot can no longer overwrite a newer
+   * on-disk journal or a concurrently-added checkpoint, because the mutation
+   * is always re-applied to the snapshot that is CURRENT at write time.
+   * Cross-process writers converge the same way: the writer whose rename
+   * lands second re-reads the first writer's content, merges, and rewrites.
+   * Bounded retries — under sustained contention the loop falls back to one
+   * final converged write (re-read + re-merge against the freshest snapshot)
+   * rather than verifying it landed, so a run is never failed forever while
+   * still preserving merges.
+   *
+   * E4 opts: `backup` gates the .bak sidecar (only boundary writes keep it),
+   * and `foldSidecar` gates the journal-delta fold: a full write merges the
+   * sidecar deltas (via parseFreshest) into the primary, then clears the
+   * sidecar — guarded by a byte re-check so a cross-process fast-path
+   * appender's newer deltas are never cleared unmerged.
    */
   const casWrite = (
     runId: string,
     produce: (current: PersistedRunState | null) => PersistedRunState,
     requireExisting = false,
+    opts: { backup?: boolean; foldSidecar?: boolean } = {},
   ): PersistedRunState | null => {
+    const backup = opts.backup ?? true;
+    const foldSidecar = opts.foldSidecar ?? true;
     ensureDir();
     const path = primaryRunPath(runId);
     let last: PersistedRunState | undefined;
     for (let attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
       const before = readPrimaryText(runId);
       const current = parseFreshest(runId);
+      const sidecarAtRead = foldSidecar ? readJournalDeltaText(runId) : null;
       if (requireExisting && current === null) return null;
       const next = produce(current);
       next.updatedAt = new Date().toISOString();
@@ -735,14 +858,28 @@ export function createRunPersistence(
       _renameSync(`${path}.tmp`, path);
       const landed = readPrimaryText(runId);
       if (landed === json) {
-        try {
-          _writeFileSync(`${path}.bak`, json);
-        } catch (e) {
-          // The .bak is the documented crash-recovery fallback used by
-          // readJsonWithBackupRecovery; a silent failure here (ENOSPC,
-          // permissions) degrades recovery invisibly, so surface it once.
-          console.warn(`[run-persistence] backup write failed for ${runId}:`, (e as Error).message);
+        if (backup) {
+          try {
+            _writeFileSync(`${path}.bak`, json);
+          } catch (e) {
+            // The .bak is the documented crash-recovery fallback used by
+            // readJsonWithBackupRecovery; a silent failure here (ENOSPC,
+            // permissions) degrades recovery invisibly, so surface it once.
+            console.warn(`[run-persistence] backup write failed for ${runId}:`, (e as Error).message);
+          }
         }
+        if (foldSidecar) {
+          // A cross-process fast-path appender may have written the sidecar
+          // since we read it — only fold (clear) when the sidecar is
+          // byte-identical to what THIS write merged. Otherwise retry: the
+          // next iteration re-reads the newer deltas and folds them too.
+          if (readJournalDeltaText(runId) !== sidecarAtRead) continue;
+          unlinkIfExistsSafe(fs, journalDeltaPath(runId));
+        }
+        foldedByRun.set(
+          runId,
+          new Map((next.journal ?? []).map((e) => [journalEntryKey(e.runId ?? runId, e.index), e])),
+        );
         invalidateListCache();
         if (TERMINAL_RUN_STATUSES.has(next.status)) enforceRetention();
         return next;
@@ -767,18 +904,99 @@ export function createRunPersistence(
       finalNext.journal = capJournalBudget(finalNext.journal, DEFAULT_JOURNAL_BYTE_BUDGET);
     }
     writeJsonAtomicWithBackup(fs, path, finalNext);
+    // E4: the fallback deliberately does NOT clear the sidecar — any deltas
+    // the write merged are also still in the sidecar, and load() merges both
+    // (per-key upsert), so nothing is ever lost. Refresh the folded map from
+    // what the primary now holds so the next fast-path write stays delta-only.
+    foldedByRun.set(
+      runId,
+      new Map((finalNext.journal ?? []).map((e) => [journalEntryKey(e.runId ?? runId, e.index), e])),
+    );
     invalidateListCache();
     if (TERMINAL_RUN_STATUSES.has(finalNext.status)) enforceRetention();
     return finalNext;
   };
 
+  /**
+   * E4 fast path: persist ONLY the journal delta since the last fold. The
+   * incoming state's journal is diffed against the per-instance folded map
+   * with CONTENT-based detection — object identity is the fast reject (the
+   * manager's journal array holds the same entry objects between saves, so
+   * an in-place replacement is a new object), and when the reference differs
+   * the two small entries are stringified and compared, so callers that
+   * re-construct the state with fresh but identical objects do NOT re-delta
+   * an already-folded entry. The delta is upserted into the `.jdelta`
+   * sidecar, and the sidecar is written atomically. The primary run file is
+   * NOT touched on this tick: it keeps the last boundary/checkpoint
+   * snapshot, and list()/the task panel overlay the LIVE in-memory run for
+   * running statuses (see WorkflowManager.getRun). The periodic full
+   * checkpoint fires when the merged sidecar would serialize past
+   * journalDeltaCheckpointBytes — a full CAS write (with .bak) that folds
+   * the sidecar into the primary.
+   */
+  const saveFastPath = (state: PersistedRunState): void => {
+    ensureDir();
+    const runId = state.runId;
+    const journal = state.journal as JournalEntry[];
+    // Delta = entries whose key is not yet on disk, or whose entry object was
+    // replaced in place (same key, newer value). O(n) Map lookups only.
+    const folded = foldedByRun.get(runId);
+    // Content-based delta detection: identity is the fast reject (same object
+    // as last save => already on disk). When the reference differs, compare
+    // serialized content — a re-constructed entry with identical content is
+    // folded, not re-delted; only a genuine content difference is a delta.
+    const delta: JournalEntry[] = [];
+    const nextFolded = folded ? new Map(folded) : new Map<string, JournalEntry>();
+    for (const entry of journal) {
+      const key = journalEntryKey(entry.runId ?? runId, entry.index);
+      const known = folded?.get(key);
+      if (known === entry) continue; // same object — already on disk
+      if (known === undefined || JSON.stringify(known) !== JSON.stringify(entry)) delta.push(entry);
+      nextFolded.set(key, entry); // refresh identity (delta or content-identical)
+    }
+    if (delta.length > 0) {
+      // Re-read the sidecar (a concurrent full writer may have folded and
+      // cleared it) and upsert the delta — newest entry per key wins.
+      const byKey = new Map<string, JournalEntry>();
+      for (const e of readJournalDelta(runId)) byKey.set(journalEntryKey(e.runId ?? runId, e.index), e);
+      for (const e of delta) byKey.set(journalEntryKey(e.runId ?? runId, e.index), e);
+      const sidecar = [...byKey.values()];
+      if (JSON.stringify(sidecar).length > journalDeltaCheckpointBytes) {
+        // Periodic full checkpoint: fold everything into the primary now.
+        casWrite(runId, (current) => {
+          return {
+            ...(current ?? {}),
+            ...state,
+            checkpoints: mergeCheckpoints(current?.checkpoints, state.checkpoints),
+            journal: mergeJournalFields(current, state),
+          };
+        });
+        return;
+      }
+      writeJournalDelta(runId, sidecar);
+    }
+    // Track what is now on disk for this run (primary-folded ∪ sidecar) so
+    // the next fast write stays delta-only. Content-identical re-constructions
+    // refresh the map too, so the next save short-circuits on identity.
+    foldedByRun.set(runId, nextFolded);
+  };
+
   return {
-    save(state: PersistedRunState) {
+    save(state: PersistedRunState, opts?: RunPersistenceSaveOptions) {
+      if (opts?.fastPath === true && Array.isArray(state.journal) && keepsResumeJournal(state.status)) {
+        // E4 fast path (throttled progress write): append only the journal
+        // delta to the `.jdelta` sidecar — no primary rewrite, no .bak — and
+        // fold into a full checkpoint once the sidecar passes the threshold.
+        saveFastPath(state);
+        return;
+      }
       // Compare-and-swap: the incoming state is layered onto the freshest
       // on-disk snapshot so a concurrently-persisted journal or checkpoint is
       // never clobbered (see casWrite). Checkpoints are merged (both lists
       // survive); the journal merge keeps entries the caller didn't write
       // while letting the caller's own entries win per (runId, index).
+      // Boundary writes (start/pause/checkpoint/failed/complete) fold the
+      // journal-delta sidecar into the primary and keep the .bak sidecar.
       casWrite(state.runId, (current) => {
         return {
           ...(current ?? {}),
@@ -1051,6 +1269,22 @@ export function redactSecrets(value: unknown): unknown {
  * the NEWEST entries are kept, the oldest re-run live on resume.
  */
 export const MAX_JOURNAL_ENTRIES = 50_000;
+
+/**
+ * Sidecar suffix for the E4 append-only journal-delta log: the primary run
+ * file's journal is the last FOLDED snapshot; entries journaled since then
+ * accumulate here (compact single-line JSON of JournalEntry[]) until the next
+ * boundary write or periodic full checkpoint folds them into the primary.
+ */
+export const JOURNAL_DELTA_SUFFIX = ".jdelta";
+
+/**
+ * Periodic full checkpoint threshold (E4): when the merged journal-delta
+ * sidecar serializes larger than this, the next fast-path write folds into a
+ * full-state write (checkpoint) instead of appending — bounding the sidecar
+ * and the primary's staleness window. Boundary writes always fold regardless.
+ */
+export const DEFAULT_JOURNAL_DELTA_CHECKPOINT_BYTES = 1024 * 1024;
 
 /**
  * Byte budget for a persisted journal. Only enforced once the entry count

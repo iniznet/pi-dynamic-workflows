@@ -131,6 +131,81 @@ test("SharedStore.discardDelta must not clobber a concurrent sibling's legitimat
   );
 });
 
+test("SharedStore.discardDelta: A/B/A interleave — a sibling write between this attempt's own writes survives the rollback", () => {
+  // Regression for the shadow-history gap: the pre-window rollback shadow was
+  // captured only at the FIRST write of the window. When a failed attempt
+  // writes a key (A), a sibling overwrites it (B), and the failed attempt
+  // writes the key AGAIN (A), the old Object.is guard saw the attempt's OWN
+  // value on top and rolled the key back to the pre-window state — silently
+  // erasing the sibling's intervening write. The rollback must restore the
+  // last value NOT written by this attempt, i.e. the sibling's "B".
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "attempt-A1", "run-1:0");
+  store.trackPut("k", "sibling-B", "run-1:1"); // sibling overwrites between A's writes
+  store.trackPut("k", "attempt-A2", "run-1:0"); // A writes the same key again
+  store.discardDelta("run-1:0");
+  assert.equal(
+    store.get("k"),
+    "sibling-B",
+    "A's discard must restore the sibling's intervening write, not the pre-window value",
+  );
+});
+
+test("SharedStore.discardDelta: A/B/A interleave keeps the sibling's write even when the key was created inside the window", () => {
+  // Same interleave, but the key did not exist before A's first write: the
+  // buggy pre-window rollback would DELETE the key (restoring the pre-window
+  // absent state) and thereby erase the sibling's write entirely. The shadow
+  // history must instead restore the sibling's value.
+  const store = new SharedStore();
+  store.trackPut("k", "A1", "run-1:0");
+  store.trackPut("k", "B", "run-1:1");
+  store.trackPut("k", "A2", "run-1:0");
+  store.discardDelta("run-1:0");
+  assert.equal(store.get("k"), "B", "the sibling's write must survive, not be deleted");
+});
+
+test("SharedStore.discardDelta: after an A/B/A rollback, the sibling's own discard still rolls back correctly", () => {
+  // The rollback must leave the shadow history consistent: after A's discard
+  // restores B's write, B's own later discard must behave as if only B had
+  // ever written the key (the key was created inside both windows, so B's
+  // rollback deletes it).
+  const store = new SharedStore();
+  store.trackPut("k", "A1", "run-1:0");
+  store.trackPut("k", "B", "run-1:1");
+  store.trackPut("k", "A2", "run-1:0");
+  store.discardDelta("run-1:0"); // restores B
+  assert.equal(store.get("k"), "B");
+  store.discardDelta("run-1:1"); // B fails too → the key it created is deleted
+  assert.equal(store.has("k"), false, "B's rollback must delete the key it created");
+});
+
+test("SharedStore.discardDelta restores a committed sibling's final value, not the pre-window value", () => {
+  // A commits successfully — its writes become a permanent baseline — then B
+  // writes the same key and fails. B's rollback must restore A's committed
+  // value (the last value not written by B), not the older pre-window value.
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "A", "run-1:0");
+  store.commitDelta("run-1:0"); // A succeeds
+  store.trackPut("k", "B", "run-1:1");
+  store.discardDelta("run-1:1"); // B fails
+  assert.equal(store.get("k"), "A", "B's rollback must restore A's committed value");
+});
+
+test("SharedStore.discardDelta does not resurrect a key evicted from the live store", () => {
+  // A failed attempt writes "k2", then cap pressure evicts it (FIFO) before
+  // the attempt fails. The rollback must leave the key absent — restoring it
+  // would resurrect state the store already purged under a bounded write.
+  const store = new SharedStore({ maxKeys: 2 });
+  store.trackPut("k2", "mine", "run-1:0"); // written first → becomes the oldest key
+  store.put("k1", "keep-me");
+  store.put("k3", "newest"); // evicts the oldest key (k2) to fit
+  assert.equal(store.has("k2"), false, "k2 was evicted under cap pressure");
+  store.discardDelta("run-1:0");
+  assert.equal(store.has("k2"), false, "rollback must not resurrect an evicted key");
+});
+
 test("SharedStore.discardDelta still rolls back a key untouched by any concurrent sibling", () => {
   const store = new SharedStore();
   store.put("k", "pre");
@@ -479,10 +554,18 @@ test("resume degrades gracefully (never corrupts) when replaying a pre-namespaci
 
   // Graceful degradation, not corruption: the surviving legacy entry belongs
   // to the parent's call (its hash matches "outer-call"'s hash under the
-  // collapsed key), so the parent cache-hits and the child — whose own entry
-  // was lost in the collapse — safely re-runs live instead of replaying the
-  // parent's (wrong) cached value. The end result is still correct.
-  assert.equal(secondCalls.count, 1, "the frame that lost its slot in the collapse re-runs live, not corrupted");
+  // collapsed key), so the parent's agent would cache-hit and the child — whose
+  // own entry was lost in the collapse — safely re-runs live instead of
+  // replaying the parent's (wrong) cached value. The child's fork is the
+  // script's FIRST statement (parent callSeq 0), so the child's miss propagates
+  // into the parent's prefix (E3): the parent's own agent executed AFTER the
+  // child in the original run is downstream of the child's divergence and must
+  // re-run live too — a conservative cut, but the end result is still correct.
+  assert.equal(
+    secondCalls.count,
+    2,
+    "both frames downstream of the child's fork re-run live (child + parent agent), not corrupted",
+  );
   // JSON-compare — see the note in the previous test about cross-vm-realm
   // prototypes tripping up assert.deepEqual.
   assert.equal(
@@ -910,4 +993,50 @@ test("store_put via the injected tool enforces guardrails end-to-end", async () 
   const [storePut] = createAgentStoreTools(store, "run-1:0") as unknown as [StoreToolHandle];
   await assert.rejects(() => storePut.execute("", { key: "k", value: "x".repeat(100) }), /exceeds maxValueBytes/);
   assert.equal(store.has("k"), false, "a rejected tool write must never land in the store");
+});
+
+// ── E2: commit-order ordinals (design #27) ───────────────────────────────────
+
+test("commitDeltaOrdered assigns monotonic ordinals per commit", () => {
+  const store = new SharedStore();
+  store.trackPut("k", "first", "run-1:0");
+  const a = store.commitDeltaOrdered("run-1:0");
+  store.trackPut("k", "second", "run-1:1");
+  const b = store.commitDeltaOrdered("run-1:1");
+  assert.deepEqual(a.delta, { k: "first" });
+  assert.equal(a.seq, 0, "first committed delta gets ordinal 0");
+  assert.equal(b.seq, 1, "second committed delta gets ordinal 1");
+  assert.ok(a.seq < b.seq, "ordinals must increase with commit order, not call order");
+});
+
+test("commitDeltaOrdered ordinals reflect completion order, not call order", () => {
+  const store = new SharedStore();
+  // Two parallel writers to the same key; the HIGHER call index completes FIRST
+  // (its delta is committed first), so its ordinal is LOWER.
+  store.trackPut("k", "call0-late", "run-1:0");
+  store.trackPut("k", "call1-early", "run-1:1");
+  const early = store.commitDeltaOrdered("run-1:1"); // completes first -> lower ordinal
+  const late = store.commitDeltaOrdered("run-1:0"); // completes last -> higher ordinal
+  assert.equal(early.seq, 0);
+  assert.equal(late.seq, 1);
+  // Sorting the deltas by ordinal and applying them reproduces the live run's
+  // final value: the LAST-completed writer (call0-late) wins.
+  const replay = [late, early].sort((x, y) => x.seq - y.seq);
+  const rebuilt = new SharedStore();
+  for (const { delta } of replay) rebuilt.applyDelta(delta);
+  assert.equal(rebuilt.get("k"), "call0-late", "ordinal-sorted replay ends with the completion-last value");
+});
+
+test("seedCommitSeq raises the next ordinal and is raises-only", () => {
+  const store = new SharedStore();
+  store.seedCommitSeq(4);
+  store.trackPut("k", "v", "run-1:0");
+  const next = store.commitDeltaOrdered("run-1:0");
+  assert.equal(next.seq, 5, "the counter continues AFTER the seeded max");
+  // Re-seeding with a LOWER max must not lower the counter (nested frames share
+  // the store and re-seed from their own resumeJournal view).
+  store.seedCommitSeq(2);
+  store.trackPut("k", "v2", "run-1:1");
+  const after = store.commitDeltaOrdered("run-1:1");
+  assert.equal(after.seq, 6, "re-seeding below the current counter is a no-op");
 });

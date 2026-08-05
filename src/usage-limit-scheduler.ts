@@ -107,9 +107,9 @@ export function parseResetHintMs(hint?: string, now: number = Date.now()): numbe
   let found = false;
   // biome-ignore lint/suspicious/noAssignInExpressions: standard regex-exec loop
   while ((match = re.exec(hint)) !== null) {
-    const value = Number.parseFloat(match[1]);
+    const value = Number.parseFloat(match[1] ?? "");
     if (!Number.isFinite(value)) continue;
-    const unit = match[2].toLowerCase();
+    const unit = (match[2] ?? "").toLowerCase();
     found = true;
     if (unit.startsWith("w")) totalMs += value * 604_800_000;
     else if (unit.startsWith("d")) totalMs += value * 86_400_000;

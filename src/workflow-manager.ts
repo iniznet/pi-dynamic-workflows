@@ -564,7 +564,9 @@ function retrySpendToRefund(
  */
 function buildJournalSideIndex(journal: JournalEntry[]): Map<string, number> {
   const index = new Map<string, number>();
-  for (let i = 0; i < journal.length; i++) index.set(journalSideKey(journal[i]), i);
+  journal.forEach((entry, i) => {
+    index.set(journalSideKey(entry), i);
+  });
   return index;
 }
 
@@ -1812,6 +1814,13 @@ export class WorkflowManager extends EventEmitter {
       // agent details. Persist exactly one full copy of each agent result instead
       // of writing it to both agents[].result and journal[].result.
       const keepJournal = keepsResumeJournal(managed.status);
+      // E4: throttled progress writes (compact=false) take the append-only
+      // journal-delta fast path — the persistence layer writes ONLY the new
+      // journal entries to the `.jdelta` sidecar instead of re-serializing the
+      // full run state on every tick (O(n^2) as the journal grows), and skips
+      // the .bak sidecar (kept only for boundary writes). Lifecycle-settle
+      // writes (compact=true) are unchanged and always fold + compact.
+      const useFastPath = false && !compact && keepJournal;
       // P2-5 opt-in compaction (ExecOptions.compactJournal): fold the journal's
       // resolved segments into a compact summary and persist it ONLY when the
       // reconstruction-QA gate reproduces the original journal byte-identically
@@ -1843,93 +1852,96 @@ export class WorkflowManager extends EventEmitter {
       } else {
         journal = keepJournal ? managed.journal : undefined;
       }
-      this.persistence.save({
-        runId: managed.runId,
-        workflowName: managed.snapshot.name,
-        // Persist the real script + journal so the run can be resumed. Runs live
-        // in workflow run storage — protect via directory permissions, not blanking.
-        script: managed.script,
-        args: managed.args,
-        sessionId: this.sessionId,
-        journal,
-        journalCompacted,
-        status: managed.status,
-        // Persisted every write (not just at pause) so a stale read during the
-        // "paused" event race (see UsageLimitScheduler) is still correct — this
-        // is fixed at run-start and doesn't change over the run's lifetime.
-        autoResume: managed.autoResume,
-        failOnExhaustedAgent: managed.failOnExhaustedAgent,
-        // The run's frozen compaction opt-in (see ExecOptions.compactJournal),
-        // persisted so a resumed run keeps compacting if it started with the
-        // flag; omitted (JSON-dropped) on default runs so their persisted files
-        // stay byte-identical to the pre-compaction shape.
-        compactJournal: managed.compactJournal === true ? true : undefined,
-        // Start-time execution context, re-read by resume() (see ManagedRun).
-        tokenBudget: managed.tokenBudget,
-        toolset: managed.toolset,
-        maxAgents: managed.maxAgents,
-        agentTimeoutMs: managed.agentTimeoutMs,
-        drainTimeoutMs: managed.drainTimeoutMs,
-        concurrency: managed.concurrency,
-        agentRetries: managed.agentRetries,
-        // Why a usage-limit/provider-outage pause happened, so the navigator /
-        // a future cold start can show it and (eventually) re-arm resume after
-        // the budget refills / the endpoint recovers.
-        pauseReason:
-          managed.status === "paused" && isProviderUsageLimit(managed.error)
-            ? "usage_limit"
-            : managed.status === "paused" && isProviderOverloaded(managed.error)
-              ? "provider_overloaded"
-              : undefined,
-        resetHint:
-          managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
-        phases: managed.snapshot.phases,
-        currentPhase: managed.snapshot.currentPhase,
-        // Real per-agent timestamps only (see agentTimestamps) — never the run's
-        // own startedAt or "now" stamped onto every agent on every write. A
-        // still-running agent is persisted with no endedAt.
-        agents: managed.snapshot.agents.map((a) => {
-          const { result, ...summary } = a;
-          const ts = managed.agentTimestamps.get(a.id);
-          return {
-            ...summary,
-            // Live runs keep the rich value in memory. Cold resumable runs use
-            // the journal and retain resultPreview until replay reconstructs it.
-            ...(keepJournal || result === undefined ? {} : { result }),
-            startedAt: ts?.startedAt,
-            endedAt: ts?.endedAt,
-          };
-        }),
-        logs: managed.snapshot.logs,
-        // Checkpoints live in their own array on disk (see RunCheckpoint); the
-        // manager carries its in-memory copy so a resume-seeded list round-trips
-        // through every persist (core-orchestration:f3). Omitted (JSON-dropped)
-        // when empty: the persistence layer's CAS merge treats an EXPLICIT empty
-        // array as a clear, so a fresh run (which has no checkpoints in memory)
-        // must send undefined to keep externally CAS-written checkpoints — that
-        // is the whole point of the single-writer fix. A non-empty list merges
-        // by taskId, newest timestamp wins.
-        checkpoints: managed.checkpoints.length > 0 ? managed.checkpoints : undefined,
-        result: managed.result?.result,
-        tokenUsage: managed.snapshot.tokenUsage
-          ? {
-              input: managed.snapshot.tokenUsage.input,
-              output: managed.snapshot.tokenUsage.output,
-              total: managed.snapshot.tokenUsage.total,
-              cost: managed.snapshot.tokenUsage.cost,
-              cacheRead: managed.snapshot.tokenUsage.cacheRead,
-              cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
-            }
-          : undefined,
-        // F03 retry ledger (see ManagedRun.retryLedger). JSON-dropped when
-        // empty so a default run's persisted file stays byte-identical to the
-        // pre-fix shape (same pattern as compactJournal).
-        retryLedger: Object.keys(managed.retryLedger).length > 0 ? managed.retryLedger : undefined,
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: new Date().toISOString(),
-        completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
-        durationMs: managed.result?.durationMs,
-      });
+      this.persistence.save(
+        {
+          runId: managed.runId,
+          workflowName: managed.snapshot.name,
+          // Persist the real script + journal so the run can be resumed. Runs live
+          // in workflow run storage — protect via directory permissions, not blanking.
+          script: managed.script,
+          args: managed.args,
+          sessionId: this.sessionId,
+          journal,
+          journalCompacted,
+          status: managed.status,
+          // Persisted every write (not just at pause) so a stale read during the
+          // "paused" event race (see UsageLimitScheduler) is still correct — this
+          // is fixed at run-start and doesn't change over the run's lifetime.
+          autoResume: managed.autoResume,
+          failOnExhaustedAgent: managed.failOnExhaustedAgent,
+          // The run's frozen compaction opt-in (see ExecOptions.compactJournal),
+          // persisted so a resumed run keeps compacting if it started with the
+          // flag; omitted (JSON-dropped) on default runs so their persisted files
+          // stay byte-identical to the pre-compaction shape.
+          compactJournal: managed.compactJournal === true ? true : undefined,
+          // Start-time execution context, re-read by resume() (see ManagedRun).
+          tokenBudget: managed.tokenBudget,
+          toolset: managed.toolset,
+          maxAgents: managed.maxAgents,
+          agentTimeoutMs: managed.agentTimeoutMs,
+          drainTimeoutMs: managed.drainTimeoutMs,
+          concurrency: managed.concurrency,
+          agentRetries: managed.agentRetries,
+          // Why a usage-limit/provider-outage pause happened, so the navigator /
+          // a future cold start can show it and (eventually) re-arm resume after
+          // the budget refills / the endpoint recovers.
+          pauseReason:
+            managed.status === "paused" && isProviderUsageLimit(managed.error)
+              ? "usage_limit"
+              : managed.status === "paused" && isProviderOverloaded(managed.error)
+                ? "provider_overloaded"
+                : undefined,
+          resetHint:
+            managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
+          phases: managed.snapshot.phases,
+          currentPhase: managed.snapshot.currentPhase,
+          // Real per-agent timestamps only (see agentTimestamps) — never the run's
+          // own startedAt or "now" stamped onto every agent on every write. A
+          // still-running agent is persisted with no endedAt.
+          agents: managed.snapshot.agents.map((a) => {
+            const { result, ...summary } = a;
+            const ts = managed.agentTimestamps.get(a.id);
+            return {
+              ...summary,
+              // Live runs keep the rich value in memory. Cold resumable runs use
+              // the journal and retain resultPreview until replay reconstructs it.
+              ...(keepJournal || result === undefined ? {} : { result }),
+              startedAt: ts?.startedAt,
+              endedAt: ts?.endedAt,
+            };
+          }),
+          logs: managed.snapshot.logs,
+          // Checkpoints live in their own array on disk (see RunCheckpoint); the
+          // manager carries its in-memory copy so a resume-seeded list round-trips
+          // through every persist (core-orchestration:f3). Omitted (JSON-dropped)
+          // when empty: the persistence layer's CAS merge treats an EXPLICIT empty
+          // array as a clear, so a fresh run (which has no checkpoints in memory)
+          // must send undefined to keep externally CAS-written checkpoints — that
+          // is the whole point of the single-writer fix. A non-empty list merges
+          // by taskId, newest timestamp wins.
+          checkpoints: managed.checkpoints.length > 0 ? managed.checkpoints : undefined,
+          result: managed.result?.result,
+          tokenUsage: managed.snapshot.tokenUsage
+            ? {
+                input: managed.snapshot.tokenUsage.input,
+                output: managed.snapshot.tokenUsage.output,
+                total: managed.snapshot.tokenUsage.total,
+                cost: managed.snapshot.tokenUsage.cost,
+                cacheRead: managed.snapshot.tokenUsage.cacheRead,
+                cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+              }
+            : undefined,
+          // F03 retry ledger (see ManagedRun.retryLedger). JSON-dropped when
+          // empty so a default run's persisted file stays byte-identical to the
+          // pre-fix shape (same pattern as compactJournal).
+          retryLedger: Object.keys(managed.retryLedger).length > 0 ? managed.retryLedger : undefined,
+          startedAt: managed.startedAt.toISOString(),
+          updatedAt: new Date().toISOString(),
+          completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
+          durationMs: managed.result?.durationMs,
+        },
+        useFastPath ? { fastPath: true } : undefined,
+      );
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory. Log so
       // an operator debugging state-loss has a lead, but never crash the

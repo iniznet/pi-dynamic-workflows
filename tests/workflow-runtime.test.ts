@@ -640,6 +640,82 @@ test("resume in parallel(): editing one thunk re-runs that index and every later
   assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
 });
 
+test("nested workflow() miss propagates into the parent's firstMiss (child divergence cuts the parent's cache-hit prefix)", async () => {
+  const child = (body: string) => `export const meta = { name: 'e3child', description: 'c' }
+const c = await agent('${body}', { label: 'c' })
+return { c }`;
+  const parent = `export const meta = { name: 'e3parent', description: 'p' }
+const p0 = await agent('P0', { label: 'p0' })
+const nested = await workflow('e3child')
+const p2 = await agent('P2', { label: 'p2' })
+return { p0, nested, p2 }`;
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "e3-nested-run",
+    loadSavedWorkflow: () => child("C0"),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 3, "live run executes parent+child+parent calls");
+
+  // Edit ONLY the child script: C0's hash changes → the child misses → the
+  // parent's P2 sits AFTER the child fork, so it must run live (the bug served
+  // it stale from the journal because the parent's own prefix looked intact).
+  const second = countingAgent();
+  await runWorkflow(parent, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "e3-nested-run",
+    loadSavedWorkflow: () => child("C0-edited"),
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(
+    second.state.calls,
+    2,
+    "child's C0 + parent's P2 re-run live; only parent's P0 (before the fork) is cached",
+  );
+});
+
+test("nested workflow() miss after an intact child prefix still cuts the parent prefix at the fork", async () => {
+  const child = (c2Body: string) => `export const meta = { name: 'e3child2', description: 'c' }
+const c1 = await agent('C1', { label: 'c1' })
+const c2 = await agent('${c2Body}', { label: 'c2' })
+return { c1, c2 }`;
+  const parent = `export const meta = { name: 'e3parent2', description: 'p' }
+const p0 = await agent('P0', { label: 'p0' })
+const nested = await workflow('e3child2')
+const p2 = await agent('P2', { label: 'p2' })
+return { p0, nested, p2 }`;
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(parent, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "e3-nested-run2",
+    loadSavedWorkflow: () => child("C2"),
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 4, "live run executes p0 + child C1 + child C2 + p2");
+
+  const second = countingAgent();
+  await runWorkflow(parent, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "e3-nested-run2",
+    loadSavedWorkflow: () => child("C2-edited"),
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(
+    second.state.calls,
+    2,
+    "child's C2 (miss) + parent's P2 (after the fork) re-run live; P0 and child C1 replay from cache",
+  );
+});
+
 test("callSeq is deterministic under parallel()", async () => {
   const journal: JournalEntry[] = [];
   const script = `export const meta = { name: 'par', description: 'parallel order' }
@@ -1628,4 +1704,112 @@ return a`,
   );
   assert.equal(result.result, "ok");
   assert.equal(calls, 2);
+});
+
+// ── E2: order-faithful store replay (design #27) ─────────────────────────────
+
+// Two parallel writers to the SAME key, with deterministic completion order
+// OPPOSITE to call order: the later (higher callIndex) writer finishes FIRST.
+// The original run's final live value is the LAST-COMPLETED writer's value.
+// A resume whose replay applied deltas in callSeq order would end with the
+// OTHER writer's value — the divergence E2's commit-ordinal replay fixes.
+const commitOrderScript = `export const meta = { name: 'e2_commit_order', description: 'commit-order store replay' }
+await parallel([
+  () => agent('write-a', { label: 'a' }),
+  () => agent('write-b', { label: 'b' }),
+])
+return await agent('read-final', { label: 'read' })`;
+
+function commitOrderRunner(readPrompt: string) {
+  const state = { calls: 0 };
+  return {
+    state,
+    runner: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runner mocks take arbitrary AgentRunOptions (repo convention)
+      async run(prompt: string, opts: any) {
+        state.calls++;
+        const tools: Array<{ name: string; execute: (id: string, params: unknown) => Promise<unknown> }> =
+          opts?.systemTools ?? [];
+        const put = tools.find((t) => t.name === "store_put");
+        const get = tools.find((t) => t.name === "store_get");
+        if (prompt === "write-a") {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          await put?.execute("", { key: "shared", value: "a-late" });
+          return "a-done";
+        }
+        if (prompt === "write-b") {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          await put?.execute("", { key: "shared", value: "b-early" });
+          return "b-done";
+        }
+        if (prompt === readPrompt) {
+          const res = (await get?.execute("", { key: "shared" })) as { details?: { value?: unknown } };
+          return res?.details?.value;
+        }
+        return `ran:${prompt}`;
+      },
+    },
+  };
+}
+
+test("resume replays buffered store deltas in the original COMMIT order, not callSeq order", async () => {
+  const first = commitOrderRunner("read-final");
+  const journal: JournalEntry[] = [];
+  const r1 = await runWorkflow<unknown>(commitOrderScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "e2-commit-order-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  // Live run: write-b completes first (10ms), write-a last (30ms) — the last
+  // completion wins the key, so the read agent observed a-late.
+  assert.equal(r1.result, "a-late");
+  assert.equal(journal.length, 3);
+  assert.ok(
+    journal.every((e) => typeof e.storeCommitSeq === "number"),
+    "E2 journals must stamp every entry with a store commit ordinal",
+  );
+  // Completion order differs from call order: callIndex 1 (write-b) committed
+  // BEFORE callIndex 0 (write-a).
+  const byIndex = new Map(journal.map((e) => [e.index, e.storeCommitSeq]));
+  assert.ok((byIndex.get(1) ?? -1) < (byIndex.get(0) ?? -1), "write-b must commit before write-a");
+
+  // Resume with an edited read prompt: calls 0/1 replay from the journal, call
+  // 2 misses and runs LIVE — its store_get must see the commit-order-final
+  // value, not the callSeq-order reconstruction.
+  const second = commitOrderRunner("read-final-edited");
+  const r2 = await runWorkflow<unknown>(commitOrderScript.replace("read-final", "read-final-edited"), {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "e2-commit-order-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "only the edited read call runs live");
+  assert.equal(r2.result, "a-late", "the replayed store must end with the LAST-COMPLETED writer's value");
+});
+
+test("legacy journals without commit stamps keep the pre-fix callSeq-order replay", async () => {
+  const first = commitOrderRunner("read-final");
+  const journal: JournalEntry[] = [];
+  await runWorkflow(commitOrderScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "e2-legacy-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  // Simulate a journal persisted before E2: strip the commit stamps.
+  const legacy: JournalEntry[] = journal.map(({ storeCommitSeq: _omit, ...rest }) => rest);
+  const second = commitOrderRunner("read-final-edited");
+  const r2 = await runWorkflow<unknown>(commitOrderScript.replace("read-final", "read-final-edited"), {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "e2-legacy-run",
+    resumeJournal: new Map(legacy.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "only the edited read call runs live");
+  assert.equal(
+    r2.result,
+    "b-early",
+    "unstamped journals replay in walk (callSeq) order — the documented pre-fix behavior",
+  );
 });

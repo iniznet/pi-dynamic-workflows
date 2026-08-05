@@ -129,6 +129,7 @@ test(
       "index",
       "result",
       "runId",
+      "storeCommitSeq",
       "storeDelta",
     ]);
 

@@ -717,7 +717,7 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
 function normalizeWorkflowScript(script: string): string {
   let text = script.trim();
   const fence = text.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
-  if (fence) text = fence[1].trim();
+  if (fence) text = (fence[1] ?? "").trim();
   return text;
 }
 

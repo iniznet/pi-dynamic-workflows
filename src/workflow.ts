@@ -115,6 +115,17 @@ export interface JournalEntry {
    */
   storeDelta?: Record<string, unknown>;
   /**
+   * Monotonic per-store commit ordinal captured when this call's store delta
+   * was committed in the ORIGINAL run (see SharedStore.commitDeltaOrdered) —
+   * the delta's position in the run's real completion order. Resume replay
+   * applies replayed deltas sorted by this ordinal, so parallel agents that
+   * wrote the same key reconstruct the same final store the live run ended
+   * with instead of a callSeq-order reconstruction (E2). Absent on journal
+   * entries persisted before this field existed: such journals replay in
+   * callSeq order — the pre-fix behavior, kept for resume integrity.
+   */
+  storeCommitSeq?: number;
+  /**
    * Typed operation traces (Fabric-style): one entry per tool call this agent
    * made, in execution order, pinned to the workflow-script line of the owning
    * agent() call. Absent when the runner reported no tool calls (e.g. a test
@@ -221,6 +232,17 @@ export interface SharedRuntime {
    * timing-dependent and must not influence call identity (see elapsedMs).
    */
   runStartedAtMs: number;
+  /**
+   * Buffered replay deltas awaiting commit-order application (E2): every
+   * cache-hit call walked during resume replay appends its journaled store
+   * delta here instead of applying it at cache-hit time (which would replay
+   * in callSeq order, not the original run's completion order). Flushed by
+   * `flushReplayDeltas` at the next live boundary (any frame's first cache
+   * miss) or at top-level run end when the whole resume was cache hits. The
+   * buffer is shared across nested workflow() frames, so ordinals sort
+   * globally across the whole run tree.
+   */
+  pendingReplayDeltas: Array<{ delta: Record<string, unknown>; seq: number | undefined }>;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -509,6 +531,14 @@ export interface WorkflowRunResult<T = unknown> {
    * clean success.
    */
   failedAgents?: Array<{ label: string; error: string; errorCode: WorkflowErrorCode; nested?: string }>;
+  /**
+   * E3: the first call index that ran live instead of replaying from the
+   * journal (Number.POSITIVE_INFINITY → absent). A nested workflow() parent
+   * reads this to cut its own cache-hit prefix at the child's fork point when
+   * the child diverged — downstream parent calls were computed against the
+   * child's OLD result, so they must run live against the new store state.
+   */
+  firstMiss?: number;
   tokenUsage?: {
     input: number;
     output: number;
@@ -875,6 +905,7 @@ export async function runWorkflow<T = unknown>(
     nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
+    pendingReplayDeltas: [],
     // Seed the elapsedMs() global from the true top-level start; a nested
     // workflow() frame inherits this exact value via options.sharedRuntime.
     runStartedAtMs: Date.now(),
@@ -936,6 +967,47 @@ export async function runWorkflow<T = unknown>(
   // One store instance per run; nested workflow() calls inherit the parent's store
   // so all agents across nesting levels share the same key-value space.
   const store: SharedStore = options.sharedStore ?? new SharedStore();
+  // E2 commit-order seeding: continue the store's commit-ordinal counter AFTER
+  // the highest ordinal in the resume journal, so a run paused and resumed more
+  // than once keeps ordinals strictly increasing across the whole history (a
+  // fresh store restarts at 0, which would tie with — or sort before — already
+  // journaled ordinals and corrupt commit-order replay on the second resume).
+  // Raises-only (see SharedStore.seedCommitSeq), so nested frames re-seeding the
+  // shared store with the same max are idempotent.
+  if (options.resumeJournal) {
+    let maxCommitSeq = -1;
+    for (const entry of options.resumeJournal.values()) {
+      if (typeof entry.storeCommitSeq === "number" && entry.storeCommitSeq > maxCommitSeq) {
+        maxCommitSeq = entry.storeCommitSeq;
+      }
+    }
+    if (maxCommitSeq >= 0) store.seedCommitSeq(maxCommitSeq);
+  }
+
+  // E2 commit-order replay: cache-hit deltas are buffered (pendingReplayDeltas)
+  // and applied together at the next live boundary, sorted by the journal's
+  // per-store commit ordinals — the original run's completion order. Applying at
+  // cache-hit time would replay in callSeq order, so parallel agents that wrote
+  // the same key would end with the callSeq-last value, not the completion-last
+  // value the live run produced (a silent store divergence for live agents after
+  // a resume). Old journals whose entries predate commit stamps (no
+  // storeCommitSeq) keep the pre-fix callSeq-order replay — see the allStamped
+  // gate below. The whole prefix replays synchronously before any live agent
+  // starts, so every buffered entry's ordinal is final relative to the others by
+  // the time a flush fires (an entry buffered later was walked later, which
+  // means it committed later in the original run — a higher ordinal).
+  const flushReplayDeltas = (): void => {
+    const pending = shared.pendingReplayDeltas;
+    if (pending.length === 0) return;
+    shared.pendingReplayDeltas = [];
+    // Legacy journals (no commit stamps on any entry) keep current behavior:
+    // apply in walk (callSeq) order, exactly as the pre-fix replay did.
+    const allStamped = pending.every((p) => typeof p.seq === "number");
+    const ordered = allStamped ? [...pending].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0)) : pending;
+    for (const { delta } of ordered) {
+      if (Object.keys(delta).length > 0) store.applyDelta(delta);
+    }
+  };
 
   const log = (message: string) => {
     const text = String(message);
@@ -1250,15 +1322,28 @@ export async function runWorkflow<T = unknown>(
         tokens: 0,
         model: displayModel,
       });
-      // Apply this agent's write delta so live agents later in the run see a
-      // consistent store. Additive apply preserves parallel-agent writes that
-      // came from higher-callIndex agents finishing before this one.
-      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
+      // E2: buffer this agent's write delta for commit-order application instead
+      // of applying it at cache-hit time — applying here would replay in callSeq
+      // order (the order the script re-walks the calls), not the order the
+      // original run's parallel agents completed, so same-key writers would end
+      // with the callSeq-last value instead of the completion-last value. The
+      // whole prefix replays synchronously before any live agent starts, so
+      // buffering loses nothing; flushReplayDeltas applies the buffer at the
+      // next live boundary in commit order.
+      if (cached.storeDelta) {
+        shared.pendingReplayDeltas.push({ delta: cached.storeDelta, seq: cached.storeCommitSeq });
+      }
       return cached.result;
     }
     // A genuine miss (no journal entry, or the hash changed) marks where the
     // unchanged prefix ends; this call and every later one then run live.
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!hashMatches || cachedEmptyOutput) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      // First live boundary reached: apply every buffered replay delta in commit
+      // order before this live call (or any other) reads the store (idempotent —
+      // an empty buffer flushes nothing).
+      flushReplayDeltas();
+    }
 
     return limiter(async () => {
       // PhaseGuard activation (see PhaseStateIntegration): agent() is the live
@@ -1540,12 +1625,18 @@ export async function runWorkflow<T = unknown>(
             }
 
             const tokens = recordTokens(result);
+            // E2: capture the delta together with its store commit ordinal — the
+            // delta's position in the run's real completion order — so resume
+            // replay can reconstruct the same store the live run ended with
+            // instead of a callSeq-order reconstruction.
+            const storeCommit = store.commitDeltaOrdered(deltaKey);
             safeCallback("onAgentJournal", options.onAgentJournal, {
               index: callIndex,
               runId,
               hash: callHash,
               result,
-              storeDelta: store.commitDelta(deltaKey),
+              storeDelta: storeCommit.delta,
+              storeCommitSeq: storeCommit.seq,
               // Typed operation traces for this call (absent when the runner
               // reported none).
               operations: operations.length ? operations : undefined,
@@ -1862,6 +1953,12 @@ export async function runWorkflow<T = unknown>(
       // no exception; once anything upstream in the parent has missed, cut
       // the child off from the journal entirely so it runs fully live.
       const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
+      // E3: snapshot the parent's callSeq at the child's fork point. Every
+      // parent agent()/checkpoint() AFTER this index sits downstream of the
+      // child's output, so if the child's replay diverges (its own firstMiss
+      // finite), those parent calls must run live too — their journaled
+      // results were computed against the child's OLD result/store state.
+      const forkIndex = state.callSeq;
       const child = await runWorkflow(childScript, {
         ...options,
         // Share the parent frame's per-run tier-config memo so the whole run
@@ -1887,6 +1984,19 @@ export async function runWorkflow<T = unknown>(
         for (const f of child.failedAgents) {
           state.failedAgents.push({ ...f, nested: workflowName });
         }
+      }
+      // E3: propagate the child's divergence into the parent's prefix. The
+      // child's own frame already cut ITS prefix internally and ran live
+      // (flushing the shared replay buffer at its miss boundary); the parent
+      // must cut at the fork index so no downstream parent call replays stale
+      // deltas against the child's new writes. No-op when the child's prefix
+      // stayed intact (or the parent's was already cut before the fork).
+      if (typeof child.firstMiss === "number" && child.firstMiss !== Number.POSITIVE_INFINITY) {
+        state.firstMiss = Math.min(state.firstMiss, forkIndex);
+        // Defensive: the child's live run already flushed pending replay
+        // deltas at its own first-miss boundary; guards a divergence without
+        // a live-boundary flush (empty buffer → no-op).
+        flushReplayDeltas();
       }
       return child.result;
     } finally {
@@ -2035,7 +2145,10 @@ export async function runWorkflow<T = unknown>(
     ).filter(Boolean) as Array<{ index: number; attempt: unknown; score: number; judgments: unknown[] }>;
     // Highest mean score; stable tie-break by input index.
     let best = scored[0];
-    for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
+    // empty scored keeps the prior semantics: best stays undefined and is returned as-is
+    if (best !== undefined) {
+      for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
+    }
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
       stage: "end",
@@ -2203,7 +2316,8 @@ export async function runWorkflow<T = unknown>(
     const results = await parallel(chunks.map((chunk, index) => async () => opts.mapper(chunk, index)));
     const failed: ChunkedFailure[] = [];
     for (let i = 0; i < results.length; i++) {
-      if (results[i] === null) failed.push({ index: i, chunk: chunks[i] });
+      // chunks has exactly one element per result; the fallback keeps the access provably safe
+      if (results[i] === null) failed.push({ index: i, chunk: chunks[i] ?? [] });
     }
     if (opts.synthesizer !== undefined) {
       return opts.synthesizer(results, { failed, chunkCount: chunks.length, items });
@@ -2533,7 +2647,12 @@ export async function runWorkflow<T = unknown>(
       shared.agentCount++;
       return cached.result; // replay the journaled human reply
     }
-    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (cached == null || cached.hash !== callHash) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      // A checkpoint miss is a live boundary too — the calls that follow it run
+      // live against the store, so apply the buffered replay deltas now.
+      flushReplayDeltas();
+    }
     shared.agentCount++;
 
     let reply: unknown;
@@ -2726,6 +2845,10 @@ export async function runWorkflow<T = unknown>(
       // text both read this; absent when every agent succeeded (undefined keys
       // are JSON-dropped, keeping lenient runs' persisted shape unchanged).
       failedAgents: state.failedAgents.length > 0 ? state.failedAgents : undefined,
+      // E3: only surfaced when the prefix actually broke (finite), so an intact
+      // run's result shape stays unchanged; a nested workflow() parent uses it
+      // to cut its own prefix at the child's fork point (see workflowFn).
+      firstMiss: Number.isFinite(state.firstMiss) ? state.firstMiss : undefined,
     };
   } catch (error) {
     // This error just escaped THIS frame's own vm script execution completely
@@ -2807,6 +2930,11 @@ export async function runWorkflow<T = unknown>(
         }
         await waitForInFlightSettlement(shared.inFlight, drainDeadline);
       }
+      // E2: a resume that was fully cached never hit a live boundary — apply the
+      // buffered replay deltas here (idempotent; any live boundary already
+      // flushed them) so the store reflects the original run's state before
+      // teardown.
+      flushReplayDeltas();
       store.dispose();
       // Dispose any chained handoff session so it never outlives its run frame
       // (a no-op for injected test doubles without close()).

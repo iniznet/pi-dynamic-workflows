@@ -56,6 +56,8 @@ export type CompactJournalRecord =
       resultRef: number;
       /** Index into summary.storeDeltas; absent when the original had no delta. */
       storeDeltaRef?: number;
+      /** E2 commit ordinal; absent when the original had none (legacy entries). */
+      storeCommitSeq?: number;
       /** Index into summary.opTraces; absent when the original had no traces. */
       opRef?: number;
     }
@@ -134,6 +136,7 @@ export function compactJournal(entries: JournalEntry[]): CompactJournalSummary {
         hashRef: intern(hashes, hashRefs, entry.hash),
         resultRef: intern(results, resultRefs, entry.result),
         ...(entry.storeDelta !== undefined ? { storeDeltaRef: intern(storeDeltas, deltaRefs, entry.storeDelta) } : {}),
+        ...(entry.storeCommitSeq !== undefined ? { storeCommitSeq: entry.storeCommitSeq } : {}),
         ...(entry.operations !== undefined ? { opRef: intern(opTraces, traceRefs, entry.operations) } : {}),
       });
     } else {
@@ -155,12 +158,12 @@ export function compactJournal(entries: JournalEntry[]): CompactJournalSummary {
 /**
  * Reconstruct the original journal from a compacted summary. Entry objects
  * are built in the same canonical key order workflow.ts uses when journaling
- * (`index, runId, hash, result, storeDelta, operations`), materializing
- * optional fields only when the original had them, so JSON.stringify output
- * matches the original byte-for-byte. Interned results/deltas/traces are
- * shared by reference across entries that originally held JSON-equal values —
- * serialization is unaffected, and neither applyDelta (resume replay) nor the
- * read-only trace surface mutates them.
+ * (`index, runId, hash, result, storeDelta, storeCommitSeq, operations`),
+ * materializing optional fields only when the original had them, so
+ * JSON.stringify output matches the original byte-for-byte. Interned
+ * results/deltas/traces are shared by reference across entries that originally
+ * held JSON-equal values — serialization is unaffected, and neither applyDelta
+ * (resume replay) nor the read-only trace surface mutates them.
  */
 export function reconstructJournal(summary: CompactJournalSummary): JournalEntry[] {
   return summary.records.map((record): JournalEntry => {
@@ -171,6 +174,7 @@ export function reconstructJournal(summary: CompactJournalSummary): JournalEntry
       hash: summary.hashes[record.hashRef],
       result: summary.results[record.resultRef],
       ...(record.storeDeltaRef !== undefined ? { storeDelta: summary.storeDeltas[record.storeDeltaRef] } : {}),
+      ...(record.storeCommitSeq !== undefined ? { storeCommitSeq: record.storeCommitSeq } : {}),
       ...(record.opRef !== undefined ? { operations: summary.opTraces[record.opRef] } : {}),
     };
   });
