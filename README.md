@@ -76,6 +76,7 @@ return await agent(
 ## Why use it
 
 - **Real parallel orchestration** — fan out up to 16 concurrent and 1000 total subagents from one orchestration script.
+- **Author scripts in a file, run them by path** — pass `scriptPath` to the `workflow` tool instead of inlining the script text (avoids quote/backtick escaping errors); validate the file first with `npx tsx scripts/check-workflow-script.ts <file>` in the repo, or just run with `dryRun: true` to validate without launching subagents. Plain `node --check` is not a faithful pre-check: top-level `return` is legal in the workflow sandbox but a syntax error in plain ESM.
 - **Per-agent model routing** — use `small`, `medium`, or `big` tiers, or choose an exact provider/model and thinking level.
 - **Journaled resume** — replay completed agents after interruption without rerunning them or spending their tokens again. The orchestrator can also resume with an **edited script** (`resumeFromRunId`): unchanged `agent()` calls replay from cache and only edited/new ones re-run — so a single bad prompt no longer means paying to re-run the whole workflow.
 - **Git worktree isolation** — let parallel agents edit safely on throwaway branches with `isolation: "worktree"`. Worktrees live at `<repoRoot>/.pi/worktrees/<id>` on branch `pi/wf/<id>`; edits are always finalized (`git add -A` + `git commit --allow-empty`) before teardown, then discarded unless `keepWorktree` is set; leftovers from crashed runs are swept at startup.
@@ -114,6 +115,7 @@ The installed extension generates this compact index from its executable capabil
 | process | runtime-global | `process: { cwd(): string }` | — |
 | budget | runtime-global | `budget: { total, spent(), remaining() }` | — |
 | script | workflow-tool-input | `script?: string` | — |
+| scriptPath | workflow-tool-input | `scriptPath?: string` | — |
 | name | workflow-tool-input | `name?: string` | — |
 | args | workflow-tool-input | `args?: unknown` | — |
 | background | workflow-tool-input | `background?: boolean = true` | — |

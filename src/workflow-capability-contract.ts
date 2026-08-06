@@ -596,7 +596,15 @@ const capabilities: readonly CapabilityDescriptor[] = [
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     constraints: ["new workflows should use log()"],
   }),
-  toolInput("script", "script?: string", ["required raw JavaScript workflow source unless `name` is given"]),
+  toolInput("script", "script?: string", [
+    "required raw JavaScript workflow source unless `name` or `scriptPath` is given",
+  ]),
+  toolInput("scriptPath", "scriptPath?: string", [
+    "path to a file whose content is used exactly as if passed inline as `script`",
+    "resolved against the workflow tool's cwd when not absolute",
+    "read by the extension process (not the script runtime), so authoring to a file avoids inline quote/backtick escaping",
+    "mutually exclusive with `script` and `name`",
+  ]),
   toolInput("name", "name?: string", [
     "resolves a project/user saved workflow first, then one of the 5 built-in patterns",
     "mutually exclusive with resumeFromRunId",

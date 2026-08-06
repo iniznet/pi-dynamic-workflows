@@ -293,7 +293,18 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `script?: string`
-- Constraint: required raw JavaScript workflow source unless `name` is given
+- Constraint: required raw JavaScript workflow source unless `name` or `scriptPath` is given
+
+<a id="tool-input-scriptpath"></a>
+## scriptPath
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `scriptPath?: string`
+- Constraint: path to a file whose content is used exactly as if passed inline as `script`
+- Constraint: resolved against the workflow tool's cwd when not absolute
+- Constraint: read by the extension process (not the script runtime), so authoring to a file avoids inline quote/backtick escaping
+- Constraint: mutually exclusive with `script` and `name`
 
 <a id="tool-input-name"></a>
 ## name

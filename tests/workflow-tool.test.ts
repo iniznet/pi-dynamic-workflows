@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,7 @@ import {
   createWorkflowTool,
   formatCompletedResultText,
   WORKFLOW_GATE_GUIDELINE,
+  type WorkflowToolInput,
 } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -808,6 +809,145 @@ test(
     );
   }),
 );
+
+// ─── scriptPath (file-based script source) ────────────────────────────────────
+
+const scriptPathScript = `export const meta = { name: 'file_script', description: 'read from disk' }
+const a = await agent('do it', { label: 'a' })
+return { a }`;
+
+function writeScriptFile(cwd: string, rel: string, content: string): string {
+  const absolute = join(cwd, rel);
+  mkdirSync(join(cwd, rel.split("/").slice(0, -1).join("/")), { recursive: true });
+  writeFileSync(absolute, content, "utf8");
+  return absolute;
+}
+
+test("workflow tool schema exposes scriptPath as an optional property", () => {
+  const tool = createWorkflowTool();
+  const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
+  assert.ok(schema.properties.scriptPath, "scriptPath should be a schema property");
+  assert.ok(!(schema.required ?? []).includes("scriptPath"), "scriptPath is optional");
+  const parameter = schema.properties.scriptPath as { description?: string };
+  assert.match(parameter.description ?? "", /cwd/);
+  assert.match(parameter.description ?? "", /Mutually exclusive/);
+});
+
+test("workflow tool prepareArguments passes scriptPath through and rejects non-strings", () => {
+  const tool = createWorkflowTool();
+  if (tool.prepareArguments) {
+    const prepare = tool.prepareArguments as (args: unknown) => WorkflowToolInput;
+    const result = prepare({ scriptPath: "scripts/wf.mjs" });
+    assert.equal(result.scriptPath, "scripts/wf.mjs");
+    assert.throws(() => prepare({ scriptPath: 42 }), /scriptPath.*must be a string/);
+    assert.throws(() => prepare({ name: "deep-research", scriptPath: 42 }), /scriptPath.*must be a string/);
+  }
+});
+
+test(
+  "workflow tool: scriptPath dryRun reads the file and validates without launching",
+  withToolTempCwd(async (cwd) => {
+    writeScriptFile(cwd, "scripts/wf.mjs", scriptPathScript);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "file-1",
+      { scriptPath: "scripts/wf.mjs", dryRun: true },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const details = res.details as { dryRun?: boolean; name?: string };
+    assert.equal(details.dryRun, true);
+    assert.equal(details.name, "file_script");
+    assert.equal(manager.listRuns().length, 0, "dryRun must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: scriptPath resolves absolute paths as-is",
+  withToolTempCwd(async (cwd) => {
+    const absolute = writeScriptFile(cwd, "abs-script.mjs", scriptPathScript);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute("file-2", { scriptPath: absolute, dryRun: true }, undefined, undefined, {} as never);
+    assert.equal((res.details as { name?: string }).name, "file_script");
+  }),
+);
+
+test(
+  "workflow tool: scriptPath starts a background run with the file content as the script",
+  withToolTempCwd(async (cwd) => {
+    writeScriptFile(cwd, "scripts/wf.mjs", scriptPathScript);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute("file-3", { scriptPath: "scripts/wf.mjs" }, undefined, undefined, {} as never);
+    const details = res.details as { runId?: string; background?: boolean };
+    assert.ok(details.runId, "a run id should be returned");
+    assert.equal(details.background, true);
+    const run = manager.getRun(details.runId);
+    assert.equal(run?.script, scriptPathScript, "the run script should be the file content");
+    await new Promise((r) => setTimeout(r, 20));
+  }),
+);
+
+test(
+  "workflow tool: scriptPath pointing at a missing file rejects with the resolved path",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("file-4", { scriptPath: "nope/wf.mjs" }, undefined, undefined, {} as never),
+      (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /cannot read scriptPath/);
+        assert.match(message, /nope.wf.mjs/);
+        assert.match(message, /cwd/);
+        return true;
+      },
+    );
+    assert.equal(manager.listRuns().length, 0, "no run on a read failure");
+  }),
+);
+
+test(
+  "workflow tool: scriptPath pointing at an empty file rejects",
+  withToolTempCwd(async (cwd) => {
+    writeScriptFile(cwd, "empty.mjs", "   \n  ");
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("file-5", { scriptPath: "empty.mjs" }, undefined, undefined, {} as never),
+      /which is empty/,
+    );
+  }),
+);
+
+test(
+  "workflow tool: scriptPath cannot be combined with script or name",
+  withToolTempCwd(async (cwd) => {
+    writeScriptFile(cwd, "wf.mjs", scriptPathScript);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute("file-6", { scriptPath: "wf.mjs", script: scriptPathScript }, undefined, undefined, {} as never),
+      /script.*cannot be combined.*scriptPath|scriptPath.*cannot be combined.*script/,
+    );
+    await assert.rejects(
+      () => tool.execute("file-7", { scriptPath: "wf.mjs", name: "deep-research" }, undefined, undefined, {} as never),
+      /name.*cannot be combined.*scriptPath|scriptPath.*cannot be combined.*name/,
+    );
+    assert.equal(manager.listRuns().length, 0, "conflicting inputs must not launch a run");
+  }),
+);
+
+test("workflow tool: neither script, scriptPath, nor name rejects with all three named", () => {
+  const tool = createWorkflowTool();
+  const prepare = tool.prepareArguments as (args: unknown) => WorkflowToolInput;
+  assert.throws(() => prepare({}), /script.*scriptPath.*name/);
+});
 
 // ─── schema numeric bounds (reject malformed model calls early) ───────────────
 

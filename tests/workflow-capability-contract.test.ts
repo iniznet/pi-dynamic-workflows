@@ -52,6 +52,7 @@ const EXPECTED_TOOL_INPUTS = [
   "name",
   "resumeFromRunId",
   "script",
+  "scriptPath",
   "tokenBudget",
 ] as const;
 

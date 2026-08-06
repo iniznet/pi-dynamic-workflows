@@ -67,7 +67,14 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // line, one on the resumeFromRunId param). The new boolean parameter, its
 // description, and the two clauses increase the measured definition from
 // 4,782 to 5,168 bytes (+386), and the accepted ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 5_168;
+//
+// Added an optional `scriptPath` input (path to a file whose content is
+// used exactly as if passed inline as `script` — author to disk, syntax-
+// check with `node --check`, then pass the path, avoiding inline quote/
+// backtick escaping errors). The new string parameter and its description
+// increase the measured definition from 5,168 to 5,608 bytes (+440), and
+// the accepted ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 5_608;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
@@ -78,6 +80,16 @@ const workflowToolSchema = Type?.Object({
         "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
         "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
         "On failure or pause, resume with resumeFromRunId instead of starting a new run.",
+      ].join("\n"),
+    }),
+  ),
+  scriptPath: Type.Optional(
+    Type.String({
+      description: [
+        "Path to a file containing the workflow script. Author the script in a file first, syntax-check it with `node --check <file>`, then pass the path instead of inlining text (avoids quote/backtick escaping errors).",
+        "Absolute paths are used as-is; relative paths resolve against the workflow tool's cwd.",
+        "The file content is used exactly as if it were passed inline as `script` — same rules and validation.",
+        "Mutually exclusive with `script` and `name`.",
       ].join("\n"),
     }),
   ),
@@ -178,6 +190,8 @@ const workflowToolSchema = Type?.Object({
 
 export type WorkflowToolInput = {
   script?: string;
+  /** Path to a file whose content is used as the workflow script (see schema description). */
+  scriptPath?: string;
   name?: string;
   args?: Record<string, unknown>;
   background?: boolean;
@@ -271,6 +285,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       let invocationToolset: string | undefined;
       let script: string;
       let runArgs: Record<string, unknown> | undefined = params.args;
+      if (params.script && params.scriptPath) {
+        throw new Error(
+          "workflow: `script` cannot be combined with `scriptPath` — provide one script source, not both.",
+        );
+      }
       if (params.name) {
         if (params.resumeFromRunId) {
           throw new Error(
@@ -280,6 +299,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         if (params.script) {
           throw new Error(
             "workflow: `name` cannot be combined with `script` — provide either a saved/built-in `name` or a raw `script`, not both.",
+          );
+        }
+        if (params.scriptPath) {
+          throw new Error(
+            "workflow: `name` cannot be combined with `scriptPath` — provide either a saved/built-in `name` or a script source, not both.",
           );
         }
         const resolved = resolveWorkflowInvocation(params.name, params.args, { storage, cwd });
@@ -298,8 +322,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         invocationTools = resolved.tools;
         invocationToolset = resolved.toolset;
       } else {
-        if (!params.script) throw new Error("workflow requires either `script` or `name`");
-        script = normalizeWorkflowScript(params.script);
+        if (params.scriptPath) {
+          script = await readWorkflowScriptFile(params.scriptPath, cwd);
+        } else if (params.script) {
+          script = normalizeWorkflowScript(params.script);
+        } else {
+          throw new Error("workflow requires either `script`, `scriptPath`, or `name`");
+        }
       }
       const parsed = parseWorkflowScript(script);
 
@@ -704,14 +733,28 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
     if (value.script !== undefined && typeof value.script !== "string") {
       throw new Error("workflow's `script` must be a string when provided alongside `name`");
     }
+    if (value.scriptPath !== undefined && typeof value.scriptPath !== "string") {
+      throw new Error("workflow's `scriptPath` must be a string when provided alongside `name`");
+    }
     return {
       ...value,
       name: value.name.trim(),
       script: typeof value.script === "string" ? normalizeWorkflowScript(value.script) : undefined,
     } as WorkflowToolInput;
   }
-  if (typeof value.script !== "string") throw new Error("workflow requires either `script` or `name` to be a string");
-  return { ...value, script: normalizeWorkflowScript(value.script) } as WorkflowToolInput;
+  if (value.script !== undefined && typeof value.script !== "string") {
+    throw new Error("workflow's `script` must be a string when provided");
+  }
+  if (value.scriptPath !== undefined && typeof value.scriptPath !== "string") {
+    throw new Error("workflow's `scriptPath` must be a string when provided");
+  }
+  if (typeof value.script !== "string" && typeof value.scriptPath !== "string") {
+    throw new Error("workflow requires either `script`, `scriptPath`, or `name` to be a string");
+  }
+  return {
+    ...value,
+    script: typeof value.script === "string" ? normalizeWorkflowScript(value.script) : undefined,
+  } as WorkflowToolInput;
 }
 
 function normalizeWorkflowScript(script: string): string {
@@ -719,6 +762,29 @@ function normalizeWorkflowScript(script: string): string {
   const fence = text.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
   if (fence) text = (fence[1] ?? "").trim();
   return text;
+}
+
+/**
+ * Read a workflow script from disk. Runs in the extension process (fs is
+ * available here) — NOT in the workflow `vm` sandbox, whose no-fs rule applies
+ * to the script runtime only. Relative paths resolve against the tool's cwd.
+ */
+async function readWorkflowScriptFile(scriptPath: string, cwd: string): Promise<string> {
+  const absolute = isAbsolute(scriptPath) ? scriptPath : resolve(cwd, scriptPath);
+  let content: string;
+  try {
+    content = await readFile(absolute, "utf8");
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? ` (${String(error.code)})` : "";
+    throw new Error(
+      `workflow: cannot read scriptPath "${scriptPath}"${code} — resolved to ${absolute}. ` +
+        `Pass an absolute path or a path relative to the workflow tool's cwd (${cwd}).`,
+    );
+  }
+  if (content.trim().length === 0) {
+    throw new Error(`workflow: scriptPath "${scriptPath}" resolved to ${absolute}, which is empty.`);
+  }
+  return normalizeWorkflowScript(content);
 }
 
 function _isAbortError(error: unknown): boolean {
