@@ -370,7 +370,7 @@ export function resolveAgentModelSpec(
  * unmapped logical key makes the pool's acquire() return undefined and this
  * run falls back to legacy single-resolution.
  */
-function logicalModelKey(spec: string, registry: ModelRegistry): string {
+export function logicalModelKey(spec: string, registry: ModelRegistry): string {
   const slashIndex = spec.indexOf("/");
   if (slashIndex !== -1) {
     const provider = spec.slice(0, slashIndex).trim().toLowerCase();

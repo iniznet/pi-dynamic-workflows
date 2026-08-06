@@ -163,6 +163,60 @@ export function formatParameterHelp(name: string, description: string, parameter
   return lines.join("\n");
 }
 
+/**
+ * Argument completions for a saved-workflow command: one `key=` suggestion per
+ * DECLARED parameter key not already satisfied in the typed argument text, so
+ * the popup doubles as an argument hint (pi 0.83.0 has no argumentHint field
+ * on RegisteredCommand — per-item `description` is the only hint channel).
+ *
+ * The host's pi-tui applyCompletion swaps the WHOLE argument span it handed us
+ * (the `prefix` in { items, prefix }) for item.value — so each value must
+ * reproduce the already-typed completed tokens verbatim. For a workflow with
+ * `scope` + `depth`, typing `scope=src d` yields value `scope=src depth=`;
+ * a bare `depth=` would clobber the committed `scope=src `. The label stays
+ * the short `key=` form; the description carries type/required/default.
+ */
+export function savedWorkflowArgumentCompletions(
+  argumentText: string,
+  parameters?: WorkflowParameters,
+): Array<{ value: string; label: string; description: string }> {
+  const specs = parameters ?? {};
+  const keys = Object.keys(specs);
+  if (keys.length === 0) return [];
+
+  // Tokenize exactly like parseCommandArgs: whitespace-separated tokens; a
+  // `key=value` token carries a key, anything else is positional free text.
+  const tokens = argumentText.split(/\s+/).filter(Boolean);
+  const endsWithSpace = argumentText.length === 0 || /\s$/.test(argumentText);
+  const currentToken = endsWithSpace ? "" : (tokens.at(-1) ?? "");
+  // Everything before the token being typed is committed text the replacement
+  // value must preserve (see the applyCompletion note above).
+  const completedText = endsWithSpace ? argumentText : argumentText.slice(0, argumentText.length - currentToken.length);
+
+  // A key= token in a completed position satisfies its parameter; the key is
+  // not suggested again even while a value after it is still being typed.
+  const satisfied = new Set<string>();
+  for (const tok of tokens) {
+    const eq = tok.indexOf("=");
+    if (eq > 0) satisfied.add(tok.slice(0, eq));
+  }
+
+  return keys
+    .filter((key) => !satisfied.has(key))
+    .filter((key) => `${key}=`.startsWith(currentToken))
+    .map((key) => {
+      const spec = specs[key];
+      const required = spec.required ? "required" : "optional";
+      const defaultPart = spec.default !== undefined ? `, default ${JSON.stringify(spec.default)}` : "";
+      const detail = spec.description ? ` — ${spec.description}` : "";
+      return {
+        value: `${completedText}${key}=`,
+        label: `${key}=`,
+        description: `${spec.type ?? "string"}, ${required}${defaultPart}${detail}`,
+      };
+    });
+}
+
 /** Register one saved workflow as a `/<name>` command (idempotent).
  * When a WorkflowManager is provided, the workflow runs through it (visible in
  * /workflows TUI, background execution, task panel). Otherwise falls back to
@@ -183,6 +237,7 @@ export function registerSavedWorkflow(
   if (isRegistered(pi, wf.name)) return;
   pi.registerCommand(wf.name, {
     description: wf.description || `Saved workflow: ${wf.name}`,
+    getArgumentCompletions: (argumentText: string) => savedWorkflowArgumentCompletions(argumentText, wf.parameters),
     async handler(args: string, ctx: ExtensionCommandContext) {
       if (exists && !exists()) {
         ctx.ui.notify(`/${wf.name} was deleted — reload the session to remove this command.`, "warning");

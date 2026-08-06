@@ -334,3 +334,107 @@ describe("registerSavedWorkflow", () => {
     assert.match(notified[0].message, /scope \(string, required\)/);
   });
 });
+
+describe("registerSavedWorkflow argument completions", () => {
+  const TYPED_PARAMETERS = {
+    scope: { type: "string", required: true, description: "what to scan" },
+    depth: { type: "integer", default: 3 },
+    verbose: { type: "boolean", description: "emit detail lines" },
+  };
+
+  type Completion = { value: string; label: string; description?: string };
+
+  async function completionsFor(prefix: string): Promise<Completion[]> {
+    const { registerSavedWorkflow } = await load();
+    const { pi, commands } = makeCommandRegistryPi();
+    const wf = {
+      name: "typed",
+      script: "export const meta = { name: 't', description: 't' };",
+      description: "typed workflow",
+      location: "project" as const,
+      parameters: TYPED_PARAMETERS,
+    };
+    registerSavedWorkflow(pi, "/cwd", wf as unknown as SavedWorkflow);
+    const registered = commands[0] as unknown as {
+      getArgumentCompletions?: (prefix: string) => Completion[] | null;
+    };
+    return registered?.getArgumentCompletions?.(prefix) ?? [];
+  }
+
+  it("registers getArgumentCompletions on the saved-workflow command", async () => {
+    const { registerSavedWorkflow } = await load();
+    const { pi, commands } = makeCommandRegistryPi();
+    const wf = {
+      name: "plain",
+      script: "export const meta = { name: 't', description: 't' };",
+      location: "project" as const,
+    };
+    registerSavedWorkflow(pi, "/cwd", wf as unknown as SavedWorkflow);
+    const registered = commands[0] as unknown as { getArgumentCompletions?: unknown };
+    assert.equal(typeof registered.getArgumentCompletions, "function");
+  });
+
+  it("suggests every declared parameter key with a type/required hint in the description", async () => {
+    const completions = await completionsFor("");
+    assert.deepEqual(
+      completions.map((c) => c.label),
+      ["scope=", "depth=", "verbose="],
+    );
+    assert.deepEqual(
+      completions.map((c) => c.value),
+      ["scope=", "depth=", "verbose="],
+    );
+    const scope = completions.find((c) => c.label === "scope=");
+    assert.match(scope?.description ?? "", /string, required/);
+    assert.match(scope?.description ?? "", /what to scan/);
+    const depth = completions.find((c) => c.label === "depth=");
+    assert.match(depth?.description ?? "", /integer, optional, default 3/);
+    const verbose = completions.find((c) => c.label === "verbose=");
+    assert.match(verbose?.description ?? "", /boolean, optional/);
+  });
+
+  it("filters by the token being typed", async () => {
+    const completions = await completionsFor("sc");
+    assert.deepEqual(
+      completions.map((c) => c.label),
+      ["scope="],
+    );
+  });
+
+  it("does not re-suggest a key already satisfied by a key= token", async () => {
+    const completions = await completionsFor("scope=src ");
+    assert.deepEqual(
+      completions.map((c) => c.label),
+      ["depth=", "verbose="],
+    );
+  });
+
+  it("preserves committed tokens in the replacement value (pi-tui swaps the whole argument span)", async () => {
+    const completions = await completionsFor("scope=src d");
+    assert.deepEqual(
+      completions.map((c) => c.label),
+      ["depth="],
+    );
+    assert.equal(completions[0]?.value, "scope=src depth=");
+  });
+
+  it("stays silent while a value is being typed after its key=", async () => {
+    const completions = await completionsFor("depth=");
+    assert.deepEqual(completions, []);
+  });
+
+  it("returns no suggestions when the workflow declares no parameters", async () => {
+    const { registerSavedWorkflow } = await load();
+    const { pi, commands } = makeCommandRegistryPi();
+    const wf = {
+      name: "plain",
+      script: "export const meta = { name: 't', description: 't' };",
+      location: "project" as const,
+    };
+    registerSavedWorkflow(pi, "/cwd", wf as unknown as SavedWorkflow);
+    const registered = commands[0] as unknown as {
+      getArgumentCompletions?: (prefix: string) => Completion[] | null;
+    };
+    assert.deepEqual(registered?.getArgumentCompletions?.("") ?? [], []);
+  });
+});

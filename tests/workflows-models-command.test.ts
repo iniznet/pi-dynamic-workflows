@@ -52,6 +52,25 @@ describe("workflows-models-command", () => {
       assert.ok(capturedDescription.length > 0, "description should not be empty");
       assert.ok(capturedDescription.toLowerCase().includes("tier"), "description should mention tiers");
     });
+
+    it("registers an explicit no-arg completion list and a usage hint in the description", async () => {
+      const { registerWorkflowModelsCommand } = await loadCommand();
+      let captured: { description?: string; getArgumentCompletions?: (prefix: string) => unknown[] } | undefined;
+
+      const mockPi = {
+        registerCommand: mock.fn(
+          (_name: string, opts: { description?: string; getArgumentCompletions?: (prefix: string) => unknown[] }) => {
+            captured = opts;
+          },
+        ),
+      };
+
+      registerWorkflowModelsCommand(mockPi as never);
+      assert.equal(typeof captured?.getArgumentCompletions, "function");
+      assert.deepEqual(captured?.getArgumentCompletions?.("") ?? null, [], "no args → no suggestions");
+      assert.deepEqual(captured?.getArgumentCompletions?.("small") ?? null, [], "any prefix → no suggestions");
+      assert.ok(captured?.description?.includes("no args"), "description should carry the no-args hint");
+    });
   });
 
   describe("editSingleTier", () => {

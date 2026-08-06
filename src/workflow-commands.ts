@@ -47,6 +47,33 @@ const USAGE =
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
+/** Subcommand vocabulary for `/workflows` completions, mirroring the handler's dispatch. */
+const WORKFLOWS_SUBCOMMANDS: ReadonlyArray<{ value: string; description: string }> = [
+  { value: "run", description: "<prompt> — start a workflow from a prompt" },
+  { value: "ui", description: "open the interactive run navigator" },
+  { value: "list", description: "list runs (the default with no args)" },
+  { value: "status", description: "<id> — show a run's status" },
+  { value: "watch", description: "<id> — live progress in the status bar until it finishes" },
+  { value: "stop", description: "<id> — stop a running run" },
+  { value: "pause", description: "<id> — pause a running run" },
+  { value: "resume", description: "<id> — resume a paused run" },
+  { value: "implement", description: "<id> — fan out an approved plan's steps into worktrees" },
+  { value: "clean", description: "sweep orphan worktrees and temporary pi/wf branches" },
+  { value: "rm", description: "<id> — delete a run and its resume journal (destructive)" },
+  { value: "save", description: "<name> [runId] — save a run as a reusable /name workflow" },
+];
+
+/** Verbs whose next token is a run id (`/workflows <verb> <id>`). */
+const WORKFLOWS_ID_VERBS: ReadonlySet<string> = new Set([
+  "status",
+  "watch",
+  "stop",
+  "pause",
+  "resume",
+  "implement",
+  "rm",
+]);
+
 /** Sanitized agent list from a possibly-corrupt persisted run (M6). */
 function persistedAgents(run: PersistedRunState): Array<PersistedRunState["agents"][number]> {
   return Array.isArray(run.agents) ? run.agents : [];
@@ -334,6 +361,70 @@ export function registerWorkflowCommands(
   pi.registerCommand("workflows", {
     description:
       "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/implement <id> | clean | rm <id> | save <name> [runId]",
+    getArgumentCompletions: (prefix: string) => {
+      // The host hands over the raw text after the first space, untrimmed — so
+      // a trailing space means the token being typed is empty and sits one
+      // position past the committed tokens (contract report §d.2).
+      const trimmed = prefix.trim();
+      const tokens = trimmed.length > 0 ? trimmed.split(/\s+/) : [];
+      const endsWithSpace = /\s$/.test(prefix);
+      const currentIndex = endsWithSpace ? tokens.length : Math.max(0, tokens.length - 1);
+      const current = currentIndex < tokens.length ? tokens[currentIndex] : "";
+
+      if (currentIndex === 0) {
+        return WORKFLOWS_SUBCOMMANDS.filter((c) => c.value.startsWith(current)).map((c) => ({
+          value: c.value,
+          label: c.value,
+          description: c.description,
+        }));
+      }
+
+      const verb = tokens[0].toLowerCase();
+      const runs = manager.listRuns();
+      // pi-tui swaps the WHOLE argument span for the item value on selection,
+      // so multi-token completions must carry the committed prefix text too.
+      const runCompletions = (prefixText: string) =>
+        runs
+          .filter((r) => r.runId.startsWith(current))
+          .map((r) => ({
+            value: `${prefixText}${prefixText ? " " : ""}${r.runId}`,
+            label: `${r.runId} — ${r.workflowName ?? "workflow"} (${r.status})`,
+            description: r.currentPhase,
+          }));
+
+      if (WORKFLOWS_ID_VERBS.has(verb) && currentIndex === 1) {
+        return runCompletions(verb);
+      }
+      if (verb === "save") {
+        if (currentIndex === 1) {
+          const savedNames = (opts.storage?.list?.() ?? []).map((w) => w.name);
+          return [
+            ...savedNames.map((name) => ({
+              value: `save ${name}`,
+              label: `${name} (saved)`,
+              description: "saved workflow",
+            })),
+            ...runs.map((r) => ({
+              value: `save ${r.runId}`,
+              label: `${r.runId} (run)`,
+              description: r.workflowName ?? "workflow",
+            })),
+          ].filter((c) => c.value.slice("save ".length).startsWith(current));
+        }
+        if (currentIndex === 2) {
+          return runs
+            .filter((r) => r.runId.startsWith(current))
+            .map((r) => ({
+              value: `save ${tokens[1]} ${r.runId}`,
+              label: r.runId,
+              description: r.workflowName ?? "workflow",
+            }));
+        }
+      }
+      // `run <prompt>` is free text, `clean`/`list`/`ui` take nothing more, and
+      // anything past the run-id slot has no vocabulary — suppress the popup.
+      return null;
+    },
     async handler(args: string, ctx: ExtensionCommandContext) {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();

@@ -357,6 +357,10 @@ export function registerWorkflowSubagentToolsCommand(
   }
   pi.registerCommand(COMMAND_NAME, {
     description: COMMAND_DESCRIPTION,
+    // Read-only listing: the handler ignores args, so there are no argument
+    // tokens to complete. Empty list (not null) so a host can tell "no
+    // completions" from "no completer".
+    getArgumentCompletions: () => [],
     async handler(_args: string, ctx: ExtensionCommandContext) {
       const settings = options.loadSettings();
       const [assembled, infos, extensionToolSources] = await Promise.all([
@@ -391,4 +395,4 @@ export function registerWorkflowSubagentToolsCommand(
 const COMMAND_NAME = "workflows-subagent-tools";
 
 const COMMAND_DESCRIPTION =
-  "Show the effective workflow subagent toolset: per-tool source and allow status, MCP servers, and host tools that cannot reach subagents on the 0.83.0 ExtensionAPI";
+  "Show the effective workflow subagent toolset: per-tool source and allow status, MCP servers, and host tools that cannot reach subagents on the 0.83.0 ExtensionAPI — no args (read-only listing)";

@@ -18,9 +18,11 @@ import type { CapturedSourceResult } from "../src/subagent/extension-tools-captu
 import {
   buildSubagentToolRows,
   classifyToolSource,
+  registerWorkflowSubagentToolsCommand,
   renderSubagentToolsListing,
   type SubagentToolsListingInput,
 } from "../src/workflows-subagent-tools-command.js";
+import { makeCommandRegistryPi } from "./helpers/mock-pi.js";
 
 /** ToolInfo metadata for a host-registered tool (the getAllTools() shape). */
 function fakeInfo(name: string, source: string = "extension"): ToolInfo {
@@ -302,5 +304,38 @@ describe("renderSubagentToolsListing", () => {
     );
     assert.match(md, /Extension tools: \*\*on\*\*/);
     assert.match(md, /captured in-process from installed sources/);
+  });
+});
+
+describe("registerWorkflowSubagentToolsCommand", () => {
+  // Registration only touches the option stubs below; the handler gathers live
+  // inputs through them at invocation time, never during registration.
+  const stubOptions = {
+    loadSettings: () => ({}) as never,
+    getHostToolInfos: () => [],
+    assembleDefaultTools: async () => [],
+    listMcpServers: () => [],
+    getChromeGranted: () => false,
+    getExtensionToolSources: async () => [],
+  };
+
+  test("registers with an explicit no-arg completion list and a usage-hinted description", () => {
+    const { pi, commands } = makeCommandRegistryPi();
+    registerWorkflowSubagentToolsCommand(pi, stubOptions);
+    assert.equal(commands.length, 1);
+    assert.equal(commands[0]?.name, "workflows-subagent-tools");
+    const spec = commands[0] as unknown as {
+      description?: string;
+      getArgumentCompletions?: (prefix: string) => unknown[] | null;
+    };
+    assert.ok(spec.description?.includes("no args"), "description should carry the no-args hint");
+    assert.equal(typeof spec.getArgumentCompletions, "function");
+    assert.deepEqual(spec.getArgumentCompletions?.("") ?? null, [], "read-only listing → no suggestions");
+  });
+
+  test("is idempotent against an already-registered name", () => {
+    const { pi, commands } = makeCommandRegistryPi(["workflows-subagent-tools"]);
+    registerWorkflowSubagentToolsCommand(pi, stubOptions);
+    assert.equal(commands.length, 0, "must not re-register an existing name");
   });
 });

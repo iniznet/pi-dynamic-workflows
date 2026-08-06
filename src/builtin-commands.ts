@@ -149,7 +149,12 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "deep-research")) {
     pi.registerCommand("deep-research", {
-      description: "Research a question across the web with cross-checked sources",
+      description: "Research a question across the web with cross-checked sources — Usage: /deep-research <question>",
+      // Free-text argument: the whole trimmed arg is the question, so there is
+      // no fixed token vocabulary to complete. Null (not []/absent) expresses
+      // "this command has a completer, but the arg is free text" and suppresses
+      // the argument popup.
+      getArgumentCompletions: () => null,
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("deep-research", args, ctx)) return;
         const question = args.trim();
@@ -176,7 +181,10 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "adversarial-review")) {
     pi.registerCommand("adversarial-review", {
-      description: "Investigate a task, then cross-check each finding with skeptical reviewers",
+      description:
+        "Investigate a task, then cross-check each finding with skeptical reviewers — Usage: /adversarial-review <task or question>",
+      // Free-text task argument — no fixed token set (see deep-research).
+      getArgumentCompletions: () => null,
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("adversarial-review", args, ctx)) return;
         const task = args.trim();
@@ -190,7 +198,13 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "code-review")) {
     pi.registerCommand("code-review", {
-      description: "Review a diff or PR with parallel specialized finders, then verify and rank findings",
+      description:
+        "Review a diff or PR with parallel specialized finders, then verify and rank findings — Usage: /code-review [<path> | <PR#> | <range>]",
+      // Semi-structured free text: empty → "git diff HEAD", a bare number → a
+      // PR for `gh pr diff`, a ".." range, or a git pathspec. None of those can
+      // be enumerated statically, so there is no completion vocabulary (the
+      // description's usage hint is the whole help surface).
+      getArgumentCompletions: () => null,
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("code-review", args, ctx)) return;
         const input = args.trim();
@@ -284,7 +298,10 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "multi-perspective")) {
     pi.registerCommand("multi-perspective", {
-      description: "Analyze a topic from several independent perspectives in parallel, then synthesize",
+      description:
+        'Analyze a topic from several independent perspectives in parallel, then synthesize — Usage: /multi-perspective "<topic>" [perspective1] [perspective2] …',
+      // Free-text topic + user-chosen perspective names — no fixed vocabulary.
+      getArgumentCompletions: () => null,
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("multi-perspective", args, ctx)) return;
         const [topic, ...rest] = tokenizeArgs(args);
@@ -302,7 +319,10 @@ export function registerBuiltinWorkflows(
 
   if (!alreadyRegistered(pi, "codebase-audit")) {
     pi.registerCommand("codebase-audit", {
-      description: "Run parallel checks against a codebase scope, then cross-validate and report",
+      description:
+        'Run parallel checks against a codebase scope, then cross-validate and report — Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]',
+      // Free-text scope + arbitrary check descriptions — no fixed vocabulary.
+      getArgumentCompletions: () => null,
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("codebase-audit", args, ctx)) return;
         const [scope, ...checks] = tokenizeArgs(args);

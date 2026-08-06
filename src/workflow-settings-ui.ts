@@ -67,6 +67,17 @@ export interface SettingsScopePaths {
   projectPath?: string;
 }
 
+/**
+ * One pickable model for the pool editor's "Add model" list: the canonical
+ * `provider/modelId` spec (displayed verbatim, so the provider name is
+ * visible) plus the logical id the pool config is keyed by (the spec with a
+ * known provider prefix stripped — same derivation routing uses).
+ */
+export interface AvailableModelSpec {
+  spec: string;
+  logicalId: string;
+}
+
 /** Extra rendering options for the form. */
 export interface WorkflowSettingsFormOptions {
   /** Offer the "Project" scope option only when the project is trusted. */
@@ -79,6 +90,13 @@ export interface WorkflowSettingsFormOptions {
    * inject a plain fake here.
    */
   settingsListTheme?: SettingsListTheme;
+  /**
+   * Registry-backed list of models the pool editor's "Add model" step can
+   * offer as a filterable picker (rows labeled with the full spec, provider
+   * visible). Undefined = no registry wired (tests / non-TUI callers): the
+   * step falls back to the free-text custom-id input only.
+   */
+  availableModels?: ReadonlyArray<AvailableModelSpec>;
 }
 
 /** Submenu factories injected so `buildSettingItems` stays I/O-free and testable. */
@@ -358,6 +376,8 @@ interface EditorViewOptions {
   buildItems: () => SettingItem[];
   onChange: (id: string, value: string) => void;
   onCancel: () => void;
+  /** Render the built-in search input and fuzzy-filter rows by label. */
+  enableSearch?: boolean;
 }
 
 /**
@@ -376,7 +396,7 @@ function buildEditorView(
   container.addChild(new Text(theme.fg("accent", theme.bold(options.title)), 1, 0));
   container.addChild(new Spacer(1));
   const list = new SettingsList(options.buildItems(), MAX_VISIBLE_ROWS, listTheme, options.onChange, options.onCancel, {
-    enableSearch: false,
+    enableSearch: options.enableSearch ?? false,
   });
   container.addChild(list);
   container.addChild(new Spacer(1));
@@ -454,8 +474,90 @@ function buildPoolScalarSubmenu(
   );
 }
 
-/** Add-model row submenu: validates a fresh logical model id, then upserts. */
+/**
+ * Add-model submenu: two-stage picker. Stage 1 (when `availableModels` is
+ * supplied) is a filterable list of every available model spec — rows are
+ * labeled with the full `provider/modelId` spec so the provider name stays
+ * visible, and typing fuzzy-filters them (SettingsList enableSearch). Picking
+ * a row confirms and upserts the LOGICAL id (provider prefix stripped):
+ * routing derives the pool key via logicalModelKey, so storing the full spec
+ * as the key would never be hit by acquire(). Stage 2, reachable through the
+ * trailing "✎ Type custom model id" row (and the only stage when no list is
+ * supplied — tests / non-TUI callers), is the legacy free-text input with the
+ * same fresh-id validation.
+ */
 function buildAddModelSubmenu(
+  tui: TUI,
+  theme: Theme,
+  editor: ProviderPoolEditorModel,
+  done: (value?: string) => void,
+  listTheme: SettingsListTheme,
+  availableModels?: ReadonlyArray<AvailableModelSpec>,
+): Component {
+  const hasList = availableModels !== undefined;
+  const picker = buildEditorView(tui, theme, listTheme, {
+    title: "Add model",
+    enableSearch: true,
+    buildItems: buildPickerItems,
+    // Any row submenu that resolves with a value (a confirmed spec or a valid
+    // custom id) closes this picker back to the pool root; its onChange
+    // refresh then shows the new model row.
+    onChange: (_id, value) => done(value),
+    onCancel: () => done(undefined),
+  });
+
+  function buildPickerItems(): SettingItem[] {
+    const items: SettingItem[] = [];
+    if (hasList) {
+      // Logical ids already in the pool are hidden — picking is the only way
+      // in, so the confirm can assume a fresh key.
+      const fresh = availableModels.filter((m) => !editor.config.models[m.logicalId]);
+      if (fresh.length === 0) {
+        items.push({
+          id: "no-models",
+          label: "no models available in this session",
+          currentValue: "",
+          description: "no available models, or every one is already in the pool",
+        });
+      }
+      for (const model of fresh) {
+        items.push({
+          id: `spec:${model.spec}`,
+          label: model.spec,
+          currentValue: "",
+          description: `logical id: ${model.logicalId}`,
+          // SettingsList only fires onChange through a submenu that resolves
+          // with a value, so the pick is confirmed on a second Enter — the
+          // same confirm pattern every other committing pool row uses.
+          submenu: (_cv, doneSubmenu) =>
+            buildConfirmSubmenu(
+              tui,
+              theme,
+              `Add ${model.spec}?`,
+              `pool key: ${model.logicalId} · Enter=add · Esc=cancel`,
+              (value) => {
+                if (value !== undefined) editor.upsertModel(model.logicalId);
+                doneSubmenu(value);
+              },
+            ),
+        });
+      }
+    }
+    items.push({
+      id: "custom-model",
+      label: "✎ Type custom model id",
+      currentValue: "",
+      description: "enter a logical model id manually (e.g. claude-sonnet-4)",
+      submenu: (_cv, doneSubmenu) => buildCustomModelSubmenu(tui, theme, editor, doneSubmenu),
+    });
+    return items;
+  }
+
+  return picker.component;
+}
+
+/** Free-text fallback stage of the add-model flow: fresh-id validation, then upsert. */
+function buildCustomModelSubmenu(
   tui: TUI,
   theme: Theme,
   editor: ProviderPoolEditorModel,
@@ -712,6 +814,7 @@ function buildProviderPoolSubmenu(
   model: SettingsFormModel,
   done: (value?: string) => void,
   listTheme: SettingsListTheme,
+  availableModels?: ReadonlyArray<AvailableModelSpec>,
 ): Component {
   const editor = new ProviderPoolEditorModel(model.draft[field.key]);
   const view = buildEditorView(tui, theme, listTheme, {
@@ -766,11 +869,17 @@ function buildProviderPoolSubmenu(
       items.push(item);
     }
     for (const modelId of editor.modelIds()) {
+      // A model picked from the available list keeps its provider-prefixed
+      // spec on the row label (the stored key stays the logical id routing
+      // derives); custom ids keep their bare label.
+      const pickedSpec = availableModels?.find((m) => m.logicalId === modelId)?.spec;
       items.push({
         id: `model:${modelId}`,
-        label: modelId,
+        label: pickedSpec ?? modelId,
         currentValue: `${editor.providerIds(modelId).length} provider(s)`,
-        description: "provider routing for this logical model",
+        description: pickedSpec
+          ? `provider routing for logical id ${modelId}`
+          : "provider routing for this logical model",
         submenu: (_cv, doneSubmenu) => buildModelEditor(tui, theme, editor, modelId, doneSubmenu, listTheme),
       });
     }
@@ -779,7 +888,7 @@ function buildProviderPoolSubmenu(
       label: "＋ Add model",
       currentValue: "",
       description: "add a logical model id with provider entries",
-      submenu: (_cv, doneSubmenu) => buildAddModelSubmenu(tui, theme, editor, doneSubmenu),
+      submenu: (_cv, doneSubmenu) => buildAddModelSubmenu(tui, theme, editor, doneSubmenu, listTheme, availableModels),
     });
     items.push({
       id: PP_DONE_ID,
@@ -872,6 +981,7 @@ export function buildFormComponent(
         model,
         doneSubmenu,
         options.settingsListTheme ?? getSettingsListTheme(),
+        options.availableModels,
       ),
     saveSubmenu: (_currentValue, doneSubmenu) => buildSaveConfirm(tui, theme, model, doneSubmenu),
   };

@@ -62,7 +62,12 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI, options?: Workfl
   const MENU_SEPARATOR = "─".repeat(30);
 
   pi.registerCommand("workflows-models", {
-    description: "View and edit model tiers used by workflows (small/medium/big)",
+    description: "View and edit model tiers used by workflows — no args (interactive menu; tiers: small/medium/big)",
+    // The handler ignores args entirely (pure ctx.ui menu), so there are no
+    // argument tokens to complete. An explicit empty list is returned (not
+    // null) so a host can tell "no completions for this command" apart from
+    // "command has no completer at all".
+    getArgumentCompletions: () => [],
     handler: async (_args, ctx) => {
       await ctx.waitForIdle();
 

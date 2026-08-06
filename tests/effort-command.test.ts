@@ -34,6 +34,10 @@ test("buildArmedWorkflowPrompt appends the extra directive only when provided", 
 
 type CmdDef = { handler: (a: string, c: unknown) => Promise<void> };
 
+type Completion = { value: string; label: string; description?: string };
+
+type CompletionSpec = { getArgumentCompletions?: (prefix: string) => Completion[] | null };
+
 function registerAndCapture(state: ReturnType<typeof createEffortState>) {
   const cmds = new Map<string, CmdDef>();
   const pi = {
@@ -71,4 +75,59 @@ test("registerEffortCommand: /ultracode turns ultra on, /ultracode off turns it 
   assert.equal(state.level, "off", "/ultracode off turns it off");
   await ultracode?.handler("anything", {});
   assert.equal(state.level, "ultra", "/ultracode <anything-but-off> sets ultra");
+});
+
+test("registerEffortCommand: /effort argument completions suggest off/high/ultra, prefix-filtered", () => {
+  const state = createEffortState();
+  const effort = registerAndCapture(state).get("effort") as unknown as CompletionSpec;
+  assert.equal(typeof effort.getArgumentCompletions, "function", "/effort must expose argument completions");
+
+  const all = effort.getArgumentCompletions?.("") ?? [];
+  assert.deepEqual(
+    all.map((c) => c.value),
+    ["off", "high", "ultra"],
+  );
+  // every candidate carries a hint description
+  for (const c of all) assert.ok(c.description, `candidate ${c.value} needs a description`);
+
+  assert.deepEqual(
+    (effort.getArgumentCompletions?.("of") ?? []).map((c) => c.value),
+    ["off"],
+  );
+  assert.deepEqual(
+    (effort.getArgumentCompletions?.("h") ?? []).map((c) => c.value),
+    ["high"],
+  );
+  assert.deepEqual(
+    (effort.getArgumentCompletions?.("u") ?? []).map((c) => c.value),
+    ["ultra"],
+  );
+  assert.deepEqual(effort.getArgumentCompletions?.("x") ?? [], [], "non-matching prefix → empty");
+
+  // the current level is marked in its item description (a live status readout)
+  assert.equal(state.level, "off");
+  const off = all.find((c) => c.value === "off");
+  assert.match(off?.description ?? "", /\(current\)/);
+  const ultra = all.find((c) => c.value === "ultra");
+  assert.doesNotMatch(ultra?.description ?? "", /\(current\)/);
+});
+
+test("registerEffortCommand: /ultracode argument completions suggest off (and on)", () => {
+  const state = createEffortState();
+  const ultracode = registerAndCapture(state).get("ultracode") as unknown as CompletionSpec;
+  assert.equal(typeof ultracode.getArgumentCompletions, "function", "/ultracode must expose argument completions");
+
+  assert.deepEqual(
+    (ultracode.getArgumentCompletions?.("") ?? []).map((c) => c.value),
+    ["off", "on"],
+  );
+  assert.deepEqual(
+    (ultracode.getArgumentCompletions?.("of") ?? []).map((c) => c.value),
+    ["off"],
+  );
+  assert.deepEqual(
+    (ultracode.getArgumentCompletions?.("o") ?? []).map((c) => c.value),
+    ["off", "on"],
+  );
+  assert.deepEqual(ultracode.getArgumentCompletions?.("x") ?? [], [], "non-matching prefix → empty");
 });

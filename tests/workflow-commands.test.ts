@@ -12,7 +12,9 @@ import { createRunPersistence, loadRunState } from "../src/run-persistence.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
+import type { WorkflowStorage } from "../src/workflow-saved.js";
 import { createWorktree } from "../src/worktree.js";
+import { makeCommandRegistryPi } from "./helpers/mock-pi.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 
@@ -1298,4 +1300,117 @@ test("/workflows <unknown> warns usage", async () => {
   assert.equal(h.notified.length, 1);
   assert.equal(h.notified[0].type, "warning");
   assert.match(h.notified[0].message, /Unknown subcommand/);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// argument completions (getArgumentCompletions)
+// ═══════════════════════════════════════════════════════════════════════════
+
+type Completion = { value: string; label: string; description?: string };
+
+test("/workflows argument completions: verbs, run ids, save names", () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const runs = [
+    {
+      runId: "run-1",
+      workflowName: "audit",
+      status: "running",
+      currentPhase: "Scan",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "",
+    },
+    {
+      runId: "run-2",
+      workflowName: "audit",
+      status: "paused",
+      currentPhase: "Verify",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "",
+    },
+  ];
+  const manager = { listRuns: () => runs } as unknown as WorkflowManager;
+  const storage = { list: () => [{ name: "nightly" }] } as unknown as WorkflowStorage;
+  registerWorkflowCommands(pi, manager, { cwd: "/tmp", storage });
+
+  const spec = commands[0] as unknown as {
+    getArgumentCompletions?: (prefix: string) => Completion[] | null;
+  };
+  assert.equal(typeof spec.getArgumentCompletions, "function", "/workflows must expose argument completions");
+  const comp = (prefix: string) => spec.getArgumentCompletions?.(prefix) ?? [];
+
+  // empty prefix → the full 12-verb vocabulary in handler dispatch order
+  assert.deepEqual(
+    comp("").map((c) => c.value),
+    ["run", "ui", "list", "status", "watch", "stop", "pause", "resume", "implement", "clean", "rm", "save"],
+  );
+  // every verb carries a hint description
+  for (const c of comp("")) assert.ok(c.description, `verb ${c.value} needs a description`);
+
+  // prefix filtering on the verb slot
+  assert.deepEqual(
+    comp("st").map((c) => c.value),
+    ["status", "stop"],
+  );
+  assert.deepEqual(
+    comp("sav").map((c) => c.value),
+    ["save"],
+  );
+  assert.deepEqual(comp("z"), [], "non-matching verb prefix → empty");
+
+  // run-id slot: value carries the verb (pi-tui swaps the whole arg span)
+  assert.deepEqual(
+    comp("status ").map((c) => c.value),
+    ["status run-1", "status run-2"],
+  );
+  assert.deepEqual(
+    comp("status ").map((c) => c.label),
+    ["run-1 — audit (running)", "run-2 — audit (paused)"],
+  );
+  assert.deepEqual(
+    comp("status run-2").map((c) => c.value),
+    ["status run-2"],
+  );
+  assert.deepEqual(
+    comp("rm ").map((c) => c.value),
+    ["rm run-1", "rm run-2"],
+  );
+
+  // save name slot: saved workflow names first, then run ids
+  const saveValues = comp("save ").map((c) => c.value);
+  assert.deepEqual(saveValues, ["save nightly", "save run-1", "save run-2"]);
+  assert.deepEqual(
+    comp("save n").map((c) => c.value),
+    ["save nightly"],
+  );
+  // save runId slot (after the name): run ids only, verb + name preserved
+  assert.deepEqual(
+    comp("save nightly ").map((c) => c.value),
+    ["save nightly run-1", "save nightly run-2"],
+  );
+  assert.deepEqual(
+    comp("save nightly run-2").map((c) => c.value),
+    ["save nightly run-2"],
+  );
+
+  // free-text prompt slot and no-arg verbs suppress the popup
+  assert.equal(spec.getArgumentCompletions?.("run "), null);
+  assert.equal(spec.getArgumentCompletions?.("run refactor the auth module"), null);
+  assert.equal(spec.getArgumentCompletions?.("clean "), null);
+  assert.equal(spec.getArgumentCompletions?.("list "), null);
+  assert.equal(spec.getArgumentCompletions?.("ui "), null);
+});
+
+test("/workflows run-id completions stay empty when no runs exist", () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  const manager = { listRuns: () => [] } as unknown as WorkflowManager;
+  registerWorkflowCommands(pi, manager);
+  const spec = commands[0] as unknown as {
+    getArgumentCompletions?: (prefix: string) => Completion[] | null;
+  };
+  assert.deepEqual(spec.getArgumentCompletions?.("status ") ?? [], []);
+  assert.deepEqual(spec.getArgumentCompletions?.("save ") ?? [], []);
 });

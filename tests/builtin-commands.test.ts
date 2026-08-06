@@ -223,6 +223,31 @@ test("registerBuiltinWorkflows creates handlers with expected structure", () => 
   assert.equal(typeof codeReviewCmd.handler, "function");
 });
 
+test("registerBuiltinWorkflows registers argument completions on all five built-ins (free text → null)", () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp", manager: makeFakeManager().manager });
+  assert.equal(commands.length, 5);
+  for (const cmd of commands) {
+    const spec = cmd as unknown as { getArgumentCompletions?: (prefix: string) => unknown[] | null };
+    assert.equal(typeof spec.getArgumentCompletions, "function", `${cmd.name} must expose getArgumentCompletions`);
+    // Every built-in takes free-text args (question/task/diff/scope) with no
+    // fixed vocabulary, so the completer exists but always suppresses the popup.
+    assert.equal(spec.getArgumentCompletions?.(""), null, `${cmd.name}: empty prefix → null`);
+    assert.equal(spec.getArgumentCompletions?.("anything at all"), null, `${cmd.name}: free text → null`);
+  }
+});
+
+test("registerBuiltinWorkflows descriptions embed a usage hint for each free-text command", () => {
+  const { pi, commands } = makeCommandRegistryPi();
+  registerBuiltinWorkflows(pi, { cwd: "/tmp", manager: makeFakeManager().manager });
+  const byName = new Map(commands.map((c) => [c.name, c.description ?? ""]));
+  assert.match(byName.get("deep-research") ?? "", /Usage: \/deep-research <question>/);
+  assert.match(byName.get("adversarial-review") ?? "", /Usage: \/adversarial-review <task/);
+  assert.match(byName.get("code-review") ?? "", /Usage: \/code-review/);
+  assert.match(byName.get("multi-perspective") ?? "", /Usage: \/multi-perspective/);
+  assert.match(byName.get("codebase-audit") ?? "", /Usage: \/codebase-audit/);
+});
+
 // ─── Precedence: a saved workflow shadows a built-in of the same name ──────────
 //
 // Builtins register their commands before saved workflows do (see

@@ -25,6 +25,18 @@ export function createEffortState(): EffortState {
   return { level: "off" };
 }
 
+/** The one-line hint shown next to each /effort completion candidate. */
+const EFFORT_LEVELS: readonly EffortLevel[] = ["off", "high", "ultra"];
+
+const EFFORT_LEVEL_HINTS: Record<EffortLevel, string> = {
+  off: "turn standing effort off — messages are no longer auto-armed",
+  high: "thorough — a few parallel reviewers/perspectives plus an adversarial verify pass",
+  ultra: "exhaustive — wide fan-out, big-tier synthesis (spends tokens quickly)",
+};
+
+/** /ultracode accepts a single token; anything but "off" means ultra. */
+const ULTRACODE_TOKENS = ["off", "on"] as const;
+
 const HIGH_DIRECTIVE =
   "Effort: HIGH. Be thorough — use a few parallel reviewers/perspectives and an adversarial verify pass (see verify()/judgePanel()); set maxAgents to match the planned fan-out.";
 const ULTRA_DIRECTIVE =
@@ -57,6 +69,16 @@ export function isSubstantive(text: string): boolean {
 export function registerEffortCommand(pi: ExtensionAPI, state: EffortState): void {
   pi.registerCommand("effort", {
     description: "Standing workflow effort: off | high | ultra — auto-arms a workflow for substantive messages",
+    // Single-token vocabulary (off | high | ultra), prefix-filtered like the
+    // workflows-settings reference; the current level is marked in the item
+    // description so the suggestion doubles as a status readout.
+    getArgumentCompletions: (prefix: string) =>
+      EFFORT_LEVELS.filter((candidate) => candidate.startsWith(prefix)).map((candidate) => ({
+        value: candidate,
+        label: candidate,
+        description:
+          candidate === state.level ? `${EFFORT_LEVEL_HINTS[candidate]} (current)` : EFFORT_LEVEL_HINTS[candidate],
+      })),
     async handler(args: string, _ctx: ExtensionCommandContext) {
       const arg = args.trim().toLowerCase();
       const say = (content: string) => pi.sendMessage({ customType: "effort", content, display: true });
@@ -78,6 +100,18 @@ export function registerEffortCommand(pi: ExtensionAPI, state: EffortState): voi
   pi.registerCommand("ultracode", {
     description:
       "Ultracode: standing maximal-effort mode (this session only, never persisted) — auto-arms an exhaustive workflow for substantive messages. /ultracode off to stop.",
+    // The handler turns ultra on for ANY argument except "off" (even none), so
+    // the only meaningful completions are "off" (to stop) and "on" (an
+    // explicit, accepted-but-redundant enable).
+    getArgumentCompletions: (prefix: string) =>
+      ULTRACODE_TOKENS.filter((candidate) => candidate.startsWith(prefix)).map((candidate) => ({
+        value: candidate,
+        label: candidate,
+        description:
+          candidate === "off"
+            ? "turn ultracode off — standing effort off"
+            : "turn ultracode on — same as /ultracode with no args",
+      })),
     async handler(args: string, _ctx: ExtensionCommandContext) {
       const arg = args.trim().toLowerCase();
       const say = (content: string) => pi.sendMessage({ customType: "effort", content, display: true });

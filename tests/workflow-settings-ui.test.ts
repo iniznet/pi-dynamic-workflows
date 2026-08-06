@@ -16,6 +16,7 @@ import type { Component, SettingItem, SettingsListTheme, TUI } from "@earendil-w
 import type { WorkflowSettings } from "../src/workflow-settings.js";
 import { FIELD_REGISTRY, type FormResult, SettingsFormModel } from "../src/workflow-settings-fields.js";
 import {
+  type AvailableModelSpec,
   buildFormComponent,
   buildSettingItems,
   type WorkflowSettingsFormOptions,
@@ -311,13 +312,15 @@ describe("provider pool visual editor", () => {
     );
   });
 
-  it("adds a model via the text submenu and commits it", () => {
+  it("adds a model via the custom-id text input and commits it", () => {
     const model = makeModel();
     const { root } = buildForm(model);
     navigateTo(root, POOL_ROW);
     root.handleInput?.(KEY_CONFIRM);
     navigateTo(root, 4); // ＋ Add model (4 scalars then Add)
     root.handleInput?.(KEY_CONFIRM);
+    // No availableModels supplied → the picker shows only the custom-id row.
+    root.handleInput?.(KEY_CONFIRM); // open the free-text input
     for (const char of "gpt-5") root.handleInput?.(char);
     root.handleInput?.(KEY_SUBMIT);
     assert.ok(
@@ -328,6 +331,120 @@ describe("provider pool visual editor", () => {
     root.handleInput?.(KEY_CONFIRM);
     root.handleInput?.(KEY_CONFIRM);
     assert.deepEqual(model.draft.providerPool, { models: { "gpt-5": {} } });
+  });
+
+  describe("add-model picker (registry-backed availableModels)", () => {
+    const AVAILABLE: AvailableModelSpec[] = [
+      { spec: "openai-codex/gpt-5.5", logicalId: "gpt-5.5" },
+      { spec: "anthropic/claude-sonnet-4", logicalId: "claude-sonnet-4" },
+    ];
+
+    it("lists every supplied spec with the provider name visible", () => {
+      const model = makeModel();
+      const { root } = buildForm(model, { availableModels: AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      navigateTo(root, 4); // ＋ Add model
+      root.handleInput?.(KEY_CONFIRM); // open the picker
+      const lines = root.render(80);
+      assert.ok(
+        lines.some((l) => l.includes("openai-codex/gpt-5.5")),
+        "provider-qualified spec row",
+      );
+      assert.ok(
+        lines.some((l) => l.includes("anthropic/claude-sonnet-4")),
+        "second spec row",
+      );
+      assert.ok(
+        lines.some((l) => l.includes("✎ Type custom model id")),
+        "custom fallback row is always present",
+      );
+    });
+
+    it("typing fuzzy-filters the list by spec label", () => {
+      const model = makeModel();
+      const { root } = buildForm(model, { availableModels: AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM);
+      navigateTo(root, 4);
+      root.handleInput?.(KEY_CONFIRM); // open the picker
+      for (const char of "claude") root.handleInput?.(char);
+      const lines = root.render(80);
+      assert.ok(
+        lines.some((l) => l.includes("anthropic/claude-sonnet-4")),
+        "matching spec stays listed",
+      );
+      assert.ok(!lines.some((l) => l.includes("openai-codex/gpt-5.5")), "non-matching spec filtered out");
+    });
+
+    it("picking a spec confirms, adds the logical id, and commits it", () => {
+      const model = makeModel();
+      const { root } = buildForm(model, { availableModels: AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      navigateTo(root, 4); // ＋ Add model
+      root.handleInput?.(KEY_CONFIRM); // open the picker (selection on first spec)
+      root.handleInput?.(KEY_CONFIRM); // open the confirm for openai-codex/gpt-5.5
+      assert.ok(
+        root.render(80).some((l) => l.includes("Add openai-codex/gpt-5.5?")),
+        "confirm names the full spec",
+      );
+      root.handleInput?.(KEY_CONFIRM); // confirm → picker closes, pool root refreshes
+      assert.ok(
+        root.render(80).some((l) => l.includes("openai-codex/gpt-5.5")),
+        "pool root row keeps the provider-qualified spec label",
+      );
+      navigateTo(root, 2); // Done (4 scalars + gpt-5.5 + Add + Done; selection preserved on Add)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, { models: { "gpt-5.5": {} } });
+      assert.equal(model.dirtyCount, 1);
+    });
+
+    it("hides logical ids already present in the pool", () => {
+      const model = makeModel({ providerPool: modelPool({ "gpt-5.5": {} }) });
+      const { root } = buildForm(model, { availableModels: AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      assert.ok(
+        root.render(80).some((l) => l.includes("openai-codex/gpt-5.5")),
+        "already-added model row shows its provider-qualified spec at the pool root",
+      );
+      navigateTo(root, 5); // ＋ Add model (4 scalars + gpt-5.5 row + Add)
+      root.handleInput?.(KEY_CONFIRM); // open the picker
+      const lines = root.render(80);
+      assert.ok(!lines.some((l) => l.includes("openai-codex/gpt-5.5")), "already-added spec hidden from the picker");
+      assert.ok(
+        lines.some((l) => l.includes("anthropic/claude-sonnet-4")),
+        "fresh spec still listed",
+      );
+    });
+
+    it("degrades to the custom path when the list is empty", () => {
+      const model = makeModel();
+      const { root } = buildForm(model, { availableModels: [] });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM);
+      navigateTo(root, 4);
+      root.handleInput?.(KEY_CONFIRM); // open the picker
+      assert.ok(
+        root.render(80).some((l) => l.includes("no models available in this session")),
+        "empty list shows the inert hint row",
+      );
+      root.handleInput?.(KEY_DOWN); // hint row is inert → move to the custom row
+      root.handleInput?.(KEY_CONFIRM); // open the free-text input
+      for (const char of "custom-1") root.handleInput?.(char);
+      root.handleInput?.(KEY_SUBMIT);
+      assert.ok(
+        root.render(80).some((l) => l.includes("custom-1")),
+        "custom model row appears",
+      );
+      navigateTo(root, 2); // Done (4 scalars + custom-1 + Add + Done; selection preserved on Add)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, { models: { "custom-1": {} } });
+      assert.equal(model.dirtyCount, 1);
+    });
   });
 
   it("edits a per-provider scalar through the nested editors", () => {

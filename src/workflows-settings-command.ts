@@ -19,6 +19,7 @@
 
 import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { listAvailableModelSpecs, logicalModelKey } from "./agent.js";
 import { applyEnvSettingsOverride, workflowSettingsFromEnv } from "./config.js";
 import {
   ConfigError,
@@ -45,7 +46,7 @@ const COMMAND_NAME = "workflows-settings";
 const COMMAND_DESCRIPTION =
   "Interactive workflow settings editor — no args (editor) | status/print (effective settings + paths) | paths (file locations)";
 
-const ARGUMENT_OPTIONS = ["status", "paths"] as const;
+const ARGUMENT_OPTIONS = ["status", "paths", "print"] as const;
 
 const BOOLEAN_DISPLAYS = ["true", "false"] as const;
 
@@ -149,8 +150,18 @@ export async function runWorkflowSettingsCommand(
 
   if (ctx.mode === "tui" && ctx.hasUI) {
     const model = new SettingsFormModel(effective, envLocks, "global");
+    // Pass the registry-backed available-model list into the form so the pool
+    // editor's "Add model" step can offer a filterable picker (provider names
+    // visible). Each spec maps to the logical id the pool is keyed by — the
+    // same derivation routing uses (logicalModelKey), so a picked spec is
+    // stored under an id the pool's acquire() will actually hit.
+    const availableModels = listAvailableModelSpecs(ctx.modelRegistry).map((spec) => ({
+      spec,
+      logicalId: logicalModelKey(spec, ctx.modelRegistry),
+    }));
     const result = await openWorkflowSettingsForm(ctx, model, {
       scopePaths: { globalPath: paths.globalPath, projectPath: paths.projectPath },
+      availableModels,
     });
     await applyFormResult(ctx, result, model.dirtyCount, paths);
     return;
