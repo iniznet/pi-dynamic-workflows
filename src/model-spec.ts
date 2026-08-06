@@ -74,11 +74,16 @@ export function canonicalModelSpec(model: Model<Api>): string {
  * segment is always the provider — even when the model id itself carries a
  * vendor slash (e.g. openrouter's "deepseek/x"). Returns undefined for a spec
  * with no "/".
+ *
+ * Verbatim, not lowercased: canonical specs are built as `${provider}/${id}`
+ * straight from the registry, whose provider map is keyed case-sensitively
+ * (ModelRegistry.find → exact Map lookup). Lowercasing here would produce a
+ * provider id that never resolves for mixed-case custom providers.
  */
 export function providerFromCanonicalSpec(spec: string): string | undefined {
   const slashIndex = spec.indexOf("/");
   if (slashIndex === -1) return undefined;
-  const provider = spec.slice(0, slashIndex).trim().toLowerCase();
+  const provider = spec.slice(0, slashIndex).trim();
   return provider || undefined;
 }
 

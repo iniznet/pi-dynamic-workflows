@@ -5,6 +5,7 @@ import { type ModelRegistry, type ModelRuntime, resolveCliModel } from "@earendi
 import fc from "fast-check";
 import {
   formatModelSpecWithThinking,
+  providerFromCanonicalSpec,
   resolveModelSpecWithThinking,
   splitModelSpecThinking,
   THINKING_LEVELS,
@@ -43,6 +44,16 @@ const modelIdSpec = fc.array(segment, { minLength: 1, maxLength: 3 }).map((parts
 const thinkingSpec = fc.constantFrom(...THINKING_LEVELS);
 
 describe("model spec thinking suffixes", () => {
+  it("returns the provider verbatim (case-preserving) — the registry's provider map is keyed case-sensitively", () => {
+    assert.equal(providerFromCanonicalSpec("opencode-go/deepseek-v4-flash"), "opencode-go");
+    assert.equal(providerFromCanonicalSpec("openrouter/deepseek/deepseek-v4-flash"), "openrouter");
+    // Mixed-case custom providers (user-defined in models.json) must survive
+    // untouched: the pool seeds its provider key from this and routes via
+    // ModelRegistry.find, an exact-case Map lookup.
+    assert.equal(providerFromCanonicalSpec("MyOllama/llama-3.3"), "MyOllama");
+    assert.equal(providerFromCanonicalSpec("deepseek-v4-flash"), undefined);
+    assert.equal(providerFromCanonicalSpec(" /deepseek-v4-flash"), undefined);
+  });
   it("resolves provider/model:thinking using Pi CLI-style parsing", () => {
     const gpt55 = model("openai-codex", "gpt-5.5");
     const resolved = resolveModelSpecWithThinking(

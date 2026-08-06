@@ -422,3 +422,31 @@ test("providers without configured auth are skipped by routing (with a one-time 
   assert.equal(choice?.provider, "authed", "no-auth provider must never be chosen");
   assert.equal(warnMock.mock.callCount(), 1);
 });
+
+test("registry lookup is case-sensitive: a mixed-case provider key must match exactly (picker seeds verbatim)", async () => {
+  // The UI picker seeds the pool key verbatim from the canonical spec (the
+  // registry's provider map is keyed case-sensitively). A lowercased key must
+  // NOT resolve — isAuthConfigured fails and routing skips the entry, so the
+  // whole pool saturates (non-recoverable) instead of a case-blind match.
+  const reg = makeRegistry([{ provider: "MyOllama", modelId: "llama-3.3", concurrency: 5, weight: 1 }]);
+  const { pool: verbatimPool } = makePool(
+    "llama-3.3",
+    [{ provider: "MyOllama", modelId: "llama-3.3", concurrency: 5, weight: 1 }],
+    {},
+    reg,
+  );
+  const choice = await verbatimPool.acquire("llama-3.3");
+  assert.equal(choice?.provider, "MyOllama", "verbatim mixed-case key routes");
+
+  const { pool: loweredPool } = makePool(
+    "llama-3.3",
+    [{ provider: "myollama", modelId: "llama-3.3", concurrency: 5, weight: 1 }],
+    { whenSaturated: "fail" },
+    reg,
+  );
+  await assert.rejects(
+    loweredPool.acquire("llama-3.3"),
+    (err: Error & { code?: string }) => err.code === "PROVIDER_SATURATED",
+    "lowercased key never becomes placeable → whole-pool saturation (non-recoverable)",
+  );
+});

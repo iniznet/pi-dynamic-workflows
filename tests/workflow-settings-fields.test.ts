@@ -11,7 +11,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { WORKFLOW_ENV_VARS } from "../src/config.js";
-import { normalizeProviderPoolConfig } from "../src/gateway/provider-pool-config.js";
+import {
+  DEFAULT_PROVIDER_CONCURRENCY,
+  DEFAULT_PROVIDER_WEIGHT,
+  normalizeProviderPoolConfig,
+} from "../src/gateway/provider-pool-config.js";
 import type { WorkflowSettings } from "../src/workflow-settings.js";
 import {
   FIELD_GROUPS,
@@ -397,5 +401,83 @@ describe("provider-pool entry scalars (PROVIDER_POOL_ENTRY_SCALARS)", () => {
     // Empty model maps are runtime-safe: the pool falls back to legacy
     // resolution for a model with no entries, so no routing is lost.
     assert.equal(editor.entry("gpt-5", "any-provider"), undefined);
+  });
+});
+
+describe("ProviderPoolEditorModel.seedProvider", () => {
+  it("creates the logical model map AND the provider entry with defaults", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("deepseek-v4-flash", "opencode-go", "deepseek-v4-flash");
+    assert.deepEqual(editor.entry("deepseek-v4-flash", "opencode-go"), {
+      provider: "opencode-go",
+      modelId: "deepseek-v4-flash",
+      concurrency: DEFAULT_PROVIDER_CONCURRENCY,
+      weight: DEFAULT_PROVIDER_WEIGHT,
+    });
+    assert.deepEqual(editor.modelIds(), ["deepseek-v4-flash"], "model map created");
+    assert.deepEqual(editor.providerIds("deepseek-v4-flash"), ["opencode-go"]);
+  });
+
+  it("records the explicit model id even when it differs from the logical id", () => {
+    // The registry model id on a provider can diverge from the logical key
+    // (e.g. an alias); the explicit parameter keeps that representable.
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("logical-model", "openrouter", "deepseek/deepseek-v4-flash");
+    const entry = editor.entry("logical-model", "openrouter");
+    assert.equal(entry?.provider, "openrouter");
+    assert.equal(entry?.modelId, "deepseek/deepseek-v4-flash", "registry model id kept verbatim");
+  });
+
+  it("seeds multiple providers under one logical model (multi-provider routing)", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("gpt-5.5", "openai-codex", "gpt-5.5");
+    editor.seedProvider("gpt-5.5", "openrouter", "gpt-5.5");
+    assert.deepEqual(editor.providerIds("gpt-5.5"), ["openai-codex", "openrouter"]);
+    assert.equal(editor.entry("gpt-5.5", "openai-codex")?.modelId, "gpt-5.5");
+  });
+
+  it("is idempotent: re-seeding an existing entry never overwrites it", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("gpt-5.5", "openai-codex", "gpt-5.5");
+    editor.setEntryScalar("gpt-5.5", "openai-codex", "concurrency", 4);
+    editor.seedProvider("gpt-5.5", "openai-codex", "gpt-5.5");
+    assert.equal(
+      editor.entry("gpt-5.5", "openai-codex")?.concurrency,
+      4,
+      "re-seed must not clobber user-tuned scalars",
+    );
+    assert.equal(editor.providerIds("gpt-5.5").length, 1, "no duplicate provider row");
+  });
+
+  it("is a no-op for an empty provider id (no model map is created)", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("gpt-5.5", "   ", "gpt-5.5");
+    assert.deepEqual(editor.modelIds(), [], "no model key without a provider id");
+    assert.equal(editor.entry("gpt-5.5", ""), undefined);
+  });
+
+  it("saves as the minimal raw input (defaults dropped, modelId == logical id)", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.seedProvider("gpt-5.5", "openai-codex", "gpt-5.5");
+    assert.deepEqual(providerPoolInputOf(editor.config), { models: { "gpt-5.5": { "openai-codex": {} } } });
+    // ...and normalizing that minimal input back re-fills the defaults, so the
+    // seeded entry survives a save → load round-trip intact.
+    const reloaded = normalizeProviderPoolConfig(providerPoolInputOf(editor.config));
+    const entry = reloaded.models["gpt-5.5"]?.["openai-codex"];
+    assert.equal(entry?.provider, "openai-codex");
+    assert.equal(entry?.modelId, "gpt-5.5");
+    assert.equal(entry?.concurrency, DEFAULT_PROVIDER_CONCURRENCY);
+    assert.equal(entry?.weight, DEFAULT_PROVIDER_WEIGHT);
+  });
+
+  it("upsertProvider keeps its legacy shape via delegation (entry modelId = logical id)", () => {
+    const editor = new ProviderPoolEditorModel(undefined);
+    editor.upsertProvider("gpt-5.5", "openai-codex");
+    assert.deepEqual(editor.entry("gpt-5.5", "openai-codex"), {
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      concurrency: DEFAULT_PROVIDER_CONCURRENCY,
+      weight: DEFAULT_PROVIDER_WEIGHT,
+    });
   });
 });

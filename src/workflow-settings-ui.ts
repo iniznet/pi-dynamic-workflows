@@ -33,6 +33,7 @@ import {
   Text,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { providerFromCanonicalSpec } from "./model-spec.js";
 import {
   FIELD_REGISTRY,
   type FormResult,
@@ -479,12 +480,13 @@ function buildPoolScalarSubmenu(
  * supplied) is a filterable list of every available model spec — rows are
  * labeled with the full `provider/modelId` spec so the provider name stays
  * visible, and typing fuzzy-filters them (SettingsList enableSearch). Picking
- * a row confirms and upserts the LOGICAL id (provider prefix stripped):
- * routing derives the pool key via logicalModelKey, so storing the full spec
- * as the key would never be hit by acquire(). Stage 2, reachable through the
- * trailing "✎ Type custom model id" row (and the only stage when no list is
- * supplied — tests / non-TUI callers), is the legacy free-text input with the
- * same fresh-id validation.
+ * a row confirms and SEEDS the provider entry under the LOGICAL id (provider
+ * prefix stripped): routing derives the pool key via logicalModelKey, so
+ * storing the full spec as the key would never be hit by acquire(), and a
+ * model with no provider entry is a dead pool row (indexEntries skips empty
+ * maps). Stage 2, reachable through the trailing "✎ Type custom model id" row
+ * (and the only stage when no list is supplied — tests / non-TUI callers), is
+ * the legacy free-text input with the same fresh-id validation.
  */
 function buildAddModelSubmenu(
   tui: TUI,
@@ -509,18 +511,28 @@ function buildAddModelSubmenu(
   function buildPickerItems(): SettingItem[] {
     const items: SettingItem[] = [];
     if (hasList) {
-      // Logical ids already in the pool are hidden — picking is the only way
-      // in, so the confirm can assume a fresh key.
-      const fresh = availableModels.filter((m) => !editor.config.models[m.logicalId]);
+      // Hide only specs whose (logicalId, provider) pair is already in the
+      // pool: a SECOND provider for an existing logical model stays pickable
+      // (multi-provider routing, the pool's core feature), while re-adding
+      // the same pair is pointless. Specs without a provider segment are
+      // skipped — there is nothing to seed from them.
+      const fresh = availableModels
+        .map((model) => ({ model, provider: providerFromCanonicalSpec(model.spec) }))
+        .filter((entry): entry is { model: AvailableModelSpec; provider: string } => {
+          if (entry.provider === undefined) return false;
+          const existing = editor.config.models[entry.model.logicalId];
+          if (!existing) return true;
+          return !existing[entry.provider];
+        });
       if (fresh.length === 0) {
         items.push({
           id: "no-models",
           label: "no models available in this session",
           currentValue: "",
-          description: "no available models, or every one is already in the pool",
+          description: "no available models, or every model/provider pairing is already in the pool",
         });
       }
-      for (const model of fresh) {
+      for (const { model, provider } of fresh) {
         items.push({
           id: `spec:${model.spec}`,
           label: model.spec,
@@ -533,10 +545,18 @@ function buildAddModelSubmenu(
             buildConfirmSubmenu(
               tui,
               theme,
-              `Add ${model.spec}?`,
-              `pool key: ${model.logicalId} · Enter=add · Esc=cancel`,
+              `Add provider ${provider} → model ${model.logicalId}?`,
+              `seeds ${provider} under ${model.logicalId} · Enter=add · Esc=cancel`,
               (value) => {
-                if (value !== undefined) editor.upsertModel(model.logicalId);
+                if (value !== undefined) {
+                  // The pool only routes models with at least one provider
+                  // (indexEntries skips empty maps), so a picked spec must
+                  // seed its provider entry — not just the logical key. The
+                  // registry model id on that provider equals the logical id
+                  // for every canonical spec (logicalModelKey strips exactly
+                  // the provider prefix), so the entry routes on pick.
+                  editor.seedProvider(model.logicalId, provider, model.logicalId);
+                }
                 doneSubmenu(value);
               },
             ),
@@ -583,8 +603,8 @@ function buildCustomModelSubmenu(
   );
 }
 
-/** Add-provider row submenu: validates a fresh provider id under the model, then upserts. */
-function buildAddProviderSubmenu(
+/** Free-text fallback stage of the add-provider flow: fresh-id validation, then upsert. */
+function buildCustomProviderSubmenu(
   tui: TUI,
   theme: Theme,
   editor: ProviderPoolEditorModel,
@@ -609,6 +629,92 @@ function buildAddProviderSubmenu(
     },
     done,
   );
+}
+
+/**
+ * Add-provider row submenu: two-stage picker mirroring the add-model flow.
+ * Stage 1 (when `availableModels` is supplied) is a filterable list of every
+ * registry spec for THIS logical model, labeled with the full spec; picking
+ * one confirms and upserts the provider entry under the model. Stage 2,
+ * reachable through the trailing "✎ Type custom provider id" row (and the
+ * only stage when no list is supplied — tests / non-TUI callers), is the
+ * legacy free-text input with the same fresh-id validation. Asymmetric with
+ * the model picker on purpose: model rows display the full spec but store the
+ * logical id, provider rows display the full spec but store the bare provider
+ * id — the pool config is keyed by provider id, not spec.
+ */
+function buildAddProviderSubmenu(
+  tui: TUI,
+  theme: Theme,
+  editor: ProviderPoolEditorModel,
+  modelId: string,
+  done: (value?: string) => void,
+  listTheme: SettingsListTheme,
+  availableModels?: ReadonlyArray<AvailableModelSpec>,
+): Component {
+  const hasList = availableModels !== undefined;
+  const picker = buildEditorView(tui, theme, listTheme, {
+    title: `Add provider to ${modelId}`,
+    enableSearch: true,
+    buildItems: buildPickerItems,
+    // A confirmed spec (or a valid custom id) closes this picker back to the
+    // model editor; its onChange refresh then shows the new provider row.
+    onChange: (_id, value) => done(value),
+    onCancel: () => done(undefined),
+  });
+
+  function buildPickerItems(): SettingItem[] {
+    const items: SettingItem[] = [];
+    if (hasList) {
+      // Candidate specs: same logical model, provider not already present
+      // (upsertProvider seeds with defaults, so `entry` truthiness is the
+      // dupes check). Specs without a provider segment are skipped.
+      const fresh = availableModels
+        .filter((model) => model.logicalId === modelId)
+        .map((model) => ({ model, provider: providerFromCanonicalSpec(model.spec) }))
+        .filter((entry): entry is { model: AvailableModelSpec; provider: string } => {
+          if (entry.provider === undefined) return false;
+          return !editor.entry(modelId, entry.provider);
+        });
+      if (fresh.length === 0) {
+        items.push({
+          id: "no-providers",
+          label: "no providers available for this model",
+          currentValue: "",
+          description: "no matching registry specs, or every provider is already added",
+        });
+      }
+      for (const { model, provider } of fresh) {
+        items.push({
+          id: `spec:${model.spec}`,
+          label: model.spec,
+          currentValue: "",
+          description: `pool entry under ${modelId}`,
+          submenu: (_cv, doneSubmenu) =>
+            buildConfirmSubmenu(
+              tui,
+              theme,
+              `Add provider ${provider}?`,
+              `entry under ${modelId} · Enter=add · Esc=cancel`,
+              (value) => {
+                if (value !== undefined) editor.upsertProvider(modelId, provider);
+                doneSubmenu(value);
+              },
+            ),
+        });
+      }
+    }
+    items.push({
+      id: "custom-provider",
+      label: "✎ Type custom provider id",
+      currentValue: "",
+      description: "enter a provider id manually (e.g. anthropic-direct, openrouter)",
+      submenu: (_cv, doneSubmenu) => buildCustomProviderSubmenu(tui, theme, editor, modelId, doneSubmenu),
+    });
+    return items;
+  }
+
+  return picker.component;
 }
 
 /** One per-provider scalar row submenu (alias / concurrency / weight / tpm / cooldown). */
@@ -727,6 +833,7 @@ function buildModelEditor(
   modelId: string,
   done: (value?: string) => void,
   listTheme: SettingsListTheme,
+  availableModels?: ReadonlyArray<AvailableModelSpec>,
 ): Component {
   const view = buildEditorView(tui, theme, listTheme, {
     title: `Model · ${modelId}`,
@@ -774,7 +881,8 @@ function buildModelEditor(
       label: "＋ Add provider",
       currentValue: "",
       description: `add a provider entry under ${modelId}`,
-      submenu: (_cv, doneSubmenu) => buildAddProviderSubmenu(tui, theme, editor, modelId, doneSubmenu),
+      submenu: (_cv, doneSubmenu) =>
+        buildAddProviderSubmenu(tui, theme, editor, modelId, doneSubmenu, listTheme, availableModels),
     });
     items.push({
       id: PP_REMOVE_MODEL_ID,
@@ -871,16 +979,21 @@ function buildProviderPoolSubmenu(
     for (const modelId of editor.modelIds()) {
       // A model picked from the available list keeps its provider-prefixed
       // spec on the row label (the stored key stays the logical id routing
-      // derives); custom ids keep their bare label.
+      // derives); custom ids keep their bare label. A model routing MORE than
+      // one provider falls back to the logical id — no single spec represents
+      // it, and the first spec alone would mislead.
+      const providerCount = editor.providerIds(modelId).length;
       const pickedSpec = availableModels?.find((m) => m.logicalId === modelId)?.spec;
+      const label = pickedSpec !== undefined && providerCount === 1 ? pickedSpec : modelId;
       items.push({
         id: `model:${modelId}`,
-        label: pickedSpec ?? modelId,
-        currentValue: `${editor.providerIds(modelId).length} provider(s)`,
+        label,
+        currentValue: `${providerCount} provider(s)`,
         description: pickedSpec
           ? `provider routing for logical id ${modelId}`
           : "provider routing for this logical model",
-        submenu: (_cv, doneSubmenu) => buildModelEditor(tui, theme, editor, modelId, doneSubmenu, listTheme),
+        submenu: (_cv, doneSubmenu) =>
+          buildModelEditor(tui, theme, editor, modelId, doneSubmenu, listTheme, availableModels),
       });
     }
     items.push({

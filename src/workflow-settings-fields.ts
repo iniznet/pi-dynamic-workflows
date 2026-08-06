@@ -302,7 +302,7 @@ export const PROVIDER_POOL_ENTRY_SCALARS: readonly ProviderPoolEntryScalarField[
     key: "concurrency",
     type: "number",
     label: "Concurrency",
-    help: "Max parallel subagents this provider may serve (default 2).",
+    help: "Max parallel subagents this provider may serve (default 1).",
     min: 1,
   },
   {
@@ -672,23 +672,43 @@ export class ProviderPoolEditorModel {
     delete this._config.models[modelId];
   }
 
-  /** Create the provider entry with defaults when absent (no-op on empty id). */
-  upsertProvider(modelId: string, providerId: string): void {
-    const key = providerId.trim();
+  /**
+   * Seed the provider entry for a registry spec picked in the "Add model"
+   * flow: creates the logical model map when absent AND the provider entry
+   * with defaults, recording the registry model id explicitly. For every
+   * canonical registry spec (`provider/modelId`, the form the picker lists)
+   * the registry model id equals the logical id — logicalModelKey strips only
+   * the provider prefix (agent.ts) — so callers can pass the spec's remainder
+   * for both; the explicit parameter keeps a future non-canonical alias
+   * representable without touching routing. No-op on an empty provider id;
+   * an existing entry is left untouched (idempotent, same as upsertProvider).
+   */
+  seedProvider(logicalId: string, provider: string, modelId: string): void {
+    const key = provider.trim();
     if (key.length === 0) return;
-    let model = this._config.models[modelId];
+    let model = this._config.models[logicalId];
     if (!model) {
       model = {};
-      this._config.models[modelId] = model;
+      this._config.models[logicalId] = model;
     }
     if (!model[key]) {
+      const alias = modelId.trim();
       model[key] = {
         provider: key,
-        modelId,
+        modelId: alias.length > 0 ? alias : logicalId,
         concurrency: DEFAULT_PROVIDER_CONCURRENCY,
         weight: DEFAULT_PROVIDER_WEIGHT,
       };
     }
+  }
+
+  /** Create the provider entry with defaults when absent (no-op on empty id). */
+  upsertProvider(modelId: string, providerId: string): void {
+    // Delegates to seedProvider with the logical id as the model id: the two
+    // are equal for every registry spec (the canonical spec IS provider + the
+    // registry model id), so the legacy free-text add-provider path keeps its
+    // exact shape while sharing one entry-creation implementation.
+    this.seedProvider(modelId, providerId, modelId);
   }
 
   removeProvider(modelId: string, providerId: string): void {

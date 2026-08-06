@@ -258,6 +258,13 @@ describe("provider pool visual editor", () => {
   const POOL_ROW = 16; // providerPool is the 17th registry row (0-based)
   const modelPool = (models: Record<string, Record<string, unknown>>) =>
     ({ models }) as WorkflowSettings["providerPool"];
+  // Two providers for the same logical model (gpt-5.5) + one fresh model: the
+  // fixture that proves multi-provider routing stays reachable through the UI.
+  const MULTI_AVAILABLE: AvailableModelSpec[] = [
+    { spec: "openai-codex/gpt-5.5", logicalId: "gpt-5.5" },
+    { spec: "openrouter/gpt-5.5", logicalId: "gpt-5.5" },
+    { spec: "anthropic/claude-sonnet-4", logicalId: "claude-sonnet-4" },
+  ];
 
   it("opens a nested row editor and Esc discards without staging", () => {
     const model = makeModel({ providerPool: modelPool({ "claude-sonnet-4": { "anthropic-direct": {} } }) });
@@ -377,7 +384,7 @@ describe("provider pool visual editor", () => {
       assert.ok(!lines.some((l) => l.includes("openai-codex/gpt-5.5")), "non-matching spec filtered out");
     });
 
-    it("picking a spec confirms, adds the logical id, and commits it", () => {
+    it("picking a spec confirms, seeds its provider entry, and commits it", () => {
       const model = makeModel();
       const { root } = buildForm(model, { availableModels: AVAILABLE });
       navigateTo(root, POOL_ROW);
@@ -386,24 +393,29 @@ describe("provider pool visual editor", () => {
       root.handleInput?.(KEY_CONFIRM); // open the picker (selection on first spec)
       root.handleInput?.(KEY_CONFIRM); // open the confirm for openai-codex/gpt-5.5
       assert.ok(
-        root.render(80).some((l) => l.includes("Add openai-codex/gpt-5.5?")),
-        "confirm names the full spec",
+        root.render(80).some((l) => l.includes("Add provider openai-codex → model gpt-5.5?")),
+        "confirm names the provider and the logical model",
       );
       root.handleInput?.(KEY_CONFIRM); // confirm → picker closes, pool root refreshes
+      const lines = root.render(80);
       assert.ok(
-        root.render(80).some((l) => l.includes("openai-codex/gpt-5.5")),
+        lines.some((l) => l.includes("openai-codex/gpt-5.5")),
         "pool root row keeps the provider-qualified spec label",
       );
-      navigateTo(root, 2); // Done (4 scalars + gpt-5.5 + Add + Done; selection preserved on Add)
+      assert.ok(
+        lines.some((l) => l.includes("1 provider(s)")),
+        "picked spec seeds its provider entry (not 0 provider(s))",
+      );
+      navigateTo(root, 2); // Done (4 scalars + gpt-5.5 + Add + Done; selection restored on the new model row)
       root.handleInput?.(KEY_CONFIRM);
       root.handleInput?.(KEY_CONFIRM);
-      assert.deepEqual(model.draft.providerPool, { models: { "gpt-5.5": {} } });
+      assert.deepEqual(model.draft.providerPool, { models: { "gpt-5.5": { "openai-codex": {} } } });
       assert.equal(model.dirtyCount, 1);
     });
 
-    it("hides logical ids already present in the pool", () => {
-      const model = makeModel({ providerPool: modelPool({ "gpt-5.5": {} }) });
-      const { root } = buildForm(model, { availableModels: AVAILABLE });
+    it("hides only specs whose (model, provider) pair is already present — a second provider stays pickable", () => {
+      const model = makeModel({ providerPool: modelPool({ "gpt-5.5": { "openai-codex": {} } }) });
+      const { root } = buildForm(model, { availableModels: MULTI_AVAILABLE });
       navigateTo(root, POOL_ROW);
       root.handleInput?.(KEY_CONFIRM); // open the pool editor
       assert.ok(
@@ -413,11 +425,40 @@ describe("provider pool visual editor", () => {
       navigateTo(root, 5); // ＋ Add model (4 scalars + gpt-5.5 row + Add)
       root.handleInput?.(KEY_CONFIRM); // open the picker
       const lines = root.render(80);
-      assert.ok(!lines.some((l) => l.includes("openai-codex/gpt-5.5")), "already-added spec hidden from the picker");
+      assert.ok(
+        !lines.some((l) => l.includes("openai-codex/gpt-5.5")),
+        "already-present (model, provider) pair hidden from the picker",
+      );
+      assert.ok(
+        lines.some((l) => l.includes("openrouter/gpt-5.5")),
+        "a SECOND provider for the same logical id stays pickable (multi-provider)",
+      );
       assert.ok(
         lines.some((l) => l.includes("anthropic/claude-sonnet-4")),
-        "fresh spec still listed",
+        "fresh logical id still listed",
       );
+    });
+
+    it("picks a second provider for an existing logical model and commits both entries", () => {
+      const model = makeModel({ providerPool: modelPool({ "gpt-5.5": { "openai-codex": {} } }) });
+      const { root } = buildForm(model, { availableModels: MULTI_AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      navigateTo(root, 5); // ＋ Add model (4 scalars + gpt-5.5 + Add)
+      root.handleInput?.(KEY_CONFIRM); // open the picker (selection on openrouter/gpt-5.5)
+      root.handleInput?.(KEY_CONFIRM); // open the confirm
+      root.handleInput?.(KEY_CONFIRM); // confirm → pool root refreshes
+      assert.ok(
+        root.render(80).some((l) => l.includes("2 provider(s)")),
+        "the model row now routes two providers",
+      );
+      navigateTo(root, 1); // Done (4 scalars + gpt-5.5 + Add + Done; selection restored on Add at 5)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, {
+        models: { "gpt-5.5": { "openai-codex": {}, openrouter: {} } },
+      });
+      assert.equal(model.dirtyCount, 1);
     });
 
     it("degrades to the custom path when the list is empty", () => {
@@ -443,6 +484,135 @@ describe("provider pool visual editor", () => {
       root.handleInput?.(KEY_CONFIRM);
       root.handleInput?.(KEY_CONFIRM);
       assert.deepEqual(model.draft.providerPool, { models: { "custom-1": {} } });
+      assert.equal(model.dirtyCount, 1);
+    });
+  });
+
+  describe("add-provider picker (registry-backed availableModels)", () => {
+    it("lists matching provider specs, filters, confirms one, and commits both entries", () => {
+      const model = makeModel({ providerPool: modelPool({ "gpt-5.5": { "openai-codex": {} } }) });
+      const { root } = buildForm(model, { availableModels: MULTI_AVAILABLE });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      navigateTo(root, 4); // model row gpt-5.5
+      root.handleInput?.(KEY_CONFIRM); // open the model editor
+      assert.ok(
+        root.render(80).some((l) => l.includes("Model · gpt-5.5")),
+        "per-model editor",
+      );
+      navigateTo(root, 1); // ＋ Add provider (openai-codex row at 0)
+      root.handleInput?.(KEY_CONFIRM); // open the picker
+      const initial = root.render(80);
+      assert.ok(
+        initial.some((l) => l.includes("openrouter/gpt-5.5")),
+        "matching provider spec listed",
+      );
+      assert.ok(!initial.some((l) => l.includes("openai-codex/gpt-5.5")), "already-added provider hidden");
+      assert.ok(
+        !initial.some((l) => l.includes("anthropic/claude-sonnet-4")),
+        "specs for other logical models excluded",
+      );
+      for (const char of "openrouter") root.handleInput?.(char);
+      const filtered = root.render(80);
+      assert.ok(
+        filtered.some((l) => l.includes("openrouter/gpt-5.5")),
+        "matching spec stays under the filter",
+      );
+      assert.ok(!filtered.some((l) => l.includes("✎ Type custom provider id")), "custom fallback row filtered out");
+      root.handleInput?.(KEY_CONFIRM); // open the confirm
+      assert.ok(
+        root.render(80).some((l) => l.includes("Add provider openrouter?")),
+        "confirm names the bare provider id",
+      );
+      root.handleInput?.(KEY_CONFIRM); // confirm → model editor refreshes
+      assert.ok(
+        root.render(80).some((l) => l.includes("openrouter")),
+        "provider row appears under the model",
+      );
+      navigateTo(root, 3); // Done (openai-codex + openrouter + Add + Remove + Done; selection restored on openrouter at 1)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM); // back to the pool root
+      assert.ok(
+        root.render(80).some((l) => l.includes("2 provider(s)")),
+        "model row count updated",
+      );
+      assert.ok(
+        root.render(80).some((l) => l.includes("gpt-5.5")),
+        "multi-provider model row labels the logical id (no single spec represents it)",
+      );
+      assert.ok(
+        !root.render(80).some((l) => l.includes("openai-codex/gpt-5.5")),
+        "the single-spec label is not shown for a 2-provider model",
+      );
+      navigateTo(root, 2); // Done (4 scalars + gpt-5.5 + Add + Done; selection restored on gpt-5.5 at 4)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, {
+        models: { "gpt-5.5": { "openai-codex": {}, openrouter: {} } },
+      });
+      assert.equal(model.dirtyCount, 1);
+    });
+
+    it("degrades to the free-text fallback when no specs match the model", () => {
+      const model = makeModel({ providerPool: modelPool({ m: {} }) });
+      const { root } = buildForm(model, { availableModels: [] });
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM); // open the pool editor
+      navigateTo(root, 4); // model row m
+      root.handleInput?.(KEY_CONFIRM); // open the model editor
+      root.handleInput?.(KEY_CONFIRM); // ＋ Add provider (first row, selection at 0)
+      assert.ok(
+        root.render(80).some((l) => l.includes("no providers available for this model")),
+        "empty candidate list shows the inert hint row",
+      );
+      root.handleInput?.(KEY_DOWN); // hint row is inert → move to the custom row
+      root.handleInput?.(KEY_CONFIRM); // open the free-text input
+      for (const char of "p1") root.handleInput?.(char);
+      root.handleInput?.(KEY_SUBMIT);
+      assert.ok(
+        root.render(80).some((l) => l.includes("p1")),
+        "provider row appears under the model",
+      );
+      navigateTo(root, 3); // Done (p1 + Add + Remove + Done; selection restored on p1 at 0)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM); // back to the pool root
+      assert.ok(
+        root.render(80).some((l) => l.includes("1 provider(s)")),
+        "model row count updated",
+      );
+      navigateTo(root, 2); // Done (4 scalars + m + Add + Done; selection restored on m at 4)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, { models: { m: { p1: {} } } });
+      assert.equal(model.dirtyCount, 1);
+    });
+
+    it("degrades to the free-text input only when no registry list is supplied", () => {
+      const model = makeModel({ providerPool: modelPool({ m: {} }) });
+      const { root } = buildForm(model); // no availableModels
+      navigateTo(root, POOL_ROW);
+      root.handleInput?.(KEY_CONFIRM);
+      navigateTo(root, 4); // model row m
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM); // ＋ Add provider → picker shows only the custom row
+      assert.ok(
+        !root.render(80).some((l) => l.includes("no providers available")),
+        "no hint row when no registry list is wired",
+      );
+      root.handleInput?.(KEY_CONFIRM); // open the free-text input
+      for (const char of "p1") root.handleInput?.(char);
+      root.handleInput?.(KEY_SUBMIT);
+      assert.ok(
+        root.render(80).some((l) => l.includes("p1")),
+        "provider row appears",
+      );
+      navigateTo(root, 3); // Done (p1 + Add + Remove + Done; selection restored on p1 at 0)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      navigateTo(root, 2); // Done (4 scalars + m + Add + Done; selection restored on m at 4)
+      root.handleInput?.(KEY_CONFIRM);
+      root.handleInput?.(KEY_CONFIRM);
+      assert.deepEqual(model.draft.providerPool, { models: { m: { p1: {} } } });
       assert.equal(model.dirtyCount, 1);
     });
   });
