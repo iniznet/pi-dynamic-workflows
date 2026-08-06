@@ -2,7 +2,7 @@
 
 ## Bounds and budget
 
-Set finite bounds that match the work for `maxAgents`, `concurrency`, and `agentRetries`; bound loops and semantic retries inside the script. Treat invocation-level `agentTimeoutMs` and `tokenBudget` as opt-in user constraints, not precautionary defaults. Omit `tokenBudget` unless the user supplies a cap or explicitly asks you to choose one. If asked to choose, allow for every planned agent call, retry, synthesis, and verification pass, with headroom. A tight gate can terminate coverage; it does not reduce work already in flight. An omitted `agentTimeoutMs` uses the configured `defaultAgentTimeoutMs` and is otherwise unbounded. An omitted `tokenBudget` uses the configured `defaultTokenBudget` and is otherwise unlimited.
+Set finite bounds that match the work for `maxAgents`, `concurrency`, and `agentRetries`; bound loops and semantic retries inside the script. `maxAgents` defaults to 1000 — a safety ceiling, not a target — and `concurrency` is clamped to the runtime maximum of 16. Treat invocation-level `agentTimeoutMs` and `tokenBudget` as opt-in user constraints, not precautionary defaults. Omit `tokenBudget` unless the user supplies a cap or explicitly asks you to choose one. If asked to choose, allow for every planned agent call, retry, synthesis, and verification pass, with headroom. A tight gate can terminate coverage; it does not reduce work already in flight. An omitted `agentTimeoutMs` uses the configured `defaultAgentTimeoutMs` and is otherwise unbounded. An omitted `tokenBudget` uses the configured `defaultTokenBudget` and is otherwise unlimited.
 
 Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does not carry budgets. `N` is a token allowance, not a call or round count: size it for the intended agent work instead of copying a small iteration limit. Token and phase budgets are soft pre-call gates. Spend lands after agents finish, so concurrent work can overshoot. A phase budget gates later calls in that phase; it neither reserves tokens nor cancels active calls. `budget.spent()` and `budget.remaining()` include nested work.
 
@@ -24,13 +24,29 @@ Always retain `{ id, status, result }` or an equivalent ledger for each intended
 
 `AGENT_EMPTY_OUTPUT` (whitespace-only text from a schema-less call) is recoverable and retries like any other transient failure. Some models occasionally produce it on an otherwise-working first attempt; a fleet built on such a model should set `agentRetries: 1-2` rather than treat one occurrence as a failed run. A `schema` call never trips this check — schema noncompliance is its own, nonrecoverable failure (see [serialization](#serialization)).
 
+`failOnExhaustedAgent` defaults to true: a run that resolves with exhausted agents settles FAILED (resumable) instead of silently completing — the journal is preserved, so resume replays the completed prefix from cache and re-runs only the failed call live. Pass `false` only for best-effort runs that report failed agents; a lenient completion still surfaces the failures in its result text and must not be treated as a clean success.
+
+Context-window overflow is classified `CONTEXT_OVERFLOW` (non-recoverable) from a provider `stopReason` of `"error"` with overflow text, and from silent truncation — a `"length"` stop whose final message holds no complete answer. It settles the run failed with the journal preserved; resume re-runs only the overflowing call with a fresh session instead of retrying into the same wall.
+
 ## Resume
 
 Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live. Stable lexical call ordering, prompts, labels, routing options, and inputs therefore matter. Retry chains can cascade after an upstream miss. Nested workflows do not reuse the parent's resume journal.
 
 Only a call that finishes with a real result is journaled. A call whose every attempt was recoverable (including one that only ever produced `AGENT_EMPTY_OUTPUT`) contributes no journal entry, so resuming that run reruns exactly that call and everything lexically after it live; the earlier, already-succeeded prefix still replays from cache.
 
+Resume accepts the same run knobs as a fresh start — `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `tokenBudget`; an unset knob restores the run's persisted start-time value, an explicit one overrides it. `failOnExhaustedAgent` is deliberately not forwarded: it is a safety knob frozen at run start, so a resume can never downgrade a strict run to lenient.
+
 The runtime blocks common accidental nondeterminism, but this is not a security boundary. Pass timestamps, randomness, and external decisions through `args`.
+
+## Damage control
+
+`workflow_damage_control` is the agent-facing control surface for the active workflow and its subagents — nine verbs: `list`, `status`, `agents`, `pause`, `resume`, `stop`, `kill-agent`, `recover`, `clean` (`workflow_control` is the five-verb lifecycle subset: `list`, `status`, `pause`, `resume`, `stop`). `pause` only affects a running run (settles `paused`, resumable); `stop` only a running or paused one (settles `aborted` — terminal, never resumable); `resume` refuses running, completed, and aborted runs and accepts paused and failed ones.
+
+- `kill-agent` terminates one subagent by numeric `agents[].id` or a `runId:callIndex` call id, with clean in-run reconciliation — never run-fatal by itself: parallel/pipeline fan-outs absorb the item, and a sequential top-level kill lets the run settle failed/resumable.
+- `recover` classifies a crashed/failed run, reclaims a stale lease, and replays the journal prefix via the manager's resume — it never deletes state.
+- `clean` sweeps orphans (stale leases, orphan runs normalized to paused, ghost worktrees, temp branches). It is dry-run by default — report candidates first, act only on an explicit `dryRun: false` — and never deletes run state.
+
+Subagents can be granted the toolset via the `subagentDamageControlTools` setting: `"off"` (default), `"readonly"` (inspection verbs `list`/`status`/`agents`/`clean`), or `"on"` (the full verb set, acting on the current active run).
 
 ## Nesting and shared state
 

@@ -11,3 +11,11 @@ When copying a workflow between installations:
 3. Treat compatibility entries as preservation aids, not portable recommendations.
 4. Re-resolve dynamic model routes and agent types from destination context; static docs intentionally contain no live entries.
 5. Prefer runtime behavior when prose and execution disagree, and report the documentation mismatch rather than changing behavior during an authoring fix.
+
+## Version log
+
+This skill's docs were last synced at package `3.6.0` (frontmatter `metadata.version`, generated contract content, and `package.json` all agree). Headline src additions since the previous skills sync (git log of `src/` from `c0b6fdb` on):
+
+- `3.6.0` — `scriptPath` file-based script source; single-glance workflow status across navigator/tool text/confirmations; visual provider pool editor; audit-fix phases A–E (5xx/truncation correctness, lease heartbeat, stop TOCTOU, retry-spend accounting, journal checkpointing, store replay); resume run-knob forwarding; provider-pool concurrency caps + run-sticky routing; empty-output recovery nudge + truncation classification; damage-control toolset (9 verbs) + subagent exposure; `meta.gate` review flag; pipeline + phaseState wiring (wayfinder/prewalk, plannotator gate); closed tier vocabulary.
+
+Treat this as a trace anchor only: `present-at` claims in the generated index remain the authoritative per-capability facts for the recorded version.

@@ -20,8 +20,10 @@ over a built-in of that name — on the slash command, too.
 
 These 7 names are reachable only at the `workflow` tool's top-level `name`
 input, not via the in-script `await workflow(savedName, childArgs)` helper —
-that helper resolves saved workflows only. Calling `workflow('deep-research')`
-from inside a script fails as an unknown saved workflow; use the top-level
+that helper resolves saved workflows only and treats any other string as raw
+script text. Calling `workflow('deep-research')` from inside a script
+therefore fails at script validation (the string is not a script with
+`export const meta`), never as a saved-workflow name lookup; use the top-level
 `name` input instead.
 
 ## Patterns

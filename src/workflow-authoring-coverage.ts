@@ -46,7 +46,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "840accc31a67f74c724bf5f7ba5b17c03ff6fb159dd844f087b4cbf3f3445de9",
+    sha256: "c81fe157899ca4ef11c734d7133c456a3d6e99e190decf3ce5f2328e0f1ead1d",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -58,7 +58,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "6cff8c149e014440561441a0a24cda13e21eb9176a3c4503c7b6129d248666be",
+    sha256: "94575168aa416236de8d1dd1abdce1acda7543d22a3c03e3ab0c07a9d7b3eff2",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -70,7 +70,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/registry-ownership.md",
-    sha256: "425babf6fa5bd24fa0adef3d9b398661ad1e933d372b3989d22fe99e63f2c7ba",
+    sha256: "5e3c5baaffd1d3fc4f90a73206f37499e8a54a76c1d3ee870e6152e5fbbe78a0",
   },
   {
     path: "skills/workflow-authoring/references/review.md",

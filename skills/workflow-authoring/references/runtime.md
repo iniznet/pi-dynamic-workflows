@@ -8,6 +8,14 @@ Start with the only legal export: `export const meta = { name, description, phas
 
 The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
 
+## Script source
+
+Pass the script inline as `script`, or point the tool at a file with `scriptPath`. The two are mutually exclusive, and both exclude `name` (saved/built-in) — provide exactly one source. The full input surface (`name`, `args`, `background`, `maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, `failOnExhaustedAgent`, `tokenBudget`, `resumeFromRunId`, `dryRun`) lives in the generated capability index; the defaults that matter while authoring are `background: true`, `maxAgents: 1000` (a safety ceiling, not a target), and `failOnExhaustedAgent: true` (strict completion).
+
+`scriptPath` is for scripts authored in a file first. An absolute path is used as-is; a relative path resolves against the workflow tool's cwd. The file is read once, by the extension process, before the run — the no-fs rule inside the vm governs the script runtime, not the loading of the file itself — and the content is used exactly as if it had been passed inline as `script`: same `meta` contract, same determinism rules, same validation. Inside the vm the script still cannot `import`/`require` or read sibling files at runtime, so keep every helper in the one file.
+
+Syntax-gate a file before handing it over with `npx tsx scripts/check-workflow-script.ts <file>` — it runs the same `parseWorkflowScript` the tool uses (acorn with top-level `await`/`return` allowed, determinism blocklist, `export const meta` first). Plain `node --check` is not a faithful substitute: top-level `return` is legal inside the workflow vm sandbox but a hard syntax error in plain ESM, so node would reject valid scripts.
+
 ## Topology
 
 - `parallel()` takes thunks, runs independent work, and preserves input order. Await the whole array before whole-set synthesis.
