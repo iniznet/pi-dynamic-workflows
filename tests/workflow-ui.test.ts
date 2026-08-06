@@ -1210,3 +1210,87 @@ test("stopping a run whose manager.stop throws (cold-run lease/persistence failu
   assert.match(notifications[0].message, /stop.*failed/);
   assert.match(notifications[0].message, /ENOSPC/);
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S4 navigator-glance — canonical status block + live facts in the header
+// ═══════════════════════════════════════════════════════════════════════════
+
+function glanceManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
+  const snapshot: WorkflowSnapshot = {
+    name: "audit",
+    phases: ["Scan", "Report"],
+    currentPhase: "Report",
+    logs: [],
+    agents: [
+      { id: 1, label: "scan a", phase: "Scan", prompt: "p", status: "done", tokens: 100 },
+      { id: 2, label: "scan b", phase: "Scan", prompt: "p", status: "done", tokens: 50 },
+      { id: 3, label: "write report", phase: "Report", prompt: "p", status: "running", tokens: 0 },
+    ],
+    agentCount: 3,
+    runningCount: 1,
+    doneCount: 2,
+    errorCount: 0,
+    startedAtMs: Date.now() - 12_000,
+    tokenBudget: 10_000,
+    tokenUsage: { input: 100, output: 50, total: 4500, cost: 0 },
+  };
+  return {
+    listRuns: () => [
+      {
+        runId: "run-1",
+        workflowName: "audit",
+        status: "running",
+        phases: ["Scan", "Report"],
+        agents: snapshot.agents,
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: (id: string) =>
+      id === "run-1" ? ({ runId: "run-1", status: "running", snapshot } as unknown as ManagedRun) : undefined,
+  };
+}
+
+test("phases header is a one-glance canonical status block (glyph+word, running, elapsed, budget bar)", () => {
+  const model = new NavigatorModel(glanceManager());
+  const state = new NavigatorState();
+  assert.ok(state.drill(model), "drill into the run's phases");
+  const text = renderNavigator(state, model, 80).join("\n");
+  // Canonical glyph + canonical word for a running run (never the raw alias).
+  assert.match(text, /◆ running/);
+  // Total running agents among the per-phase counts.
+  assert.match(text, /1 running/);
+  // Live elapsed from startedAtMs via formatElapsed.
+  assert.match(text, /12s/);
+  // Spend-vs-budget bar when the run carries a tokenBudget.
+  assert.match(text, /45%/);
+});
+
+test("runs list rows use the canonical status glyph and word, not aliases", () => {
+  const model = new NavigatorModel({
+    listRuns: () => [
+      {
+        runId: "e",
+        workflowName: "err",
+        status: "error",
+        phases: [],
+        agents: [],
+        logs: [],
+      } as unknown as PersistedRunState,
+      {
+        runId: "s",
+        workflowName: "stp",
+        status: "stopped",
+        phases: [],
+        agents: [],
+        logs: [],
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+  });
+  const text = renderNavigator(new NavigatorState(), model, 80).join("\n");
+  // "error" → canonical "failed" (✗), "stopped" → canonical "aborted" (⊘).
+  assert.match(text, /✗ err/);
+  assert.match(text, /failed/);
+  assert.match(text, /⊘ stp/);
+  assert.match(text, /aborted/);
+});

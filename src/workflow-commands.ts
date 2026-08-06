@@ -89,6 +89,41 @@ function runElapsed(run: PersistedRunState, now = Date.now()): string | undefine
   return formatElapsed(Math.max(0, now - startedMs));
 }
 
+/**
+ * Canonical one-liner confirming an action's resulting run state, sharing the
+ * list row vocabulary (glyph id  name — word · phase · n/m agents · elapsed)
+ * so a "Paused run-p1"-style message reads the same as the run's list row.
+ * The target status is the action's outcome word (aborted after stop, paused,
+ * running after resume), mapped through runStatusWord/STATUS_GLYPH; facts are
+ * taken from the run's current persisted state when the manager can resolve
+ * it, degrading to a bare `glyph id — word` line otherwise.
+ */
+function actionConfirm(id: string, status: string, run?: PersistedRunState): string {
+  const word = runStatusWord(status);
+  const glyph = STATUS_GLYPH[word] ?? STATUS_GLYPH[status] ?? "?";
+  const head = run ? `${glyph} ${id}  ${run.workflowName ?? "workflow"} — ${word}` : `${glyph} ${id} — ${word}`;
+  if (!run) return head;
+  const agents = persistedAgents(run);
+  const done = agents.filter((a) => a.status === "done").length;
+  const parts = [head];
+  if (run.currentPhase) parts.push(run.currentPhase);
+  parts.push(`${done}/${agents.length} agents`);
+  // tokens/cost segment mirrors summarizeRun (list rows) so confirms and rows
+  // never diverge; omitted when the persisted state carries no usage.
+  const usage = run.tokenUsage;
+  const costInfo = usage?.cost ? ` · ${fmtCost(usage.cost)}` : "";
+  const segment = fmtTokenSegment(tokenFigures(usage), fmtFull);
+  if (segment || costInfo) parts.push(`${segment}${costInfo}`);
+  const elapsed = runElapsed(run);
+  if (elapsed) parts.push(elapsed);
+  return parts.join(" · ");
+}
+
+/** The persisted record for a run id, for action confirmations. */
+function persistedRun(manager: WorkflowManager, id: string): PersistedRunState | undefined {
+  return manager.listRuns().find((r) => r.runId === id);
+}
+
 /** Deterministic, filesystem-safe slug for a blueprint step's worktree name. */
 function stepSlug(text: string): string {
   return (
@@ -124,7 +159,7 @@ function oneLineProgress(snapshot: WorkflowSnapshot): string {
   const phase = snapshot.currentPhase ? ` · ${snapshot.currentPhase}` : "";
   const elapsed = elapsedMs(snapshot, Date.now());
   const elapsedSegment = elapsed === undefined ? "" : ` · ${formatElapsed(elapsed)}`;
-  return `◆ ${snapshot.name}: ${done}/${total} done${running ? `, ${running} running` : ""}${
+  return `${STATUS_GLYPH.running ?? "◆"} ${snapshot.name}: ${done}/${total} done${running ? `, ${running} running` : ""}${
     errs ? `, ${errs} err` : ""
   }${phase}${elapsedSegment}`;
 }
@@ -207,7 +242,7 @@ function renderPersistedStatus(run: PersistedRunState): string {
   }
   const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   if (tokenSegment) lines.push(`  tokens: ${tokenSegment}`);
-  if (run.durationMs) lines.push(`  duration: ${(run.durationMs / 1000).toFixed(1)}s`);
+  if (run.durationMs) lines.push(`  duration: ${formatElapsed(run.durationMs)}`);
   return lines.join("\n");
 }
 
@@ -387,7 +422,10 @@ export function registerWorkflowCommands(
           // A running run streams live progress to the status bar and prints the
           // final snapshot when it finishes — no need to re-run the command.
           if (watchRun(manager, pi, ctx, id)) {
-            ctx.ui.notify(`Watching ${id} — live progress in the status bar; result prints when it finishes.`, "info");
+            ctx.ui.notify(
+              `${STATUS_GLYPH.running ?? "◆"} ${id} — watching (live progress in the status bar; result prints when it finishes)`,
+              "info",
+            );
             return;
           }
           const live = manager.getSnapshot(id);
@@ -405,21 +443,42 @@ export function registerWorkflowCommands(
         }
         case "stop": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
+          if (manager.stop(id)) {
+            ctx.ui.notify(actionConfirm(id, "aborted", persistedRun(manager, id)), "info");
+            return;
+          }
+          const run = persistedRun(manager, id);
           ctx.ui.notify(
-            manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id} (not running)`,
-            manager.getRun(id) ? "info" : "warning",
+            `✗ Cannot stop ${id}${run ? ` — ${runStatusWord(run.status)} (not running)` : " (not running)"}`,
+            "warning",
           );
           return;
         }
         case "pause": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          ctx.ui.notify(manager.pause(id) ? `Paused ${id}` : `Cannot pause ${id} (not running)`, "info");
+          if (manager.pause(id)) {
+            ctx.ui.notify(actionConfirm(id, "paused", persistedRun(manager, id)), "info");
+            return;
+          }
+          const run = persistedRun(manager, id);
+          ctx.ui.notify(
+            `✗ Cannot pause ${id}${run ? ` — ${runStatusWord(run.status)} (not running)` : " (not running)"}`,
+            "info",
+          );
           return;
         }
         case "resume": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
-          ctx.ui.notify(ok ? `Resumed ${id}` : `Resume not available for ${id} yet`, ok ? "info" : "warning");
+          if (ok) {
+            ctx.ui.notify(actionConfirm(id, "running", persistedRun(manager, id)), "info");
+            return;
+          }
+          const run = persistedRun(manager, id);
+          ctx.ui.notify(
+            `✗ Resume not available for ${id} yet${run ? ` — ${runStatusWord(run.status)}` : ""}`,
+            "warning",
+          );
           return;
         }
         case "implement": {

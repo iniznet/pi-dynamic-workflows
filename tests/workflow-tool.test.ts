@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentUsage, WorkflowAgent } from "../src/agent.js";
 import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "../src/config.js";
+import { createWorkflowSnapshot, recomputeWorkflowSnapshot } from "../src/display.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
@@ -85,6 +86,71 @@ test("formatCompletedResultText maps legacy numeric failure codes to their names
   const text = formatCompletedResultText(result);
   assert.ok(!text.includes("-31003"), "raw numeric code must not leak into the failure row");
   assert.ok(text.includes("APPROVAL_REQUIRED (human approval required)"), "numeric code renders as its label");
+});
+
+test("formatCompletedResultText keeps the legacy completion lead for snapshot-less callers", () => {
+  const result = {
+    meta: { name: "fanout", description: "d" },
+    result: { ok: true },
+    logs: [],
+    phases: [],
+    agentCount: 3,
+    durationMs: 120,
+    runId: "fanout-1",
+    tokenUsage: { input: 10, output: 5, total: 15, cost: 0 },
+  };
+  const text = formatCompletedResultText(result);
+  assert.ok(text.startsWith("Workflow **fanout** completed with **3** agent(s)."), "legacy lead must be preserved");
+});
+
+test("formatCompletedResultText leads with the canonical status block when a snapshot is provided", () => {
+  const result = {
+    meta: { name: "fanout", description: "d" },
+    result: { ok: true },
+    logs: [],
+    phases: ["Research", "Build"],
+    agentCount: 2,
+    durationMs: 125_000,
+    runId: "fanout-1",
+    tokenUsage: { input: 500, output: 300, total: 800, cost: 0 },
+  };
+  const snapshot = recomputeWorkflowSnapshot(
+    createWorkflowSnapshot({ name: "fanout", description: "d", phases: [{ title: "Research" }, { title: "Build" }] }),
+  );
+  snapshot.startedAtMs = Date.now() - 125_000;
+  snapshot.tokenBudget = 2000;
+  snapshot.tokenUsage = { input: 500, output: 300, total: 800, cost: 0 };
+  snapshot.agents = [
+    { id: 1, label: "r-agent", status: "done", phase: "Research", prompt: "x" },
+    { id: 2, label: "b-agent", status: "done", phase: "Build", prompt: "x" },
+  ] as never[];
+  const text = formatCompletedResultText(result, recomputeWorkflowSnapshot(snapshot));
+  // Canonical word + glyph lead the header, with elapsed and the budget bar.
+  assert.match(text, /^Workflow completed ✓: fanout \(2\/2 done/, `block header, got: ${text.split("\n")[0]}`);
+  assert.match(text, /· 2m 05s/, "elapsed survives in the final header");
+  assert.ok(text.includes("[████░░░░░░] 40%"), "budget bar renders when a tokenBudget is present");
+  // Phase checklist with per-phase counts, then the result sections.
+  assert.match(text, /✓ Research 1\/1/, "phase line with per-phase counts");
+  assert.ok(text.includes("## Result"), "result section follows the block");
+  assert.ok(!text.includes("completed with **"), "legacy lead must not duplicate the block header");
+});
+
+test("formatCompletedResultText uses the live snapshot's counts in the final block header", () => {
+  const result = {
+    meta: { name: "fanout", description: "d" },
+    result: { ok: true },
+    logs: [],
+    phases: [],
+    agentCount: 1,
+    durationMs: 0,
+    runId: "fanout-1",
+    tokenUsage: undefined,
+  };
+  const snapshot = createWorkflowSnapshot({ name: "fanout", description: "d" });
+  snapshot.agents = [{ id: 1, label: "a1", status: "running", phase: "Research", prompt: "x" }] as never[];
+  const text = formatCompletedResultText(result, recomputeWorkflowSnapshot(snapshot));
+  assert.match(text, /Workflow completed ✓: fanout \(0\/1 done, 1 running\)/, "block header names the true counts");
+  assert.ok(text.includes("## Result"), "result section still follows");
 });
 
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
@@ -1059,7 +1125,12 @@ test(
     assert.ok(details.runId, "sync run should produce a run id");
     assert.equal(details.agentCount, 1, "the blocking result reports the agent count");
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
-    assert.match(text, /completed with \*\*1\*\* agent/);
+    // The final text leads with the canonical single-glance status block —
+    // canonical glyph + word + counts (the engine's token segment may follow)
+    // — instead of the old wordy lead line.
+    assert.match(text, /^Workflow completed ✓: resume_tool \(1\/1 done/, "completed block leads the final text");
+    assert.match(text, /## Result/, "result section follows the block");
+    assert.match(text, /"a": "ok"/, "result dump survives");
     const runId = details.runId;
     assert.ok(runId);
     assert.equal(manager.getRun(runId)?.status, "completed", "sync run is tracked and completes");

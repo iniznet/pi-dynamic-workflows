@@ -271,7 +271,7 @@ export function createToolUpdateWorkflowDisplay(
   const emit = (snapshot: WorkflowSnapshot, completed = false) => {
     if (streamToolUpdates) {
       onUpdate?.({
-        content: [{ type: "text", text: renderWorkflowText(snapshot, completed) }],
+        content: [{ type: "text", text: renderWorkflowText(snapshot, completed, options) }],
         details: snapshot,
       });
     }
@@ -334,14 +334,7 @@ export function renderWorkflowLines(
 ): string[] {
   const maxAgents = options.maxAgents ?? 8;
   const showResultPreviews = options.showResultPreviews ?? false;
-  // One-glance header facts: live elapsed from the run's start clock, then the
-  // spend-vs-budget bar when the run carries a hard tokenBudget. Both segments
-  // degrade away when the data is absent (legacy snapshots, budget-free runs).
-  const headerFacts: string[] = [];
-  const elapsed = elapsedMs(snapshot, Date.now());
-  if (elapsed !== undefined) headerFacts.push(formatElapsed(elapsed));
-  const budgetBar = formatBudgetBar(snapshot.tokenUsage?.total ?? 0, snapshot.tokenBudget);
-  if (budgetBar) headerFacts.push(budgetBar);
+  const headerFacts = workflowHeaderFacts(snapshot);
   const header = `${theme.bold(`◆ Workflow: ${snapshot.name}`)} ${workflowCountsSuffix(snapshot)}`;
   const lines = [headerFacts.length ? `${header} · ${headerFacts.join(" · ")}` : header];
 
@@ -396,8 +389,12 @@ export function renderWorkflowLines(
   return lines;
 }
 
-export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
-  return renderWorkflowStatusText(snapshot, completed ? "completed" : "running");
+export function renderWorkflowText(
+  snapshot: WorkflowSnapshot,
+  completed = false,
+  options: WorkflowDisplayOptions = {},
+): string {
+  return renderWorkflowStatusText(snapshot, completed ? "completed" : "running", options);
 }
 
 /**
@@ -425,14 +422,41 @@ export function workflowFinalHeader(status: string): string {
 }
 
 /**
+ * Elapsed + spend-vs-budget bar facts for the one-glance header. Live elapsed
+ * comes from the run's start clock, then the spend-vs-budget bar when the run
+ * carries a hard tokenBudget; both segments degrade away when the data is
+ * absent (legacy snapshots, budget-free runs).
+ */
+function workflowHeaderFacts(snapshot: WorkflowSnapshot): string[] {
+  const facts: string[] = [];
+  const elapsed = elapsedMs(snapshot, Date.now());
+  if (elapsed !== undefined) facts.push(formatElapsed(elapsed));
+  const budgetBar = formatBudgetBar(snapshot.tokenUsage?.total ?? 0, snapshot.tokenBudget);
+  if (budgetBar) facts.push(budgetBar);
+  return facts;
+}
+
+/**
  * Render a snapshot with a truthful final-status header (see {@link workflowFinalHeader}).
  * ONE header (F51): the final status is folded into the identity line —
- * "Workflow completed: <name> (X/Y done…)" — instead of stacking
- * "Workflow completed" over the widget's "◆ Workflow: <name>" line.
+ * "Workflow completed ✓: <name> (X/Y done…) · <elapsed> · [bar]" — instead of
+ * stacking "Workflow completed" over the widget's "◆ Workflow: <name>" line.
+ * The canonical word leads (every surface reads "Workflow paused (resumable)"
+ * first, M7) with the run-status glyph paired to it, and the elapsed + budget
+ * facts the widget header carries are preserved so the text never degrades to
+ * a bare counts line.
  */
-export function renderWorkflowStatusText(snapshot: WorkflowSnapshot, status: string): string {
-  const lines = renderWorkflowLines(snapshot);
-  lines[0] = `${workflowFinalHeader(status)}: ${snapshot.name} ${workflowCountsSuffix(snapshot)}`;
+export function renderWorkflowStatusText(
+  snapshot: WorkflowSnapshot,
+  status: string,
+  options: WorkflowDisplayOptions = {},
+): string {
+  const lines = renderWorkflowLines(snapshot, options);
+  const facts = workflowHeaderFacts(snapshot);
+  const glyph = STATUS_GLYPH[runStatusWord(status)] ?? "◆";
+  lines[0] =
+    `${workflowFinalHeader(status)} ${glyph}: ${snapshot.name} ${workflowCountsSuffix(snapshot)}` +
+    (facts.length ? ` · ${facts.join(" · ")}` : "");
   return lines.join("\n");
 }
 

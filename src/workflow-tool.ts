@@ -11,8 +11,10 @@ import {
   fmtFull,
   fmtTokenSegment,
   recomputeWorkflowSnapshot,
+  renderWorkflowStatusText,
   renderWorkflowText,
   tokenFigures,
+  type WorkflowDisplayOptions,
   type WorkflowSnapshot,
 } from "./display.js";
 import { formatErrorCode, WorkflowError, WorkflowErrorCode } from "./errors.js";
@@ -420,8 +422,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, {
         key: "workflow",
         streamToolUpdates: true,
-        maxAgents: 4,
-        showResultPreviews: false,
+        ...TOOL_DISPLAY_OPTIONS,
       });
 
       let result: WorkflowRunResult;
@@ -479,7 +480,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         content: [
           {
             type: "text",
-            text: formatCompletedResultText(result),
+            text: formatCompletedResultText(result, snapshot),
           },
         ],
         details: {
@@ -521,6 +522,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
 }
 
 /**
+ * Compact per-phase agent rows for the tool's inline text, shared by the live
+ * update stream and the final completion block (the full detail always survives
+ * in the tool details + the result dump, so a glance is enough here).
+ */
+const TOOL_DISPLAY_OPTIONS: WorkflowDisplayOptions = { maxAgents: 4, showResultPreviews: false };
+
+/**
  * Cap on the pretty-printed result dump in completed-run text. The delivery
  * path truncates the whole message far lower anyway, so a huge inline dump is
  * pure token burn; the full value always survives in the tool details and (when
@@ -537,12 +545,21 @@ function formatResultDump(result: unknown, runId?: string): string {
 }
 
 /**
- * The tool result text for a COMPLETED run. Deliberately carries no resume
+ * The tool result text for a COMPLETED run. When a live snapshot is provided
+ * (the tool's sync path), the canonical single-glance status block leads the
+ * text — canonical glyph + word + phase checklist with per-phase counts + total
+ * + elapsed + budget bar — and the old wordy lead line is dropped as redundant.
+ * Without a snapshot the legacy lead is kept, so snapshot-less callers still
+ * get the completion statement spelled out. Deliberately carries no resume
  * hint: a completed run cannot be resumed (its journal is dropped on
  * completion), so advertising resumeFromRunId here would mislead the model
  * (M18). Paused/failed runs get the hint from their own paths.
  */
-export function formatCompletedResultText(result: WorkflowRunResult): string {
+export function formatCompletedResultText(
+  result: WorkflowRunResult,
+  snapshot?: WorkflowSnapshot,
+  options: WorkflowDisplayOptions = TOOL_DISPLAY_OPTIONS,
+): string {
   // Format token usage (include cost when the provider reports it)
   const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
   const tokenInfo = tokenSegment
@@ -569,7 +586,13 @@ export function formatCompletedResultText(result: WorkflowRunResult): string {
   const formattedResult =
     result.result !== undefined ? `\n\`\`\`json\n${formatResultDump(result.result, result.runId)}\n\`\`\`` : "";
 
-  return `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}${failures}\n\n## Result${formattedResult}`;
+  const statusBlock = snapshot ? `${renderWorkflowStatusText(snapshot, "completed", options)}\n\n` : "";
+  const lead = snapshot ? "" : `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).`;
+  // Notes already carry their own leading blank lines for the legacy layout;
+  // trim them when composing so the status block is followed by one blank line.
+  const notes = [tokenInfo.trim(), failures.trim()].filter(Boolean).join("\n\n");
+  const body = notes ? `${notes}\n\n` : "";
+  return `${statusBlock}${lead}${body}## Result${formattedResult}`;
 }
 
 /**

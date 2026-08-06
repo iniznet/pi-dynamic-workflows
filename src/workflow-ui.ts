@@ -25,23 +25,24 @@ import type { Component, Focusable, MarkdownTheme, TUI } from "@earendil-works/p
 import { Markdown, parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
 import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
-import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
+import {
+  aggregateAgentUsage,
+  elapsedMs,
+  fmtCost,
+  fmtTokenSegment,
+  formatBudgetBar,
+  formatElapsed,
+  runStatusWord,
+  STATUS_GLYPH,
+  tokenFigures,
+} from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 
-const STATUS_ICON: Record<string, string> = {
-  pending: "·",
-  running: "◆",
-  paused: "⏸",
-  completed: "✓",
-  done: "✓",
-  failed: "✗",
-  error: "✗",
-  aborted: "⊘",
-  skipped: "⊘",
-};
+// Run-status glyphs live in display.ts (STATUS_GLYPH) — the ONE vocabulary
+// every surface shares; the navigator reads canonical words through it (S4).
 
 const PLAIN: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
@@ -266,6 +267,11 @@ export class NavigatorModel {
     // Coerce (#110): a corrupt persisted run can carry a non-string status, which
     // would otherwise crash twoPaneHeader's truncateToWidth() with text.slice().
     return asText(this.snapshot(runId)?.status ?? "unknown");
+  }
+
+  /** The live (or persisted-rehydrated) snapshot for a run, or undefined when absent. */
+  runSnapshot(runId: string): WorkflowSnapshot | undefined {
+    return this.snapshot(runId)?.snapshot;
   }
 
   phases(runId: string): PhaseRow[] {
@@ -1127,10 +1133,11 @@ function renderNavigatorFrame(
       if (i < runs.length) {
         const r = runs[i];
         if (!r) continue;
-        const icon = STATUS_ICON[r.status] ?? "?";
+        const word = runStatusWord(asText(r.status));
+        const icon = STATUS_GLYPH[word] ?? "?";
         const tok = fmtTokenSegment(r, pad);
         const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
-        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${shortRunId(r.runId)} · ${r.status} · ${meta}`)}`));
+        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${shortRunId(r.runId)} · ${word} · ${meta}`)}`));
       } else {
         const w = saved[i - runs.length];
         if (!w) continue;
@@ -1236,11 +1243,13 @@ function renderNavigatorFrame(
 }
 
 /**
- * Two-line header above the Phases | agents frame (spec §1):
+ * Two-line header above the Phases | agents frame (spec §1) — the S4
+ * single-glance status block:
  *   line 0: <name>                          (ACCENT_BOLD)
- *   line 1: <status>            <done>/<total> agent[s] · <tokens>   (DIM)
+ *   line 1: <glyph> <canonical word>   <done>/<total> agent[s] · [n running] · <elapsed> · <tokens> · [bar]%
  * Right segment is built first and never truncated; the left segment is
- * truncated to the remaining width with an ellipsis.
+ * truncated to the remaining width with an ellipsis. Live facts (elapsed,
+ * budget bar, running count) degrade away when the snapshot lacks the data.
  */
 function twoPaneHeader(
   model: NavigatorModel,
@@ -1250,7 +1259,10 @@ function twoPaneHeader(
   theme: ThemeLike,
 ): string[] {
   const name = model.runName(runId);
-  const status = model.runStatus(runId);
+  // Canonical status block (S4): glyph + canonical word, never a raw alias
+  // like "done"/"error"/"stopped" — same vocabulary as every other surface.
+  const canonical = runStatusWord(model.runStatus(runId));
+  const glyph = STATUS_GLYPH[canonical] ?? "?";
   let done = 0;
   let total = 0;
   let fresh = 0;
@@ -1268,21 +1280,36 @@ function twoPaneHeader(
   const nameText = truncateToWidth(name, Math.max(1, width - visibleWidth(idSuffix)), ELLIPSIS, false);
   const line0 = theme.fg("accent", theme.bold(nameText)) + theme.fg("dim", idSuffix);
 
-  // Line 1 — left status, right summary.
+  // Line 1 — left canonical status block, right one-glance facts: per-phase
+  // done/total, total running agents, live elapsed from startedAtMs, tokens,
+  // and the spend-vs-budget bar when the run carries a tokenBudget. Elapsed
+  // and budget segments degrade away when the snapshot lacks the data, and the
+  // running count is omitted at zero so finished runs stay quiet.
+  const snap = model.runSnapshot(runId);
+  const facts: string[] = [];
+  if (snap?.runningCount) facts.push(`${snap.runningCount} running`);
+  const elapsed = snap ? elapsedMs(snap, Date.now()) : undefined;
+  if (elapsed !== undefined) facts.push(formatElapsed(elapsed));
   const headerSegment = fmtTokenSegment({ fresh, cacheRead }, compactTokens);
-  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${headerSegment ? ` · ${headerSegment}` : ""}`;
+  if (headerSegment) facts.push(headerSegment);
+  const budgetBar = snap ? formatBudgetBar(snap.tokenUsage?.total ?? 0, snap.tokenBudget) : "";
+  if (budgetBar) facts.push(budgetBar);
+  const rightRaw = `${done}/${total} ${pluralize("agent", total)}${facts.length ? ` · ${facts.join(" · ")}` : ""}`;
   const rightW = visibleWidth(rightRaw);
   const gap = 2;
+  const statusText = `${glyph} ${canonical}`;
+  const statusColor = AGENT_STATUS_COLOR[canonical] ?? "dim";
   let line1: string;
   if (rightW >= width) {
     // No room for left content: right-align (truncate from the right as last resort).
     line1 = theme.fg("dim", truncateToWidth(rightRaw, width, ELLIPSIS, false));
   } else {
     const availL = width - rightW - gap;
-    const leftText = availL > 0 ? truncateToWidth(status, availL, ELLIPSIS, false) : "";
+    const leftText = availL > 0 ? truncateToWidth(statusText, availL, ELLIPSIS, false) : "";
     const leftW = visibleWidth(leftText);
     const fill = " ".repeat(Math.max(gap, width - leftW - rightW));
-    line1 = theme.fg("dim", leftText) + fill + theme.fg("dim", rightRaw);
+    const styledLeft = leftText ? theme.fg(statusColor, leftText) : "";
+    line1 = styledLeft + fill + theme.fg("dim", rightRaw);
   }
   return [line0, line1];
 }

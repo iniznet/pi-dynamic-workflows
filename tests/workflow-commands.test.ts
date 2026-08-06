@@ -398,12 +398,12 @@ test("/workflows watch appends elapsed to the live status line when the snapshot
 // pause — calls manager.pause, shows notify
 // ═══════════════════════════════════════════════════════════════════════════
 
-test("/workflows pause <id> calls manager.pause and notifies Paused", async () => {
+test("/workflows pause <id> calls manager.pause and notifies the canonical paused line", async () => {
   const h = harness();
   await h.run("pause run-p1");
   assert.deepEqual(h.calls, ["pause:run-p1"], "should call manager.pause");
   assert.equal(h.notified.length, 1);
-  assert.match(h.notified[0].message, /Paused.+run-p1/);
+  assert.match(h.notified[0].message, /⏸ run-p1 — paused/);
 });
 
 test("/workflows pause without id warns usage", async () => {
@@ -427,7 +427,7 @@ test("/workflows pause <id> warns when manager.pause returns false", async () =>
 // resume — calls manager.resume, shows notify
 // ═══════════════════════════════════════════════════════════════════════════
 
-test("/workflows resume <id> calls manager.resume and notifies Resumed", async () => {
+test("/workflows resume <id> calls manager.resume and notifies the canonical running line", async () => {
   const h = harness({
     resume: async (id: string) => {
       h.calls.push(`resume:${id}`);
@@ -440,8 +440,8 @@ test("/workflows resume <id> calls manager.resume and notifies Resumed", async (
     "should call manager.resume",
   );
   assert.ok(
-    h.notified.some((n) => n.message.includes("Resumed")),
-    "should notify Resumed",
+    h.notified.some((n) => n.message.includes("◆ run-r1 — running")),
+    "should notify the canonical running line",
   );
 });
 
@@ -519,9 +519,146 @@ test("/workflows stop <id> shows Cannot stop when manager returns false", async 
 test("/workflows stop <id> notifies info (not warning) when stopped a real run", async () => {
   const h = harness({ stop: () => true, getRun: () => ({}) });
   await h.run("stop run-active");
-  const stopMsg = h.notified.find((n) => n.message.includes("Stopped"));
-  assert.ok(stopMsg, "should notify Stopped");
+  const stopMsg = h.notified.find((n) => n.message.includes("⊘ run-active — aborted"));
+  assert.ok(stopMsg, "should notify the canonical aborted line");
   assert.equal(stopMsg?.type, "info", "should be info when run was actually running");
+});
+
+test("/workflows stop <id> confirms with the full canonical one-liner (glyph id name — word · phase · agents · elapsed)", async () => {
+  const h = harness({
+    stop: () => true,
+    listRuns: () => [
+      {
+        runId: "run-s",
+        workflowName: "audit",
+        status: "aborted",
+        currentPhase: "Scan",
+        phases: ["Scan"],
+        agents: [
+          { id: 1, label: "a", status: "done", prompt: "x" },
+          { id: 2, label: "b", status: "done", prompt: "x" },
+          { id: 3, label: "c", status: "done", prompt: "x" },
+        ],
+        logs: [],
+        durationMs: 242_000,
+      },
+    ],
+  });
+  await h.run("stop run-s");
+  assert.match(h.notified[0].message, /⊘ run-s\s+audit — aborted · Scan · 3\/3 agents · 4m 02s/);
+});
+
+test("/workflows pause <id> confirms with the full canonical one-liner", async () => {
+  const h = harness({
+    pause: () => true,
+    listRuns: () => [
+      {
+        runId: "run-p",
+        workflowName: "audit",
+        status: "paused",
+        currentPhase: "Scan",
+        phases: ["Scan"],
+        agents: [
+          { id: 1, label: "a", status: "done", prompt: "x" },
+          { id: 2, label: "b", status: "running", prompt: "x" },
+          { id: 3, label: "c", status: "pending", prompt: "x" },
+        ],
+        logs: [],
+        durationMs: 242_000,
+      },
+    ],
+  });
+  await h.run("pause run-p");
+  assert.match(h.notified[0].message, /⏸ run-p\s+audit — paused · Scan · 1\/3 agents · 4m 02s/);
+});
+
+test("/workflows resume <id> confirms with the full canonical one-liner (live elapsed)", async () => {
+  const h = harness({
+    resume: async () => true,
+    listRuns: () => [
+      {
+        runId: "run-r",
+        workflowName: "audit",
+        status: "running",
+        currentPhase: "Scan",
+        phases: ["Scan"],
+        agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+        logs: [],
+        startedAtMs: Date.now() - 4 * 60_000,
+      },
+    ],
+  });
+  await h.run("resume run-r");
+  assert.match(h.notified[0].message, /◆ run-r\s+audit — running · Scan · 0\/1 agents · 4m 0\ds/);
+});
+
+test("/workflows pause <id> confirmation carries the tokens/cost segment like list rows", async () => {
+  const h = harness({
+    pause: () => true,
+    listRuns: () => [
+      {
+        runId: "run-t",
+        workflowName: "audit",
+        status: "paused",
+        currentPhase: "Report",
+        phases: ["Report"],
+        agents: [{ id: 1, label: "a", status: "done", prompt: "x" }],
+        logs: [],
+        durationMs: 1000,
+        tokenUsage: { input: 1000, output: 500, total: 1500, cost: 0.004 },
+      },
+    ],
+  });
+  await h.run("pause run-t");
+  // glyph id  name — word · phase · n/m agents · tokens/cost · elapsed
+  assert.match(h.notified[0].message, /⏸ run-t\s+audit — paused · Report · 1\/1 agents · 1\.500 tok · \$0\.0040 · 1s/);
+});
+
+test("/workflows stop <id> failure names the run's canonical status when resolvable", async () => {
+  const h = harness({
+    stop: () => false,
+    listRuns: () => [{ runId: "run-c", workflowName: "audit", status: "completed", phases: [], agents: [], logs: [] }],
+  });
+  await h.run("stop run-c");
+  assert.ok(
+    h.notified.some((n) => n.message.includes("✗ Cannot stop run-c — completed (not running)")),
+    "should name the run's canonical status",
+  );
+});
+
+test("/workflows status <id> confirms watching with the canonical glyph + word", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    currentPhase: undefined,
+    logs: [],
+    agents: [],
+    agentCount: 0,
+    runningCount: 0,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "running", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+  const notified: Array<{ message: string; type?: string }> = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: async () => {},
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = {
+    ui: { notify: (m: string, t?: string) => notified.push({ message: m, type: t }), setStatus: () => {} },
+  };
+
+  assert.ok(handler, "handler should exist");
+  await handler("status run-1", ctx);
+  assert.match(notified[0].message, /◆ run-1 — watching/);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
