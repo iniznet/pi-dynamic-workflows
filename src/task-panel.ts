@@ -25,7 +25,7 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
-import type { PersistedRunState } from "./run-persistence.js";
+import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import { safeSetInterval } from "./timing.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -38,6 +38,15 @@ import { shortModel } from "./workflow-ui.js";
 const RUN_EVENTS = ["agentStart", "agentEnd", "phase", "log", "complete", "error", "stopped", "paused", "resumed"];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
 const RUN_END_EVENTS = ["complete", "error", "stopped"] as const;
+
+/**
+ * Coalescing window for task-panel re-renders: agentStart/agentEnd/phase/log
+ * fire several times per second per run during bursts, and each event would
+ * redraw the whole panel. A trailing debounce (mirroring workflow-ui.ts's 125ms
+ * agentHistory coalescing) repaints at most once per burst window; the 2s
+ * ticker stays the floor cadence when events are sparse.
+ */
+const PANEL_RENDER_COALESCE_MS = 125;
 
 export interface TaskPanelOptions {
   storage?: WorkflowStorage;
@@ -269,8 +278,15 @@ export function installResultDelivery(
  * persisted ISO `startedAt`. Undefined when neither exists (test mocks / legacy
  * rows) — the elapsed segment then degrades away.
  */
-function runStartedAtMs(r: PersistedRunState): number | undefined {
-  const cumulative = (r as { startedAtMs?: number }).startedAtMs;
+/** Start-time data the elapsed clock reads — satisfied by persisted rows and live snapshots alike. */
+interface PanelElapsedSource {
+  status: string;
+  startedAt?: string;
+  startedAtMs?: number;
+}
+
+function runStartedAtMs(r: PanelElapsedSource): number | undefined {
+  const cumulative = r.startedAtMs;
   if (typeof cumulative === "number" && Number.isFinite(cumulative) && cumulative > 0) return cumulative;
   if (typeof r.startedAt === "string" && r.startedAt) {
     const t = Date.parse(r.startedAt);
@@ -284,11 +300,105 @@ function runStartedAtMs(r: PersistedRunState): number | undefined {
  * so a growing "4m 02s" beside "⏸" would misread as progress) or when the start
  * time is unknown.
  */
-function runElapsedSegment(r: PersistedRunState, now: number): string {
+function runElapsedSegment(r: PanelElapsedSource, now: number): string {
   if (r.status !== "running") return "";
   const startedAtMs = runStartedAtMs(r);
   if (startedAtMs === undefined) return "";
   return formatElapsed(Math.max(0, now - startedAtMs));
+}
+
+/**
+ * Panel row source: a source-neutral view of one active run, fed from either a
+ * live in-memory ManagedRun (snapshot-backed) or a persisted PersistedRunState
+ * row. Renderers never branch on the source — {@link panelRunData} merges the
+ * live view over the persisted one.
+ */
+interface PanelRunRow {
+  runId: string;
+  status: RunStatus;
+  workflowName: string;
+  agents: WorkflowAgentSnapshot[];
+  tokenBudget?: number | null;
+  tokenUsage?: WorkflowSnapshot["tokenUsage"];
+  startedAt?: string;
+  startedAtMs?: number;
+  /** Live snapshot for detailed per-phase rendering; absent for disk-only rows. */
+  snapshot?: WorkflowSnapshot;
+}
+
+/** The manager's live run map, reachable via the same cast protocol
+ *  installResultDelivery uses for its cross-reload holder. */
+type PanelRunsView = { runs?: ReadonlyMap<string, ManagedRun> };
+
+/** Adapt a live in-memory run to the panel row shape (snapshot-backed). */
+function toPanelRow(run: ManagedRun): PanelRunRow {
+  return {
+    runId: run.runId,
+    status: run.status,
+    workflowName: run.snapshot.name,
+    agents: run.snapshot.agents,
+    tokenBudget: run.tokenBudget,
+    tokenUsage: run.snapshot.tokenUsage,
+    startedAtMs: run.snapshot.startedAtMs,
+    snapshot: run.snapshot,
+  };
+}
+
+/** Adapt a persisted run row to the panel row shape (disk-backed, no snapshot). */
+function fromPersistedRow(r: PersistedRunState): PanelRunRow {
+  return {
+    runId: r.runId,
+    status: r.status,
+    workflowName: r.workflowName,
+    agents: r.agents,
+    tokenBudget: r.tokenBudget,
+    tokenUsage: r.tokenUsage,
+    startedAt: r.startedAt,
+    startedAtMs: r.startedAtMs,
+  };
+}
+
+/**
+ * Enumerate the panel's runs without paying a persistence walk for the runs it
+ * actually draws: active rows come from the manager's LIVE in-memory view (its
+ * private `runs` map, reached through {@link PanelRunsView}) so a render during
+ * an event burst reads no disk for the rows it draws. The finished count for the
+ * navigator hint stays disk-derived — listRuns() is 300ms-TTL-cached and kept
+ * warm during progress persists by the S1 slice — because it must count runs
+ * this process may never have held in memory. Managers with no reachable live
+ * view (test mocks, legacy shapes, or no active runs in memory) fall back to
+ * listRuns() plus the getRun() overlay, preserving the historical behavior
+ * exactly.
+ */
+function panelRunData(manager: WorkflowManager): { active: PanelRunRow[]; finished: number } {
+  const inMemory = (manager as unknown as PanelRunsView).runs;
+  const inMemoryActive = inMemory
+    ? [...inMemory.values()].filter((r) => r.status === "running" || r.status === "paused")
+    : [];
+  const inMemoryIds = new Set(inMemoryActive.map((r) => r.runId));
+  // One disk read for both the finished hint and the active-row merge below:
+  // listRuns() is 300ms-TTL-cached and kept warm during progress persists (S1),
+  // so the merge does not reintroduce a per-render persistence walk.
+  const diskRows = manager.listRuns();
+  const finished = diskRows.filter((r) => r.status !== "running" && r.status !== "paused").length;
+  const diskActive = diskRows
+    .filter((r) => (r.status === "running" || r.status === "paused") && !inMemoryIds.has(r.runId))
+    .map((r) => {
+      const row = fromPersistedRow(r);
+      // Keep the live-snapshot overlay for disk rows whose run IS in memory
+      // (detailed mode's per-phase body reads it).
+      const live = manager.getRun(r.runId);
+      if (live) row.snapshot = live.snapshot;
+      return row;
+    });
+  if (inMemoryActive.length > 0) {
+    // Merge disk rows for active runs this process does not hold in memory
+    // (e.g. a paused run the manager's bounded paused-run retention evicted,
+    // or a prior-session run) so the panel never drops an active run from
+    // view — the memory-first path only determines row SOURCE per run.
+    return { active: [...inMemoryActive.map(toPanelRow), ...diskActive], finished };
+  }
+  return { active: diskActive, finished };
 }
 
 export function renderPanel(
@@ -297,21 +407,18 @@ export function renderPanel(
   width?: number,
   now: number = Date.now(),
 ): string[] {
-  const all = manager.listRuns();
-  const active = all.filter((r) => r.status === "running" || r.status === "paused");
+  const { active, finished } = panelRunData(manager);
   if (!active.length) return [];
   const rows = active.map((r) => {
-    const live = manager.getRun(r.runId);
     // Array guard (M6): a structurally corrupt persisted run (agents not an
     // array) would otherwise throw "agents is not iterable" here and take the
     // whole panel down; mirror the navigator's #110 coercion.
-    const rawAgents = live?.snapshot.agents ?? r.agents;
-    const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
+    const agents = (Array.isArray(r.agents) ? r.agents : []) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     // Paused runs freeze both the clock and the phase readout: name the state so
     // the row can't misread as still progressing (the ⏸ marker stays the cue).
-    const state = r.status === "paused" ? "Paused" : (live?.snapshot.currentPhase ?? "");
+    const state = r.status === "paused" ? "Paused" : (r.snapshot?.currentPhase ?? "");
     const usage = aggregateAgentUsage(agents);
     const meta = [
       `${done}/${agents.length} agents`,
@@ -325,7 +432,6 @@ export function renderPanel(
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
   const hint = theme.fg(
     "dim",
     finished > 0
@@ -339,6 +445,13 @@ export function renderPanel(
 
 /** Rolling window for the token/s rate. Older samples age out so a stall decays to 0. */
 const RATE_WINDOW_MS = 10_000;
+/**
+ * Map-level cap on tracked runs (token-samples-map): per-run samples are
+ * already pruned to RATE_WINDOW_MS and cleared on run end, but a run whose end
+ * event was missed (crash/aborted session) would otherwise retain one tiny
+ * entry forever. At the cap, evict the oldest runId (Map insertion order).
+ */
+const TOKEN_SAMPLES_MAX_RUNS = 200;
 /** Per-run (timestamp, cumulative total) samples, keyed by the persisted runId so
  *  the rolling rate survives pause→resume. Cleared when a run ends. */
 const tokenSamples = new Map<string, Array<{ ts: number; total: number }>>();
@@ -353,6 +466,10 @@ export function sampleTokens(runId: string, total: number, now: number): void {
   // Drop samples beyond the rolling window, always keeping ≥2 so a rate is computable.
   while (samples.length > 2 && now - samples[0].ts > RATE_WINDOW_MS) samples.shift();
   tokenSamples.set(runId, samples);
+  if (tokenSamples.size > TOKEN_SAMPLES_MAX_RUNS) {
+    const oldest = tokenSamples.keys().next().value;
+    if (oldest !== undefined) tokenSamples.delete(oldest);
+  }
 }
 
 /** Tokens/second over the rolling window; 0 when too few samples or totals plateau. */
@@ -452,8 +569,7 @@ export function renderPanelDetailed(
   maxAgents: number,
   now: number,
 ): string[] {
-  const all = manager.listRuns();
-  const active = all.filter((r) => r.status === "running" || r.status === "paused");
+  const { active, finished } = panelRunData(manager);
   if (!active.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
   const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
@@ -464,11 +580,9 @@ export function renderPanelDetailed(
   let sessionCostKnownRuns = 0;
 
   for (const r of active) {
-    const live = manager.getRun(r.runId);
-    const snap = live?.snapshot;
+    const snap = r.snapshot;
     // Array guard (M6): corrupt persisted agents must not take the panel down.
-    const rawAgents = snap?.agents ?? r.agents;
-    const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
+    const agents = (Array.isArray(r.agents) ? r.agents : []) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
     const usage = snap?.tokenUsage ?? r.tokenUsage;
@@ -522,7 +636,6 @@ export function renderPanelDetailed(
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
   if (sessionCostKnownRuns > 0) {
     const plural = sessionCostKnownRuns === 1 ? "run" : "runs";
     out.push(dim(`  ~${fmtCost(sessionCost)} estimated spend across ${sessionCostKnownRuns} active ${plural}`));
@@ -605,19 +718,32 @@ export function installTaskPanel(
     }
     return cached;
   };
-  const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running" || r.status === "paused");
+  const hasActiveRun = () => panelRunData(manager).active.length > 0;
 
   ui.setWidget(
     "workflow-tasks",
     (tui: TUI, theme: Theme) => {
-      const onEvent = () => tui.requestRender();
+      // Coalesce the per-event re-renders: agentStart/agentEnd/phase/log fire
+      // several times per second per run during bursts, and each would redraw
+      // the whole panel. A trailing debounce (mirroring workflow-ui.ts's 125ms
+      // agentHistory coalescing) repaints at most once per burst window; the 2s
+      // ticker below is the floor cadence when events are sparse.
+      let renderTimer: ReturnType<typeof setTimeout> | undefined;
+      const onEvent = () => {
+        if (renderTimer) return;
+        renderTimer = setTimeout(() => {
+          renderTimer = undefined;
+          tui.requestRender();
+        }, PANEL_RENDER_COALESCE_MS);
+        (renderTimer as { unref?: () => void }).unref?.();
+      };
       for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
       const onRunEnd = ({ runId }: { runId: string }) => clearTokenSamples(runId);
       for (const ev of RUN_END_EVENTS) manager.on(ev, onRunEnd);
       // In detailed mode, force a redraw every 2s while a run is active so the
       // token/s rate keeps updating between sparse token events — and decays to 0
-      // when an agent stalls. Gated + unref'd so it costs nothing when idle.
-      // Gated + unref'd so it costs nothing when idle; cleared on dispose.
+      // when an agent stalls. Gated + unref'd so it costs nothing when idle;
+      // cleared on dispose.
       const timer = safeSetInterval(() => {
         // Both panel modes now carry a live elapsed readout, so the 2s tick that
         // once refreshed only the detailed token rate must also repaint the
@@ -638,6 +764,8 @@ export function installTaskPanel(
         invalidate: () => {},
         dispose: () => {
           timer.clear();
+          if (renderTimer) clearTimeout(renderTimer);
+          renderTimer = undefined;
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
           for (const ev of RUN_END_EVENTS) manager.off(ev, onRunEnd);
         },
