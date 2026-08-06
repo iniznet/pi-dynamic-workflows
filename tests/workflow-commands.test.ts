@@ -107,6 +107,117 @@ test("/workflows (no args) defaults to list", async () => {
   assert.match(h.printed[0], /run-1/);
 });
 
+test("/workflows list rows unify canonical glyph + word + phase + elapsed + tokens/cost", async () => {
+  const h = harness({
+    listRuns: () => [
+      {
+        runId: "wf-a1b2",
+        workflowName: "audit",
+        status: "paused",
+        currentPhase: "Scan",
+        phases: ["Scan"],
+        agents: [
+          { id: 1, label: "a", status: "done", prompt: "x" },
+          { id: 2, label: "b", status: "done", prompt: "x" },
+          { id: 3, label: "c", status: "done", prompt: "x" },
+        ],
+        logs: [],
+        durationMs: 242_000,
+      },
+      {
+        runId: "wf-c3d4",
+        workflowName: "review",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        tokenUsage: { input: 100_000, output: 20_000, total: 120_000, cost: 1.2 },
+      },
+    ],
+  });
+  await h.run("list");
+  const out = h.printed[0];
+  assert.match(out, /Workflow runs:/);
+  assert.match(out, /⏸ wf-a1b2\s+audit — paused · Scan · 3\/3 agents · 4m 02s/);
+  assert.match(out, /✓ wf-c3d4\s+review — completed · 0\/0 agents · [\d.,]+ tok · \$1\.20/);
+  assert.match(out, /Legend: · pending ◆ running ⏸ paused ✓ completed ✗ failed ⊘ aborted/);
+});
+
+test("/workflows (no args) prints the legend instead of the 11-verb usage block", async () => {
+  const h = harness({
+    listRuns: () => [{ runId: "run-1", workflowName: "demo", status: "running", phases: [], agents: [], logs: [] }],
+  });
+  await h.run("");
+  const out = h.printed[0];
+  assert.match(out, /Workflow runs:/);
+  assert.match(out, /Legend: /);
+  assert.doesNotMatch(out, /Usage: \/workflows/);
+});
+
+test("/workflows list shows live elapsed from startedAt for a running run without durationMs", async () => {
+  const h = harness({
+    listRuns: () => [
+      {
+        runId: "wf-live",
+        workflowName: "audit",
+        status: "running",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    ],
+  });
+  await h.run("list");
+  assert.match(h.printed[0], /1m \d{2}s/);
+});
+
+test("/workflows list elapsed prefers cumulative startedAtMs over the ISO stamp (resume keeps original start)", async () => {
+  // ISO startedAt is the resume-local time on disk; startedAtMs is the run's
+  // ORIGINAL first start (see PersistedRunState.startedAtMs). The row must read
+  // the cumulative clock so a resumed run doesn't reset to ~0s.
+  const h = harness({
+    listRuns: () => [
+      {
+        runId: "wf-res",
+        workflowName: "audit",
+        status: "running",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAtMs: Date.now() - 4 * 60_000,
+        startedAt: new Date(Date.now() - 3_000).toISOString(),
+      },
+    ],
+  });
+  await h.run("list");
+  assert.match(h.printed[0], /4m \d{2}s/);
+  assert.doesNotMatch(h.printed[0], /0m 0\ds/);
+});
+
+test("/workflows status <id> labels runs with canonical glyphs", async () => {
+  const h = harness({
+    listRuns: () => [
+      {
+        runId: "run-p",
+        workflowName: "audit",
+        status: "paused",
+        phases: ["Scan"],
+        currentPhase: "Scan",
+        agents: [
+          { id: 1, label: "scan files", status: "done", prompt: "x" },
+          { id: 2, label: "audit keys", status: "running", prompt: "x" },
+        ],
+        logs: [],
+      },
+    ],
+  });
+  await h.run("status run-p");
+  assert.match(h.printed[0], /⏸ audit \(run-p\) — paused/);
+  assert.match(h.printed[0], /\s+✓ scan files/);
+  assert.match(h.printed[0], /\s+◆ audit keys/);
+});
+
 test("/workflows run without prompt warns usage", async () => {
   const h = harness();
   await h.run("run");
@@ -244,6 +355,43 @@ test("/workflows status watches a running run: live status bar + prints on compl
   manager.emit("complete", { runId: "run-1" });
   assert.equal(printed.length, 1, "prints final snapshot on completion");
   assert.ok(statusLine.includes(undefined), "clears the status line");
+});
+
+test("/workflows watch appends elapsed to the live status line when the snapshot has startedAtMs", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: ["Run"],
+    currentPhase: "Run",
+    logs: [],
+    agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    startedAtMs: Date.now() - 60_000,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-1" ? { runId: "run-1", status: "running", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const statusLine: Array<string | undefined> = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: async () => {},
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
+
+  assert.ok(handler, "handler should exist");
+  await handler("status run-1", ctx);
+  const live = statusLine.find((s) => typeof s === "string");
+  assert.ok(live, "sets a live status line");
+  assert.match(live, /1m \d{2}s/, "the status line carries the run's elapsed");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

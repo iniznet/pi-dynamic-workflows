@@ -801,6 +801,10 @@ export class WorkflowManager extends EventEmitter {
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${runId}`);
 
+    // Freeze the start-time budget once, so the snapshot's budget bar and the
+    // run's tokenBudget cap can never drift apart (see ManagedRun.tokenBudget).
+    const startTokenBudget = exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget;
+
     const managed: ManagedRun = {
       runId,
       status: "running",
@@ -814,6 +818,11 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        // Cumulative start clock for every surface's live elapsed readout; the
+        // ISO startedAt on the managed run is the resume-locally-observable
+        // counterpart (see PersistedRunState.startedAtMs for the disk mapping).
+        startedAtMs: Date.now(),
+        tokenBudget: startTokenBudget,
       },
       controller,
       startedAt: new Date(),
@@ -829,7 +838,7 @@ export class WorkflowManager extends EventEmitter {
       compactJournal: exec.compactJournal === true,
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
-      tokenBudget: exec.tokenBudget !== undefined ? exec.tokenBudget : this.defaultTokenBudget,
+      tokenBudget: startTokenBudget,
       toolset: exec.toolset,
       // Same freeze-at-start pattern as tokenBudget, for the same reason: a
       // resumed run must keep these values, not re-resolve against the
@@ -859,6 +868,7 @@ export class WorkflowManager extends EventEmitter {
         agents: [],
         logs: [],
         startedAt: managed.startedAt.toISOString(),
+        startedAtMs: managed.snapshot.startedAtMs,
         updatedAt: managed.startedAt.toISOString(),
         autoResume: managed.autoResume,
         failOnExhaustedAgent: managed.failOnExhaustedAgent,
@@ -951,6 +961,7 @@ export class WorkflowManager extends EventEmitter {
         runningCount: 0,
         doneCount: 0,
         errorCount: 0,
+        startedAtMs: Date.now(),
       },
       controller: new AbortController(),
       startedAt: new Date(),
@@ -1864,6 +1875,9 @@ export class WorkflowManager extends EventEmitter {
           journal,
           journalCompacted,
           status: managed.status,
+          // Cumulative start clock (see PersistedRunState.startedAtMs): carried
+          // through every write so a resume keeps the run's ORIGINAL start.
+          startedAtMs: managed.snapshot.startedAtMs,
           // Persisted every write (not just at pause) so a stale read during the
           // "paused" event race (see UsageLimitScheduler) is still correct — this
           // is fixed at run-start and doesn't change over the run's lifetime.
@@ -2108,6 +2122,14 @@ export class WorkflowManager extends EventEmitter {
     }
 
     const controller = new AbortController();
+    // Resolve the budget once at resume and freeze it on the run (see the
+    // ManagedRun.tokenBudget comment) so re-resume keeps start-time semantics.
+    const resumeTokenBudget =
+      exec.tokenBudget !== undefined
+        ? exec.tokenBudget
+        : persisted.tokenBudget !== undefined
+          ? persisted.tokenBudget
+          : null;
     const managed: ManagedRun = {
       runId,
       status: "running",
@@ -2128,6 +2150,11 @@ export class WorkflowManager extends EventEmitter {
         // completes doesn't lose the prior spend — onAgentEnd accumulates on
         // top of this rather than starting from scratch.
         tokenUsage: priorTokenUsage,
+        // CUMULATIVE start clock: prefer the run's ORIGINAL first-start stamp
+        // so elapsed readouts keep counting across pause/resume boundaries
+        // instead of resetting; legacy runs without one fall back to now.
+        startedAtMs: persisted.startedAtMs ?? Date.now(),
+        tokenBudget: resumeTokenBudget,
       },
       controller,
       startedAt: new Date(),
@@ -2158,12 +2185,7 @@ export class WorkflowManager extends EventEmitter {
       // recover a run paused at its usage limit, where spent >= persisted
       // budget would block the very first agent() call. Unset restores
       // start-time semantics.
-      tokenBudget:
-        exec.tokenBudget !== undefined
-          ? exec.tokenBudget
-          : persisted.tokenBudget !== undefined
-            ? persisted.tokenBudget
-            : null,
+      tokenBudget: resumeTokenBudget,
       toolset: persisted.toolset,
       // Same explicit-wins-else-persisted rule as tokenBudget for the other four
       // per-run knobs (see ManagedRun doc comments) — same rationale as

@@ -77,6 +77,12 @@ export interface PersistedRunState {
   logs: string[];
   result?: unknown;
   startedAt: string;
+  /**
+   * Cumulative wall-clock start (epoch ms) of the run's FIRST start, carried
+   * across every persist so a resume keeps the original stamp (display-core's
+   * WorkflowSnapshot.startedAtMs mapping). Absent on legacy runs.
+   */
+  startedAtMs?: number;
   updatedAt: string;
   completedAt?: string;
   durationMs?: number;

@@ -46,6 +46,17 @@ export interface WorkflowSnapshot {
   doneCount: number;
   errorCount: number;
   durationMs?: number;
+  /**
+   * Epoch ms when the run started (or was last resumed) — feeds live elapsed
+   * segments across every surface. Absent on legacy snapshots, which simply
+   * render no elapsed.
+   */
+  startedAtMs?: number;
+  /**
+   * Hard token budget the run started with (null = explicitly unbudgeted).
+   * Absent on legacy snapshots, which render no budget bar.
+   */
+  tokenBudget?: number | null;
   result?: unknown;
   tokenUsage?: {
     input: number;
@@ -56,6 +67,43 @@ export interface WorkflowSnapshot {
     cacheWrite?: number;
   };
   runId?: string;
+}
+
+/**
+ * Canonical glyph for each run status — the ONE vocabulary every surface
+ * (widget, task panel, /workflows list, navigator) uses, so a paused run reads
+ * as "⏸ paused" everywhere instead of three different markers. Agent-level
+ * statuses use {@link statusIcon} (a different key set: done/error/skipped).
+ */
+export const STATUS_GLYPH: Record<string, string> = {
+  pending: "·",
+  running: "◆",
+  paused: "⏸",
+  completed: "✓",
+  failed: "✗",
+  aborted: "⊘",
+};
+
+/**
+ * Normalize any surface's status vocabulary onto the canonical run-status word
+ * ("done"→"completed", "error"→"failed", "stopped"→"aborted",
+ * "active"→"running"). Unknown statuses pass through untouched so a legacy or
+ * unexpected value never renders an empty word.
+ */
+export function runStatusWord(status: string): string {
+  switch (status) {
+    case "done":
+    case "complete":
+      return "completed";
+    case "error":
+      return "failed";
+    case "stopped":
+      return "aborted";
+    case "active":
+      return "running";
+    default:
+      return status;
+  }
 }
 
 export interface WorkflowDisplay {
@@ -286,7 +334,16 @@ export function renderWorkflowLines(
 ): string[] {
   const maxAgents = options.maxAgents ?? 8;
   const showResultPreviews = options.showResultPreviews ?? false;
-  const lines = [`${theme.bold(`◆ Workflow: ${snapshot.name}`)} ${workflowCountsSuffix(snapshot)}`];
+  // One-glance header facts: live elapsed from the run's start clock, then the
+  // spend-vs-budget bar when the run carries a hard tokenBudget. Both segments
+  // degrade away when the data is absent (legacy snapshots, budget-free runs).
+  const headerFacts: string[] = [];
+  const elapsed = elapsedMs(snapshot, Date.now());
+  if (elapsed !== undefined) headerFacts.push(formatElapsed(elapsed));
+  const budgetBar = formatBudgetBar(snapshot.tokenUsage?.total ?? 0, snapshot.tokenBudget);
+  if (budgetBar) headerFacts.push(budgetBar);
+  const header = `${theme.bold(`◆ Workflow: ${snapshot.name}`)} ${workflowCountsSuffix(snapshot)}`;
+  const lines = [headerFacts.length ? `${header} · ${headerFacts.join(" · ")}` : header];
 
   const phaseNames = snapshot.phases.length
     ? snapshot.phases
@@ -301,7 +358,10 @@ export function renderWorkflowLines(
     const errors = agents.filter((agent) => agent.status === "error").length;
     const skipped = agents.filter((agent) => agent.status === "skipped").length;
     const complete = agents.length > 0 && done + errors + skipped === agents.length;
-    const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
+    // Queued phase (no agent started, not the current phase) reads as the
+    // canonical pending glyph "·" instead of a blank — same vocabulary as the
+    // /workflows list legend.
+    const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : "·";
     lines.push(
       theme.fg("accent", `  ${marker} ${phase}`) +
         theme.fg(
@@ -418,6 +478,27 @@ export function formatBudgetBar(spentTokens: number, budgetTokens: number | null
   const pct = Math.max(0, Math.min(1, spentTokens / budgetTokens));
   const filled = Math.round(pct * 10);
   return `[${BUDGET_BAR_FILL.repeat(filled)}${BUDGET_BAR_EMPTY.repeat(10 - filled)}] ${Math.round(pct * 100)}%`;
+}
+
+/**
+ * "12s" / "4m 02s" / "1h 05m" — wall-clock duration for run rows. Rounds to
+ * the nearest second and zero-pads the sub-leading unit so columnar lists keep
+ * their alignment.
+ */
+export function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const s = total % 60;
+  const m = Math.floor(total / 60) % 60;
+  const h = Math.floor(total / 3600);
+  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
+/** Live elapsed (ms) for a snapshot, or undefined when the run carries no start time. */
+export function elapsedMs(snapshot: WorkflowSnapshot, now: number): number | undefined {
+  if (typeof snapshot.startedAtMs !== "number" || !Number.isFinite(snapshot.startedAtMs)) return undefined;
+  return Math.max(0, now - snapshot.startedAtMs);
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {

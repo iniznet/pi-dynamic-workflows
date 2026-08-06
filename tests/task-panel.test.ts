@@ -572,6 +572,112 @@ describe("renderPanel", () => {
   });
 });
 
+// ─── renderPanel: elapsed clock + budget bar ──────────────────────────────────
+
+describe("renderPanel elapsed + budget", () => {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+  // Fixed clock so elapsed assertions are deterministic regardless of wall time.
+  const NOW = 1_000_000;
+
+  function managerWith(startedAgoMs: number, status = "running", budget?: number) {
+    return {
+      listRuns: () => [
+        {
+          runId: "el-1",
+          workflowName: "audit",
+          status,
+          agents: [
+            { id: 1, label: "scan", status: "done", phase: "Inspect", tokens: 20000 },
+            { id: 2, label: "audit", status: "running", phase: "Inspect", tokens: 22000 },
+          ],
+          logs: [],
+          startedAt: new Date(NOW - startedAgoMs).toISOString(),
+          tokenBudget: budget,
+        },
+      ],
+      getRun: () => undefined,
+    };
+  }
+
+  it("shows a live elapsed clock in compact rows (design pin 1m 12s)", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(managerWith(72_000) as never, theme as never, undefined, NOW);
+    const row = lines.find((l) => l.includes("audit")) ?? "";
+    assert.ok(row.includes("1m 12s"), `elapsed "1m 12s" in the row, got: ${row}`);
+  });
+
+  it("zero-pads seconds in the minute range (design pin 4m 02s)", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(managerWith(242_000) as never, theme as never, undefined, NOW);
+    assert.ok(
+      lines.some((l) => l.includes("4m 02s")),
+      "242s renders 4m 02s",
+    );
+  });
+
+  it("shows the spend-vs-budget bar in compact rows when a tokenBudget is set", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    // 20000 + 22000 = 42000 of 100000 → [████░░░░░░] 42% (design pin).
+    const lines = renderPanel(managerWith(72_000, "running", 100_000) as never, theme as never, undefined, NOW);
+    const row = lines.find((l) => l.includes("audit")) ?? "";
+    assert.ok(row.includes("[████░░░░░░] 42%"), `budget bar, got: ${row}`);
+  });
+
+  it("degrades to no elapsed/budget when start time or budget is missing", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        { runId: "legacy", workflowName: "legacy", status: "running", agents: [{ status: "done" }], logs: [] },
+      ],
+      getRun: () => undefined,
+    };
+    const lines = renderPanel(manager as never, theme as never, undefined, NOW);
+    const row = lines.find((l) => l.includes("legacy")) ?? "";
+    assert.ok(row.includes("1/1 agents"), "progress facts intact");
+    assert.ok(!/\ds/.test(row), `no elapsed segment without a start time, got: ${row}`);
+    assert.ok(!row.includes("%"), `no budget bar without a tokenBudget, got: ${row}`);
+  });
+
+  it("keeps the ⏸ marker and names paused runs, with no frozen clock or budget", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(managerWith(72_000, "paused", 100_000) as never, theme as never, undefined, NOW);
+    const row = lines.find((l) => l.includes("audit")) ?? "";
+    assert.ok(row.includes("⏸ audit"), "paused glyph stays");
+    assert.ok(row.includes("· Paused"), "state word");
+    assert.ok(!row.includes("1m 12s"), "no elapsed while paused (frozen clock)");
+    assert.ok(!row.includes("%"), "no budget bar while paused");
+  });
+
+  it("adds an elapsed segment to the detailed header while running", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("el-det");
+    const snapshot = {
+      name: "el-det",
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [{ id: 1, label: "a", status: "running", phase: "Scan", tokens: 100 }],
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "el-det",
+          workflowName: "el-det",
+          status: "running",
+          agents: snapshot.agents,
+          startedAt: new Date(NOW - 72_000).toISOString(),
+        },
+      ],
+      getRun: () => ({ snapshot, status: "running" }),
+    };
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, NOW);
+    assert.ok(
+      lines.some((l) => l.includes("el-det") && l.includes("1m 12s")),
+      `detailed header carries the elapsed clock, got:\n${lines.join("\n")}`,
+    );
+  });
+});
+
 // ─── token/s rolling-window math ────────────────────────────────────────────────
 
 describe("token rate", () => {

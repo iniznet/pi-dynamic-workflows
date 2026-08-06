@@ -8,11 +8,16 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createWorktreeRunner, type WorktreeRunner, type WorktreeTask } from "./agent/worktree-runner.js";
 import {
+  elapsedMs,
+  fmtCost,
   fmtFull,
   fmtTokenSegment,
+  formatElapsed,
   recomputeWorkflowSnapshot,
   renderWorkflowStatusText,
   renderWorkflowText,
+  runStatusWord,
+  STATUS_GLYPH,
   tokenFigures,
   type WorkflowSnapshot,
 } from "./display.js";
@@ -28,26 +33,14 @@ import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
 import { createWorktree, gitExec, sweepOrphanWorktrees } from "./worktree.js";
 
-const STATUS_ICON: Record<string, string> = {
-  pending: "·",
-  running: "◆",
-  paused: "⏸",
-  completed: "✓",
-  failed: "✗",
-  aborted: "⊘",
-};
-
-/**
- * Map a final watchRun event to the run's on-disk status so the printed final
- * snapshot is labeled truthfully (M7): a paused run is "resumable", a stopped
- * run is "stopped", an errored run is "failed" — never "completed".
- */
 const FINAL_EVENT_STATUS: Record<string, string> = {
   complete: "completed",
   error: "failed",
   stopped: "aborted",
   paused: "paused",
 };
+const RUN_STATUS_ORDER = ["pending", "running", "paused", "completed", "failed", "aborted"] as const;
+const RUN_STATUS_LEGEND = `Legend: ${RUN_STATUS_ORDER.map((s) => `${STATUS_GLYPH[s]} ${s}`).join(" ")}`;
 
 const USAGE =
   "Usage: /workflows [list | ui] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | clean | rm <id> | save <name> [runId]";
@@ -60,13 +53,40 @@ function persistedAgents(run: PersistedRunState): Array<PersistedRunState["agent
 }
 
 function summarizeRun(run: PersistedRunState): string {
-  const icon = STATUS_ICON[run.status] ?? "?";
+  const icon = STATUS_GLYPH[run.status] ?? "?";
   const agents = persistedAgents(run);
   const done = agents.filter((a) => a.status === "done").length;
   const total = agents.length;
-  const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
-  const tokens = segment ? ` · ${segment}` : "";
-  return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
+  const parts = [`${icon} ${run.runId}  ${run.workflowName} — ${runStatusWord(run.status)}`];
+  if (run.currentPhase) parts.push(run.currentPhase);
+  parts.push(`${done}/${total} agents`);
+  const usage = run.tokenUsage;
+  const costInfo = usage?.cost ? ` · ${fmtCost(usage.cost)}` : "";
+  const segment = fmtTokenSegment(tokenFigures(usage), fmtFull);
+  if (segment || costInfo) parts.push(`${segment}${costInfo}`);
+  const elapsed = runElapsed(run);
+  if (elapsed) parts.push(elapsed);
+  return parts.join(" · ");
+}
+
+/**
+ * Wall-clock elapsed for a persisted run: the recorded duration wins for
+ * finished runs (it stops growing), otherwise live elapsed from the run's
+ * CUMULATIVE first-start clock (persisted across pause/resume, mirroring the
+ * task panel's runStartedAtMs) so a resumed run never resets its readout;
+ * legacy runs without either fall back to the ISO stamp. Undefined when no
+ * start time is known.
+ */
+function runElapsed(run: PersistedRunState, now = Date.now()): string | undefined {
+  if (run.durationMs) return formatElapsed(run.durationMs);
+  const startedMs =
+    typeof run.startedAtMs === "number" && Number.isFinite(run.startedAtMs) && run.startedAtMs > 0
+      ? run.startedAtMs
+      : run.startedAt
+        ? Date.parse(run.startedAt)
+        : undefined;
+  if (typeof startedMs !== "number" || !Number.isFinite(startedMs)) return undefined;
+  return formatElapsed(Math.max(0, now - startedMs));
 }
 
 /** Deterministic, filesystem-safe slug for a blueprint step's worktree name. */
@@ -102,9 +122,11 @@ function oneLineProgress(snapshot: WorkflowSnapshot): string {
   const running = agents.filter((a) => a.status === "running").length;
   const errs = agents.filter((a) => a.status === "error").length;
   const phase = snapshot.currentPhase ? ` · ${snapshot.currentPhase}` : "";
+  const elapsed = elapsedMs(snapshot, Date.now());
+  const elapsedSegment = elapsed === undefined ? "" : ` · ${formatElapsed(elapsed)}`;
   return `◆ ${snapshot.name}: ${done}/${total} done${running ? `, ${running} running` : ""}${
     errs ? `, ${errs} err` : ""
-  }${phase}`;
+  }${phase}${elapsedSegment}`;
 }
 
 /**
@@ -173,11 +195,14 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
 }
 
 function renderPersistedStatus(run: PersistedRunState): string {
-  const lines = [`${STATUS_ICON[run.status] ?? "?"} ${run.workflowName} (${run.runId}) — ${run.status}`];
+  const lines = [
+    `${STATUS_GLYPH[run.status] ?? "?"} ${run.workflowName} (${run.runId}) — ${runStatusWord(run.status)}`,
+  ];
   if (run.currentPhase) lines.push(`  phase: ${run.currentPhase}`);
   for (const agent of persistedAgents(run)) {
-    const icon =
-      agent.status === "done" ? "✓" : agent.status === "error" ? "✗" : agent.status === "running" ? "◆" : "·";
+    // Agent statuses map onto the canonical run-status glyphs via runStatusWord
+    // (done→✓ completed, error→✗ failed, running→◆, pending/skipped→·).
+    const icon = STATUS_GLYPH[runStatusWord(agent.status)] ?? "·";
     lines.push(`  ${icon} ${agent.label}`);
   }
   const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
@@ -345,10 +370,11 @@ export function registerWorkflowCommands(
             await print("No workflow runs yet. Start one with /workflows run <prompt> or mention 'workflow'.");
             return;
           }
-          // F53: the bare `/workflows` command (no args) carries the usage line;
-          // an explicit `list` prints just the runs — no 11-verb block every time.
-          const listLines = ["Workflow runs:", ...runs.map(summarizeRun)];
-          if (parts.length === 0) listLines.push("", USAGE);
+          // F53: the bare `/workflows` command (no args) and an explicit `list`
+          // both print runs + the one-line status legend — the legend replaces
+          // the 11-verb usage block so the surface stays scannable (subcommand
+          // help still lives in the unknown/partial warnings).
+          const listLines = ["Workflow runs:", ...runs.map(summarizeRun), RUN_STATUS_LEGEND];
           await print(listLines.join("\n"));
           return;
         }

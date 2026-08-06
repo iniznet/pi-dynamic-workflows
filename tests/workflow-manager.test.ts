@@ -304,6 +304,11 @@ test(
     assert.equal(persisted?.status, "paused");
     assert.equal(persisted?.tokenBudget, null, "explicit null budget persists (not the 50 default)");
     assert.equal(persisted?.toolset, "webby", "toolset tag persists with the run");
+    assert.equal(typeof persisted?.startedAtMs, "number", "the cumulative start clock is persisted with the run");
+    assert.ok(
+      Number.isFinite(manager.getRun(runId)?.snapshot.startedAtMs as number),
+      "the live snapshot carries startedAtMs",
+    );
 
     // Resume: the run must keep its start-time context — no budget (not the
     // manager's current default) and the same re-resolved toolset.
@@ -317,6 +322,11 @@ test(
     assert.equal(resumed?.status, "completed", "resume completes without TOKEN_BUDGET_EXHAUSTED");
     assert.equal(resumed?.tokenBudget, null, "resume keeps the start-time budget, not the current default");
     assert.equal(resumed?.toolset, "webby");
+    assert.equal(
+      resumed?.startedAtMs,
+      persisted?.startedAtMs,
+      "resume keeps the ORIGINAL start clock instead of resetting it",
+    );
   }),
 );
 

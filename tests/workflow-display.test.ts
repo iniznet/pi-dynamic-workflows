@@ -627,6 +627,77 @@ describe("display pure helpers", () => {
   });
 });
 
+describe("run-status canonical vocabulary", () => {
+  it("STATUS_GLYPH maps every run status to its canonical glyph", async () => {
+    const { STATUS_GLYPH } = await loadDisplay();
+    assert.deepEqual(STATUS_GLYPH, {
+      pending: "·",
+      running: "◆",
+      paused: "⏸",
+      completed: "✓",
+      failed: "✗",
+      aborted: "⊘",
+    });
+  });
+
+  it("runStatusWord normalizes alias vocabularies onto canonical words", async () => {
+    const { runStatusWord } = await loadDisplay();
+    assert.equal(runStatusWord("done"), "completed");
+    assert.equal(runStatusWord("complete"), "completed");
+    assert.equal(runStatusWord("error"), "failed");
+    assert.equal(runStatusWord("stopped"), "aborted");
+    assert.equal(runStatusWord("active"), "running");
+    assert.equal(runStatusWord("paused"), "paused");
+    assert.equal(runStatusWord("mystery"), "mystery", "unknown statuses pass through");
+  });
+
+  it("formatElapsed renders seconds, minutes, and hours", async () => {
+    const { formatElapsed } = await loadDisplay();
+    assert.equal(formatElapsed(0), "0s");
+    assert.equal(formatElapsed(12_000), "12s");
+    assert.equal(formatElapsed(72_000), "1m 12s");
+    assert.equal(formatElapsed(242_000), "4m 02s");
+    assert.equal(formatElapsed(3_900_000), "1h 05m");
+  });
+
+  it("elapsedMs is undefined without startedAtMs and clamps clock skew to zero", async () => {
+    const { elapsedMs, createWorkflowSnapshot } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta());
+    assert.equal(elapsedMs(snap, Date.now()), undefined, "no start time → no elapsed");
+    snap.startedAtMs = 1000;
+    assert.equal(elapsedMs(snap, 2000), 1000);
+    assert.equal(elapsedMs(snap, 500), 0, "negative elapsed clamps to zero");
+  });
+});
+
+describe("renderWorkflowLines one-glance header facts", () => {
+  it("appends live elapsed to the header when startedAtMs is present", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("elapsed-run"));
+    snap.startedAtMs = Date.now() - 72_000;
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.match(text, /Workflow: elapsed-run[\s\S]*1m 12s/, "header carries the elapsed clock");
+  });
+
+  it("appends the spend-vs-budget bar when the snapshot carries a tokenBudget", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("budgeted-run"));
+    snap.tokenBudget = 100_000;
+    snap.tokenUsage = { input: 40_000, output: 2_000, total: 42_000 };
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.ok(text.includes("[████░░░░░░] 42%"), `budget bar in header, got: ${text.split("\n")[0]}`);
+  });
+
+  it("renders the canonical · marker for a queued (not-yet-started) phase", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
+    const snap = createWorkflowSnapshot(fakeMeta("t", "d", ["First", "Later"]));
+    snap.agents = [agent(1, "a1", "done", "First")] as never[];
+    snap.currentPhase = "First";
+    const text = renderWorkflowLines(snap).join("\n");
+    assert.match(text, /· Later/, "queued phase shows the canonical pending glyph");
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // deliverText — background result formatting
 // ═══════════════════════════════════════════════════════════════════════════

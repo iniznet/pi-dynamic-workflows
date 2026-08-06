@@ -17,6 +17,7 @@ import {
   fmtCost,
   fmtTokenSegment,
   formatBudgetBar,
+  formatElapsed,
   pricePerToken,
   shorten,
   statusIcon,
@@ -24,6 +25,7 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import type { PersistedRunState } from "./run-persistence.js";
 import { safeSetInterval } from "./timing.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -259,7 +261,42 @@ export function installResultDelivery(
   );
 }
 
-export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
+// ─── Elapsed clock (panel rows) ──────────────────────────────────────────────
+
+/**
+ * Wall-clock start of a run in ms: display-core's cumulative `startedAtMs`
+ * (persisted so a resumed run keeps its original start) when present, else the
+ * persisted ISO `startedAt`. Undefined when neither exists (test mocks / legacy
+ * rows) — the elapsed segment then degrades away.
+ */
+function runStartedAtMs(r: PersistedRunState): number | undefined {
+  const cumulative = (r as { startedAtMs?: number }).startedAtMs;
+  if (typeof cumulative === "number" && Number.isFinite(cumulative) && cumulative > 0) return cumulative;
+  if (typeof r.startedAt === "string" && r.startedAt) {
+    const t = Date.parse(r.startedAt);
+    if (Number.isFinite(t)) return t;
+  }
+  return undefined;
+}
+
+/**
+ * Elapsed segment for a panel row: empty while paused (the wall clock is frozen,
+ * so a growing "4m 02s" beside "⏸" would misread as progress) or when the start
+ * time is unknown.
+ */
+function runElapsedSegment(r: PersistedRunState, now: number): string {
+  if (r.status !== "running") return "";
+  const startedAtMs = runStartedAtMs(r);
+  if (startedAtMs === undefined) return "";
+  return formatElapsed(Math.max(0, now - startedAtMs));
+}
+
+export function renderPanel(
+  manager: WorkflowManager,
+  theme: Theme,
+  width?: number,
+  now: number = Date.now(),
+): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
@@ -272,8 +309,19 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const agents = (Array.isArray(rawAgents) ? rawAgents : []) as WorkflowAgentSnapshot[];
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
-    const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    // Paused runs freeze both the clock and the phase readout: name the state so
+    // the row can't misread as still progressing (the ⏸ marker stays the cue).
+    const state = r.status === "paused" ? "Paused" : (live?.snapshot.currentPhase ?? "");
+    const usage = aggregateAgentUsage(agents);
+    const meta = [
+      `${done}/${agents.length} agents`,
+      state,
+      runElapsedSegment(r, now),
+      r.status === "running" ? formatBudgetBar(usage.fresh + usage.cacheRead, r.tokenBudget) : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return `  ${icon} ${r.workflowName}  ${meta}`;
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -459,6 +507,7 @@ export function renderPanelDetailed(
     const meta = [
       `${done}/${agents.length} agents`,
       snap?.currentPhase || "",
+      runElapsedSegment(r, now),
       fmtTokenSegment(runUsage, fmtTokensShort),
       spentCost !== undefined ? (finalizedCost !== undefined ? fmtCost(spentCost) : `~${fmtCost(spentCost)}`) : "",
       formatBudgetBar(spentTokens, r.tokenBudget),
@@ -570,7 +619,10 @@ export function installTaskPanel(
       // when an agent stalls. Gated + unref'd so it costs nothing when idle.
       // Gated + unref'd so it costs nothing when idle; cleared on dispose.
       const timer = safeSetInterval(() => {
-        if (settings().progressPanelMode === "detailed" && hasActiveRun()) tui.requestRender();
+        // Both panel modes now carry a live elapsed readout, so the 2s tick that
+        // once refreshed only the detailed token rate must also repaint the
+        // compact panel — otherwise its clock freezes between manager events.
+        if (hasActiveRun()) tui.requestRender();
       }, 2000);
       timer.unref();
       // Purely informational: it lists running runs and re-renders on events. To
