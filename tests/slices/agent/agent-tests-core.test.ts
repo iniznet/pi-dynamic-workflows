@@ -143,9 +143,12 @@ test("resolveAgentModelSpec: tier resolves from config when no explicit model", 
   assert.equal(resolveAgentModelSpec({ tier: "big" }, "main/model", loadCfg), "vendor/big");
 });
 
-test("resolveAgentModelSpec: unconfigured tier falls back to the main model", () => {
+test("resolveAgentModelSpec: unconfigured tier (no config file) degrades to the main model", () => {
   assert.equal(resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg), "main/model");
-  assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
+});
+
+test("resolveAgentModelSpec: a tier key absent from the loaded config returns undefined — never the main model (billing guard)", () => {
+  assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), undefined);
 });
 
 test("resolveAgentModelSpec: a tier configured to inherit:main resolves to the session's main model (G6)", () => {
@@ -158,9 +161,9 @@ test("resolveAgentModelSpec: a tier configured to inherit:main resolves to the s
   );
 });
 
-test("resolveAgentModelSpec: an unknown tier name still falls back to the main model even when a sibling tier uses inherit:main", () => {
+test("resolveAgentModelSpec: an unknown tier name resolves to undefined even when a sibling tier uses inherit:main", () => {
   const cfg = () => ({ tiers: { small: "vendor/small", big: "inherit:main" } });
-  assert.equal(resolveAgentModelSpec({ tier: "doesnotexist" }, "session/main-model", cfg), "session/main-model");
+  assert.equal(resolveAgentModelSpec({ tier: "doesnotexist" }, "session/main-model", cfg), undefined);
 });
 
 test("resolvePromptAwareTier: classifies the prompt and picks the fitting tier from the ranked registry (i3)", () => {

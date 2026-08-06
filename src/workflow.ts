@@ -3294,7 +3294,13 @@ function resolveRoutingModelSignature(
   if (explicitModel) return explicitModel;
   const config = loadConfig();
   if (options.tier) {
-    return (config ? resolveTierModel(options.tier, config) : undefined) ?? mainModel;
+    if (!config) return mainModel;
+    // Mirror the live split in resolveAgentModelSpec: a missing tier KEY is a
+    // config error (run() throws MODEL_NOT_FOUND), so the replay hash must
+    // encode undefined — not mainModel — or a stale journaled result would
+    // replay a call the live path refuses. inherit:main still resolves to
+    // mainModel (passed through), matching live resolution.
+    return resolveTierModel(options.tier, config, mainModel);
   }
   // Untagged agent with a tier config present: the session routes it through
   // the configured default ("medium") tier, so include that resolved model so

@@ -326,21 +326,27 @@ export function resolveAgentModelSpec(
   if (options.model) return options.model;
   const config = loadConfig();
   if (options.tier) {
-    // Tier requested but unconfigured → it silently falls back to mainModel.
-    // Let the caller surface that (once) so the no-op is discoverable. When a
-    // prompt is available, prefer a prompt-aware default (classify the task
-    // against the available models) so a "small" scan and a "big" synthesis
-    // stay distinct instead of both collapsing onto mainModel.
+    // Tier requested but unconfigured (no model-tiers.json at all) → degrade
+    // to mainModel; the caller surfaces that (once) so the no-op is
+    // discoverable. When a prompt is available, prefer a prompt-aware default
+    // (classify the task against the available models) so a "small" scan and a
+    // "big" synthesis stay distinct instead of both collapsing onto mainModel.
+    // A CONFIGURED config whose tier KEY is missing is NOT this case — that is
+    // a config error the caller throws on (run()'s tier guard), so a user-
+    // pinned tier can never silently bill the main agent's model.
     if (!config) {
       onTierWithoutConfig?.(options.tier);
       if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel));
+      return mainModel;
     }
     // An "inherit:main" configured tier resolves to the session's main model
     // INSIDE resolveTierModel (PRD Task 3) — passing mainModel through is what
     // makes the sentinel mean "active chat session model" instead of leaking a
-    // literal spec to the registry. Any other unresolved tier falls back to
-    // mainModel here, as before.
-    return (config ? resolveTierModel(options.tier, config, mainModel) : undefined) ?? mainModel;
+    // literal spec to the registry. A tier whose KEY is absent from the loaded
+    // config returns undefined here (never mainModel), so run()'s tier guard
+    // throws a named MODEL_NOT_FOUND instead of silently billing the main
+    // agent's model for a call the user pinned to a configured tier.
+    return resolveTierModel(options.tier, config, mainModel);
   }
   // Untagged agent: default to the configured medium tier when one exists.
   if (config) {
@@ -1269,6 +1275,18 @@ export class WorkflowAgent {
     //     instead of failing every untagged agent in the run — but the degrade
     //     still needs to be loud (onModelFallback), not a silent continuation.
     const isExplicitRequest = Boolean(options.model || options.tier);
+    // A tier whose KEY is absent from the loaded model-tiers.json is a config
+    // error, not a degrade: resolveAgentModelSpec returns undefined for the
+    // key-miss (instead of silently substituting mainModel), so surface it as
+    // a hard, named error. The untagged/implicit-medium path (options.tier
+    // unset) keeps its designed degrade to the session default below.
+    if (options.tier && modelSpec === undefined) {
+      throw new WorkflowError(
+        `tier "${options.tier}" is not configured in model-tiers.json; add it with /workflows-models`,
+        WorkflowErrorCode.MODEL_NOT_FOUND,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
