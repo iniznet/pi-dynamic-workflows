@@ -108,6 +108,16 @@ export interface JournalEntry {
   hash: string;
   result: unknown;
   /**
+   * The model this agent actually ran on (resolved after onModelResolved).
+   * Persisted so a resume replay can report the REAL model instead of
+   * re-deriving displayModel = modelSpec ?? mainModel — for untagged agents
+   * that fallback is the session's main model, which fabricates a wrong
+   * model label on replayed agents (e.g. a tier-routed run showing the main
+   * agent's model). Absent on legacy entries; replay falls back to
+   * displayModel when missing.
+   */
+  model?: string;
+  /**
    * Per-agent write delta (keys set by this agent) for additive replay on resume.
    * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
    * deltas in callSeq order accumulates all agents' writes correctly regardless of
@@ -1246,10 +1256,6 @@ export async function runWorkflow<T = unknown>(
     const explicitModel = agentOptions.model ?? agentDef?.model;
     const modelSpec =
       explicitModel ?? (agentOptions.tier ? undefined : resolveModelForPhase(assignedPhase, routingConfig));
-    // For display in /workflows: the model this agent runs on — its explicit/phase
-    // spec, else the session's main model. The real resolved id overrides this via
-    // onModelResolved once the subagent session is created.
-    let displayModel = modelSpec ?? options.mainModel;
 
     // Deterministic resume key: assigned at lexical call time, before the limiter,
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
@@ -1262,6 +1268,18 @@ export async function runWorkflow<T = unknown>(
       options.mainModel,
       loadTierConfig,
     );
+
+    // For display in /workflows: the model this agent runs on — its explicit/
+    // phase/tier spec, else the session's main model. tierModel encodes the
+    // deterministic tier-config resolution (explicit > configured tier > default
+    // medium tier), so seeding with it means a tier-routed agent shows its real
+    // tier model even BEFORE the session resolves — and, critically, before
+    // journal/onAgentEnd capture it (the tier model the agent actually billed).
+    // The real resolved id overrides this via onModelResolved once the subagent
+    // session is created (an explicit model spec or registry-driven override
+    // wins there).
+    let displayModel = tierModel ?? modelSpec ?? options.mainModel;
+
     const callHash = hashAgentCall(
       prompt,
       modelSpec,
@@ -1307,12 +1325,19 @@ export async function runWorkflow<T = unknown>(
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+      // Report the model the agent ACTUALLY ran on in the original run when
+      // the journal recorded it — never re-derive displayModel here, because
+      // for an untagged agent that fallback is the session's main model and
+      // would fabricate a wrong label (e.g. a tier-routed run showing the
+      // main agent's model). Legacy entries without `model` degrade to the
+      // old displayModel behavior.
+      const replayModel = cached.model ?? displayModel;
       safeCallback("onAgentStart", options.onAgentStart, {
         id: deltaKey,
         label,
         phase: assignedPhase,
         prompt,
-        model: displayModel,
+        model: replayModel,
       });
       safeCallback("onAgentEnd", options.onAgentEnd, {
         id: deltaKey,
@@ -1320,7 +1345,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         result: cached.result,
         tokens: 0,
-        model: displayModel,
+        model: replayModel,
       });
       // E2: buffer this agent's write delta for commit-order application instead
       // of applying it at cache-hit time — applying here would replay in callSeq
@@ -1363,6 +1388,10 @@ export async function runWorkflow<T = unknown>(
         label,
         phase: assignedPhase,
         prompt,
+        // displayModel is already seeded with the deterministic tier resolution
+        // (explicit > configured tier > default medium tier > mainModel), so a
+        // running agent shows the real tier model instead of the main-model
+        // fallback until onModelResolved fires.
         model: displayModel,
       });
 
@@ -1635,6 +1664,13 @@ export async function runWorkflow<T = unknown>(
               runId,
               hash: callHash,
               result,
+              // displayModel at this point is the REAL resolved model —
+              // onModelResolved overwrote the initial modelSpec ?? mainModel
+              // fallback before the agent session was created (see run's
+              // onModelResolved). Persisting it lets resume replay report the
+              // model actually billed instead of re-deriving the main-model
+              // fallback for untagged agents.
+              model: displayModel,
               storeDelta: storeCommit.delta,
               storeCommitSeq: storeCommit.seq,
               // Typed operation traces for this call (absent when the runner

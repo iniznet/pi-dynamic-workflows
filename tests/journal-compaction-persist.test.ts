@@ -87,6 +87,7 @@ test("loadPersistedJournal reconstructs a compacted journal and passes plain/abs
     hashes: ["h0"],
     opTraces: [],
     results: ["replayed-result"],
+    models: [],
     storeDeltas: [],
     records: [{ fold: "resolved" as const, index: 0, runId: "run-x", hashRef: 0, resultRef: 0 }],
   };

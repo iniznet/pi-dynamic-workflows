@@ -579,6 +579,54 @@ return { a }`;
   assert.equal(second.state.calls, 1, "a default-tier model change must invalidate the untagged agent's cached result");
 });
 
+test("journal persists the resolved model; resume replay reports it, not the main-model fallback", async () => {
+  // The user-visible defect: an untagged agent (routed through the configured
+  // medium tier) ran on model-m, but a resume replay re-derived displayModel =
+  // modelSpec ?? mainModel and stamped the replayed agent with the SESSION
+  // main model instead of the tier model it actually billed. The journal must
+  // persist the resolved model so replay reports the truth.
+  const script = `export const meta = { name: 'journal_model', description: 'journal model' }
+const a = await agent('untagged task', { label: 'u' })
+return { a }`;
+  const loadTierConfig = () => ({ tiers: { small: "model-a", medium: "model-m", big: "model-b" } });
+
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "journal-model-run",
+    mainModel: "main-model",
+    loadTierConfig,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 1);
+  assert.equal(journal[0].model, "model-m", "journal records the tier model the agent actually ran on");
+
+  // Resume with a DIFFERENT main model. The untagged call's hash includes the
+  // resolved tierModel (non-null), so it replays despite the mainModel change.
+  // Before the fix, replay emitted displayModel = mainModel = the NEW session
+  // main model — fabricating a wrong model label on a cache hit.
+  const seenModels: Array<string | undefined> = [];
+  const second = countingAgent();
+  await runWorkflow(script, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "journal-model-run",
+    mainModel: "different-main-model",
+    loadTierConfig,
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+    onAgentStart: (e) => seenModels.push(e.model),
+    onAgentEnd: (e) => seenModels.push(e.model),
+  });
+  assert.equal(second.state.calls, 0, "unchanged tier config keeps the cached result");
+  assert.deepEqual(
+    seenModels,
+    ["model-m", "model-m"],
+    "replay reports the journaled tier model, not the main-model fallback",
+  );
+});
+
 const threeCallScript = `export const meta = { name: 'prefix', description: 'prefix resume' }
 const a = await agent('A', { label: 'a' })
 const b = await agent('B', { label: 'b' })

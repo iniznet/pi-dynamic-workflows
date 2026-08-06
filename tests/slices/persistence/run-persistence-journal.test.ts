@@ -440,6 +440,7 @@ test(
         hashes: ["h0"],
         opTraces: [],
         results: [{ key }],
+        models: [],
         storeDeltas: [],
         records: [{ fold: "resolved", index: 0, runId, hashRef: 0, resultRef: 0 }],
       },

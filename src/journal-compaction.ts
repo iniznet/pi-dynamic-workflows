@@ -54,6 +54,8 @@ export type CompactJournalRecord =
       hashRef: number;
       /** Index into summary.results. */
       resultRef: number;
+      /** Index into summary.models; absent when the original had no model. */
+      modelRef?: number;
       /** Index into summary.storeDeltas; absent when the original had no delta. */
       storeDeltaRef?: number;
       /** E2 commit ordinal; absent when the original had none (legacy entries). */
@@ -84,6 +86,8 @@ export interface CompactJournalSummary {
   opTraces: OperationTrace[][];
   /** Distinct results, in first-seen order (JSON.stringify-keyed). */
   results: unknown[];
+  /** Distinct resolved models, in first-seen order. */
+  models: string[];
   /** Distinct store deltas, in first-seen order (JSON.stringify-keyed). */
   storeDeltas: Record<string, unknown>[];
   /** Per-entry records, in the original journal's order. */
@@ -110,10 +114,12 @@ export function compactJournal(entries: JournalEntry[]): CompactJournalSummary {
   const hashes: string[] = [];
   const opTraces: OperationTrace[][] = [];
   const results: unknown[] = [];
+  const models: string[] = [];
   const storeDeltas: Record<string, unknown>[] = [];
   const hashRefs = new Map<string, number>();
   const traceRefs = new Map<string, number>();
   const resultRefs = new Map<string, number>();
+  const modelRefs = new Map<string, number>();
   const deltaRefs = new Map<string, number>();
 
   const intern = <T>(values: T[], refs: Map<string, number>, value: T): number => {
@@ -135,6 +141,7 @@ export function compactJournal(entries: JournalEntry[]): CompactJournalSummary {
         ...(entry.runId !== undefined ? { runId: entry.runId } : {}),
         hashRef: intern(hashes, hashRefs, entry.hash),
         resultRef: intern(results, resultRefs, entry.result),
+        ...(entry.model !== undefined ? { modelRef: intern(models, modelRefs, entry.model) } : {}),
         ...(entry.storeDelta !== undefined ? { storeDeltaRef: intern(storeDeltas, deltaRefs, entry.storeDelta) } : {}),
         ...(entry.storeCommitSeq !== undefined ? { storeCommitSeq: entry.storeCommitSeq } : {}),
         ...(entry.operations !== undefined ? { opRef: intern(opTraces, traceRefs, entry.operations) } : {}),
@@ -150,6 +157,7 @@ export function compactJournal(entries: JournalEntry[]): CompactJournalSummary {
     hashes,
     opTraces,
     results,
+    models,
     storeDeltas,
     records,
   };
@@ -173,6 +181,7 @@ export function reconstructJournal(summary: CompactJournalSummary): JournalEntry
       ...(record.runId !== undefined ? { runId: record.runId } : {}),
       hash: summary.hashes[record.hashRef],
       result: summary.results[record.resultRef],
+      ...(record.modelRef !== undefined ? { model: summary.models[record.modelRef] } : {}),
       ...(record.storeDeltaRef !== undefined ? { storeDelta: summary.storeDeltas[record.storeDeltaRef] } : {}),
       ...(record.storeCommitSeq !== undefined ? { storeCommitSeq: record.storeCommitSeq } : {}),
       ...(record.opRef !== undefined ? { operations: summary.opTraces[record.opRef] } : {}),
