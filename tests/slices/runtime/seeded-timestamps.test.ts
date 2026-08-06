@@ -45,19 +45,23 @@ return { a, b }`;
     promise.catch(() => {});
     for (let i = 0; i < 200 && bCalls === 0; i++) await new Promise((r) => setTimeout(r, 10));
     assert.equal(bCalls, 1, "first 'b' is in flight before pausing");
-    // Let 'a' finish and persist its real timestamps, then pause mid-'b'.
-    for (let i = 0; i < 200 && !manager.getPersistence().load(runId)?.agents.length; i++) {
+    // Let 'a' finish in memory (its journal entry lands on completion), then
+    // pause. NOTE: the fast path (journal-delta sidecar) means the PRIMARY's
+    // agents array only lands at a boundary write — so 'a''s real timestamps
+    // are read from the pause write, not from a pre-pause progress write that
+    // never touches the primary.
+    for (let i = 0; i < 200 && !(manager.getRun(runId)?.journal.length ?? 0); i++) {
       await new Promise((r) => setTimeout(r, 10));
     }
+    assert.ok((manager.getRun(runId)?.journal.length ?? 0) > 0, "'a' completed in memory before pausing");
+    assert.equal(manager.pause(runId), true);
+    await new Promise((r) => setTimeout(r, 30));
     const before = manager.getPersistence().load(runId);
     const beforeA = before?.agents.find((ag) => ag.label === "a");
-    assert.ok(beforeA, "'a' persisted before the pause");
+    assert.ok(beforeA, "'a' persisted at the pause boundary");
     const originalStartedAt = beforeA?.startedAt;
     const originalEndedAt = beforeA?.endedAt;
     assert.ok(originalStartedAt, "'a' has a real persisted startedAt");
-
-    assert.equal(manager.pause(runId), true);
-    await new Promise((r) => setTimeout(r, 30));
 
     // Resume with a fast 'b': 'a' replays from the journal (cache hit), 'b' runs live.
     const resumed = await manager.resume(runId);

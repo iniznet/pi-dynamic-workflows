@@ -387,8 +387,20 @@ export function summarizeAgents(
   for (const agent of live?.agents ?? []) {
     liveByCallId.set(agent.callId ?? journalEntryKey(run.runId, agent.id), agent);
   }
+  // The persisted run.agents array can LAG the live snapshot while a run is
+  // mid-flight: throttled progress writes go through the journal-delta fast
+  // path, which appends ONLY the journal sidecar — the agents array lands at
+  // the next lifecycle-boundary write. Merge live-only agents (same callId
+  // keying as the overlay below) so the inventory never under-reports a run
+  // that is genuinely executing.
+  const merged: Array<WorkflowAgentSnapshot & { startedAt?: string; endedAt?: string }> = [...run.agents];
+  const persistedCallIds = new Set(merged.map((a) => a.callId ?? journalEntryKey(run.runId, a.id)));
+  for (const agent of live?.agents ?? []) {
+    const callId = agent.callId ?? journalEntryKey(run.runId, agent.id);
+    if (!persistedCallIds.has(callId)) merged.push(agent);
+  }
   const summaries: AgentSummary[] = [];
-  for (const agent of run.agents) {
+  for (const agent of merged) {
     const callId = agent.callId ?? journalEntryKey(run.runId, agent.id);
     if (agentId !== undefined && callId !== agentId && String(agent.id) !== agentId) continue;
     const liveAgent = liveByCallId.get(callId);

@@ -245,6 +245,14 @@ export interface RunPersistenceSaveOptions {
    * checkpoint. Only valid for resumable statuses; ignored otherwise.
    */
   fastPath?: boolean;
+  /**
+   * Skip the journal byte-budget enforcement (capJournalBudget — a full-journal
+   * stringify plus binary-search truncation) for this write. Throttled progress
+   * writes (fastPath) pass false so the hot path stays stringify-free; the
+   * count gate (JOURNAL_BYTE_CHECK_THRESHOLD) and the binary-search truncation
+   * still run on every lifecycle/terminal write (the default).
+   */
+  checkBudget?: boolean;
 }
 
 export interface RunPersistence {
@@ -645,6 +653,11 @@ export function createRunPersistence(
   };
 
   const deleteRunFiles = (runId: string): boolean => {
+    // S1-4: drop the per-run in-memory folded-journal map with the files — a
+    // deleted run's entries must not leak memory, and a stale map for a reused
+    // runId would make the fast path skip real deltas (foldedByRun is the
+    // "already on disk" memory, so it must never outlive the files it tracks).
+    foldedByRun.delete(runId);
     let deleted = false;
     for (const path of candidateRunPaths(runId)) {
       const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
@@ -741,10 +754,15 @@ export function createRunPersistence(
   };
 
   // Serialize once; scrub secrets only when the serialized form actually
-  // contains a secret pattern (the common path stays single-stringify).
+  // contains a secret pattern (the common path stays single-stringify). The
+  // hint-gate keeps the scanner-only patterns (JWT/KEY=value) out of the
+  // backtracking-prone union while still detecting them linearly: a multi-MB
+  // journal with long homogeneous runs is exactly where a naive union test
+  // would stall (ReDoS-class), so the precheck never scans a blob that cannot
+  // contain those patterns.
   const serializeRedacted = (state: PersistedRunState): string => {
     const json = JSON.stringify(state, null, 2);
-    if (!SECRET_DETECTION_RE.test(json)) return json;
+    if (!SECRET_DETECTION_RE.test(json) && !SCANNER_PATTERN_HINT_RE.test(json) && !json.includes(".")) return json;
     return JSON.stringify(redactSecrets(JSON.parse(json) as PersistedRunState), null, 2);
   };
 
@@ -824,19 +842,30 @@ export function createRunPersistence(
    * still preserving merges.
    *
    * E4 opts: `backup` gates the .bak sidecar (only boundary writes keep it),
-   * and `foldSidecar` gates the journal-delta fold: a full write merges the
+   * `foldSidecar` gates the journal-delta fold: a full write merges the
    * sidecar deltas (via parseFreshest) into the primary, then clears the
    * sidecar — guarded by a byte re-check so a cross-process fast-path
-   * appender's newer deltas are never cleared unmerged.
+   * appender's newer deltas are never cleared unmerged. `checkBudget` gates
+   * the journal byte-budget enforcement (default true): the throttled
+   * fast-path fold passes false so the hot path stays stringify-free; every
+   * lifecycle/terminal write keeps it.
+   *
+   * S1-4c: the write itself is deliberately SYNCHRONOUS (writeFileSync +
+   * read-back verification). The CAS read/verify/rename sequence is
+   * inherently synchronous — resume() and every list()/load() immediately
+   * after a settle must observe the written bytes — so the terminal-boundary
+   * stall is bounded by reducing the PAYLOAD (per-agent detail retention
+   * cap, S1-4b) rather than by asynchronizing the write.
    */
   const casWrite = (
     runId: string,
     produce: (current: PersistedRunState | null) => PersistedRunState,
     requireExisting = false,
-    opts: { backup?: boolean; foldSidecar?: boolean } = {},
+    opts: { backup?: boolean; foldSidecar?: boolean; checkBudget?: boolean } = {},
   ): PersistedRunState | null => {
     const backup = opts.backup ?? true;
     const foldSidecar = opts.foldSidecar ?? true;
+    const checkBudget = opts.checkBudget !== false;
     ensureDir();
     const path = primaryRunPath(runId);
     let last: PersistedRunState | undefined;
@@ -850,8 +879,13 @@ export function createRunPersistence(
       next.schemaVersion = RUN_STATE_SCHEMA_VERSION;
       // Journal byte budget: bounded disk writes on huge runs. The count check
       // is cheap, so the (stringify-heavy) byte check only runs when it can
-      // matter — typical runs never pay for it.
-      if (next.journal && next.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
+      // matter — typical runs never pay for it — and the throttled fast-path
+      // fold (checkBudget=false) skips it entirely so the hot path stays
+      // stringify-free. Lifecycle/terminal writes keep full enforcement + the
+      // binary-search truncation, and the manager truncates the in-memory
+      // journal BEFORE its compaction fold so a pathological journal never
+      // reaches this merge untruncated.
+      if (checkBudget && next.journal && next.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
         next.journal = capJournalBudget(next.journal, DEFAULT_JOURNAL_BYTE_BUDGET);
       }
       last = next;
@@ -886,7 +920,12 @@ export function createRunPersistence(
           runId,
           new Map((next.journal ?? []).map((e) => [journalEntryKey(e.runId ?? runId, e.index), e])),
         );
-        invalidateListCache();
+        // S1-5: invalidate the list cache only when this write changed the run's
+        // status (or when retention evicted files below) — NOT on every write, so
+        // the 300ms TTL cache stays warm across same-status throttled progress
+        // folds. Terminal writes always transition and therefore always
+        // invalidate; delete/rename invalidate via their own paths.
+        if (current?.status !== next.status) invalidateListCache();
         if (TERMINAL_RUN_STATUSES.has(next.status)) enforceRetention();
         return next;
       }
@@ -906,7 +945,7 @@ export function createRunPersistence(
     const finalNext = produce(finalCurrent);
     finalNext.updatedAt = new Date().toISOString();
     finalNext.schemaVersion = RUN_STATE_SCHEMA_VERSION;
-    if (finalNext.journal && finalNext.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
+    if (finalNext.journal && checkBudget && finalNext.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
       finalNext.journal = capJournalBudget(finalNext.journal, DEFAULT_JOURNAL_BYTE_BUDGET);
     }
     writeJsonAtomicWithBackup(fs, path, finalNext);
@@ -918,7 +957,8 @@ export function createRunPersistence(
       runId,
       new Map((finalNext.journal ?? []).map((e) => [journalEntryKey(e.runId ?? runId, e.index), e])),
     );
-    invalidateListCache();
+    // S1-5: same status-transition-only invalidation rule as the main path.
+    if (finalCurrent?.status !== finalNext.status) invalidateListCache();
     if (TERMINAL_RUN_STATUSES.has(finalNext.status)) enforceRetention();
     return finalNext;
   };
@@ -940,7 +980,7 @@ export function createRunPersistence(
    * journalDeltaCheckpointBytes — a full CAS write (with .bak) that folds
    * the sidecar into the primary.
    */
-  const saveFastPath = (state: PersistedRunState): void => {
+  const saveFastPath = (state: PersistedRunState, opts?: RunPersistenceSaveOptions): void => {
     ensureDir();
     const runId = state.runId;
     const journal = state.journal as JournalEntry[];
@@ -968,15 +1008,28 @@ export function createRunPersistence(
       for (const e of delta) byKey.set(journalEntryKey(e.runId ?? runId, e.index), e);
       const sidecar = [...byKey.values()];
       if (JSON.stringify(sidecar).length > journalDeltaCheckpointBytes) {
-        // Periodic full checkpoint: fold everything into the primary now.
-        casWrite(runId, (current) => {
-          return {
-            ...(current ?? {}),
-            ...state,
-            checkpoints: mergeCheckpoints(current?.checkpoints, state.checkpoints),
-            journal: mergeJournalFields(current, state),
-          };
-        });
+        // Periodic full checkpoint: fold everything into the primary now. The
+        // budget check stays off (opts.checkBudget === false from the throttled
+        // caller) — this is still a progress write, not a lifecycle boundary.
+        casWrite(
+          runId,
+          (current) => {
+            return {
+              ...(current ?? {}),
+              ...state,
+              checkpoints: mergeCheckpoints(current?.checkpoints, state.checkpoints),
+              journal: mergeJournalFields(current, state),
+              // The incoming state is authoritative for the journal's on-disk
+              // form — a plain-journal fold REPLACES a stale compacted summary
+              // (never both: loadPersistedJournal prefers the compacted form,
+              // so a surviving summary would shadow the folded delta entries
+              // and lose them on resume). An explicit summary is kept.
+              journalCompacted: state.journalCompacted,
+            };
+          },
+          false,
+          { checkBudget: opts?.checkBudget },
+        );
         return;
       }
       writeJournalDelta(runId, sidecar);
@@ -993,7 +1046,7 @@ export function createRunPersistence(
         // E4 fast path (throttled progress write): append only the journal
         // delta to the `.jdelta` sidecar — no primary rewrite, no .bak — and
         // fold into a full checkpoint once the sidecar passes the threshold.
-        saveFastPath(state);
+        saveFastPath(state, opts);
         return;
       }
       // Compare-and-swap: the incoming state is layered onto the freshest
@@ -1003,14 +1056,24 @@ export function createRunPersistence(
       // while letting the caller's own entries win per (runId, index).
       // Boundary writes (start/pause/checkpoint/failed/complete) fold the
       // journal-delta sidecar into the primary and keep the .bak sidecar.
-      casWrite(state.runId, (current) => {
-        return {
-          ...(current ?? {}),
-          ...state,
-          checkpoints: mergeCheckpoints(current?.checkpoints, state.checkpoints),
-          journal: mergeJournalFields(current, state),
-        };
-      });
+      casWrite(
+        state.runId,
+        (current) => {
+          return {
+            ...(current ?? {}),
+            ...state,
+            checkpoints: mergeCheckpoints(current?.checkpoints, state.checkpoints),
+            journal: mergeJournalFields(current, state),
+            // Same never-both rule as the fast-path fold: a boundary write that
+            // carries a plain journal (or drops it on a terminal status) must
+            // clear any stale compacted summary from a prior write instead of
+            // letting it shadow the journal on load.
+            journalCompacted: state.journalCompacted,
+          };
+        },
+        false,
+        { checkBudget: opts?.checkBudget },
+      );
     },
 
     load(runId: string): PersistedRunState | null {
@@ -1053,6 +1116,9 @@ export function createRunPersistence(
       try {
         return deleteRunFiles(runId);
       } finally {
+        // S1-4: belt-and-suspenders — the public delete path must never leave a
+        // folded-journal map behind even if deleteRunFiles' shape changes.
+        foldedByRun.delete(runId);
         invalidateListCache();
       }
     },
@@ -1215,14 +1281,148 @@ export function migrateRunState(raw: unknown): PersistedRunState {
 // keys, env-var assignments, bearer/basic auth, JWTs, and PEM blocks. Each
 // replacement is JSON-safe inside a string (no quotes/backslashes), so
 // redaction can run on the serialized form without ever corrupting it.
+//
+// The JWT and KEY=value patterns are NOT regexes here: their natural regex
+// forms (`[A-Za-z0-9_-]{20,}\.` and `[A-Za-z0-9_-]{1,}(?:...|KEY|...)`)
+// backtrack O(n²) on long homogeneous runs, which a multi-MB journal turns
+// into a ReDoS-class event-loop stall — exactly the big-run CPU spike this
+// audit fixes. They are handled by the linear single-pass scanner
+// (redactPathologicalRules) below, which visits every char exactly once.
+//
+// Char-code helpers so the scanner never pays a per-char regex call.
+const isWordChar = (code: number): boolean =>
+  (code >= 65 && code <= 90) || // A-Z
+  (code >= 97 && code <= 122) || // a-z
+  (code >= 48 && code <= 57) || // 0-9
+  code === 95 || // _
+  code === 45; // -
+const isLetter = (code: number): boolean => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+const isBlank = (code: number): boolean => code === 32 || code === 9 || code === 10 || code === 13 || code === 12; // space \t \n \r \f
+
+// Keyword suffixes matched by the KEY=value scanner rule (case-sensitive, like
+// the original regex). Order is irrelevant — the scanner checks each per token.
+const SCANNER_KEYWORDS = [
+  "API_KEY",
+  "APIKEY",
+  "KEY",
+  "TOKEN",
+  "SECRET",
+  "PASSWORD",
+  "PASSWD",
+  "CREDENTIALS",
+  "CREDENTIAL",
+  "AUTH",
+  "BEARER",
+] as const;
+
+/**
+ * Linear single-pass redactor for the JWT-like and KEY=value patterns (see
+ * REDACTION_RULES note — the regex forms are O(n²) on long runs). Every char
+ * is visited exactly once; word tokens pay only a bounded keyword check.
+ *
+ * JWT rule (replaces a dot token of 3+ segments with ≥20 [A-Za-z0-9_-] each):
+ *   `aaaa...bbbb...cccc` → `[REDACTED]`
+ * KEY=value rule (replaces `IDENT <sep> value` where IDENT ends in a keyword
+ * suffix, replicating the original regex's matching semantics exactly):
+ *   `OPENAI_API_KEY = sk-1234` → `OPENAI_API_KEY=[REDACTED]`
+ */
+function redactPathologicalRules(text: string): string {
+  const n = text.length;
+  let out = "";
+  let i = 0;
+  while (i < n) {
+    // Copy the next non-word run wholesale (fast path for JSON structure).
+    const start = i;
+    while (i < n && !isWordChar(text.charCodeAt(i))) i++;
+    if (i > start) out += text.slice(start, i);
+    if (i >= n) break;
+    // Consume a maximal word run, allowing single dots between word chars so
+    // the whole dot token is one unit (the JWT shape).
+    let j = i;
+    while (j < n) {
+      const code = text.charCodeAt(j);
+      if (isWordChar(code)) {
+        j++;
+      } else if (code === 46 && j + 1 < n && isWordChar(text.charCodeAt(j + 1))) {
+        j++; // internal dot between two word chars stays part of the token
+      } else {
+        break;
+      }
+    }
+    const token = text.slice(i, j);
+    // JWT rule first (original rule order — a KEY=value pair whose value is a
+    // JWT must redact the value, not the whole assignment).
+    const segments = token.split(".");
+    if (segments.length >= 3 && segments.every((segment) => segment.length >= 20)) {
+      out += "[REDACTED]";
+      i = j;
+      continue;
+    }
+    // KEY=value rule: IDENT ending in `_?` + keyword, then optional
+    // ws/quotes/ws, `:` or `=`, optional ws/quotes/ws, then a ≥1-char value.
+    if (isLetter(token.charCodeAt(0)) && token.length >= 2) {
+      let keywordHit = false;
+      for (const keyword of SCANNER_KEYWORDS) {
+        // Faithful to the original: the identifier is `[A-Za-z]` + `[A-Za-z0-9_-]{1,}`
+        // + optional `_` + keyword — at least 2 chars before the keyword suffix
+        // (the `_` counts in the prefix, so `_KEY`-suffixed identifiers are
+        // covered by the plain endsWith check too).
+        if (token.endsWith(keyword) && token.length - keyword.length >= 2) {
+          keywordHit = true;
+          break;
+        }
+      }
+      if (keywordHit) {
+        let k = j;
+        const skipBlanks = () => {
+          while (k < n && isBlank(text.charCodeAt(k))) k++;
+        };
+        skipBlanks();
+        if (k < n && (text[k] === '"' || text[k] === "'")) {
+          k++;
+          skipBlanks();
+        }
+        if (k < n && (text[k] === ":" || text[k] === "=")) {
+          k++;
+          skipBlanks();
+          if (k < n && (text[k] === '"' || text[k] === "'")) {
+            k++;
+            skipBlanks();
+          }
+          // Value: ≥1 char of [^\s,;'"}].
+          const valueStart = k;
+          while (k < n) {
+            const code = text.charCodeAt(k);
+            if (
+              !isBlank(code) &&
+              code !== 44 && // ,
+              code !== 59 && // ;
+              code !== 39 && // '
+              code !== 34 && // "
+              code !== 125 // }
+            ) {
+              k++;
+            } else {
+              break;
+            }
+          }
+          if (k > valueStart) {
+            out += `${token}=[REDACTED]`;
+            i = k;
+            continue;
+          }
+        }
+      }
+    }
+    out += token;
+    i = j;
+  }
+  return out;
+}
+
 const REDACTION_RULES: ReadonlyArray<{ re: RegExp; replace: string }> = [
   { re: /-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----/g, replace: "[REDACTED]" },
-  { re: /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/g, replace: "[REDACTED]" },
   { re: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g, replace: "$1 [REDACTED]" },
-  {
-    re: /\b([A-Za-z][A-Za-z0-9_-]{1,}(?:_?(?:API_KEY|APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|BEARER)))\b\s*["']?\s*[:=]\s*["']?([^\s,;'"}]+)/g,
-    replace: "$1=[REDACTED]",
-  },
   { re: /\b(?:sk-ant-|sk-)[A-Za-z0-9_-]{8,}/g, replace: "[REDACTED]" },
   { re: /\bgh[pousr]_[A-Za-z0-9]{20,}/g, replace: "[REDACTED]" },
   { re: /\bgithub_pat_[A-Za-z0-9_]{20,}/g, replace: "[REDACTED]" },
@@ -1232,12 +1432,24 @@ const REDACTION_RULES: ReadonlyArray<{ re: RegExp; replace: string }> = [
 ];
 
 // Non-global union used to decide whether a serialized state needs scrubbing
-// at all — the common (secret-free) persist path stays single-stringify.
+// at all — the common (secret-free) persist path stays single-stringify. Only
+// the linear literal-prefixed rules live here; the scanner patterns are hinted
+// separately below (including them in the union would reintroduce the
+// backtracking that the scanner exists to avoid).
 const SECRET_DETECTION_RE = new RegExp(REDACTION_RULES.map((rule) => rule.re.source).join("|"));
+
+/**
+ * Linear hint for the scanner-only patterns (JWT dot-tokens, KEY=value pairs):
+ * presence of a keyword suffix OR of a `.`. Both are cheap linear checks; a
+ * false positive only costs the (linear) scrub, and neither can false-negative
+ * the scanner's own preconditions (a JWT always contains a `.`; a KEY=value
+ * pair always contains a keyword suffix).
+ */
+const SCANNER_PATTERN_HINT_RE = /\b(?:API_KEY|APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|BEARER)\b/;
 
 /** Mask provider API keys/secrets inside a single string. */
 export function redactText(text: string): string {
-  let out = text;
+  let out = redactPathologicalRules(text);
   for (const rule of REDACTION_RULES) out = out.replace(rule.re, rule.replace);
   return out;
 }
@@ -1299,7 +1511,13 @@ export const DEFAULT_JOURNAL_DELTA_CHECKPOINT_BYTES = 1024 * 1024;
  */
 export const DEFAULT_JOURNAL_BYTE_BUDGET = 32 * 1024 * 1024;
 
-const JOURNAL_BYTE_CHECK_THRESHOLD = 10_000;
+/**
+ * Entry-count gate below which the (stringify-heavy) journal byte check never
+ * runs: the count check is cheap, so the byte check only fires when it can
+ * matter — typical runs never pay for it (see casWrite and the manager's
+ * pre-fold truncation, which reuse this same gate).
+ */
+export const JOURNAL_BYTE_CHECK_THRESHOLD = 10_000;
 
 /**
  * Drop the OLDEST entries until the journal fits `maxBytes`. Entries are

@@ -398,6 +398,48 @@ test("redactText masks provider keys, env-var assignments, bearer tokens, JWTs a
   assert.equal(redactText("2024-01-01T00:00:00.000Z"), "2024-01-01T00:00:00.000Z");
 });
 
+test("redactText semantics: keyword-suffix identifiers match the original regex rule exactly", () => {
+  // Parity guards for the linear scanner replacing the old KEY=value regex
+  // (cpu-leak audit: the regex form backtracked O(n²) on long runs).
+  assert.equal(redactText("XKEY=abc"), "XKEY=abc", "1-char prefix: the original regex did not match");
+  assert.equal(redactText("AKEY=abc"), "AKEY=abc", "1-char prefix before KEY: no match (original semantics)");
+  assert.equal(redactText("API_KEY=abc"), "API_KEY=[REDACTED]");
+  assert.equal(redactText("MYTOKEN=abc"), "MYTOKEN=[REDACTED]");
+  assert.equal(redactText("secret=abc"), "secret=abc", "lowercase keyword: case-sensitive like the original");
+  assert.equal(redactText("API_KEY2=abc"), "API_KEY2=abc", "no word boundary after KEY: no match (original semantics)");
+  assert.equal(redactText("KEY="), "KEY=", "empty value: no match (original semantics)");
+  assert.equal(redactText("KEY value"), "KEY value", "missing separator: no match");
+  assert.equal(redactText("openai_key=abc"), "openai_key=abc", "no keyword suffix: untouched");
+  assert.equal(redactText("KEY:value"), "KEY:value", "0-char prefix before KEY: no match (original semantics)");
+  assert.equal(redactText("FOO_KEY:value"), "FOO_KEY=[REDACTED]", "colon separator");
+  assert.equal(redactText('FOO_KEY = "a,b"'), 'FOO_KEY=[REDACTED],b"', "value stops at comma like the original");
+  assert.equal(redactText("A_B_C_D_SECRET=xyz"), "A_B_C_D_SECRET=[REDACTED]");
+  // JWT parity: 3+ segments of >=20 [A-Za-z0-9_-] redact; short segments don't.
+  const seg = (n: number) => "a".repeat(n);
+  assert.equal(redactText(`${seg(25)}.${seg(30)}.${seg(35)}`), "[REDACTED]");
+  assert.equal(redactText(`${seg(10)}.${seg(30)}.${seg(35)}`), `${seg(10)}.${seg(30)}.${seg(35)}`);
+  assert.equal(redactText(`${seg(25)}.${seg(30)}`), `${seg(25)}.${seg(30)}`, "two segments: no match");
+  // A KEY=value pair whose value is a JWT redacts the value, not the assignment.
+  assert.equal(redactText(`TOKEN=${seg(25)}.${seg(30)}.${seg(35)}`), "TOKEN=[REDACTED]");
+});
+
+test("redactText is linear on long homogeneous runs (ReDoS regression)", () => {
+  // The old KEY=value / JWT regexes backtracked O(n²) on a long run of word
+  // chars — a 36.8MB journal of 3800-char results hung the event loop for
+  // minutes (the cpu-leak audit's "secret-regex scan" made catastrophic). The
+  // scanner must finish well under a second on the same shape.
+  const blob = "x".repeat(3800);
+  const started = performance.now();
+  for (let i = 0; i < 200; i++) {
+    redactText(i % 13 === 0 ? `${blob} SECRET_KEY=abc` : blob);
+  }
+  const elapsedMs = performance.now() - started;
+  assert.ok(
+    elapsedMs < 2000,
+    `200 scans of 3800-char runs took ${elapsedMs.toFixed(0)}ms — a linear scanner must stay under 2s (was minutes)`,
+  );
+});
+
 test(
   "a provider API key in agent output never lands in the persisted journal or compacted state",
   withTempCwd(async (cwd) => {

@@ -38,6 +38,23 @@ async function waitForStatus(
   return current;
 }
 
+/**
+ * Poll until the persisted run carries journalCompacted. Since S1-3 moved the
+ * compactJournal + verifyJournalCompaction fold OFF the pause critical path
+ * (sync-compaction-at-boundary), a non-terminal settle persists the RAW
+ * journal synchronously and the compacted form lands a tick later from the
+ * queued setImmediate task — the tests await that task instead of asserting
+ * an immediate post-pause fold.
+ */
+async function waitForCompacted(manager: WorkflowManager, runId: string, deadlineMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (manager.getPersistence().load(runId)?.journalCompacted !== undefined) return true;
+    await sleep(25);
+  }
+  return false;
+}
+
 /** Run each manager test with isolated cwd and HOME so workflow state is isolated. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -161,6 +178,9 @@ test(
     await sleep(50);
     // The tail agent is still in-flight; its call has not journaled yet.
     assert.equal(manager.pause(runId), true);
+    // The pause write persisted the raw journal synchronously; the compacted
+    // form lands from the deferred-compaction task (sync-compaction-at-boundary).
+    assert.ok(await waitForCompacted(manager, runId), "deferred compaction landed after pause");
 
     const persisted = manager.getPersistence().load(runId);
     assert.equal(persisted?.compactJournal, true, "the opt-in flag is persisted for resume");
@@ -266,6 +286,7 @@ test(
     for (let i = 0; i < 8; i++) da.resolve(i, "fan-result");
     await sleep(50);
     assert.equal(manager.pause(runId), true);
+    assert.ok(await waitForCompacted(manager, runId), "deferred compaction landed after the first pause");
     const firstPersist = manager.getPersistence().load(runId);
     assert.ok(firstPersist?.journalCompacted, "first pause persisted the compacted journal");
 
@@ -274,6 +295,7 @@ test(
     // While the resumed execution is mid-flight (tail hanging), the persisted
     // journal must STILL be compacted — the flag carried through resume().
     assert.equal(manager.pause(runId), true);
+    assert.ok(await waitForCompacted(manager, runId), "deferred compaction landed after the second pause");
     const secondPersist = manager.getPersistence().load(runId);
     assert.equal(secondPersist?.compactJournal, true, "the opt-in flag survived the pause/resume cycle");
     assert.ok(secondPersist?.journalCompacted, "the resumed run keeps compacting");

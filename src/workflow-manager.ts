@@ -15,9 +15,11 @@ import { DEFAULT_MAX_LOG_ENTRIES, pushBoundedLog } from "./logger.js";
 import { createMemoizedLoadModelTierConfig } from "./model-tier-config.js";
 import {
   buildResumeJournal,
+  capJournalBudget,
   createRunPersistence,
   DEFAULT_RUN_LEASE_TTL_MS,
   generateRunId,
+  JOURNAL_BYTE_CHECK_THRESHOLD,
   journalEntryKey,
   keepsResumeJournal,
   loadPersistedJournal,
@@ -130,6 +132,15 @@ interface ManagedRunBase {
    * still-running sibling.
    */
   agentsById: Map<string, WorkflowAgentSnapshot>;
+  /**
+   * S1-4: snapshot.agents index up to which full result/history detail has
+   * been trimmed from memory (older agents keep resultPreview only). The
+   * watermark is advanced monotonically as agents leave the last
+   * MAX_FULL_AGENT_DETAIL_IN_MEMORY window; onAgentEnd/onAgentHistory use it
+   * to drop a late-set result/history on an agent that is already outside the
+   * window. Init 0; never read before the first onAgentStart.
+   */
+  trimmedAgentDetailUpTo: number;
   /**
    * The run's cap on total agents (per-run value, else left undefined so
    * runWorkflow applies its own MAX_AGENTS_PER_RUN default), fixed at run
@@ -428,6 +439,15 @@ export interface WorkflowManagerOptions {
    */
   maxTerminalRunsInMemory?: number;
   /**
+   * How many fully-settled paused runs to retain full in-memory state for
+   * before the oldest is evicted from `runs` (paused-run-retention; see
+   * DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY). Defaults to that constant; exposed
+   * mainly for tests that want to observe eviction without many runs. Only
+   * FULLY-SETTLED paused executions are ever evicted — never one whose
+   * executeRun() promise is still pending.
+   */
+  maxPausedRunsInMemory?: number;
+  /**
    * How long an aborted execution may take to settle before the settle
    * watchdog force-releases its run from the in-memory registry (see
    * armSettleWatchdog / forceReleaseUnsettledRun). Generous default: a
@@ -486,6 +506,31 @@ const IN_MEMORY_TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed"
  * memory-retention mitigation in agent.ts).
  */
 const DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY = 20;
+
+/**
+ * How many fully-settled PAUSED runs (manual pause() or a usage-limit
+ * checkpoint whose execution has finished winding down) to retain in the
+ * in-memory registry before the oldest is evicted (paused-run-retention).
+ * Paused entries were previously never evicted at all — the audit found that
+ * unbounded paused-run retention (each entry carrying its journal, snapshot,
+ * and agent detail) grows memory without bound on a long host session that
+ * accumulates usage-limit pauses. The cap deliberately applies only to
+ * FULLY-SETTLED paused runs (see recordPausedRun) — never to one whose
+ * executeRun() promise is still pending. Once evicted, the run's disk state
+ * stays authoritative exactly as for an evicted terminal run: listRuns() and
+ * resume() never depend on the in-memory copy.
+ */
+const DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY = 20;
+
+/**
+ * S1-4: how many of the MOST RECENT agents keep their full in-memory
+ * result + history (the interactive detail pager and the terminal-boundary
+ * serialization payload). Older agents are trimmed to resultPreview — the
+ * same compact form every non-pager surface already renders — so a run with
+ * hundreds of agents keeps both its live snapshot and its boundary write
+ * payload bounded instead of retaining every full result forever.
+ */
+const MAX_FULL_AGENT_DETAIL_IN_MEMORY = 50;
 
 /**
  * Generous deadline for an aborted execution to settle before the settle
@@ -577,15 +622,18 @@ export class WorkflowManager extends EventEmitter {
    *  - An entry is added when a run starts (startInBackground/runSync) or is
    *    resumed (resume()), always with a live AbortController and (usually)
    *    an active RunLease.
-   *  - While status is "running" or "paused", the entry is NEVER evicted —
-   *    its execution could still settle (a pending executeRun() promise) or
-   *    it is mid-usage-limit-checkpoint/manually-paused and still considered
-   *    "the current state of this run" by callers. Eviction only ever
-   *    considers an entry AFTER executeRun() has fully settled it to
-   *    "completed" | "failed" | "aborted" (see IN_MEMORY_TERMINAL_STATUSES)
-   *    and persisted + released its lease — i.e. strictly after the same
-   *    isCurrent()-gated persistRun() + settleExecuting() lease-release in
-   *    executeRun()'s success/catch tails.
+   *  - While status is "running" or "paused", the entry is NEVER evicted
+   *    while its execution is still live — a pending executeRun() promise can
+   *    still settle into the in-memory entry. Eviction only ever considers an
+   *    entry AFTER executeRun() has fully settled it to "completed" |
+   *    "failed" | "aborted" (see IN_MEMORY_TERMINAL_STATUSES) and persisted +
+   *    released its lease — i.e. strictly after the same isCurrent()-gated
+   *    persistRun() + settleExecuting() lease-release in executeRun()'s
+   *    success/catch tails — or, for paused entries, after the execution has
+   *    settled to "paused" (recordPausedRun, called from executeRun()'s
+   *    finally): fully-settled paused runs beyond maxPausedRunsInMemory are
+   *    evicted oldest-first (paused-run-retention), exactly like terminal
+   *    runs beyond maxTerminalRunsInMemory.
    *  - Once terminal, an entry becomes eviction-ELIGIBLE (recordTerminalRun())
    *    but is not necessarily evicted immediately: up to
    *    maxTerminalRunsInMemory terminal entries are kept, oldest evicted
@@ -621,6 +669,16 @@ export class WorkflowManager extends EventEmitter {
    */
   private terminalRunQueue: string[] = [];
   private maxTerminalRunsInMemory: number;
+  /**
+   * FIFO of runIds whose PAUSED execution has fully settled (see
+   * recordPausedRun), oldest first — the eviction order for `runs` paused
+   * entries beyond maxPausedRunsInMemory. Mirrors terminalRunQueue's
+   * semantics: a runId can appear more than once across repeated
+   * pause/resume cycles; evicting re-checks the CURRENT entry's status so a
+   * resumed (running) run is never evicted.
+   */
+  private pausedRunQueue: string[] = [];
+  private maxPausedRunsInMemory: number;
   /** How long an aborted execution may take to settle (see armSettleWatchdog). */
   private settleWatchdogMs: number;
   /** How often a running execution renews its lease (see armLeaseHeartbeat). */
@@ -670,6 +728,7 @@ export class WorkflowManager extends EventEmitter {
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+    this.maxPausedRunsInMemory = options.maxPausedRunsInMemory ?? DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY;
     this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
     this.leaseRenewIntervalMs =
       options.leaseRenewIntervalMs ?? Math.max(1_000, Math.floor(DEFAULT_RUN_LEASE_TTL_MS / 3));
@@ -850,6 +909,7 @@ export class WorkflowManager extends EventEmitter {
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      trimmedAgentDetailUpTo: 0,
       retryLedger: {},
     };
 
@@ -973,6 +1033,7 @@ export class WorkflowManager extends EventEmitter {
       background: false,
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      trimmedAgentDetailUpTo: 0,
       retryLedger: {},
     };
   }
@@ -1205,6 +1266,11 @@ export class WorkflowManager extends EventEmitter {
             model: event.model,
           };
           managed.snapshot.agents.push(agentSnapshot);
+          // S1-4: each new agent can push older siblings out of the
+          // full-detail retention window — sweep the watermark so a run with
+          // hundreds of agents never retains every full result/history in
+          // memory (bounded boundary-serialization payload too).
+          this.trimStaleAgentDetail(managed);
           // Index by the call's unique id (never label — see agentsById's doc
           // comment) so onAgentEnd/onAgentHistory can resolve back to exactly
           // THIS entry even when a concurrent sibling shares its label.
@@ -1237,6 +1303,13 @@ export class WorkflowManager extends EventEmitter {
             agent.tokens = event.tokens;
             if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
+            // S1-4: a slow agent that ends AFTER newer siblings pushed it out
+            // of the retention window must not re-inflate memory — drop its
+            // freshly-set full detail immediately, keep the preview.
+            if (agent.id <= managed.trimmedAgentDetailUpTo) {
+              delete agent.result;
+              delete agent.history;
+            }
             // Real per-agent end time — only terminal agents get one; a still-
             // running agent's entry keeps endedAt undefined. A replayed agent's
             // seeded endedAt (its original completion time) is preserved; only
@@ -1265,6 +1338,11 @@ export class WorkflowManager extends EventEmitter {
           const agent = managed.agentsById.get(event.id);
           if (agent) {
             agent.history = event.history;
+            // S1-4: same late-setter guard as onAgentEnd — an agent already
+            // outside the full-detail window keeps only its preview.
+            if (agent.id <= managed.trimmedAgentDetailUpTo) {
+              delete agent.history;
+            }
           }
           this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
           progress();
@@ -1425,6 +1503,14 @@ export class WorkflowManager extends EventEmitter {
       }
       // The execution settled — stop renewing its lease (see armLeaseHeartbeat).
       this.disarmLeaseHeartbeat(managed);
+      // The execution has FULLY settled — a paused run (manual pause() or a
+      // usage-limit/provider-outage checkpoint) can now be retired from the
+      // in-memory registry when the paused-run cap is exceeded
+      // (paused-run-retention). Only ever here, never earlier: while
+      // executeRun() is pending, the settle path may still write into the
+      // in-memory entry (the lifecycle contract's original reason paused
+      // entries were never evicted).
+      if ((managed as unknown as ManagedRunRuntime).status === "paused") this.recordPausedRun(managed);
     }
   }
 
@@ -1499,6 +1585,32 @@ export class WorkflowManager extends EventEmitter {
       // that was terminal when queued) — resume() may have since replaced
       // it with a fresh, live execution, which must never be evicted here.
       if (current && IN_MEMORY_TERMINAL_STATUSES.has(current.status)) {
+        this.runs.delete(oldest);
+      }
+    }
+  }
+
+  /**
+   * Paused-run-retention: mark `runId` as eviction-eligible now that its
+   * PAUSED execution has fully settled, and evict the oldest eligible paused
+   * entries beyond maxPausedRunsInMemory. Callers must only invoke this from
+   * executeRun()'s finally (the settle-complete point) — a paused run whose
+   * executeRun() promise is still pending must never be evicted (it can still
+   * settle into the in-memory entry). Like recordTerminalRun, this re-checks
+   * the CURRENT entry's status before deleting: a run resumed back to
+   * "running" after being queued is never evicted while its newer execution
+   * lives, and a paused run is only dropped from the registry — its disk
+   * state (the pause persist) stays authoritative, so resume()/listRuns()
+   * work exactly as they do for an evicted terminal run.
+   */
+  private recordPausedRun(managed: ManagedRun): void {
+    const runId = managed.runId;
+    this.pausedRunQueue.push(runId);
+    while (this.pausedRunQueue.length > this.maxPausedRunsInMemory) {
+      const oldest = this.pausedRunQueue.shift();
+      if (oldest === undefined) break;
+      const current = this.runs.get(oldest);
+      if (current && current.status === "paused") {
         this.runs.delete(oldest);
       }
     }
@@ -1732,6 +1844,18 @@ export class WorkflowManager extends EventEmitter {
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
+   * Pending S1-3 deferred-compaction setImmediate tasks, keyed by runId,
+   * remembering the status snapshot each was queued from. A non-terminal
+   * settle write (start/pause/resume) with compactJournal enabled queues one
+   * of these instead of running compactJournal + the reconstruction QA on the
+   * critical path; the task re-persists the compacted form only if the run is
+   * still the SAME live ManagedRun in the SAME state (see
+   * queueDeferredCompaction), so a resumed/completed/deleted run is never
+   * clobbered by a stale compacted snapshot.
+   */
+  private deferredCompactions = new Map<string, { timer: ReturnType<typeof setImmediate>; status: RunStatus }>();
+
+  /**
    * Coalesce rapid progress persists (currently: onAgentJournal, which fires
    * once per completed agent and can burst under concurrency) to at most one
    * disk write per PERSIST_THROTTLE_MS (trailing edge) instead of one write
@@ -1784,6 +1908,92 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
+   * S1-3: run compactJournal + verifyJournalCompaction for a run and decide
+   * what lands on disk — the compacted summary ONLY when reconstruction QA
+   * reproduces the journal byte-identically AND the summary actually shrinks
+   * it; otherwise the original journal (with a warn when QA rejected it).
+   * Shared by the terminal-settle branch and the deferred-compaction task so
+   * the gate's semantics are identical everywhere it runs.
+   */
+  private foldJournalCompaction(managed: ManagedRun): {
+    journal?: PersistedRunState["journal"];
+    journalCompacted?: PersistedRunState["journalCompacted"];
+  } {
+    const summary = compactJournal(managed.journal);
+    const qa = verifyJournalCompaction(summary, managed.journal);
+    if (qa.ok && JSON.stringify(summary).length <= JSON.stringify(managed.journal).length) {
+      return { journalCompacted: summary };
+    }
+    if (!qa.ok) {
+      console.warn(
+        `[workflow-manager] journal compaction QA rejected for run ${managed.runId} (${qa.reason}) — keeping the original journal`,
+      );
+    }
+    return { journal: managed.journal };
+  }
+
+  /**
+   * S1-3: queue compactJournal + verifyJournalCompaction off the pause/resume
+   * critical path. The raw journal is already on disk (the caller persisted it
+   * first); this task re-runs the fold and re-persists the compacted form ONLY
+   * when `managed` is still the current live entry for its runId AND still in
+   * the same non-terminal state it was queued from. Any of resume() (replaces
+   * the object), a terminal settle, stop(), or deleteRun() invalidates the task
+   * — the newer writer's state is never clobbered by a stale compacted
+   * snapshot. unref'd: a pending compaction must never keep the process alive.
+   *
+   * Superseding: at most one pending task per (runId, status snapshot). A task
+   * queued while another is pending for the SAME status is a duplicate — skip
+   * it (the pending fold will land the same compacted form). A task for a
+   * DIFFERENT status supersedes the pending one: the older task's fold would
+   * be skipped anyway (its status snapshot no longer matches the live run), so
+   * leaving it armed would swallow the newer deferral entirely and no fold
+   * would ever land.
+   */
+  private queueDeferredCompaction(managed: ManagedRun): void {
+    const runId = managed.runId;
+    const status = managed.status;
+    const pending = this.deferredCompactions.get(runId);
+    if (pending) {
+      if (pending.status === status) return; // same-status duplicate — the pending fold covers it
+      clearImmediate(pending.timer);
+      this.deferredCompactions.delete(runId);
+    }
+    const timer = setImmediate(() => {
+      this.deferredCompactions.delete(runId);
+      const current = this.runs.get(runId);
+      // Same-object AND same-status: resume() swaps in a fresh ManagedRun, and
+      // a terminal settle/stop changes the status — either way this run has
+      // moved on and its own writes already handled the fold (or are the
+      // current word), so a stale compacted re-persist must not land.
+      if (!current || current !== managed || current.status !== status) return;
+      this.writeRunToDisk(current, true, { forceSyncCompaction: true });
+    });
+    timer.unref?.();
+    this.deferredCompactions.set(runId, { timer, status });
+  }
+
+  /**
+   * S1-4: advance the per-run full-detail watermark. Agents whose snapshot
+   * index fell out of the last MAX_FULL_AGENT_DETAIL_IN_MEMORY window have
+   * their heavy in-memory result/history dropped (resultPreview stays — the
+   * compact form every non-pager surface renders). Amortized O(1) per new
+   * agent: each agent is visited once, when the window moves past it.
+   */
+  private trimStaleAgentDetail(managed: ManagedRun): void {
+    const agents = managed.snapshot.agents;
+    const windowStart = Math.max(0, agents.length - MAX_FULL_AGENT_DETAIL_IN_MEMORY);
+    if (windowStart <= managed.trimmedAgentDetailUpTo) return;
+    for (let i = managed.trimmedAgentDetailUpTo; i < windowStart; i++) {
+      const agent = agents[i];
+      if (agent === undefined) continue;
+      delete agent.result;
+      delete agent.history;
+    }
+    managed.trimmedAgentDetailUpTo = windowStart;
+  }
+
+  /**
    * The sole choke point for every disk write (both persistRun()'s direct
    * calls and schedulePersist()'s deferred timer funnel through here).
    * F19: `compact` gates the opt-in compaction + reconstruction-QA work — it
@@ -1794,7 +2004,7 @@ export class WorkflowManager extends EventEmitter {
    * reconstructs to the exact original) is unchanged — a fast-path raw write
    * simply defers the fold to the next settle boundary.
    */
-  private writeRunToDisk(managed: ManagedRun, compact = true) {
+  private writeRunToDisk(managed: ManagedRun, compact = true, opts: { forceSyncCompaction?: boolean } = {}) {
     // The sole choke point for every disk write (both persistRun()'s direct
     // calls and schedulePersist()'s deferred timer funnel through here) — skip
     // silently when `managed` is no longer the current entry for its runId
@@ -1825,13 +2035,28 @@ export class WorkflowManager extends EventEmitter {
       // agent details. Persist exactly one full copy of each agent result instead
       // of writing it to both agents[].result and journal[].result.
       const keepJournal = keepsResumeJournal(managed.status);
-      // E4: throttled progress writes (compact=false) take the append-only
+      // E4/S1-1: throttled progress writes (compact=false) take the append-only
       // journal-delta fast path — the persistence layer writes ONLY the new
       // journal entries to the `.jdelta` sidecar instead of re-serializing the
       // full run state on every tick (O(n^2) as the journal grows), and skips
       // the .bak sidecar (kept only for boundary writes). Lifecycle-settle
       // writes (compact=true) are unchanged and always fold + compact.
-      const useFastPath = false && !compact && keepJournal;
+      const useFastPath = !compact && keepJournal;
+      // S1-3: budget-truncate the in-memory journal BEFORE the compaction fold
+      // (and before the boundary persist) so a pathological journal never enters
+      // compactJournal/verifyJournalCompaction — both re-stringify the whole
+      // journal — and the persisted form never exceeds the byte budget. Count-
+      // gated with the persistence layer's own JOURNAL_BYTE_CHECK_THRESHOLD so
+      // typical runs pay nothing. The truncation applies to the in-memory
+      // journal itself (and its O(1) upsert side-index is rebuilt) so memory,
+      // disk, and the persistence layer's foldedByRun map stay consistent —
+      // otherwise the next fast-path write would re-delta the entries the
+      // budget dropped from disk. Dropped entries simply re-run live on resume
+      // (capJournalBudget's documented degradation).
+      if (compact && keepJournal && managed.journal.length > JOURNAL_BYTE_CHECK_THRESHOLD) {
+        managed.journal = capJournalBudget(managed.journal);
+        managed.journalIndex = buildJournalSideIndex(managed.journal);
+      }
       // P2-5 opt-in compaction (ExecOptions.compactJournal): fold the journal's
       // resolved segments into a compact summary and persist it ONLY when the
       // reconstruction-QA gate reproduces the original journal byte-identically
@@ -1842,23 +2067,30 @@ export class WorkflowManager extends EventEmitter {
       // larger "compaction" buys nothing. The positional deltaKey scheme
       // (`${runId}:${callIndex}`) is untouched in both forms. F19: this block
       // runs only when `compact` is set — the throttled fast path (schedule-
-      // Persist) skips it and persists the raw journal; the next lifecycle
-      // settle boundary re-folds the full in-memory journal from scratch, so
-      // the QA gate and its byte-identity guarantee are unchanged.
+      // Persist) skips it and persists the raw journal.
+      //
+      // S1-3: on NON-terminal settle writes (start/pause/resume) the fold is
+      // moved off the critical path — the raw journal is persisted synchronously
+      // FIRST, and compactJournal + verifyJournalCompaction run in a queued
+      // setImmediate task (queueDeferredCompaction) whose re-persist lands the
+      // compacted form only if the run is still the same live run in the same
+      // state. Terminal settles (completed/failed/aborted) and the deferred
+      // task itself (forceSyncCompaction) still fold synchronously — the QA
+      // gate always runs, just possibly off the pause/resume critical path.
       let journal: PersistedRunState["journal"];
       let journalCompacted: PersistedRunState["journalCompacted"];
-      if (compact && keepJournal && managed.compactJournal === true) {
-        const summary = compactJournal(managed.journal);
-        const qa = verifyJournalCompaction(summary, managed.journal);
-        if (qa.ok && JSON.stringify(summary).length <= JSON.stringify(managed.journal).length) {
-          journalCompacted = summary;
+      const isTerminalSettle = compact && keepJournal && IN_MEMORY_TERMINAL_STATUSES.has(managed.status);
+      if (isTerminalSettle && managed.compactJournal === true) {
+        ({ journal, journalCompacted } = this.foldJournalCompaction(managed));
+      } else if (compact && keepJournal && managed.compactJournal === true) {
+        if (opts.forceSyncCompaction) {
+          // The deferred compaction task's own write: fold synchronously here
+          // (the event loop is idle — that is the point of the deferral).
+          ({ journal, journalCompacted } = this.foldJournalCompaction(managed));
         } else {
-          if (!qa.ok) {
-            console.warn(
-              `[workflow-manager] journal compaction QA rejected for run ${managed.runId} (${qa.reason}) — keeping the original journal`,
-            );
-          }
+          // Non-terminal settle: raw journal now, compaction + QA queued.
           journal = managed.journal;
+          this.queueDeferredCompaction(managed);
         }
       } else {
         journal = keepJournal ? managed.journal : undefined;
@@ -1954,7 +2186,7 @@ export class WorkflowManager extends EventEmitter {
           completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
           durationMs: managed.result?.durationMs,
         },
-        useFastPath ? { fastPath: true } : undefined,
+        useFastPath ? { fastPath: true, checkBudget: false } : undefined,
       );
     } catch (err) {
       // Persistence is best-effort: the run is still healthy in memory. Log so
@@ -2231,6 +2463,7 @@ export class WorkflowManager extends EventEmitter {
       // via seededAgentTimestamps (L4) — never fabricated resume-time ones.
       agentTimestamps: new Map(),
       agentsById: new Map(),
+      trimmedAgentDetailUpTo: 0,
       seededAgentTimestamps,
       retryLedger: seededRetryLedger,
     };
