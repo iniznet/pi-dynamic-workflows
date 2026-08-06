@@ -128,6 +128,16 @@ export function hostToolsFromDefinitions(
  */
 export class HostToolGateway {
   private bridge: MCPBridge | null = null;
+  /**
+   * The single shared MCPProxyClient for the running bridge
+   * (mcp-proxy-client-socket-leak fix): created lazily on first toolset
+   * resolution, reused across every createGatewayProxiedTools() call — a run
+   * start and a resume must not each open a fresh bridge connection — and
+   * disconnected deterministically by stop(). Nulled by stop() so a later
+   * start reconnects through a fresh client bound to the new bridge's socket
+   * path + auth token.
+   */
+  private proxiedClient: MCPProxyClient | null = null;
   /** Last-known proxied tool list, retained across stop so an opt-in run that
    * resolves the toolset while the gateway is stopped still fails loudly at
    * call time instead of silently running without the tools it asked for. */
@@ -150,6 +160,36 @@ export class HostToolGateway {
     return this.bridge?.getAuthToken();
   }
 
+  /**
+   * The shared proxied client for the running bridge, created lazily on first
+   * use. One client per start→stop lifetime: the socket-leak audit found a
+   * fresh MCPProxyClient per createGatewayProxiedTools() call (i.e. per run
+   * start AND per resume), each holding a live bridge connection that was
+   * never disconnected — with the bridge's 10-connection cap, enough
+   * resolves/resumes wedged the gateway. Every caller (concurrent runs,
+   * resumes) now shares this single connection; stop() disconnects it
+   * deterministically.
+   *
+   * The connection is fired in the background; each proxied execute awaits
+   * client.connect() (idempotent: returns the shared in-flight promise, or
+   * immediately when already connected), so the first call made by a subagent
+   * never races the socket handshake and a failed initial connect is retried
+   * per call instead of wedging the shared client. The detached catch keeps a
+   * stale/dead-socket rejection from becoming an unhandledRejection (Node's
+   * default --unhandled-rejections=throw would crash the host); the per-call
+   * `await client.connect()` still surfaces the error.
+   */
+  getProxyClient(): MCPProxyClient | undefined {
+    if (!this.bridge) return undefined;
+    if (!this.proxiedClient) {
+      const client = new MCPProxyClient(this.bridge.getSocketPath(), { authToken: this.bridge.getAuthToken() });
+      const connecting = client.connect();
+      connecting.catch(() => {});
+      this.proxiedClient = client;
+    }
+    return this.proxiedClient;
+  }
+
   /** The proxied tool metadata for the running bridge (empty when stopped). */
   getProxiedToolDefinitions(): ProxiedToolDef[] {
     return this.bridge ? this.knownToolDefs : [];
@@ -170,16 +210,44 @@ export class HostToolGateway {
   }
 
   async stop(): Promise<void> {
-    if (!this.bridge) return;
     const bridge = this.bridge;
     this.bridge = null;
-    await bridge.stop();
+    const client = this.proxiedClient;
+    this.proxiedClient = null;
+    // Release the shared proxied socket deterministically — a stopped gateway
+    // must not leave a client connected to a dead/stopped bridge (the leak the
+    // shared-client design closes). Idempotent: both null → no-op. Every stop
+    // path funnels here: /workflows-gateway stop, extension reload/shutdown
+    // (dispose fanout → stopHostToolGateway), and discard of an abandoned
+    // generation.
+    if (client) await client.disconnect();
+    if (bridge) await bridge.stop();
   }
 }
 
 /** Message surfaced when a run opts into host-tools while the gateway is stopped. */
 export const GATEWAY_NOT_RUNNING_MESSAGE =
   'Host tool gateway is not running — start it with /workflows-gateway start before a run uses toolset "host-tools".';
+
+/**
+ * Proxied defs that fail loudly at call time — used when the gateway is
+ * stopped (or a running gateway lacks a shared client, defensively). The defs
+ * still resolve so an explicit opt-in is never silently dropped; each call
+ * throws the actionable message.
+ */
+function unavailableToolDefinitions(gateway: HostToolGateway): ToolDefinition[] {
+  return gateway.getKnownToolDefinitions().map((def) =>
+    defineTool({
+      name: def.name,
+      label: def.name,
+      description: `[Proxied host tool — unavailable] ${def.description}`,
+      parameters: proxiedParameters(def.inputSchema),
+      async execute() {
+        throw new Error(GATEWAY_NOT_RUNNING_MESSAGE);
+      },
+    }),
+  );
+}
 
 /**
  * Resolve the `host-tools` toolset for a workflow run.
@@ -190,34 +258,34 @@ export const GATEWAY_NOT_RUNNING_MESSAGE =
  * toolsets before its try/catch, so a throw would strand the run in "running"
  * without a persisted failure) but each call fails loudly with an actionable
  * message. The README default is preserved: no toolset tag, no host tools.
+ *
+ * The proxied defs are backed by ONE shared MCPProxyClient held on the
+ * gateway (mcp-proxy-client-socket-leak fix): every run start AND every resume
+ * used to create a fresh client whose live bridge connection was never
+ * disconnected, eventually wedging the bridge's connection cap. See
+ * {@link HostToolGateway#getProxyClient}.
  */
 export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinition[] {
-  const socketPath = gateway.getSocketPath();
-  if (!gateway.isRunning() || !socketPath) {
+  if (!gateway.isRunning() || !gateway.getSocketPath()) {
     // A gateway that never started has no tool list — nothing to proxy. One
     // that was stopped still knows its last tool set; each advertised def
     // fails loudly so an explicit opt-in is never silently dropped.
-    return gateway.getKnownToolDefinitions().map((def) =>
-      defineTool({
-        name: def.name,
-        label: def.name,
-        description: `[Proxied host tool — unavailable] ${def.description}`,
-        parameters: proxiedParameters(def.inputSchema),
-        async execute() {
-          throw new Error(GATEWAY_NOT_RUNNING_MESSAGE);
-        },
-      }),
-    );
+    return unavailableToolDefinitions(gateway);
   }
 
-  const client = new MCPProxyClient(socketPath, { authToken: gateway.getAuthToken() });
-  // Fire the connection in the background; each proxied execute awaits it, so
-  // the first call made by a subagent never races the socket handshake. The
-  // catch detaches the rejection when the socket is stale/dead: with Node's
-  // default --unhandled-rejections=throw an unattached rejection would crash
-  // the host; the per-call `await connecting` still surfaces the error.
-  const connecting = client.connect();
-  connecting.catch(() => {});
+  // One shared client per gateway lifetime — never a fresh MCPProxyClient per
+  // resolution. A per-call client was the mcp-proxy-client-socket-leak finding:
+  // every run start AND every resume opened a new bridge connection that was
+  // never disconnected (disconnect() only ever ran in tests), eventually
+  // wedging the bridge's connection cap. getProxyClient() fires the background
+  // connect and each proxied execute awaits client.connect(), so the first
+  // call made by a subagent never races the socket handshake.
+  const client = gateway.getProxyClient();
+  if (!client) {
+    // Defensive: getProxyClient creates a client whenever the bridge exists,
+    // so a running gateway without one means the bridge is mid-transition.
+    return unavailableToolDefinitions(gateway);
+  }
 
   return gateway.getProxiedToolDefinitions().map((def) =>
     defineTool({
@@ -227,7 +295,7 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
       parameters: proxiedParameters(def.inputSchema),
       async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
         try {
-          await connecting;
+          await client.connect();
           const result = await client.executeToolCall(def.name, (params ?? {}) as Record<string, unknown>, {
             signal,
           });

@@ -28,6 +28,15 @@ const LENGTH_PREFIX_SIZE = 4;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** Poll until a condition holds or the deadline passes (for async teardown). */
+async function waitFor(cond: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < deadline) {
+    await sleep(5);
+  }
+  assert.ok(cond(), `condition not met within ${timeoutMs}ms: ${label}`);
+}
+
 /** Length-prefix a JSON value into one IPC frame. */
 function framed(obj: unknown): Buffer {
   const messageBuffer = Buffer.from(JSON.stringify(obj), "utf-8");
@@ -876,5 +885,58 @@ describe("MCPBridge", () => {
     } finally {
       await client.disconnect();
     }
+  });
+
+  it("drops the connection slot when a client socket closes — the cap self-heals (mcp-proxy-client-socket-leak)", async () => {
+    // Steady-state leak check: every tracked connection must be removed when
+    // its client socket closes/destroys. If entries lingered, enough dead
+    // clients would wedge the connection cap and block every later run/resume
+    // (the leak that made the gateway stop accepting after repeated toolset
+    // resolutions).
+    bridge = new MCPBridge({ tools, maxConnections: 2 });
+    await bridge.start();
+
+    const conns = (bridge as unknown as { connections: Set<Socket> }).connections;
+
+    const s1 = new Socket();
+    await new Promise<void>((resolve) => s1.connect(bridge.getSocketPath(), resolve));
+    const s2 = new Socket();
+    await new Promise<void>((resolve) => s2.connect(bridge.getSocketPath(), resolve));
+    await waitFor(() => conns.size === 2, 1000, "both connections tracked");
+
+    // A third connection at the cap must be refused outright.
+    const rejected = new Socket();
+    rejected.on("error", () => {});
+    const rejectedClosed = new Promise<void>((resolve) => rejected.once("close", () => resolve()));
+    await new Promise<void>((resolve) => rejected.connect(bridge.getSocketPath(), resolve));
+    await Promise.race([
+      rejectedClosed,
+      sleep(1000).then(() => {
+        throw new Error("bridge must refuse a connection beyond the cap");
+      }),
+    ]);
+    assert.equal(conns.size, 2, "the refused connection must not be tracked");
+
+    // Close one tracked client: the bridge must drop its connection slot.
+    s1.destroy();
+    await waitFor(() => conns.size === 1, 1000, "closed client slot released");
+
+    // A NEW client now fits under the cap and can authenticate + call tools.
+    const s3 = await connectToBridge(bridge);
+    const response = await sendRequest(s3, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "echo", args: { healed: true } },
+      id: "after-close",
+    });
+    assert.deepStrictEqual((response as { result?: ToolCallResult }).result, {
+      content: JSON.stringify({ healed: true }),
+      isError: false,
+    });
+    assert.equal(conns.size, 2, "the reconnected client occupies the freed slot");
+
+    s2.destroy();
+    s3.destroy();
+    await waitFor(() => conns.size === 0, 1000, "all client slots released");
   });
 });

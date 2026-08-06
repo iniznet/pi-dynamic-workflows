@@ -272,6 +272,94 @@ test("createGatewayProxiedTools round-trips a call through the running gateway",
   assert.strictEqual(result.content[0].text, JSON.stringify({ hello: "world" }));
 });
 
+test("createGatewayProxiedTools reuses ONE shared client across calls (mcp-proxy-client-socket-leak)", async () => {
+  // Every run start AND every resume resolves the toolset again. Each
+  // resolution used to create a fresh MCPProxyClient whose live bridge
+  // connection was never disconnected — the leak under test. Two resolutions
+  // must now yield proxied defs backed by the same client and exactly one
+  // bridge connection.
+  const gateway = trackedGateway();
+  await gateway.start(hostToolsFromDefinitions([echoTool()]));
+
+  const firstDefs = createGatewayProxiedTools(gateway);
+  const shared = gateway.getProxyClient();
+  assert.ok(shared, "a shared proxied client must exist once the toolset resolves");
+  await shared.connect();
+  assert.equal(shared.getState(), "connected");
+
+  // A second resolution (a resume, another run) must reuse the SAME client.
+  const secondDefs = createGatewayProxiedTools(gateway);
+  assert.equal(gateway.getProxyClient(), shared, "a second resolution must reuse the same client");
+  assert.equal(secondDefs.length, firstDefs.length, "both resolutions advertise the same tool list");
+
+  // The bridge sees exactly ONE connection, not one per resolution.
+  const bridge = (gateway as unknown as { bridge: { connections: Set<unknown> } | null }).bridge;
+  assert.ok(bridge, "gateway must hold a running bridge");
+  assert.equal(
+    bridge.connections.size,
+    1,
+    "two toolset resolutions must yield exactly one bridge connection, never two",
+  );
+
+  // Both definition sets round-trip calls over that one connection.
+  const echoA = firstDefs.find((d) => d.name === "echo") as unknown as {
+    execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+  };
+  const echoB = secondDefs.find((d) => d.name === "echo") as unknown as {
+    execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+  };
+  assert.ok(echoA && echoB);
+  const [ra, rb] = await Promise.all([
+    echoA.execute("call-1", { via: "first" }),
+    echoB.execute("call-2", { via: "second" }),
+  ]);
+  assert.strictEqual(ra.content[0].text, JSON.stringify({ via: "first" }));
+  assert.strictEqual(rb.content[0].text, JSON.stringify({ via: "second" }));
+});
+
+test("gateway.stop() disconnects the shared client; a later start reconnects cleanly (mcp-proxy-client-socket-leak)", async () => {
+  // stop() is the deterministic release point every shutdown path funnels
+  // through (/workflows-gateway stop, extension reload/shutdown dispose
+  // fanout). A stopped gateway must release the socket — and a later start
+  // must reconnect through a fresh client, not a stale one.
+  const gateway = trackedGateway();
+  await gateway.start(hostToolsFromDefinitions([echoTool()]));
+
+  createGatewayProxiedTools(gateway);
+  const shared = gateway.getProxyClient();
+  assert.ok(shared, "a shared proxied client must exist once the toolset resolves");
+  await shared.connect();
+  assert.equal(shared.getState(), "connected");
+
+  await gateway.stop();
+  assert.equal(
+    shared.getState(),
+    "disconnected",
+    "stop() must deterministically disconnect the shared proxied client (socket released)",
+  );
+  assert.equal(gateway.getProxyClient(), undefined, "a stopped gateway must no longer expose a client");
+  assert.equal(
+    (gateway as unknown as { bridge: unknown }).bridge,
+    null,
+    "stop() must drop the bridge reference so nothing keeps the old connection alive",
+  );
+
+  // A later start reconnects through a FRESH client bound to the new bridge.
+  await gateway.start(hostToolsFromDefinitions([echoTool()]));
+  const freshDefs = createGatewayProxiedTools(gateway);
+  const fresh = gateway.getProxyClient();
+  assert.ok(fresh, "a restarted gateway must expose a proxied client again");
+  assert.notEqual(fresh, shared, "restart must create a fresh client for the new bridge");
+  const echo = freshDefs.find((d) => d.name === "echo") as unknown as {
+    execute: (id: string, p: unknown) => Promise<{ content: Array<{ type: string; text: string }> }>;
+  };
+  assert.ok(echo);
+  const result = (await echo.execute("call-1", { after: "restart" })) as {
+    content: Array<{ type: string; text: string }>;
+  };
+  assert.strictEqual(result.content[0].text, JSON.stringify({ after: "restart" }));
+});
+
 test("createGatewayProxiedTools propagates an abort as ProxyAbortError, not an isError result (gateway-ipc:i1)", async () => {
   // The production gateway consumer must mirror executeToolCall's guard: an
   // aborted call rejects with ProxyAbortError instead of degrading into a
