@@ -305,7 +305,7 @@ async function promptFieldValue(
 function prefillFor(field: WorkflowSettingsField, current: unknown): string {
   if (current === undefined || current === null) return NULLABLE_NUMBER_PREFILL;
   if (field.type === "string[]") return (current as readonly string[]).join(", ");
-  if (field.type === "object") return JSON.stringify(current);
+  if (field.type === "providerPool") return JSON.stringify(current);
   return String(current);
 }
 

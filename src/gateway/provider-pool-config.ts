@@ -38,6 +38,12 @@ export const DEFAULT_TPM_WINDOW_MS = 60_000;
 /** Default cooldown a provider enters after a recorded 429/limit event. */
 export const DEFAULT_COOLDOWN_MS = 60_000;
 
+/** Default per-provider concurrency cap (used by normalizeEntry and the visual editor). */
+export const DEFAULT_PROVIDER_CONCURRENCY = 1;
+
+/** Default per-provider routing weight (used by normalizeEntry and the visual editor). */
+export const DEFAULT_PROVIDER_WEIGHT = 1;
+
 /** Raw per-provider entry as written in settings.json / the env JSON override. */
 export interface ProviderPoolEntryInput {
   /**
@@ -167,7 +173,11 @@ function normalizeModels(raw: Record<string, unknown>): ProviderPoolConfig["mode
       const entry = normalizeEntry(provider, logicalModel, value);
       if (entry) entries[provider] = entry;
     }
-    if (Object.keys(entries).length > 0) models[logicalModel] = entries;
+    // Keep empty maps: a model with no providers is a deliberate "no routing"
+    // state (acquire falls back to legacy resolution), and the visual editor
+    // lets users add a model before its providers. Dropping it here would make
+    // a just-added model silently vanish on the next open.
+    models[logicalModel] = entries;
   }
   return models;
 }
@@ -176,8 +186,8 @@ function normalizeEntry(provider: string, logicalModel: string, value: unknown):
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const modelId = typeof raw.modelId === "string" && raw.modelId.trim().length > 0 ? raw.modelId.trim() : logicalModel;
-  const concurrency = normalizeInteger(raw.concurrency, 1, Number.MAX_SAFE_INTEGER) ?? 1;
-  const weight = normalizeInteger(raw.weight, 1, Number.MAX_SAFE_INTEGER) ?? 1;
+  const concurrency = normalizeInteger(raw.concurrency, 1, Number.MAX_SAFE_INTEGER) ?? DEFAULT_PROVIDER_CONCURRENCY;
+  const weight = normalizeInteger(raw.weight, 1, Number.MAX_SAFE_INTEGER) ?? DEFAULT_PROVIDER_WEIGHT;
   const tpm = normalizeInteger(raw.tpm, 1, Number.MAX_SAFE_INTEGER);
   const cooldownMs = normalizeInteger(raw.cooldownMs, 1, Number.MAX_SAFE_INTEGER);
   const entry: ProviderPoolEntry = { provider, modelId, concurrency, weight };

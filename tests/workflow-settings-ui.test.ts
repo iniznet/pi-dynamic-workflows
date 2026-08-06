@@ -98,6 +98,7 @@ describe("row structure (buildSettingItems)", () => {
   it("wires cyclers for boolean/enum rows and submenu rows otherwise", () => {
     const submenus = {
       fieldSubmenu: () => ({ render: () => [] as string[], invalidate: () => {} }),
+      providerPoolSubmenu: () => ({ render: () => [] as string[], invalidate: () => {} }),
       saveSubmenu: () => ({ render: () => [] as string[], invalidate: () => {} }),
     };
     const items = buildSettingItems(makeModel(), {}, submenus);
@@ -249,5 +250,164 @@ describe("form interactions (buildFormComponent)", () => {
     root.handleInput?.(KEY_CONFIRM);
     root.handleInput?.(KEY_CONFIRM);
     assert.deepEqual(done.mock.calls[0]?.arguments[0], { cancelled: false, settings: {}, scope: "global" });
+  });
+});
+
+describe("provider pool visual editor", () => {
+  const POOL_ROW = 16; // providerPool is the 17th registry row (0-based)
+  const modelPool = (models: Record<string, Record<string, unknown>>) =>
+    ({ models }) as WorkflowSettings["providerPool"];
+
+  it("opens a nested row editor and Esc discards without staging", () => {
+    const model = makeModel({ providerPool: modelPool({ "claude-sonnet-4": { "anthropic-direct": {} } }) });
+    const { root, done } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM); // open the pool editor
+    const lines = root.render(80);
+    assert.ok(
+      lines.some((l) => l.includes("Provider pool")),
+      "pool editor header",
+    );
+    assert.ok(
+      lines.some((l) => l.includes("Enabled")),
+      "scalar row",
+    );
+    assert.ok(lines.some((l) => l.includes("When saturated")));
+    assert.ok(
+      lines.some((l) => l.includes("claude-sonnet-4")),
+      "model row",
+    );
+    assert.ok(
+      lines.some((l) => l.includes("1 provider(s)")),
+      "model row summary",
+    );
+    assert.ok(lines.some((l) => l.includes("＋ Add model")));
+    assert.ok(lines.some((l) => l.includes("Done")));
+    root.handleInput?.(KEY_CANCEL); // Esc at the pool root discards the session
+    assert.deepEqual(model.draft.providerPool, { models: { "claude-sonnet-4": { "anthropic-direct": {} } } });
+    assert.equal(model.dirtyCount, 0, "no edits staged on discard");
+    assert.equal(done.mock.callCount(), 0, "Esc in the pool editor must not cancel the whole form");
+  });
+
+  it("cycles the Enabled scalar and Done commits the minimal input", () => {
+    const model = makeModel();
+    const { root } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM); // open pool editor (selection on Enabled)
+    root.handleInput?.(KEY_CONFIRM); // cycle true → false
+    assert.ok(
+      root.render(80).some((l) => l.includes("false")),
+      "row shows the cycled value",
+    );
+    navigateTo(root, 5); // Done (4 scalars + Add model + Done)
+    root.handleInput?.(KEY_CONFIRM); // open Done confirm
+    root.handleInput?.(KEY_CONFIRM); // apply
+    assert.deepEqual(model.draft.providerPool, { enabled: false });
+    assert.equal(model.dirtyCount, 1);
+    assert.equal(
+      root.render(80).some((l) => l.includes("off · wait · 0 model(s)")),
+      true,
+      "form row summary",
+    );
+  });
+
+  it("adds a model via the text submenu and commits it", () => {
+    const model = makeModel();
+    const { root } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 4); // ＋ Add model (4 scalars then Add)
+    root.handleInput?.(KEY_CONFIRM);
+    for (const char of "gpt-5") root.handleInput?.(char);
+    root.handleInput?.(KEY_SUBMIT);
+    assert.ok(
+      root.render(80).some((l) => l.includes("gpt-5")),
+      "new model row appears",
+    );
+    navigateTo(root, 2); // Done (selection is preserved on the new model row: 4 scalars + gpt-5 + Add + Done)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM);
+    assert.deepEqual(model.draft.providerPool, { models: { "gpt-5": {} } });
+  });
+
+  it("edits a per-provider scalar through the nested editors", () => {
+    const model = makeModel({ providerPool: modelPool({ m: { p1: {} } }) });
+    const { root } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 4); // model row m
+    root.handleInput?.(KEY_CONFIRM);
+    assert.ok(
+      root.render(80).some((l) => l.includes("Model · m")),
+      "per-model editor",
+    );
+    root.handleInput?.(KEY_CONFIRM); // open provider p1 (first row)
+    assert.ok(
+      root.render(80).some((l) => l.includes("m · p1")),
+      "per-provider editor",
+    );
+    navigateTo(root, 3); // TPM cap (unset → empty prefill, typed input is not prefixed)
+    root.handleInput?.(KEY_CONFIRM);
+    for (const char of "100000") root.handleInput?.(char);
+    root.handleInput?.(KEY_SUBMIT);
+    assert.ok(
+      root.render(80).some((l) => l.includes("TPM cap") && l.includes("100000")),
+      "row shows 100000",
+    );
+    navigateTo(root, 3); // Done (5 scalars + Remove + Done; selection preserved on TPM)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM); // back to the model editor
+    navigateTo(root, 3); // Done (p1 + Add + Remove + Done; selection preserved on p1)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM); // back to the pool editor
+    navigateTo(root, 2); // Done (4 scalars + m + Add + Done; selection preserved on m)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM);
+    assert.deepEqual(model.draft.providerPool, { models: { m: { p1: { tpm: 100000 } } } });
+    assert.equal(model.dirtyCount, 1);
+  });
+
+  it("removes a provider through the confirm row", () => {
+    const model = makeModel({ providerPool: modelPool({ m: { p1: {}, p2: {} } }) });
+    const { root } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 4); // model m
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 1); // provider p2
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 5); // － Remove provider (5 scalars + Remove + Done)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM); // confirm removal → back to model editor
+    assert.ok(
+      root.render(80).some((l) => l.includes("p1")),
+      "p1 remains",
+    );
+    assert.ok(!root.render(80).some((l) => l.includes("p2")), "p2 row is gone");
+    navigateTo(root, 2); // Done (p1 + Add + Remove + Done; selection preserved on Add)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 2); // Done (4 scalars + m + Add + Done; selection preserved on m)
+    root.handleInput?.(KEY_CONFIRM);
+    root.handleInput?.(KEY_CONFIRM);
+    assert.deepEqual(model.draft.providerPool, { models: { m: { p1: {} } } });
+  });
+
+  it("stays inside the editor when scalar input is invalid", () => {
+    const model = makeModel();
+    const { root } = buildForm(model);
+    navigateTo(root, POOL_ROW);
+    root.handleInput?.(KEY_CONFIRM);
+    navigateTo(root, 2); // Saturation wait (ms)
+    root.handleInput?.(KEY_CONFIRM);
+    for (const char of "abc") root.handleInput?.(char);
+    root.handleInput?.(KEY_SUBMIT);
+    assert.equal(model.dirtyCount, 0, "invalid input must not stage");
+    assert.ok(
+      root.render(80).some((l) => l.includes("must be a finite number")),
+      "inline error shown",
+    );
+    root.handleInput?.(KEY_CANCEL); // Esc closes the input, back to the pool editor
+    assert.equal(model.dirtyCount, 0);
   });
 });

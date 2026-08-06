@@ -19,13 +19,27 @@ import {
   WORKFLOW_ENV_VARS,
   workflowSettingsFromEnv,
 } from "./config.js";
+import type { ProviderPoolConfig, ProviderPoolEntry } from "./gateway/provider-pool.js";
+import type {
+  ProviderPoolEntryInput,
+  ProviderPoolModelInput,
+  ProviderPoolSettingsInput,
+} from "./gateway/provider-pool-config.js";
+import {
+  DEFAULT_PROVIDER_CONCURRENCY,
+  DEFAULT_PROVIDER_WEIGHT,
+  DEFAULT_SATURATION_WAIT_TIMEOUT_MS,
+  DEFAULT_TPM_WINDOW_MS,
+  DEFAULT_WHEN_SATURATED,
+  normalizeProviderPoolConfig,
+} from "./gateway/provider-pool-config.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 
 /** UI grouping for the settings form rows, in render order. */
 export type WorkflowSettingsFieldGroup = "Trigger" | "Execution" | "Progress" | "Advanced";
 
 /** How a settings row is edited/parsed. */
-export type WorkflowSettingsFieldType = "boolean" | "number" | "string" | "enum" | "string[]" | "object";
+export type WorkflowSettingsFieldType = "boolean" | "number" | "string" | "enum" | "string[]" | "providerPool";
 
 /** Where the interactive editor writes a partial save. */
 export type SettingsScope = "global" | "project";
@@ -222,13 +236,14 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     envVar: WORKFLOW_ENV_VARS.subagentDamageControlTools,
   },
   {
-    // Nested JSON config consumed by the provider pool (see provider-pool-config.ts).
-    // Editable as a JSON blob in the TUI/dialog tiers; the PI_WORKFLOW_PROVIDER_POOL
-    // env var is the full-JSON headless/CI override.
+    // Nested config consumed by the provider pool (see provider-pool-config.ts), edited
+    // VISUALLY as form rows (PROVIDER_POOL_SCALARS + ProviderPoolEditorModel) in the
+    // TUI/dialog tiers — never as a raw JSON blob. The PI_WORKFLOW_PROVIDER_POOL env
+    // var remains the full-JSON headless/CI override and env-locks the whole key.
     key: "providerPool",
-    type: "object",
+    type: "providerPool",
     label: "Provider pool",
-    help: "Per-model provider routing for parallel subagents: per-provider concurrency caps, weights, TPM gates, and cooldowns. JSON object, or set the PI_WORKFLOW_PROVIDER_POOL env var.",
+    help: "Per-model provider routing for parallel subagents: pool scalars, per-model provider lists, and per-provider concurrency/weight/TPM/cooldown rows. Edited visually; PI_WORKFLOW_PROVIDER_POOL is the headless JSON override.",
     group: "Advanced",
     defaultDisplay: "(unset)",
     envVar: WORKFLOW_ENV_VARS.providerPool,
@@ -243,6 +258,206 @@ export const FIELD_GROUPS: readonly WorkflowSettingsFieldGroup[] = [
 /** Look up a field by its settings key. */
 export function getField(key: keyof WorkflowSettings): WorkflowSettingsField | undefined {
   return FIELD_REGISTRY.find((field) => field.key === key);
+}
+
+// ─── Provider pool visual editor ────────────────────────────────────────────
+
+/**
+ * The four top-level provider-pool scalars, edited as rows inside the visual
+ * provider-pool submenu (TUI) and prompted one-by-one (dialog tier). Bounds and
+ * options mirror normalizeProviderPoolConfig (provider-pool-config.ts).
+ */
+export type ProviderPoolScalarKey = "enabled" | "whenSaturated" | "saturationWaitTimeoutMs" | "defaultTpmWindowMs";
+
+/** Entry scalar keys editable inside the per-provider submenu. */
+export type ProviderPoolEntryScalarKey = "modelId" | "concurrency" | "weight" | "tpm" | "cooldownMs";
+
+/**
+ * One declarative row for one per-provider scalar (see PROVIDER_POOL_ENTRY_SCALARS).
+ * String rows edit the modelId alias; number rows floor and reject below-min
+ * input; nullable number rows map empty/"null" input to null (unset). All
+ * bounds mirror setEntryScalar (workflow-settings-fields.ts) and
+ * normalizeProviderPoolConfig.
+ */
+export interface ProviderPoolEntryScalarField {
+  key: ProviderPoolEntryScalarKey;
+  type: "string" | "number";
+  label: string;
+  help: string;
+  /** Inclusive lower bound for number rows (mirrors normalizeInteger). */
+  min?: number;
+  /** null = unset (delete the key) for optional number rows. */
+  nullable?: boolean;
+}
+
+/** The five per-provider scalar rows, in render order. */
+export const PROVIDER_POOL_ENTRY_SCALARS: readonly ProviderPoolEntryScalarField[] = [
+  {
+    key: "modelId",
+    type: "string",
+    label: "Model alias",
+    help: "Provider-side model id when it differs from the logical model; empty uses the logical model id.",
+  },
+  {
+    key: "concurrency",
+    type: "number",
+    label: "Concurrency",
+    help: "Max parallel subagents this provider may serve (default 2).",
+    min: 1,
+  },
+  {
+    key: "weight",
+    type: "number",
+    label: "Weight",
+    help: "Relative routing weight vs other providers of the same model (default 1).",
+    min: 1,
+  },
+  {
+    key: "tpm",
+    type: "number",
+    label: "TPM cap",
+    help: "Max output tokens per minute this provider may serve; empty clears the cap.",
+    min: 1,
+    nullable: true,
+  },
+  {
+    key: "cooldownMs",
+    type: "number",
+    label: "Cooldown (ms)",
+    help: "Rest period after this provider errors before it is eligible again; empty clears it.",
+    min: 1,
+    nullable: true,
+  },
+];
+
+/** Look up a per-provider scalar by key. */
+export function getProviderPoolEntryScalar(key: ProviderPoolEntryScalarKey): ProviderPoolEntryScalarField | undefined {
+  return PROVIDER_POOL_ENTRY_SCALARS.find((scalar) => scalar.key === key);
+}
+
+/**
+ * Compact row display for one provider entry: "conc 2 · w 1 · tpm 100k · cd 30s".
+ * Alias is shown first only when it differs from the logical model id; optional
+ * caps are omitted when unset; a missing entry renders as "(missing)".
+ */
+export function providerPoolEntryDisplay(modelId: string, entry: ProviderPoolEntry | undefined): string {
+  if (!entry) return "(missing)";
+  const parts: string[] = [];
+  if (entry.modelId !== modelId) parts.push(`alias ${entry.modelId}`);
+  parts.push(`conc ${entry.concurrency}`);
+  parts.push(`w ${entry.weight}`);
+  if (entry.tpm !== undefined) parts.push(`tpm ${entry.tpm}`);
+  if (entry.cooldownMs !== undefined) parts.push(`cd ${Math.round(entry.cooldownMs / 1000)}s`);
+  return parts.join(" · ");
+}
+
+/**
+ * Typed parse for one per-provider scalar row. Mirrors the settings-row rules:
+ * strings trim and reject empty input, numbers floor and reject below-min
+ * input, nullable numbers map empty/"null" to null (delete the key).
+ */
+export function parseProviderPoolEntryScalar(
+  scalar: ProviderPoolEntryScalarField,
+  raw: string,
+): { ok: true; value: string | number | null } | { ok: false; error: string } {
+  if (scalar.type === "string") {
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? { ok: true, value: trimmed } : { ok: false, error: "must not be empty" };
+  }
+  return parseIntegerInput(raw, { min: scalar.min, nullable: scalar.nullable === true });
+}
+
+/** One declarative row for one provider-pool scalar (see PROVIDER_POOL_SCALARS). */
+export interface ProviderPoolScalarField {
+  key: ProviderPoolScalarKey;
+  type: "boolean" | "enum" | "number";
+  label: string;
+  help: string;
+  /** Inclusive lower bound for number scalars (mirrors normalizeInteger). */
+  min?: number;
+  /** Cycler values (boolean + enum scalars). */
+  options?: readonly string[];
+}
+
+/** The four provider-pool scalar rows, in render order. */
+export const PROVIDER_POOL_SCALARS: readonly ProviderPoolScalarField[] = [
+  {
+    key: "enabled",
+    type: "boolean",
+    label: "Enabled",
+    help: "Pool on/off. Off keeps the legacy single-resolution behavior (no routing).",
+    options: ["true", "false"],
+  },
+  {
+    key: "whenSaturated",
+    type: "enum",
+    label: "When saturated",
+    help: 'Saturation behavior: "wait" (FIFO queue, abort-aware) or "fail" (immediate error to the run).',
+    options: ["wait", "fail"],
+  },
+  {
+    key: "saturationWaitTimeoutMs",
+    type: "number",
+    label: "Saturation wait (ms)",
+    help: "Max wait for a saturated acquire before the pool fails it; 0 waits forever.",
+    min: 0,
+  },
+  {
+    key: "defaultTpmWindowMs",
+    type: "number",
+    label: "TPM window (ms)",
+    help: "Rolling window over which output-TPM is measured and the TPM cap gate applies.",
+    min: 1_000,
+  },
+];
+
+/** Look up a provider-pool scalar by key. */
+export function getProviderPoolScalar(key: ProviderPoolScalarKey): ProviderPoolScalarField | undefined {
+  return PROVIDER_POOL_SCALARS.find((scalar) => scalar.key === key);
+}
+
+/**
+ * Compact row display for the provider-pool value: "on · wait · 2 model(s)".
+ * Unset renders as "(unset)" (matches the registry defaultDisplay).
+ */
+export function providerPoolSummary(value: unknown): string {
+  if (value === undefined) return "(unset)";
+  const config = normalizeProviderPoolConfig(value);
+  const modelCount = Object.keys(config.models).length;
+  return `${config.enabled ? "on" : "off"} · ${config.whenSaturated} · ${modelCount} model(s)`;
+}
+
+/**
+ * Map a fully-shaped ProviderPoolConfig back to the minimal raw settings input
+ * shape: fields equal to their normalized defaults are dropped, so the visual
+ * editor writes only what the user changed. Idempotent under
+ * normalizeProviderPoolConfig (defaults re-fill on the next read).
+ */
+export function providerPoolInputOf(config: ProviderPoolConfig): ProviderPoolSettingsInput {
+  const input: ProviderPoolSettingsInput = {};
+  if (config.enabled !== true) input.enabled = config.enabled;
+  if (config.whenSaturated !== DEFAULT_WHEN_SATURATED) input.whenSaturated = config.whenSaturated;
+  if (config.saturationWaitTimeoutMs !== DEFAULT_SATURATION_WAIT_TIMEOUT_MS)
+    input.saturationWaitTimeoutMs = config.saturationWaitTimeoutMs;
+  if (config.defaultTpmWindowMs !== DEFAULT_TPM_WINDOW_MS) input.defaultTpmWindowMs = config.defaultTpmWindowMs;
+  const models: Record<string, ProviderPoolModelInput> = {};
+  for (const [logicalModel, entries] of Object.entries(config.models)) {
+    const providers: Record<string, ProviderPoolEntryInput> = {};
+    for (const [providerId, entry] of Object.entries(entries)) {
+      const raw: ProviderPoolEntryInput = {};
+      if (entry.modelId !== logicalModel) raw.modelId = entry.modelId;
+      if (entry.concurrency !== DEFAULT_PROVIDER_CONCURRENCY) raw.concurrency = entry.concurrency;
+      if (entry.weight !== DEFAULT_PROVIDER_WEIGHT) raw.weight = entry.weight;
+      if (entry.tpm !== undefined) raw.tpm = entry.tpm;
+      if (entry.cooldownMs !== undefined) raw.cooldownMs = entry.cooldownMs;
+      providers[providerId] = raw;
+    }
+    // Keep empty model maps: normalizeModels preserves them too, so a model
+    // added in the visual editor survives the save → load round-trip.
+    models[logicalModel] = providers;
+  }
+  if (Object.keys(models).length > 0) input.models = models;
+  return input;
 }
 
 /**
@@ -264,7 +479,7 @@ export function fieldDisplayValue(field: WorkflowSettingsField, value: unknown):
       return String(value);
     case "string[]":
       return Array.isArray(value) ? value.join(", ") : String(value);
-    case "object":
+    case "providerPool":
       try {
         return JSON.stringify(value);
       } catch {
@@ -278,23 +493,33 @@ function parseNumber(
   raw: string,
 ): { ok: true; value: number | null } | { ok: false; error: string } {
   const trimmed = raw.trim();
-  if (field.nullable && (trimmed === "" || trimmed.toLowerCase() === "null")) return { ok: true, value: null };
-  if (trimmed === "") return { ok: false, error: "must be a number" };
   // Null tombstone: an exact "0" on the token budget is the "clear it" marker
   // (normalizeSettingsForSave rewrites defaultTokenBudget 0 → null), so pass it
   // through untouched instead of coercing it to the minimum. Other nullable
   // fields have no save-path tombstone — a "0" there is a silent no-op edit
   // (normalize drops below-min values), so reject it like any other below-min.
   if (field.key === "defaultTokenBudget" && trimmed === "0") return { ok: true, value: 0 };
+  return parseIntegerInput(raw, { min: field.min, max: field.max, nullable: field.nullable });
+}
+
+/**
+ * Shared integer parsing for settings rows and provider-pool scalars: empty/
+ * "null" on a nullable field maps to null, input must be a finite number at or
+ * above `min`, fractional input floors, and values above `max` clamp to it
+ * (mirrors normalizeInteger).
+ */
+function parseIntegerInput(
+  raw: string,
+  bounds: { min?: number; max?: number; nullable?: boolean },
+): { ok: true; value: number | null } | { ok: false; error: string } {
+  const trimmed = raw.trim();
+  if (bounds.nullable && (trimmed === "" || trimmed.toLowerCase() === "null")) return { ok: true, value: null };
+  if (trimmed === "") return { ok: false, error: "must be a number" };
   const number = Number(trimmed);
   if (!Number.isFinite(number)) return { ok: false, error: "must be a finite number" };
-  // Mirror normalizeInteger (ws): below-min values are dropped at load, so the
-  // editor rejects them; above-max values clamp to max; fractional values floor.
-  if (field.min !== undefined && number < field.min) {
-    return { ok: false, error: `must be at least ${field.min}` };
-  }
+  if (bounds.min !== undefined && number < bounds.min) return { ok: false, error: `must be at least ${bounds.min}` };
   const floored = Math.floor(number);
-  return { ok: true, value: field.max !== undefined ? Math.min(field.max, floored) : floored };
+  return { ok: true, value: bounds.max !== undefined ? Math.min(bounds.max, floored) : floored };
 }
 
 /**
@@ -348,20 +573,154 @@ export function parseFieldInput(
         .filter((name) => name.length > 0);
       return { ok: true, value: names };
     }
-    case "object": {
-      // The providerPool row: the value is a nested JSON object (settings.json
-      // shape), so the editor accepts a JSON blob and the save path writes it
-      // through unchanged. Empty input is rejected — clear it via settings.json.
-      if (raw.trim() === "") return { ok: false, error: "must be a JSON object" };
-      try {
-        const parsed: unknown = JSON.parse(raw);
-        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-          return { ok: true, value: parsed };
-        }
-        return { ok: false, error: 'must be a JSON object, e.g. { "enabled": true, "models": {} }' };
-      } catch {
-        return { ok: false, error: "must be valid JSON" };
-      }
+    case "providerPool": {
+      // The provider pool is edited visually (nested form rows via
+      // ProviderPoolEditorModel), never as a raw JSON blob — reject blob input
+      // so a stale JSON paste cannot silently bypass the structured validation.
+      return { ok: false, error: "edit via the visual form, not raw JSON" };
+    }
+  }
+}
+
+/**
+ * Typed parse for a provider-pool scalar (TUI scalar rows + dialog prompts).
+ * Mirrors the settings-row rules: booleans accept "true"/"false", enums must
+ * be a listed option, numbers floor and reject below-min input.
+ */
+export function parseProviderPoolScalar(
+  scalar: ProviderPoolScalarField,
+  raw: string,
+): { ok: true; value: boolean | "wait" | "fail" | number } | { ok: false; error: string } {
+  switch (scalar.type) {
+    case "boolean": {
+      if (raw === "true") return { ok: true, value: true };
+      if (raw === "false") return { ok: true, value: false };
+      return { ok: false, error: "must be true or false" };
+    }
+    case "enum": {
+      if (scalar.options?.includes(raw)) return { ok: true, value: raw as "wait" | "fail" };
+      return { ok: false, error: `must be one of: ${scalar.options?.join(", ") ?? ""}` };
+    }
+    case "number": {
+      const parsed = parseIntegerInput(raw, { min: scalar.min });
+      // Bounds pass no `nullable`, so a successful parse is never null.
+      return parsed.ok ? { ok: true, value: parsed.value as number } : parsed;
+    }
+  }
+}
+
+/**
+ * Pure working copy for the provider-pool visual editor: wraps a normalized
+ * ProviderPoolConfig and exposes small mutations. The TUI/dialog tiers mutate
+ * this and stage `toInput()` (a minimal raw input) into the settings model;
+ * the normalization at construction fills defaults so rows always show the
+ * effective values.
+ */
+export class ProviderPoolEditorModel {
+  private readonly _config: ProviderPoolConfig;
+
+  constructor(value: unknown) {
+    this._config = normalizeProviderPoolConfig(value);
+  }
+
+  /** The normalized working copy (defaults filled in). */
+  get config(): ProviderPoolConfig {
+    return this._config;
+  }
+
+  /** Compact display string for the row ("on · wait · 2 model(s)"). */
+  summary(): string {
+    return providerPoolSummary(this._config);
+  }
+
+  /** Minimal raw settings input for saving; defaults dropped. */
+  toInput(): ProviderPoolSettingsInput {
+    return providerPoolInputOf(this._config);
+  }
+
+  /** Set one of the four top-level scalars. */
+  setScalar(key: ProviderPoolScalarKey, value: boolean | "wait" | "fail" | number): void {
+    if (key === "enabled") this._config.enabled = Boolean(value);
+    else if (key === "whenSaturated") this._config.whenSaturated = value as "wait" | "fail";
+    else if (key === "saturationWaitTimeoutMs") this._config.saturationWaitTimeoutMs = value as number;
+    else this._config.defaultTpmWindowMs = value as number;
+  }
+
+  /** Logical model ids in insertion order. */
+  modelIds(): string[] {
+    return Object.keys(this._config.models);
+  }
+
+  /** Provider ids for one logical model, in insertion order. */
+  providerIds(modelId: string): string[] {
+    return Object.keys(this._config.models[modelId] ?? {});
+  }
+
+  /** One provider entry (undefined when the model/provider does not exist). */
+  entry(modelId: string, providerId: string): ProviderPoolEntry | undefined {
+    return this._config.models[modelId]?.[providerId];
+  }
+
+  /** Create the model's provider map when absent (no-op on empty id). */
+  upsertModel(modelId: string): void {
+    const key = modelId.trim();
+    if (key.length === 0) return;
+    if (!this._config.models[key]) this._config.models[key] = {};
+  }
+
+  removeModel(modelId: string): void {
+    delete this._config.models[modelId];
+  }
+
+  /** Create the provider entry with defaults when absent (no-op on empty id). */
+  upsertProvider(modelId: string, providerId: string): void {
+    const key = providerId.trim();
+    if (key.length === 0) return;
+    let model = this._config.models[modelId];
+    if (!model) {
+      model = {};
+      this._config.models[modelId] = model;
+    }
+    if (!model[key]) {
+      model[key] = {
+        provider: key,
+        modelId,
+        concurrency: DEFAULT_PROVIDER_CONCURRENCY,
+        weight: DEFAULT_PROVIDER_WEIGHT,
+      };
+    }
+  }
+
+  removeProvider(modelId: string, providerId: string): void {
+    delete this._config.models[modelId]?.[providerId];
+  }
+
+  /**
+   * Set one provider-entry scalar. modelId: non-empty string sets the alias,
+   * empty clears it back to the logical model. concurrency/weight: number >= 1
+   * (floored). tpm/cooldownMs: number >= 1 sets, null clears (unset).
+   */
+  setEntryScalar(
+    modelId: string,
+    providerId: string,
+    key: ProviderPoolEntryScalarKey,
+    value: string | number | null,
+  ): void {
+    const entry = this._config.models[modelId]?.[providerId];
+    if (!entry) return;
+    if (key === "modelId") {
+      const trimmed = typeof value === "string" ? value.trim() : "";
+      entry.modelId = trimmed.length > 0 ? trimmed : modelId;
+    } else if (key === "concurrency") {
+      entry.concurrency = typeof value === "number" && value >= 1 ? Math.floor(value) : entry.concurrency;
+    } else if (key === "weight") {
+      entry.weight = typeof value === "number" && value >= 1 ? Math.floor(value) : entry.weight;
+    } else if (key === "tpm") {
+      if (value === null) delete entry.tpm;
+      else if (typeof value === "number" && value >= 1) entry.tpm = Math.floor(value);
+    } else if (key === "cooldownMs") {
+      if (value === null) delete entry.cooldownMs;
+      else if (typeof value === "number" && value >= 1) entry.cooldownMs = Math.floor(value);
     }
   }
 }

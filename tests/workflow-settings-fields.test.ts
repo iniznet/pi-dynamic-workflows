@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { WORKFLOW_ENV_VARS } from "../src/config.js";
+import { normalizeProviderPoolConfig } from "../src/gateway/provider-pool-config.js";
 import type { WorkflowSettings } from "../src/workflow-settings.js";
 import {
   FIELD_GROUPS,
@@ -18,7 +19,13 @@ import {
   fieldDisplayValue,
   getEnvLockedKeys,
   getField,
+  getProviderPoolEntryScalar,
+  PROVIDER_POOL_ENTRY_SCALARS,
+  ProviderPoolEditorModel,
   parseFieldInput,
+  parseProviderPoolEntryScalar,
+  providerPoolEntryDisplay,
+  providerPoolInputOf,
   SettingsFormModel,
   type WorkflowSettingsField,
 } from "../src/workflow-settings-fields.js";
@@ -27,6 +34,12 @@ function fieldOf(key: keyof WorkflowSettings): WorkflowSettingsField {
   const field = getField(key);
   assert.ok(field, `registry must contain a field for ${key}`);
   return field;
+}
+
+function entryScalarOf(key: Parameters<typeof getProviderPoolEntryScalar>[0]) {
+  const scalar = getProviderPoolEntryScalar(key);
+  assert.ok(scalar, `registry must contain an entry scalar for ${key}`);
+  return scalar;
 }
 
 function parse(key: keyof WorkflowSettings, raw: string) {
@@ -315,5 +328,74 @@ describe("getEnvLockedKeys", () => {
 
   it("returns an empty set for an empty env", () => {
     assert.equal(getEnvLockedKeys({}).size, 0);
+  });
+});
+
+describe("provider-pool entry scalars (PROVIDER_POOL_ENTRY_SCALARS)", () => {
+  it("declares exactly the five editable entry keys in render order", () => {
+    assert.deepEqual(
+      PROVIDER_POOL_ENTRY_SCALARS.map((scalar) => scalar.key),
+      ["modelId", "concurrency", "weight", "tpm", "cooldownMs"],
+    );
+    const tpm = PROVIDER_POOL_ENTRY_SCALARS.find((s) => s.key === "tpm");
+    assert.equal(tpm?.nullable, true, "tpm is an optional cap: empty input clears it");
+    assert.equal(tpm?.min, 1);
+    const concurrency = PROVIDER_POOL_ENTRY_SCALARS.find((s) => s.key === "concurrency");
+    assert.equal(concurrency?.min, 1);
+  });
+
+  it("looks up entry scalars by key", () => {
+    assert.equal(getProviderPoolEntryScalar("concurrency")?.label, "Concurrency");
+    assert.equal(getProviderPoolEntryScalar("bogus" as never), undefined);
+  });
+
+  it("parses the modelId alias as a trimmed non-empty string", () => {
+    const ok = parseProviderPoolEntryScalar(entryScalarOf("modelId"), "  claude-3-5-sonnet  ");
+    assert.deepEqual(ok, { ok: true, value: "claude-3-5-sonnet" });
+    const empty = parseProviderPoolEntryScalar(entryScalarOf("modelId"), "   ");
+    assert.equal(empty.ok, false);
+  });
+
+  it("parses bounded numbers with floor semantics", () => {
+    const concurrency = entryScalarOf("concurrency");
+    assert.deepEqual(parseProviderPoolEntryScalar(concurrency, "5.7"), { ok: true, value: 5 });
+    assert.equal(parseProviderPoolEntryScalar(concurrency, "0").ok, false, "below-min input must reject");
+    assert.equal(parseProviderPoolEntryScalar(concurrency, "abc").ok, false);
+  });
+
+  it('maps empty/"null" input on nullable caps to null (delete the key)', () => {
+    const tpm = entryScalarOf("tpm");
+    assert.deepEqual(parseProviderPoolEntryScalar(tpm, ""), { ok: true, value: null });
+    assert.deepEqual(parseProviderPoolEntryScalar(tpm, "null"), { ok: true, value: null });
+    assert.deepEqual(parseProviderPoolEntryScalar(tpm, "100000"), { ok: true, value: 100000 });
+  });
+
+  it("renders a compact per-provider row summary", () => {
+    const entry = { provider: "anthropic-direct", modelId: "claude-sonnet-4", concurrency: 2, weight: 1 };
+    assert.equal(providerPoolEntryDisplay("claude-sonnet-4", entry), "conc 2 · w 1");
+    assert.equal(
+      providerPoolEntryDisplay("claude-sonnet-4", { ...entry, modelId: "claude-3-5-sonnet" }),
+      "alias claude-3-5-sonnet · conc 2 · w 1",
+    );
+    assert.equal(
+      providerPoolEntryDisplay("claude-sonnet-4", {
+        ...entry,
+        modelId: "claude-3-5-sonnet",
+        tpm: 100_000,
+        cooldownMs: 30_000,
+      }),
+      "alias claude-3-5-sonnet · conc 2 · w 1 · tpm 100000 · cd 30s",
+    );
+    assert.equal(providerPoolEntryDisplay("claude-sonnet-4", undefined), "(missing)");
+  });
+
+  it("preserves empty model maps through normalize and the minimal input (add-then-save round-trip)", () => {
+    const normalized = normalizeProviderPoolConfig({ models: { "gpt-5": {} } });
+    assert.deepEqual(Object.keys(normalized.models), ["gpt-5"], "an added model must survive normalization");
+    const editor = new ProviderPoolEditorModel({ models: { "gpt-5": {} } });
+    assert.deepEqual(providerPoolInputOf(editor.config), { models: { "gpt-5": {} } }, "...and the minimal raw input");
+    // Empty model maps are runtime-safe: the pool falls back to legacy
+    // resolution for a model with no entries, so no routing is lost.
+    assert.equal(editor.entry("gpt-5", "any-provider"), undefined);
   });
 });
