@@ -3371,8 +3371,53 @@ function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): b
   return schema === undefined && typeof result === "string" && result.trim().length === 0;
 }
 
+/**
+ * Size guard for estimateTokens: values whose PROBED serialized size stays under
+ * this budget keep the exact stringify path (byte-accurate token accounting);
+ * anything larger (a huge agent result on a big run — the estimate-tokens-cost
+ * finding) falls back to the length probe so the estimator never pays a
+ * multi-MB JSON.stringify on the event loop just to count tokens.
+ */
+const TOKEN_ESTIMATE_STRINGIFY_BUDGET = 200_000;
+
+/**
+ * Cheap one-level serialized-length probe (no allocation): string length,
+ * array element lengths, own-key/primitive lengths. Monotonically approximates
+ * JSON.stringify(...).length closely enough to gate the exact path above.
+ */
+function probeSerializedLength(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (typeof value === "number" || typeof value === "boolean" || value === null || value === undefined) {
+    return String(value).length;
+  }
+  if (Array.isArray(value)) {
+    let sum = 2; // [ ]
+    for (const item of value) sum += probeSerializedLength(item) + 1; // , separator
+    return sum;
+  }
+  if (typeof value === "object") {
+    let sum = 2; // { }
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      sum += key.length + 3 + probeSerializedLength(item) + 1; // "key": value,
+    }
+    return sum;
+  }
+  return String(value).length;
+}
+
 function estimateTokens(value: unknown): number {
-  return Math.ceil(JSON.stringify(value ?? "").length / 4);
+  const source = value ?? "";
+  if (typeof source === "string") return Math.ceil(source.length / 4);
+  if (typeof source !== "object") return Math.ceil(String(source).length / 4);
+  const probe = probeSerializedLength(source);
+  if (probe <= TOKEN_ESTIMATE_STRINGIFY_BUDGET) {
+    try {
+      return Math.ceil(JSON.stringify(source).length / 4);
+    } catch {
+      // Circular/bigint values can't stringify — the probe estimate is close enough.
+    }
+  }
+  return Math.ceil(probe / 4);
 }
 
 function normalizeConcurrency(value: unknown): number {

@@ -218,12 +218,22 @@ export class ProviderPool {
   /** Providers already logged as "no configured auth" (one-time log per provider). */
   private readonly warnedNoAuth = new Set<string>();
   private nextReservationId = 0;
+  /** Set once shutdown() ran; acquires then reject like a pool-level abort. */
+  private shutdownDone = false;
 
   constructor(config: ProviderPoolConfig, registry: ModelRegistry, options: ProviderPoolOptions = {}) {
     this.config = config;
     this.registry = registry;
     this.poolSignal = options.signal;
     if (config.enabled) this.indexEntries(config.models);
+    // A pool-level abort (host session end) deterministically tears the pool
+    // down: settle every queued waiter and clear every armed wake timer. Without
+    // this, a pool dropped mid-saturation keeps its timers alive until the next
+    // cooldown/TPM expiry even though nothing will ever satisfy its waiters.
+    if (this.poolSignal) {
+      if (this.poolSignal.aborted) this.shutdown();
+      else this.poolSignal.addEventListener("abort", () => this.shutdown(), { once: true });
+    }
   }
 
   /**
@@ -251,7 +261,7 @@ export class ProviderPool {
   ): Promise<ProviderChoice | undefined> {
     const entries = this.entriesByModel.get(logicalModel);
     if (!entries || entries.length === 0) return undefined;
-    if (this.poolSignal?.aborted) throw abortError("Provider pool was shut down");
+    if (this.shutdownDone || this.poolSignal?.aborted) throw abortError("Provider pool was shut down");
     if (options.signal?.aborted) throw abortError();
 
     // Sticky re-acquire: retry attempts share the stickyKey (deltaKey) and
@@ -634,7 +644,15 @@ export class ProviderPool {
     const index = queue.indexOf(waiter);
     if (index === -1) return;
     queue.splice(index, 1);
-    if (queue.length === 0) this.waiters.delete(waiter.logicalModel);
+    if (queue.length === 0) {
+      this.waiters.delete(waiter.logicalModel);
+      // Abort/timeout paths settle a waiter without a dispatch() to clean up
+      // after it, so the model's wake timer (armed at enqueue) would otherwise
+      // survive and fire into an empty queue at the next cooldown/TPM expiry —
+      // a timer a dead pool must not keep around. The release path is already
+      // covered: dispatch() clears it when the queue empties.
+      this.clearWakeTimer(waiter.logicalModel);
+    }
   }
 
   /**
@@ -776,6 +794,12 @@ export class ProviderPool {
       },
       Math.max(0, earliest - Date.now()),
     );
+    // A wake timer is purely advisory — dispatch() is also triggered by
+    // release(), recordLimitEvent(), and acquire(). unref() so a pool that is
+    // dropped (or waiting out a long cooldown) can never pin the event loop
+    // open on its own; if the process is alive for any other reason the timer
+    // still fires and re-checks the queue.
+    timer.unref();
     this.wakeTimers.set(logicalModel, { timer, dueAt: earliest });
   }
 
@@ -785,6 +809,27 @@ export class ProviderPool {
       clearTimeout(existing.timer);
       this.wakeTimers.delete(logicalModel);
     }
+  }
+
+  /**
+   * Deterministic teardown for a dead pool: settle every queued waiter with an
+   * abort error and clear every armed wake timer. Idempotent — a pool-level
+   * signal abort, a host shutdown, and each waiter's own abort all converge on
+   * this, and later calls (or a re-entrant settle from a listener) are no-ops.
+   * Acquires after shutdown reject like a pool-level abort.
+   */
+  shutdown(): void {
+    if (this.shutdownDone) return;
+    this.shutdownDone = true;
+    for (const [logicalModel] of [...this.waiters]) {
+      // settleWaiter → removeWaiter clears each model's wake timer via the
+      // queue-empty path below; the sweep is a safety net for any timer whose
+      // model map entry was already gone.
+      for (const waiter of [...(this.waiters.get(logicalModel) ?? [])]) {
+        this.settleWaiter(waiter, undefined, abortError("Provider pool was shut down"), true);
+      }
+    }
+    for (const logicalModel of [...this.wakeTimers.keys()]) this.clearWakeTimer(logicalModel);
   }
 
   /** Re-arm wake timers for every logical model served by a provider. */

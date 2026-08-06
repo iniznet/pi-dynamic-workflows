@@ -125,6 +125,13 @@ export class MCPBridge {
   private readonly idempotentExecutions = new Map<string, Promise<ToolCallResult>>();
   private started = false;
   private cleanupHandlersInstalled = false;
+  /**
+   * This bridge's installed process lifecycle handlers ([event, fn] pairs), so
+   * stop() can removeListener exactly the ones it installed — each extension
+   * generation that started a bridge used to leave three process.on listeners
+   * behind forever (process-listeners-reload).
+   */
+  private readonly processCleanupHandlers: Array<[string, (...args: unknown[]) => void]> = [];
   /** Outstanding per-call timeout timers; every settled call must leave this empty. */
   private readonly activeTimeoutHandles = new Set<ReturnType<typeof setTimeout>>();
 
@@ -208,6 +215,15 @@ export class MCPBridge {
    * Stop the IPC server and close all connections.
    */
   async stop(): Promise<void> {
+    // Remove this bridge's own process lifecycle handlers first — a stopped
+    // bridge must not leave process.on listeners behind (process-listeners-
+    // reload: every extension generation used to accumulate three). Safe on
+    // every stop path: the array is empty until installCleanupHandlers() ran.
+    for (const [event, handler] of this.processCleanupHandlers) {
+      process.removeListener(event, handler);
+    }
+    this.processCleanupHandlers.length = 0;
+
     if (!this.started || !this.server) {
       return;
     }
@@ -329,15 +345,18 @@ export class MCPBridge {
       }
     };
 
+    const onSigterm = () => {
+      cleanup();
+      process.exit(0);
+    };
+    const onSigint = () => {
+      cleanup();
+      process.exit(0);
+    };
+    this.processCleanupHandlers.push(["exit", cleanup], ["SIGTERM", onSigterm], ["SIGINT", onSigint]);
     process.on("exit", cleanup);
-    process.on("SIGTERM", () => {
-      cleanup();
-      process.exit(0);
-    });
-    process.on("SIGINT", () => {
-      cleanup();
-      process.exit(0);
-    });
+    process.on("SIGTERM", onSigterm);
+    process.on("SIGINT", onSigint);
   }
 
   /**
