@@ -7,7 +7,9 @@
  *  - "auto" (default): the gateway starts lazily on the first run that needs
  *    host tools; untagged runs get merged coding + proxied host tools.
  *  - "on": same merged default; the extension eagerly starts the gateway at
- *    load (opt-in only — the default path stays side-effect free).
+ *    the first session_start (opt-in only — the default path stays side-effect
+ *    free; deferred past load because pi's runtime only binds action methods
+ *    after extension loading finishes).
  *  - "off": exact legacy behavior — nothing auto-starts; untagged runs get
  *    coding tools only; toolset "host-tools" is the only proxy path and needs
  *    a manual `/workflows-gateway start`.

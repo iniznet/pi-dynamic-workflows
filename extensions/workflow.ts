@@ -493,9 +493,11 @@ export default function extension(pi: ExtensionAPI) {
       ),
     hostToolsAutomatic: hostToolsPolicy.isEnabled(),
   });
-  // "on" (opt-in): eager start at load for latency-sensitive users. The
-  // default "auto" stays lazy — nothing opens until a run needs host tools.
-  if (hostToolsPolicy.mode === "on") void hostToolsPolicy.ensureStarted();
+  // "on" (opt-in): the eager start happens at the first session_start below,
+  // NOT at load — action methods (getAllTools inside buildMergedHostTools)
+  // throw "Extension runtime not initialized" until the host binds the
+  // runtime after loading, so a load-time start always failed. The default
+  // "auto" stays lazy — nothing opens until a run needs host tools.
   // Auto-resume runs that paused on a provider usage limit once the quota is
   // likely refilled. Standalone: only consumes the manager's public surface, so
   // it stays decoupled from manager/persistence internals. Its constructor also
@@ -589,6 +591,13 @@ export default function extension(pi: ExtensionAPI) {
     // so both already-built and future bundles adopt it immediately;
     // session_start always fires before any workflow run starts.
     if (ctx.sessionManager) hostSessionManager = () => ctx.sessionManager;
+    // "on" (opt-in): eager start deferred to the first session_start — the
+    // runtime is bound by then (action methods throw during load), and the
+    // real session manager is captured just above so the bundle is built with
+    // it. ensureStarted is idempotent (running-guard + shared in-flight
+    // start), so re-fires on session switch are safe; a transient failure is
+    // logged once and retried by the next run's lazy path.
+    if (hostToolsPolicy.mode === "on") void hostToolsPolicy.ensureStarted();
     const active = pi.getActiveTools();
     const workflowTools = registeredToolNames;
     const missing = workflowTools.filter((name) => !active.includes(name));

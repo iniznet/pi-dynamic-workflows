@@ -12,9 +12,11 @@
  * Extension-level tests (design §9 item 5, mock-pi): the default "auto" mode
  * leaves the gateway STOPPED at load with the automatic-default copy; "off"
  * (settings file) keeps the legacy opt-in-only copy; "on" (settings file)
- * eagerly starts the gateway at load. Untagged-run tool delivery itself is
- * covered by the manager defaultTools tests (resolution order) plus the policy
- * merge tests — spinning a real subagent session is out of scope for unit tests.
+ * eagerly starts the gateway at the first session_start — NOT at load, because
+ * pi's runtime binds action methods only after extension loading finishes.
+ * Untagged-run tool delivery itself is covered by the manager defaultTools
+ * tests (resolution order) plus the policy merge tests — spinning a real
+ * subagent session is out of scope for unit tests.
  */
 
 import assert from "node:assert/strict";
@@ -380,7 +382,7 @@ describe("extension wiring (mock-pi)", () => {
     }
   });
 
-  test("'on' (settings file) eagerly starts the gateway at extension load", async () => {
+  test("'on' (settings file) eagerly starts the gateway at the first session_start", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-hosttools-on-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
@@ -396,8 +398,27 @@ describe("extension wiring (mock-pi)", () => {
         const { ctx } = makeNotifyCtx();
         const handler = command.handler as (args: string, c: ExtensionCommandContext) => Promise<void>;
 
-        // The eager ensureStarted is fire-and-forget; poll the status until the
-        // bridge reports RUNNING (socket bind is fast, well under the poll cap).
+        // No start at load: pi's runtime binds action methods only after
+        // extension loading finishes, so a load-time start would throw
+        // ("Extension runtime not initialized"). Status must be STOPPED.
+        await handler("status", ctx);
+        assert.match(lastSent(extension), /STOPPED/, "'on' must NOT start the gateway at extension load");
+
+        // Fire the session_start handlers the extension registered (post-bind
+        // in real pi): the eager ensureStarted is fire-and-forget, so poll the
+        // status until the bridge reports RUNNING.
+        for (const fire of extension.handlers.session_start ?? []) {
+          fire(
+            {},
+            {
+              model: undefined,
+              modelRegistry: {},
+              sessionManager: { getSessionId: () => "session-1" },
+              ui: { setWidget: () => {} },
+            },
+          );
+        }
+
         let running = "";
         for (let i = 0; i < 100; i++) {
           await handler("status", ctx);
@@ -405,7 +426,7 @@ describe("extension wiring (mock-pi)", () => {
           if (/RUNNING on/.test(running)) break;
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        assert.match(running, /RUNNING on/, "'on' mode must start the gateway at extension load");
+        assert.match(running, /RUNNING on/, "'on' mode must start the gateway at the first session_start");
 
         cleanupExtension(extension.handlers);
       });

@@ -180,8 +180,9 @@ test("hostToolsFromDefinitions falls back to a stable session-manager shim when 
     },
   } as ToolDefinition;
 
-  // A bundle built before the first session_start (eager "on" mode) must not
-  // crash bash — the shim is honest (gateway identity, no fake session file).
+  // A bundle built before the first session_start (no real session manager yet)
+  // must not crash bash — the shim is honest (gateway identity, no fake session
+  // file).
   const fallback = hostToolsFromDefinitions([readsSessionCtx]);
   const first = await (fallback.tools.get("bash_like") as ToolExecutor)({});
   const second = await (fallback.tools.get("bash_like") as ToolExecutor)({});
@@ -212,8 +213,10 @@ test("hostToolsFromDefinitions resolves a provider per call so a load-time bundl
     },
   } as ToolDefinition;
 
-  // Simulates eager "on" mode: the bundle is built at load, BEFORE the
-  // session_start handler assigns the real manager to the provider.
+  // Simulates a bundle built before the real session manager exists (eager
+  // "on" mode now builds at session_start, but the provider form stays safe
+  // for any earlier build): the provider is resolved per call, so the bundle
+  // adopts the real manager the moment it is assigned.
   let real: { getSessionId(): string; getSessionFile(): string | undefined } | undefined;
   const bundle = hostToolsFromDefinitions([readsSessionCtx], () => real);
   const executor = bundle.tools.get("bash_like") as ToolExecutor;
