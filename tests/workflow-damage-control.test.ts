@@ -221,7 +221,7 @@ test("readonly capability always returns exactly the readonly verbs, whatever th
   for (const status of ["running", "paused", "failed", "pending", "completed", "aborted"] as RunStatus[]) {
     assert.deepEqual(allowedDamageControlActions(status, "readonly"), [...DAMAGE_CONTROL_READONLY_ACTIONS]);
   }
-  assert.deepEqual([...DAMAGE_CONTROL_READONLY_ACTIONS], ["list", "status", "agents", "clean"]);
+  assert.deepEqual([...DAMAGE_CONTROL_READONLY_ACTIONS], ["list", "status", "agents"]);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,7 +240,7 @@ test("summarizeRunDeep folds phase, journal, checkpoints, lease, config, counts,
   assert.equal(summary.journal.compacted, false);
   assert.equal(summary.checkpoints.total, 1);
   assert.equal(summary.checkpoints.first, "checkpoint-1");
-  assert.ok(summary.lease && summary.lease.reclaimable);
+  assert.ok(summary.lease?.reclaimable);
   assert.equal(summary.config.agentRetries, 2);
   assert.equal(summary.logs, 1, "live snapshot logs win over persisted");
   assert.equal(summary.resultPresent, false);
@@ -287,12 +287,14 @@ test("summarizeAgents filters by numeric id or callId and reports no matches as 
 
 test("summarizeAgents surfaces the failing-operation one-liner from live or persisted data", () => {
   const withLiveFailure = snapshot();
-  withLiveFailure.agents[0]!.failingOperation = { op: "bash", line: 7, outcome: "exit 1" };
+  const liveAgent = withLiveFailure.agents[0];
+  assert.ok(liveAgent, "snapshot() seeds a first agent");
+  liveAgent.failingOperation = { op: "bash", line: 7, outcome: "exit 1" };
   const liveSummary = summarizeAgents(run(), withLiveFailure).find((agent) => agent.id === 1);
   assert.equal(liveSummary?.failingOperation, "bash (line 7): exit 1");
   const persistedFailure = run();
   persistedFailure.agents[1] = {
-    ...persistedFailure.agents[1]!,
+    ...persistedFailure.agents[1],
     failingOperation: { op: "edit", line: 3, outcome: "conflict" },
   };
   const persistedSummary = summarizeAgents(persistedFailure, null).find((agent) => agent.id === 2);
@@ -333,7 +335,8 @@ test("reconcileAgentAfterKill flips a live agent to error/AGENT_KILLED in place 
   const state = run();
   const outcome = reconcileAgentAfterKill(state, "1");
   assert.deepEqual(outcome, { found: true, alreadyTerminal: false, changed: true });
-  const agent = state.agents[0]!;
+  const agent = state.agents[0];
+  assert.ok(agent, "run() seeds a first agent");
   assert.equal(agent.status, "error");
   assert.equal(agent.error, "killed via workflow_damage_control");
   assert.equal(agent.errorCode, "AGENT_KILLED");
@@ -401,7 +404,7 @@ test("collectCleanCandidates lists stale leases, orphan runs, ghost worktrees, t
     assert.deepEqual(orphanRuns.map((candidate) => candidate.runId).sort(), ["healthy-1", "orphan-1"]);
     const ghost = candidates.filter((candidate) => candidate.kind === "ghost-worktree");
     assert.equal(ghost.length, 1);
-    assert.equal(ghost[0]!.path, `${projectDir}/orphan-1`);
+    assert.equal(ghost[0]?.path, `${projectDir}/orphan-1`);
   } finally {
     rmSync(existingWorktree, { recursive: true, force: true });
   }

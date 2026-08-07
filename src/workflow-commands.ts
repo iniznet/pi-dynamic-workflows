@@ -3,8 +3,7 @@
  * Shares the extension's single WorkflowManager so background runs are reachable.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createWorktreeRunner, type WorktreeRunner, type WorktreeTask } from "./agent/worktree-runner.js";
@@ -24,6 +23,7 @@ import {
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { writeJsonFileAtomic } from "./fs-persistence.js";
 import type { ExecutionBlueprint } from "./phases/prewalk.js";
 import { WorkflowStateManager } from "./phases/state-machine.js";
 import { isPlanBig, planSizeMetrics } from "./plan-size.js";
@@ -182,31 +182,17 @@ async function loadRunPlan(dir: string, runId: string): Promise<ExecutionBluepri
   }
 }
 
-/**
- * Persist an approved plan verdict atomically (tmp + rename inside the plans
- * dir, mirroring the bridge's writePlanAtomic pattern) so a concurrent
- * review-page poll or future read never observes a torn file. A prewalk
- * blueprint carries no status field; deciding adds one alongside the untouched
- * blueprint content, so `/workflows implement` still fans out the SAME steps.
- */
-async function writePlanAtomic(dir: string, runId: string, plan: ExecutionBlueprint): Promise<void> {
-  const plansDir = join(dir, ".pi", "workflows", "plans");
-  const path = join(plansDir, `${runId}.json`);
-  await mkdir(plansDir, { recursive: true });
-  const tmpPath = `${path}.${randomUUID()}.${process.pid}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(plan, null, 2), "utf-8");
-  try {
-    await rename(tmpPath, path);
-  } catch (error) {
-    await rm(tmpPath, { force: true }).catch(() => {});
-    throw error;
-  }
+/** Canonical plans-dir path for a run's plan file (`.pi/workflows/plans/<runId>.json`). */
+function plansFilePath(dir: string, runId: string): string {
+  return join(dir, ".pi", "workflows", "plans", `${runId}.json`);
 }
 
 /**
- * Persist an approved plan verdict atomically (tmp + rename inside the plans
- * dir, mirroring the bridge's writePlanAtomic pattern) so a concurrent
- * review-page poll or future read never observes a torn file. A prewalk
+ * Persist an approved plan verdict atomically through the shared
+ * {@link writeJsonFileAtomic} (fs-persistence.ts) — the SAME retrying tmp +
+ * rename writer the bridge's /approve and the plan pollers use (audit WPA-01),
+ * so a concurrent review-page poll never observes a torn file and a Windows
+ * EPERM rename (a reader holding the destination open) is retried. A prewalk
  * blueprint carries no status field; deciding adds one alongside the untouched
  * blueprint content, so `/workflows implement` still fans out the SAME steps.
  */
@@ -216,7 +202,7 @@ async function decidePlanApproved(dir: string, runId: string, plan: ExecutionBlu
     status: "approved",
     reviewedAt: new Date().toISOString(),
   };
-  await writePlanAtomic(dir, runId, decided);
+  await writeJsonFileAtomic(plansFilePath(dir, runId), decided, { mkdir: true });
 }
 
 function oneLineProgress(snapshot: WorkflowSnapshot): string {
@@ -505,8 +491,11 @@ export function registerWorkflowCommands(
               { customType: "workflow-run", content: armed, display: true },
               { triggerTurn: true, deliverAs: "followUp" },
             );
-          } catch {
-            ctx.ui.notify("Could not start the workflow turn.", "error");
+          } catch (error) {
+            ctx.ui.notify(
+              `Could not start the workflow turn: ${error instanceof Error ? error.message : String(error)}`,
+              "error",
+            );
           }
           return;
         }
@@ -679,22 +668,41 @@ export function registerWorkflowCommands(
             await phaseState.approvePlan();
             await phaseState.transitionTo(3, { enforcePrerequisites: true });
           } catch (error) {
-            // Defense against a race (another process advanced the phase after
-            // our read): surface the same Phase-2-only refusal instead of a
-            // cryptic throw, and never claim success. A state write failure
-            // AFTER the verdict landed must not wedge the run: the plan file
-            // would stay "approved" while the machine sits at Phase 2 (implement
-            // refuses on the closed gate, re-approve refuses on the verdict) —
-            // best-effort rollback restores the pending blueprint so a retry
-            // (or the bridge) can decide it again. Rollback failure still
-            // surfaces the original error and the wedge warning.
-            await writePlanAtomic(cwd, id, plan).catch(() => {});
+            // The run itself may have won the race: its recordGateVerdict
+            // (bridge/browser or in-run gate) already approved the plan and
+            // advanced the machine to Phase 3 while this CLI verb was in
+            // flight. approvePlan is Phase-2-only, so the re-record threw
+            // APPROVAL_REQUIRED — but the end state is the one the user asked
+            // for. Read the machine fresh: when Phase 3 + humanApproved already
+            // hold, report success and KEEP the plan file's verdict (do not
+            // roll back an approval that actually happened). Only a genuine
+            // Phase-2 violation (humanApproved still false) falls through to
+            // the refusal + rollback below.
+            if (error instanceof WorkflowError && error.code === WorkflowErrorCode.APPROVAL_REQUIRED) {
+              const latest = await phaseState.getState();
+              if (latest.activePhase >= 3 && latest.humanApproved) {
+                ctx.ui.notify(
+                  `Plan for ${id} was already approved by the run itself — Phase 3 open; subagent fan-out unlocked via /workflows implement ${id}`,
+                  "info",
+                );
+                return;
+              }
+            }
+            let rolledBack = true;
+            try {
+              await writeJsonFileAtomic(plansFilePath(cwd, id), plan, { mkdir: true });
+            } catch {
+              rolledBack = false;
+            }
             const approvalBlocked =
               error instanceof WorkflowError && error.code === WorkflowErrorCode.APPROVAL_REQUIRED;
+            const failure = approvalBlocked
+              ? `approve refused for ${id}: plan approval is only valid in Phase 2.`
+              : `approve failed for ${id}: ${error instanceof Error ? error.message : String(error)}`;
             ctx.ui.notify(
-              approvalBlocked
-                ? `approve refused for ${id}: plan approval is only valid in Phase 2.`
-                : `approve failed for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+              rolledBack
+                ? failure
+                : `${failure} ⚠ rollback also failed: the plan may stay "approved" at Phase 2, wedging /workflows implement and re-approve — restore the pending plan file (or use the approval bridge) before retrying.`,
               "warning",
             );
             return;
@@ -742,6 +750,22 @@ export function registerWorkflowCommands(
           const tasks: WorktreeTask[] = [];
           for (const [index, step] of blueprint.executionSteps.entries()) {
             const wt = await createWorktree(cwd, `${id}-${index}-${stepSlug(step.action)}`);
+            // Isolation is a hard prerequisite for fan-out (C-02): createWorktree
+            // returns {isolated:false, cwd: baseCwd} when it could not create a
+            // worktree, and running the protocol there would commit the agent's
+            // edits to the MAIN branch. Refuse the whole fan-out (never a
+            // degraded shared-tree run) and surface the reason instead.
+            if (!wt.isolated) {
+              const detail = wt.reason ?? "worktree isolation unavailable";
+              const stray = (wt as { error?: unknown }).error;
+              const strayDetail =
+                stray instanceof Error ? ` (${stray.message})` : stray === undefined ? "" : ` (${String(stray)})`;
+              ctx.ui.notify(
+                `implement refused for ${id}: could not create an isolated worktree for step ${index} — ${detail}${strayDetail}. Refusing fan-out rather than committing to the main branch.`,
+                "error",
+              );
+              return;
+            }
             tasks.push({
               id: `${id}-${index}`,
               description: `${step.description} — ${step.action}`,

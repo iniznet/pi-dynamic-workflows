@@ -445,18 +445,15 @@ test("registry lookup is case-sensitive: a mixed-case provider key must match ex
     { whenSaturated: "fail" },
     reg,
   );
-  await assert.rejects(
-    loweredPool.acquire("llama-3.3"),
-    (err: Error & { code?: string }) => {
-      assert.equal(
-        err.code,
-        WorkflowErrorCode.MODEL_NOT_FOUND,
-        "all-no-auth pool fail-fasts (D2) instead of case-blind routing or 'at capacity'",
-      );
-      assert.match(err.message, /\.?\"myollama\"/, "the error names the unauthenticated provider");
-      return true;
-    },
-  );
+  await assert.rejects(loweredPool.acquire("llama-3.3"), (err: Error & { code?: string }) => {
+    assert.equal(
+      err.code,
+      WorkflowErrorCode.MODEL_NOT_FOUND,
+      "all-no-auth pool fail-fasts (D2) instead of case-blind routing or 'at capacity'",
+    );
+    assert.match(err.message, /\.?"myollama"/, "the error names the unauthenticated provider");
+    return true;
+  });
 });
 
 // ─── D2: all-no-auth pool fails fast ─────────────────────────────────────────
@@ -489,11 +486,9 @@ test("D2: an all-no-auth pool in wait mode fails fast naming the providers (no s
 });
 
 test("D2: an all-no-auth pool in fail mode also names the providers instead of 'at capacity'", async () => {
-  const { pool } = makePool(
-    "m",
-    [{ provider: "noauth-c", modelId: "c", concurrency: 5, weight: 1, auth: false }],
-    { whenSaturated: "fail" },
-  );
+  const { pool } = makePool("m", [{ provider: "noauth-c", modelId: "c", concurrency: 5, weight: 1, auth: false }], {
+    whenSaturated: "fail",
+  });
   await assert.rejects(pool.acquire("m"), (error: unknown) => {
     assert.equal((error as { code: string }).code, WorkflowErrorCode.MODEL_NOT_FOUND);
     assert.match((error as Error).message, /"noauth-c"/);

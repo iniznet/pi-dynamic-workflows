@@ -987,9 +987,7 @@ export async function runWorkflow<T = unknown>(
     // core-06: swallow the PREVIOUS link's rejection so one failed (backward)
     // transition can never poison the chain for every later declaration — the
     // next link still runs, and a flush point observes the LAST link's outcome.
-    phaseStateChain = phaseStateChain
-      .catch(() => {})
-      .then(() => runQueuedPhaseTransition(stage));
+    phaseStateChain = phaseStateChain.catch(() => {}).then(() => runQueuedPhaseTransition(stage));
   };
   const flushPhaseState = () => phaseStateChain;
   /** Record a gate verdict in the persisted state machine (approval only at stage 2). */
@@ -1027,7 +1025,21 @@ export async function runWorkflow<T = unknown>(
     // mirrors the CLI path and is satisfiable — both flags are set.
     const afterApproval = await stateManager.getState();
     if (afterApproval.activePhase < 3) {
-      await stateManager.transitionTo(3, { enforcePrerequisites: true });
+      try {
+        await stateManager.transitionTo(3, { enforcePrerequisites: true });
+      } catch (error) {
+        // Cross-process race (review observation, hardening-fix-batch): the CLI
+        // /workflows approve landed between the peek above and this transition —
+        // the machine is already at Phase 3 with human approval. That is exactly
+        // the end state this branch produces; an invalid/no-op transition is a
+        // success, never a loud failure. Only rethrow when the machine did NOT
+        // actually reach the approved Phase 3 state.
+        if (error instanceof WorkflowError && error.code === WorkflowErrorCode.PHASE_TRANSITION_INVALID) {
+          const state = await stateManager.getState();
+          if (state.activePhase >= 3 && state.humanApproved) return;
+        }
+        throw error;
+      }
     }
   };
   /**

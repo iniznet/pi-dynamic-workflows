@@ -250,8 +250,12 @@ test("/workflows run <prompt> notifies error when sendMessage rejects and does n
   const h = harness({}, {}, [WORKFLOW_TOOL_NAME], failingSend);
   await h.run("run audit auth");
   assert.ok(
-    h.notified.some((n) => n.message === "Could not start the workflow turn."),
+    h.notified.some((n) => n.message.startsWith("Could not start the workflow turn")),
     "should notify the error message",
+  );
+  assert.ok(
+    h.notified.some((n) => n.message.includes("send failed")),
+    "the notify surfaces the underlying cause (C-08)",
   );
 });
 
@@ -1162,6 +1166,47 @@ test("/workflows implement <id> fans approved plan steps out into isolated workt
   }
 });
 
+test("/workflows implement <id> refuses fan-out when the worktree cannot be isolated", async () => {
+  // NOT a git repository: createWorktree degrades to {isolated:false,
+  // cwd: baseCwd} — running the protocol there would commit to the MAIN
+  // branch, so the command must refuse the whole fan-out (C-02).
+  const dir = mkdtempSync(join(tmpdir(), "wf-cmd-noiso-"));
+  let factoryCalls = 0;
+  try {
+    const phaseState = await approvedImplementFixture(dir, "run-noiso", 2);
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "completed" }) },
+      {
+        cwd: dir,
+        phaseState,
+        implementRunnerFactory: () => {
+          factoryCalls++;
+          return {
+            executeTasks: async () => [],
+            getTaskStatus: () => undefined,
+            cleanup: async () => {},
+            abort: () => {},
+          };
+        },
+      },
+    );
+    await h.run("implement run-noiso");
+    assert.ok(
+      h.notified.some(
+        (n) =>
+          n.type === "error" &&
+          n.message.includes("implement refused for run-noiso") &&
+          n.message.includes("not a git repository") &&
+          n.message.includes("Refusing fan-out"),
+      ),
+      "a worktree that could not be created must refuse fan-out instead of degrading to the shared tree",
+    );
+    assert.equal(factoryCalls, 0, "no fan-out without worktree isolation");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // clean + end-to-end checkpoint wiring (G5)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1453,6 +1498,45 @@ test("/workflows approve <id> rolls back the verdict when the state-machine writ
     };
     assert.equal(decided.status, "approved", "a retry approves the pending plan");
     assert.ok(h2.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-rb")));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> surfaces a wedge hint when the verdict rollback itself fails", async () => {
+  const repo = initRepo("wf-cmd-approve-rbfail-");
+  try {
+    await pendingPlanFixture(repo, "run-rbf", 2);
+    // The state write fails AFTER the verdict landed AND sabotages the
+    // rollback's target: the plan path is replaced by a directory, so the
+    // rollback rename fails (a file cannot replace a directory) — the wedge
+    // (plan "approved" at Phase 2) the hint must warn the operator about.
+    const plansDir = join(repo, ".pi", "workflows", "plans");
+    const sabotagingMachine = {
+      getState: async () => ({ activePhase: 2 }),
+      setState: async () => {
+        rmSync(join(plansDir, "run-rbf.json"), { force: true });
+        mkdirSync(join(plansDir, "run-rbf.json"));
+        throw new Error("state write failed (simulated)");
+      },
+    } as unknown as WorkflowStateManager;
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "running" }) },
+      { cwd: repo, phaseState: sabotagingMachine },
+    );
+    await h.run("approve run-rbf");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("approve failed for run-rbf")),
+      "the original failure is still surfaced",
+    );
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("rollback also failed")),
+      "a failed rollback must warn about the wedge instead of being silently swallowed (C-06)",
+    );
+    assert.ok(
+      h.notified.some((n) => n.message.includes("wedging /workflows implement and re-approve")),
+      "the wedge hint names what is stuck (implement gate + re-approve verdict)",
+    );
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

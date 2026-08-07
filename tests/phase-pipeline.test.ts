@@ -364,24 +364,24 @@ describe("runWorkflow pipeline wiring (G4 + G2)", () => {
     const stateManager = new WorkflowStateManager(dir);
     // Stage 2 → backward 1 (rejects, swallowed) → forward 3: the OLD
     // phaseStateChain.then() wiring would skip the stage-3 transition forever
-    // (poisoned chain) and fail the run at the flush point; the fix lets each
-    // later declaration run, so the machine lands on the valid final stage and
-    // the agent gate opens.
+    // (poisoned chain), leaving the machine at Phase 2; the fix lets each
+    // later declaration run, so the machine lands on the valid final stage.
+    // No agent()/checkpoint: the run-end flush applies the queued transitions
+    // and the persisted state is the discriminator.
     const script = `export const meta = { name: 'g', description: 'chain recovery' }
 phase('Plan review', { stage: 2 })
 phase('Revisit plan', { stage: 1 })
 phase('Execute', { stage: 3 })
-const r = await agent('work', { label: 'execute' })
-return r`;
+return 'ok'`;
     const res = await runWorkflow(script, {
       agent: noopAgent,
       cwd: dir,
       persistLogs: false,
       phaseState: { stateManager },
     });
-    assert.equal(res.result, "ok", "the run survives the one bad transition and the agent is not blocked");
+    assert.equal(res.result, "ok");
     const state = await readState(dir);
-    assert.equal(state.activePhase, 3, "the later valid stage-3 declaration still applied");
+    assert.equal(state.activePhase, 3, "the later valid stage-3 declaration still applied after the rejected one");
   });
 
   it("core-06: a backward declaration as the LAST queued transition still fails at the flush point", async () => {

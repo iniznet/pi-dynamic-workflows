@@ -787,7 +787,7 @@ test(
 
     const resumed = resumedEvent as { runId: string } | null;
     assert.ok(resumed, "resumed event should fire");
-    assert.equal(resumed!.runId, runId);
+    assert.equal(resumed.runId, runId);
 
     da.resolve("done");
     await promise.catch(() => {});
@@ -844,8 +844,8 @@ test(
 
     const failureEvent = capturedError as { runId: string; error: WorkflowError } | null;
     assert.ok(failureEvent, "a genuine run failure must emit 'error'");
-    assert.ok(failureEvent!.error instanceof WorkflowError, "error should be instance of WorkflowError");
-    assert.equal(failureEvent!.error.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+    assert.ok(failureEvent.error instanceof WorkflowError, "error should be instance of WorkflowError");
+    assert.equal(failureEvent.error.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
     assert.equal(manager.listRuns()[0]?.status, "failed");
   }),
 );
@@ -2152,7 +2152,8 @@ test(
     // (without that, it would sit in `runs` forever: no pending tail left to
     // ever call recordTerminalRun() for it).
     const other = await manager.runSync(oneAgentScript);
-    assert.ok(manager.getRun(other.runId!), "the newest terminal run is in memory");
+    assert.ok(other.runId, "a completed run carries its runId");
+    assert.ok(manager.getRun(other.runId), "the newest terminal run is in memory");
     assert.equal(
       manager.getRun(pausedId),
       undefined,

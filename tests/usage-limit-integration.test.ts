@@ -191,7 +191,7 @@ test("D1/D8: through the manager, whole-pool saturation checkpoints the run as p
         defaultTpmWindowMs: 60_000,
         models: {
           "faux-model": {
-            fauxtest: { modelId: "faux-model", concurrency: 4, weight: 1, tpm: 100 },
+            fauxtest: { provider: "fauxtest", modelId: "faux-model", concurrency: 4, weight: 1, tpm: 100 },
           },
         },
       },

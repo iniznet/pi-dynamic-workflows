@@ -1555,11 +1555,7 @@ export class WorkflowManager extends EventEmitter {
       if (checkpointPaused) {
         this.emitLive(managed, "paused", {
           runId: managed.runId,
-          reason: saturatedPaused
-            ? "provider_saturated"
-            : overloadedPaused
-              ? "provider_overloaded"
-              : "usage_limit",
+          reason: saturatedPaused ? "provider_saturated" : overloadedPaused ? "provider_overloaded" : "usage_limit",
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
