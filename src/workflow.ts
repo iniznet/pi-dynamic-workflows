@@ -1093,6 +1093,29 @@ export async function runWorkflow<T = unknown>(
     }
   }
 
+  // Prompt-aware tier classification stage (GAP-2): the persisted state
+  // machine's activePhase, clamped to 0..1, threaded into agent() model
+  // resolution so wayfinder/prewalk reconnaissance (phases 0-1, read-only)
+  // classifies scan/edit prompts to the cheap tier instead of the generic
+  // "runtime" default (whose prompt-level rules let a recon prompt's
+  // synthesize phrasing escalate to the big tier). Any later stage clamps to
+  // "1" — the early-phase branch only ADDS scan/edit priority; synthesize and
+  // analyze keywords classify identically, so post-pipeline synthesis stays on
+  // the big tier. Read once per run so agentImpl's resume-key section stays
+  // synchronous. Absent a pipeline/phaseState machine the stage stays
+  // undefined and resolution behaves exactly as before the fix.
+  let pipelineStage: "0" | "1" | undefined;
+  const pipelineStageManager = options.pipeline?.stateManager ?? phaseStateIntegration?.stateManager;
+  if (pipelineStageManager) {
+    try {
+      const pipelineStageState = await pipelineStageManager.getState();
+      const clampedStage = Math.min(Math.max(pipelineStageState.activePhase, 0), 1);
+      pipelineStage = clampedStage === 0 ? "0" : "1";
+    } catch {
+      pipelineStage = undefined;
+    }
+  }
+
   /**
    * Guarded host-callback dispatch (M1): every host-invoked callback
    * (onAgentStart/onAgentEnd/onAgentJournal/onAgentHistory/onTokenUsage/onPhase/
@@ -1603,6 +1626,11 @@ export async function runWorkflow<T = unknown>(
               instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
               model: modelSpec,
               tier: agentOptions.tier,
+              // GAP-2: the run's pipeline stage (clamped 0..1) so the
+              // prompt-aware tier fallback classifies wayfinder/prewalk recon
+              // to the cheap tier. Undefined on non-pipeline runs (unchanged
+              // behavior).
+              pipelineStage,
               modelRegistry: options.modelRegistry,
               // Provider pool: the run's pool + this call's sticky key (the
               // deltaKey) — retry attempts re-acquire the same pinned provider;

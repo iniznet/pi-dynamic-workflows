@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import test from "node:test";
@@ -1291,6 +1291,291 @@ test("/workflows implement persists one atomic checkpoint per task via the real 
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// approve — Phase 2 plan approval opens Phase 3 (GAP-1)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fixture for `/workflows approve`: writes the run's plan file at the canonical
+ * `.pi/workflows/plans/<runId>.json` path and drives the REAL phase machine
+ * into the state a DEFAULT UNGATED run leaves behind — Phase 2 (plannotator
+ * review) after the wayfinder → prewalk pipeline, nothing submitted/approved.
+ * Mirrors prd-runtime-activation: the run-entry pipeline transitions 0 → 1 → 2
+ * and stops; only a checkpoint gate would ever set plannotatorSubmitted.
+ */
+async function pendingPlanFixture(repo: string, runId: string, stepCount = 2): Promise<WorkflowStateManager> {
+  const plansDir = join(repo, ".pi", "workflows", "plans");
+  mkdirSync(plansDir, { recursive: true });
+  writeFileSync(
+    join(plansDir, `${runId}.json`),
+    JSON.stringify({
+      id: `bp-${runId}`,
+      title: `plan for ${runId}`,
+      preconditions: ["p"],
+      executionSteps: Array.from({ length: stepCount }, (_, i) => ({
+        id: `s${i}`,
+        description: `step ${i}`,
+        action: `action ${i}`,
+        expectedOutcome: "done",
+        rollbackProcedure: "revert",
+      })),
+      failSafeProcedures: ["fs"],
+      verificationTests: ["vt"],
+      createdAt: new Date().toISOString(),
+    }),
+    "utf-8",
+  );
+  const phaseState = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+  await phaseState.markWayfinderComplete();
+  await phaseState.markPrewalkComplete();
+  await phaseState.transitionTo(1, { enforcePrerequisites: true });
+  await phaseState.transitionTo(2, { enforcePrerequisites: true });
+  return phaseState;
+}
+
+test("/workflows approve <id> approves a pending Phase 2 plan: file verdict + humanApproved + Phase 3", async () => {
+  const repo = initRepo("wf-cmd-approve-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-app", 2);
+    // Production shape: no opts.phaseState — the verb reads the canonical
+    // active-state.json fresh from disk like /workflows implement does.
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-app");
+
+    // The plan file now carries the decided verdict, atomically persisted, with
+    // the blueprint content intact for /workflows implement.
+    const decided = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-app.json"), "utf-8")) as {
+      status?: string;
+      reviewedAt?: string;
+      title?: string;
+      executionSteps?: unknown[];
+    };
+    assert.equal(decided.status, "approved", "the plan file flips to approved");
+    assert.ok(decided.reviewedAt, "a decided plan records when it was reviewed");
+    assert.equal(decided.title, "plan for run-app", "the blueprint content survives the verdict");
+    assert.equal(decided.executionSteps?.length, 2, "the execution steps stay fan-out ready");
+
+    // Persisted phase machine: the CLI approval records the submission the
+    // ungated pipeline never produced, the human verdict, and Phase 3.
+    const state = await phaseState.getState();
+    assert.equal(state.plannotatorSubmitted, true);
+    assert.equal(state.humanApproved, true);
+    assert.equal(state.activePhase, 3);
+
+    // The gate /workflows implement checks is open — also from a FRESH machine
+    // (production constructs one per command invocation, reading from disk).
+    assert.equal(phaseState.canSpawnSubagents(), true);
+    const fresh = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+    await fresh.getState();
+    assert.equal(fresh.canSpawnSubagents(), true, "a fresh machine read from disk sees the open gate");
+
+    assert.ok(h.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-app")));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve without id warns usage", async () => {
+  const h = harness();
+  await h.run("approve");
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "warning");
+  assert.match(h.notified[0].message, /Usage: \/workflows approve/);
+});
+
+test("/workflows approve <id> errors when the run does not exist (unknown runId)", async () => {
+  const h = harness(); // default getRun → undefined
+  await h.run("approve run-missing");
+  assert.equal(h.notified.length, 1);
+  assert.equal(h.notified[0].type, "error");
+  assert.match(h.notified[0].message, /No workflow run/);
+});
+
+test("/workflows approve <id> errors when no plan file exists (unknown plan)", async () => {
+  const repo = initRepo("wf-cmd-approve-noplan-");
+  try {
+    const h = harness({ getRun: () => ({ runId: "run-x", status: "running" }) }, { cwd: repo });
+    await h.run("approve run-x");
+    assert.equal(h.notified.length, 1);
+    assert.equal(h.notified[0].type, "error");
+    assert.match(h.notified[0].message, /No plan found for run run-x/);
+    assert.equal(existsSync(join(repo, ".pi", "workflows", "plans", "run-x.json")), false, "nothing is written");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> rolls back the verdict when the state-machine write fails (no permanent wedge)", async () => {
+  const repo = initRepo("wf-cmd-approve-rollback-");
+  try {
+    await pendingPlanFixture(repo, "run-rb", 2);
+    // A state write that fails AFTER the plan verdict landed — the wedge the
+    // reviewer flagged: plan stays "approved" while the machine sits at Phase
+    // 2, so implement refuses (closed gate) and re-approve refuses (verdict).
+    const throwingMachine = {
+      getState: async () => ({ activePhase: 2 }),
+      setState: async () => {
+        throw new Error("state write failed (simulated)");
+      },
+    } as unknown as WorkflowStateManager;
+    const h = harness(
+      { getRun: (id: string) => ({ runId: id, status: "running" }) },
+      { cwd: repo, phaseState: throwingMachine },
+    );
+    await h.run("approve run-rb");
+
+    // The verdict was written, then rolled back: the plan file is pending
+    // again (no status), so a retry can decide it — no permanent wedge.
+    const plan = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-rb.json"), "utf-8")) as {
+      status?: string;
+      executionSteps?: unknown[];
+    };
+    assert.equal(plan.status, undefined, "the plan verdict is rolled back to pending");
+    assert.equal(plan.executionSteps?.length, 2, "the blueprint content survives the rollback");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("approve failed for run-rb")),
+      "the failure is surfaced, never a fake success",
+    );
+
+    // Wedge-escape proof: a fresh approve against the REAL disk machine (the
+    // production shape, no injected phaseState) succeeds end-to-end.
+    const h2 = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h2.run("approve run-rb");
+    const decided = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-rb.json"), "utf-8")) as {
+      status?: string;
+    };
+    assert.equal(decided.status, "approved", "a retry approves the pending plan");
+    assert.ok(h2.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-rb")));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> refuses an already-decided plan (409 semantics) and leaves the machine untouched", async () => {
+  const repo = initRepo("wf-cmd-approve-decided-");
+  try {
+    const plansDir = join(repo, ".pi", "workflows", "plans");
+    mkdirSync(plansDir, { recursive: true });
+    // A bridge-submitted ReviewPlan already carries its verdict.
+    writeFileSync(
+      join(plansDir, "run-decided.json"),
+      JSON.stringify({
+        id: "bp-run-decided",
+        title: "decided",
+        status: "approved",
+        reviewedAt: "2024-01-01T00:00:00.000Z",
+        preconditions: ["p"],
+        executionSteps: [],
+        failSafeProcedures: [],
+        verificationTests: [],
+      }),
+      "utf-8",
+    );
+    const phaseState = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+    await phaseState.markWayfinderComplete();
+    await phaseState.markPrewalkComplete();
+    await phaseState.transitionTo(1, { enforcePrerequisites: true });
+    await phaseState.transitionTo(2, { enforcePrerequisites: true });
+    const h = harness({ getRun: () => ({ runId: "run-decided", status: "running" }) }, { cwd: repo });
+    await h.run("approve run-decided");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("already approved")),
+      "approval is a one-shot transition — already-decided plans are refused",
+    );
+    const after = await phaseState.getState();
+    assert.equal(after.activePhase, 2, "no phase transition for a re-approval");
+    assert.equal(after.humanApproved, false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> refuses outside Phase 2 (approvePlan's APPROVAL_REQUIRED) and never writes the verdict", async () => {
+  const repo = initRepo("wf-cmd-approve-phase-");
+  try {
+    await pendingPlanFixture(repo, "run-phase", 1);
+    // Machine at Phase 3 WITHOUT approval (a run that somehow skipped the
+    // gate): approvePlan is only valid at exactly Phase 2.
+    const phaseState = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+    await phaseState.setState({ activePhase: 3, humanApproved: false });
+    const h = harness({ getRun: () => ({ runId: "run-phase", status: "running" }) }, { cwd: repo });
+    await h.run("approve run-phase");
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && n.message.includes("only valid in Phase 2")),
+      "the refusal mirrors the bridge's 409 for a phase mismatch",
+    );
+    const decided = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-phase.json"), "utf-8")) as {
+      status?: string;
+    };
+    assert.equal(decided.status, undefined, "a phase-mismatched approve must not persist the verdict");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("E2E: default ungated run state → /workflows approve → /workflows implement succeeds where it previously refused", async () => {
+  const repo = initRepo("wf-cmd-approve-e2e-");
+  let factoryCalls = 0;
+  const receivedTasks: string[] = [];
+  const runnerFactory = () => {
+    factoryCalls++;
+    return {
+      executeTasks: async (tasks: Array<{ id: string }>) => {
+        receivedTasks.push(...tasks.map((t) => t.id));
+        return tasks.map((t) => ({ taskId: t.id, success: true, output: "ok", duration: 5 }));
+      },
+      getTaskStatus: () => undefined,
+      cleanup: async () => {},
+      abort: () => {},
+    };
+  };
+  try {
+    // The default pipeline (wayfinder → prewalk → transitionTo(2)) leaves
+    // exactly this behind: a pending plan + machine at Phase 2, no approval.
+    await pendingPlanFixture(repo, "run-e2e", 2);
+    const stateManager = new WorkflowStateManager(join(repo, ".pi", "workflows"));
+    await stateManager.getState();
+    assert.equal(stateManager.canSpawnSubagents(), false, "the default run's Phase 3 gate is closed");
+
+    // 1) /workflows implement REFUSES before approval — the gap's refusal.
+    const before = harness(
+      { getRun: (id: string) => ({ runId: id, status: "running" }) },
+      { cwd: repo, implementRunnerFactory: runnerFactory },
+    );
+    await before.run("implement run-e2e");
+    assert.ok(
+      before.notified.some((n) => n.message.includes("implement blocked")),
+      "implement must refuse the default ungated run before approval",
+    );
+    assert.equal(factoryCalls, 0, "no fan-out while the approval gate is closed");
+
+    // 2) /workflows approve flips the gate: plan file + machine both persist
+    //    the decision (fresh machines read disk, like production).
+    const approve = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await approve.run("approve run-e2e");
+    assert.ok(approve.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-e2e")));
+    const decided = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-e2e.json"), "utf-8")) as {
+      status?: string;
+    };
+    assert.equal(decided.status, "approved");
+
+    // 3) /workflows implement now succeeds — same cwd, fresh machines, the
+    //    only change on disk is the approval.
+    const after = harness(
+      { getRun: (id: string) => ({ runId: id, status: "running" }) },
+      { cwd: repo, implementRunnerFactory: runnerFactory },
+    );
+    await after.run("implement run-e2e");
+    assert.equal(factoryCalls, 1, "the gate opening lets the runner fire");
+    assert.deepEqual(receivedTasks, ["run-e2e-0", "run-e2e-1"], "the approved plan's steps fan out");
+    assert.match(after.printed[0], /Implement run-e2e: 2 task\(s\) from "plan for run-e2e"/);
+    assert.match(after.printed[0], /✓ run-e2e-0/);
+    assert.match(after.printed[0], /✓ run-e2e-1/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // unknown subcommand
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1342,10 +1627,10 @@ test("/workflows argument completions: verbs, run ids, save names", () => {
   assert.equal(typeof spec.getArgumentCompletions, "function", "/workflows must expose argument completions");
   const comp = (prefix: string) => spec.getArgumentCompletions?.(prefix) ?? [];
 
-  // empty prefix → the full 12-verb vocabulary in handler dispatch order
+  // empty prefix → the full 13-verb vocabulary in handler dispatch order
   assert.deepEqual(
     comp("").map((c) => c.value),
-    ["run", "ui", "list", "status", "watch", "stop", "pause", "resume", "implement", "clean", "rm", "save"],
+    ["run", "ui", "list", "status", "watch", "stop", "pause", "resume", "approve", "implement", "clean", "rm", "save"],
   );
   // every verb carries a hint description
   for (const c of comp("")) assert.ok(c.description, `verb ${c.value} needs a description`);
@@ -1377,6 +1662,15 @@ test("/workflows argument completions: verbs, run ids, save names", () => {
   assert.deepEqual(
     comp("rm ").map((c) => c.value),
     ["rm run-1", "rm run-2"],
+  );
+  // approve is an id verb like status/rm
+  assert.deepEqual(
+    comp("approve ").map((c) => c.value),
+    ["approve run-1", "approve run-2"],
+  );
+  assert.deepEqual(
+    comp("approve run-2").map((c) => c.value),
+    ["approve run-2"],
   );
 
   // save name slot: saved workflow names first, then run ids

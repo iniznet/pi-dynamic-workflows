@@ -3,7 +3,8 @@
  * Shares the extension's single WorkflowManager so background runs are reachable.
  */
 
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createWorktreeRunner, type WorktreeRunner, type WorktreeTask } from "./agent/worktree-runner.js";
@@ -22,6 +23,7 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import type { ExecutionBlueprint } from "./phases/prewalk.js";
 import { WorkflowStateManager } from "./phases/state-machine.js";
 import { type PersistedRunState, saveCheckpoint } from "./run-persistence.js";
@@ -43,7 +45,7 @@ const RUN_STATUS_ORDER = ["pending", "running", "paused", "completed", "failed",
 const RUN_STATUS_LEGEND = `Legend: ${RUN_STATUS_ORDER.map((s) => `${STATUS_GLYPH[s]} ${s}`).join(" ")}`;
 
 const USAGE =
-  "Usage: /workflows [list | ui] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | implement <id> | clean | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list | ui] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | approve <id> | implement <id> | clean | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -57,6 +59,7 @@ const WORKFLOWS_SUBCOMMANDS: ReadonlyArray<{ value: string; description: string 
   { value: "stop", description: "<id> — stop a running run" },
   { value: "pause", description: "<id> — pause a running run" },
   { value: "resume", description: "<id> — resume a paused run" },
+  { value: "approve", description: "<id> — approve a Phase 2 plan, opening Phase 3 for implement" },
   { value: "implement", description: "<id> — fan out an approved plan's steps into worktrees" },
   { value: "clean", description: "sweep orphan worktrees and temporary pi/wf branches" },
   { value: "rm", description: "<id> — delete a run and its resume journal (destructive)" },
@@ -70,6 +73,7 @@ const WORKFLOWS_ID_VERBS: ReadonlySet<string> = new Set([
   "stop",
   "pause",
   "resume",
+  "approve",
   "implement",
   "rm",
 ]);
@@ -175,6 +179,43 @@ async function loadRunPlan(dir: string, runId: string): Promise<ExecutionBluepri
   } catch {
     return null;
   }
+}
+
+/**
+ * Persist an approved plan verdict atomically (tmp + rename inside the plans
+ * dir, mirroring the bridge's writePlanAtomic pattern) so a concurrent
+ * review-page poll or future read never observes a torn file. A prewalk
+ * blueprint carries no status field; deciding adds one alongside the untouched
+ * blueprint content, so `/workflows implement` still fans out the SAME steps.
+ */
+async function writePlanAtomic(dir: string, runId: string, plan: ExecutionBlueprint): Promise<void> {
+  const plansDir = join(dir, ".pi", "workflows", "plans");
+  const path = join(plansDir, `${runId}.json`);
+  await mkdir(plansDir, { recursive: true });
+  const tmpPath = `${path}.${randomUUID()}.${process.pid}.tmp`;
+  await writeFile(tmpPath, JSON.stringify(plan, null, 2), "utf-8");
+  try {
+    await rename(tmpPath, path);
+  } catch (error) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Persist an approved plan verdict atomically (tmp + rename inside the plans
+ * dir, mirroring the bridge's writePlanAtomic pattern) so a concurrent
+ * review-page poll or future read never observes a torn file. A prewalk
+ * blueprint carries no status field; deciding adds one alongside the untouched
+ * blueprint content, so `/workflows implement` still fans out the SAME steps.
+ */
+async function decidePlanApproved(dir: string, runId: string, plan: ExecutionBlueprint): Promise<void> {
+  const decided: ExecutionBlueprint & { status: "approved"; reviewedAt: string } = {
+    ...plan,
+    status: "approved",
+    reviewedAt: new Date().toISOString(),
+  };
+  await writePlanAtomic(dir, runId, decided);
 }
 
 function oneLineProgress(snapshot: WorkflowSnapshot): string {
@@ -360,7 +401,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/implement <id> | clean | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/approve/implement <id> | clean | rm <id> | save <name> [runId]",
     getArgumentCompletions: (prefix: string) => {
       // The host hands over the raw text after the first space, untrimmed — so
       // a trailing space means the token being typed is empty and sits one
@@ -569,6 +610,84 @@ export function registerWorkflowCommands(
           ctx.ui.notify(
             `✗ Resume not available for ${id} yet${run ? ` — ${runStatusWord(run.status)}` : ""}`,
             "warning",
+          );
+          return;
+        }
+        case "approve": {
+          if (!id) return ctx.ui.notify("Usage: /workflows approve <runId>", "warning");
+          const run = manager.getRun(id);
+          if (!run) {
+            ctx.ui.notify(`No workflow run "${id}"`, "error");
+            return;
+          }
+          const cwd = opts.cwd ?? process.cwd();
+          // Same persisted machine the run's Phase 0/1 pipeline advanced to
+          // Phase 2 and `/workflows implement` later gates on. Production
+          // registers without opts.phaseState (extensions/workflow.ts), so
+          // each verb reads the canonical active-state.json fresh from disk.
+          const phaseState = opts.phaseState ?? new WorkflowStateManager(join(cwd, ".pi", "workflows"));
+          const state = await phaseState.getState();
+          // Validation ladder mirrors the bridge's POST /approve before any
+          // mutation: the plan file must exist, must be undecided, and the
+          // machine must sit at Phase 2 (the only phase where approvePlan is
+          // valid — a phase mismatch is the 409 the bridge answers with).
+          const plan = await loadRunPlan(cwd, id);
+          if (!plan) {
+            ctx.ui.notify(`No plan found for run ${id} — run a Phase 1 prewalk first.`, "error");
+            return;
+          }
+          // A prewalk blueprint has no status field (still pending); a
+          // bridge-submitted ReviewPlan carries one. Any decided status is
+          // refused (409 semantics) — approval is a one-shot transition.
+          const planStatus = (plan as unknown as { status?: string }).status;
+          if (planStatus === "approved" || planStatus === "rejected") {
+            ctx.ui.notify(`Plan for run ${id} is already ${planStatus} — nothing to approve.`, "warning");
+            return;
+          }
+          if (state.activePhase !== 2) {
+            ctx.ui.notify(
+              `approve refused for ${id}: plan approval is only valid in Phase 2 (current phase: ${state.activePhase}).`,
+              "warning",
+            );
+            return;
+          }
+          try {
+            // Verdict first (the bridge's /approve order): the plan file flips
+            // to approved before any state-machine write, so a concurrent poll
+            // observes the decision exactly once.
+            await decidePlanApproved(cwd, id, plan);
+            // The default ungated pipeline never produces plannotatorSubmitted
+            // (only a checkpoint gate does, workflow.ts recordGateVerdict) — CLI
+            // approval records the submission itself, then humanApproved, so
+            // both Phase 3 prerequisites hold and the enforced transition opens
+            // the subagent gate for /workflows implement.
+            await phaseState.setState({ plannotatorSubmitted: true });
+            await phaseState.approvePlan();
+            await phaseState.transitionTo(3, { enforcePrerequisites: true });
+          } catch (error) {
+            // Defense against a race (another process advanced the phase after
+            // our read): surface the same Phase-2-only refusal instead of a
+            // cryptic throw, and never claim success. A state write failure
+            // AFTER the verdict landed must not wedge the run: the plan file
+            // would stay "approved" while the machine sits at Phase 2 (implement
+            // refuses on the closed gate, re-approve refuses on the verdict) —
+            // best-effort rollback restores the pending blueprint so a retry
+            // (or the bridge) can decide it again. Rollback failure still
+            // surfaces the original error and the wedge warning.
+            await writePlanAtomic(cwd, id, plan).catch(() => {});
+            const approvalBlocked =
+              error instanceof WorkflowError && error.code === WorkflowErrorCode.APPROVAL_REQUIRED;
+            ctx.ui.notify(
+              approvalBlocked
+                ? `approve refused for ${id}: plan approval is only valid in Phase 2.`
+                : `approve failed for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+              "warning",
+            );
+            return;
+          }
+          ctx.ui.notify(
+            `Approved plan for ${id} — Phase 3 open; subagent fan-out unlocked via /workflows implement ${id}`,
+            "info",
           );
           return;
         }

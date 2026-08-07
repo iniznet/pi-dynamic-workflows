@@ -12,6 +12,8 @@
  * per-pattern generator scripts are written exactly once.
  */
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createCodingTools, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 import {
@@ -49,6 +51,15 @@ interface BuiltinWorkflowDescriptor {
   description: string;
   /** Build the script (and exec context) for one invocation; throws on invalid `args`. */
   resolve(cwd: string, args: unknown): BuiltinWorkflowInvocation;
+  /**
+   * Optional host-side arg preparation for the workflow tool's `name` path,
+   * run BEFORE resolve(). May be async because a pattern can need to fetch
+   * data in the extension process — code-review resolves `diffSource` (a
+   * git/gh command string) into `diff` by executing it (GAP-3). The slash
+   * commands never run this hook: they fetch the same data themselves and
+   * pass the already-resolved args straight to resolve() (builtin-commands.ts).
+   */
+  prepareArgs?(cwd: string, args: unknown, onNotify?: (message: string) => void): Promise<unknown>;
 }
 
 function asRecord(args: unknown): Record<string, unknown> {
@@ -108,13 +119,37 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "code-review",
     description:
-      "Multi-angle parallel code review: 8 specialized finders (correctness, removed-behavior, call-site, reuse, simplification, efficiency, altitude, security) + verify pass → ranked findings. args: { diff: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number }.",
+      "Multi-angle parallel code review: 8 specialized finders (correctness, removed-behavior, call-site, reuse, simplification, efficiency, altitude, security) + verify pass → ranked findings. args: { diff?: string, diffSource?: string (a 'git …'/'gh pr diff …' command whose output becomes diff when diff is not supplied), diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number }.",
+    /**
+     * GAP-3: `diffSource` was documented as a first-class tool-path arg but
+     * never resolved there — the generated script only used it as a
+     * `<diff source=…>` label (code-review.ts), so a model passing
+     * diffSource:'git diff HEAD' could not get a real diff (it hit a
+     * misleading "requires args.diff" error, or with an empty diff reviewed
+     * nothing). This hook fetches the source host-side BEFORE resolve(),
+     * mirroring the /code-review slash command's execFile fetch
+     * (builtin-commands.ts) — same buffer cap, timeout, kill signal, and
+     * empty-diff error. When `diff` is supplied the fetch is bypassed.
+     */
+    async prepareArgs(cwd, args, onNotify) {
+      const record = asRecord(args);
+      if (record.diffSource !== undefined && typeof record.diffSource !== "string") {
+        throw new Error('Built-in workflow "code-review" requires args.diffSource to be a string when present.');
+      }
+      const diff = typeof record.diff === "string" ? record.diff : "";
+      const diffSource = typeof record.diffSource === "string" ? record.diffSource.trim() : "";
+      // An explicit diff wins; with no source named there is nothing to fetch
+      // (resolve() then fails with its usual "requires args.diff" validation).
+      if (diff.trim() || !diffSource) return args;
+      const fetched = await fetchDiffFromSource(diffSource, cwd, onNotify);
+      return { ...record, diff: fetched, diffSource };
+    },
     resolve(_cwd, args) {
       const record = asRecord(args);
-      // Truncation past MAX_DIFF_CHARS already happens inside the generated
-      // script at runtime (see code-review.ts); a caller invoking by name is
-      // responsible for supplying `diff` (e.g. by running `git diff` itself),
-      // unlike the /code-review slash command, which fetches it automatically.
+      // Truncation past MAX_DIFF_CHARS happens inside the generated script at
+      // runtime (see code-review.ts); a caller invoking by name either supplies
+      // `diff` itself or a `diffSource` command, which prepareArgs resolves
+      // into `diff` before this validation runs (GAP-3).
       requireNonEmptyString(record.diff, "diff", "code-review");
       validateNumericArgs(record, CODE_REVIEW_NUMERIC_ARGS, "code-review");
       return { script: generateCodeReviewWorkflow() };
@@ -195,6 +230,115 @@ export const BUILTIN_WORKFLOW_NAMES: readonly string[] = BUILTIN_WORKFLOWS.map((
 
 export function findBuiltinWorkflow(name: string): BuiltinWorkflowDescriptor | undefined {
   return BUILTIN_WORKFLOWS.find((w) => w.name === name);
+}
+
+// ─── diffSource host-side resolution (GAP-3) ────────────────────────────────────
+// The /code-review slash command fetches the diff itself and passes the
+// resolved args to resolve(); the workflow tool's `name` path reaches the same
+// builtin through prepareArgs() → fetchDiffFromSource(), so `diffSource`
+// behaves identically on both surfaces. Constants and error shapes mirror
+// builtin-commands.ts exactly (same maxBuffer/timeout/killSignal and the same
+// execFile-no-shell security boundary).
+
+/** Cap on the diff-source exec's stdout+stderr buffer (see builtin-commands.ts). */
+const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** Hard deadline for the diff-source exec; a hung gh/git must never wedge a run. */
+const DIFF_EXEC_TIMEOUT_MS = 60_000;
+
+/** SIGKILL is uncatchable by the child, so a wedged fetch dies for real. */
+const DIFF_EXEC_KILL_SIGNAL = "SIGKILL" as const;
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Split a diffSource command string into shell words, respecting single/double
+ * quotes (same tokenizer the /code-review command uses for its free-text arg).
+ */
+function tokenizeShellWords(input: string): string[] {
+  const tokens: string[] = [];
+  for (const m of input.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)) {
+    tokens.push(m[1] ?? m[2] ?? m[3] ?? "");
+  }
+  return tokens;
+}
+
+/**
+ * Parse a diffSource command string into an execFile-safe (binary, args) pair.
+ * execFile never runs a shell, and the binary whitelist (git/gh) keeps a
+ * crafted source from being interpreted as anything but a diff fetch.
+ */
+function parseDiffSourceCommand(source: string): { binary: "git" | "gh"; args: string[] } {
+  const tokens = tokenizeShellWords(source);
+  const binary = tokens[0];
+  if (binary !== "git" && binary !== "gh") {
+    throw new Error(
+      `workflow: code-review diffSource must start with "git" or "gh" (got ${binary ? `"${binary}"` : "nothing"}) — ` +
+        'use e.g. "git diff HEAD", "git diff <range>", or "gh pr diff <n>".',
+    );
+  }
+  return { binary, args: tokens.slice(1) };
+}
+
+/**
+ * Execute a diffSource command and return its stdout, mirroring the /code-review
+ * slash command's fetch (builtin-commands.ts): execFile + bounded buffer +
+ * timeout + SIGKILL, with a pre-exec notify and a descriptive error when the
+ * source yields nothing. Throws on empty output and on any exec failure.
+ */
+export async function fetchDiffFromSource(
+  source: string,
+  cwd: string,
+  onNotify?: (message: string) => void,
+): Promise<string> {
+  const { binary, args } = parseDiffSourceCommand(source);
+  onNotify?.(`Fetching diff from ${source}…`);
+  let stdout: string;
+  try {
+    const result = await execFileAsync(binary, args, {
+      cwd,
+      maxBuffer: DIFF_EXEC_MAX_BUFFER,
+      timeout: DIFF_EXEC_TIMEOUT_MS,
+      killSignal: DIFF_EXEC_KILL_SIGNAL,
+    });
+    stdout = result.stdout;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "ERR_CHILD_PROCESS_STDOUT_MAXBUFFER") {
+      throw new Error(
+        `workflow: diff from ${source} exceeds the ${Math.floor(DIFF_EXEC_MAX_BUFFER / (1024 * 1024))}MB capture limit — ` +
+          "narrow the target (e.g. a specific file or path) and try again.",
+      );
+    }
+    if (code === "ETIMEDOUT") {
+      throw new Error(
+        `workflow: diff fetch from ${source} timed out after ${DIFF_EXEC_TIMEOUT_MS / 1000}s — ` +
+          "check that the command works in your shell, then try again.",
+      );
+    }
+    throw new Error(`workflow: failed to get diff (${source}): ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!stdout.trim()) {
+    throw new Error(`workflow: no diff output from: ${source} — the source is empty or the working tree is clean.`);
+  }
+  return stdout;
+}
+
+/**
+ * Run a built-in's prepareArgs hook (host-side arg resolution for the workflow
+ * tool's `name` path) before the registry resolves the script. Returns the args
+ * unchanged when the builtin has no hook. A same-named SAVED workflow is an
+ * opaque script, so callers skip this entirely for it (workflow-tool.ts).
+ */
+export async function prepareBuiltinWorkflowArgs(
+  name: string,
+  args: unknown,
+  cwd: string,
+  onNotify?: (message: string) => void,
+): Promise<unknown> {
+  const builtin = findBuiltinWorkflow(name);
+  if (!builtin?.prepareArgs) return args;
+  return builtin.prepareArgs(cwd, args, onNotify);
 }
 
 /**

@@ -305,9 +305,16 @@ export function resolvePromptAwareTier(
   mainModel: string | undefined,
   availableModels: readonly RankableModel[],
   defaults?: ModelTierConfig,
+  phase?: string,
 ): string | undefined {
   const tierConfig = defaults ?? buildDefaultTierConfig(mainModel, availableModels);
-  const tier = tierNameForTask("runtime", prompt);
+  // GAP-2: the classifier's phase input. A pipeline run threads its persisted
+  // stage ("0"/"1" — wayfinder/prewalk reconnaissance, clamped) so early-phase
+  // scan/edit prompts route to the cheap tier instead of the generic
+  // "runtime" default, whose prompt-level rules would let a recon prompt's
+  // synthesize phrasing escalate it to the big tier. Absent a stage the
+  // pre-fix behavior is unchanged.
+  const tier = tierNameForTask(phase ?? "runtime", prompt);
   return resolveTierModel(tier, tierConfig, mainModel) ?? mainModel;
 }
 
@@ -322,6 +329,12 @@ export function resolveAgentModelSpec(
   // When provided, the prompt-aware fallback reuses the cached rank instead of
   // re-scanning + re-sorting the full registry on every run().
   buildDefaults?: (mainModel: string | undefined) => ModelTierConfig,
+  // GAP-2: the run's pipeline stage ("0"/"1", clamped from the persisted state
+  // machine) threaded into the prompt-aware tier fallback so wayfinder/prewalk
+  // reconnaissance classifies scan/edit prompts to the cheap tier. Absent this
+  // (non-pipeline runs, or callers that predate the fix) classification uses
+  // the generic "runtime" default exactly as before.
+  phase?: string,
 ): string | undefined {
   if (options.model) return options.model;
   const config = loadConfig();
@@ -336,7 +349,7 @@ export function resolveAgentModelSpec(
     // pinned tier can never silently bill the main agent's model.
     if (!config) {
       onTierWithoutConfig?.(options.tier);
-      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel));
+      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel), phase);
       return mainModel;
     }
     // An "inherit:main" configured tier resolves to the session's main model
@@ -738,6 +751,16 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * onModelFallback below for how that degrade stays visible.
    */
   tier?: string;
+  /**
+   * Pipeline stage of the top-level pipeline/phaseState run this agent belongs
+   * to ("0"|"1" — the persisted state machine's activePhase clamped to 0..1;
+   * wayfinder/prewalk reconnaissance). Threaded into the prompt-aware tier
+   * fallback (see resolveAgentModelSpec's `phase`) so scan/edit prompts during
+   * those read-only recon stages route to the cheap tier instead of the
+   * generic "runtime" classification. Absent (non-pipeline runs), the
+   * prompt-aware fallback classifies exactly as it did before GAP-2.
+   */
+  pipelineStage?: "0" | "1";
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /**
@@ -1228,6 +1251,11 @@ export class WorkflowAgent {
       // instead of re-scanning + re-ranking the full registry on every agent
       // (fresh-install path, no model-tiers.json).
       (main) => memoizedDefaultTierConfig(main, modelRegistry),
+      // GAP-2: the pipeline stage threaded by workflow.ts (clamped 0..1 from
+      // the persisted state machine) so wayfinder/prewalk reconnaissance
+      // classifies scan/edit prompts to the cheap tier. Absent on non-pipeline
+      // runs — the prompt-aware fallback then classifies as "runtime" as before.
+      options.pipelineStage,
     );
 
     // Provider pool: consult BEFORE model resolution so the session binds the

@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
-import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
+import { BUILTIN_WORKFLOW_NAMES, prepareBuiltinWorkflowArgs, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import {
   createToolUpdateWorkflowDisplay,
@@ -308,7 +308,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
             "workflow: `name` cannot be combined with `scriptPath` — provide either a saved/built-in `name` or a script source, not both.",
           );
         }
-        const resolved = resolveWorkflowInvocation(params.name, params.args, { storage, cwd });
+        // GAP-3: a built-in may need host-side arg preparation before the
+        // registry resolves it — code-review's diffSource is a git/gh command
+        // whose output must be fetched into `diff` before the script runs
+        // (mirroring the /code-review slash command's own fetch in
+        // builtin-commands.ts, which passes already-resolved args and never
+        // takes this hook). A same-named SAVED workflow shadows the builtin and
+        // is an opaque script, so it skips the hook entirely.
+        const saved = storage.load(params.name);
+        const invocationArgs: Record<string, unknown> | undefined = saved
+          ? params.args
+          : ((await prepareBuiltinWorkflowArgs(params.name, params.args, cwd, (message) => {
+              // Pre-exec progress notice, streamed like any tool update — the
+              // tool-path analog of the slash command's ui.notify (M12).
+              onUpdate?.({ content: [{ type: "text", text: message }], details: { phase: "preparing" } });
+            })) as Record<string, unknown> | undefined);
+        runArgs = invocationArgs;
+        const resolved = resolveWorkflowInvocation(params.name, invocationArgs, { storage, cwd });
         if (!resolved) {
           throw new Error(
             `workflow: no saved or built-in workflow named "${params.name}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`,
@@ -318,8 +334,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         // coerce + validate the caller's args against it before launching, so a
         // mistyped or missing arg fails here with a descriptive error instead of
         // reaching the script as an undefined/raw value.
-        const saved = storage.load(params.name);
-        if (saved?.parameters) runArgs = coerceArgs(params.args, saved.parameters);
+        if (saved?.parameters) runArgs = coerceArgs(invocationArgs, saved.parameters);
         script = normalizeWorkflowScript(resolved.script);
         invocationTools = resolved.tools;
         invocationToolset = resolved.toolset;

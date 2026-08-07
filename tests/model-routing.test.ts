@@ -149,3 +149,36 @@ test("classifyTask prioritizes synthesize/analyze over scan for non-early phases
   assert.equal(classifyTask("0", "scan for final summary"), TaskClassification.SCAN);
   assert.equal(classifyTask("2", "scan for final summary"), TaskClassification.SYNTHESIZE);
 });
+
+// ─── GAP-2: pipeline-stage-aware early-phase classification ─────────────────
+
+test("classifyTask early-phase identifiers phase-0/phase1 classify scan prompts to SCAN", () => {
+  assert.equal(classifyTask("phase-0", "scan the imports"), TaskClassification.SCAN);
+  assert.equal(classifyTask("phase1", "scan the imports"), TaskClassification.SCAN);
+});
+
+test("classifyTask early-phase branch: an edit prompt in phase 0/1 classifies to EDIT", () => {
+  assert.equal(classifyTask("0", "edit the loader"), TaskClassification.EDIT);
+  assert.equal(classifyTask("1", "edit the loader"), TaskClassification.EDIT);
+});
+
+test("classifyTask early-phase scan priority beats the prompt-level synthesize rule (GAP-2 signal)", () => {
+  // The exact divergence prompt-aware tier routing threads the pipeline stage
+  // to exploit: inside phases 0/1 (wayfinder/prewalk) a recon prompt that also
+  // uses synthesize phrasing stays SCAN (cheap tier); outside those phases the
+  // prompt-wide synthesize rule escalates it to SYNTHESIZE (big tier).
+  assert.equal(classifyTask("0", "scan the codebase and synthesize a ticket list"), TaskClassification.SCAN);
+  assert.equal(classifyTask("1", "scan the codebase and synthesize a ticket list"), TaskClassification.SCAN);
+  assert.equal(classifyTask("2", "scan the codebase and synthesize a ticket list"), TaskClassification.SYNTHESIZE);
+  assert.equal(
+    classifyTask("runtime", "scan the codebase and synthesize a ticket list"),
+    TaskClassification.SYNTHESIZE,
+  );
+});
+
+test("tierNameForTask maps early-phase recon to the small tier (GAP-2)", () => {
+  assert.equal(tierNameForTask("0", "scan the codebase and synthesize a ticket list"), "small");
+  assert.equal(tierNameForTask("1", "scan the codebase for failing tests"), "small");
+  assert.equal(tierNameForTask("phase-0", "find the failing test"), "small");
+  assert.equal(tierNameForTask("runtime", "scan the codebase and synthesize a ticket list"), "big");
+});
