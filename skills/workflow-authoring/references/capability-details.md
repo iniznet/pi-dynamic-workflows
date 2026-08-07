@@ -312,7 +312,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `name?: string`
-- Constraint: resolves a project/user saved workflow first, then one of the 5 built-in patterns
+- Constraint: resolves a project/user saved workflow first, then one of the 7 built-in patterns
 - Constraint: mutually exclusive with resumeFromRunId
 
 <a id="tool-input-args"></a>
@@ -406,10 +406,11 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `script-contract`
 - Support: `supported`
-- Signature: `export const meta = { name: string, description: string, phases?: Array<{ title: string; detail?: string; model?: string }>, model?: string }`
+- Signature: `export const meta = { name: string, description: string, phases?: Array<{ title: string; detail?: string; model?: string }>, gate?: "approve", model?: string }`
 - Constraint: must be the first statement
 - Constraint: name and description must be nonblank strings
 - Constraint: metadata must use literal values; expressions such as string concatenation and template interpolation are rejected
+- Constraint: meta.gate: "approve" publishes the plan to the plannotator bridge and pauses the run for a human verdict before any agent work (the shipped plan-then-execute builtin declares it)
 - Constraint: the meta declaration is the only legal export because the remaining body executes inside an async function
 
 <a id="return-value"></a>

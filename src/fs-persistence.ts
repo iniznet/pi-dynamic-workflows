@@ -19,6 +19,7 @@
  * copies.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -29,6 +30,13 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import {
+  mkdir as mkdirAsync,
+  rename as renameAsync,
+  rm as rmAsync,
+  writeFile as writeFileAsync,
+} from "node:fs/promises";
+import { dirname } from "node:path";
 
 /** Filesystem operations used by JSON persistence. Exposed for testing. */
 export type PersistenceFsLayer = {
@@ -97,6 +105,63 @@ export function writeJsonAtomicWithBackup(fs: PersistenceFsLayer, path: string, 
       // ignore
     }
   }
+}
+
+/** How many times to retry an atomic rename when the destination is briefly busy. */
+export const RENAME_RETRY_ATTEMPTS = 5;
+/** Delay between rename retries (see {@link writeJsonFileAtomic}). */
+export const RENAME_RETRY_DELAY_MS = 20;
+
+/** Options for {@link writeJsonFileAtomic}. */
+export interface WriteJsonFileAtomicOptions {
+  /**
+   * Ensure the parent directory exists (recursive mkdir) before writing. Dir
+   * semantics stay at the call site: the caller decides whether the parent is
+   * guaranteed to exist (already mkdir'd) or must be created here.
+   */
+  mkdir?: boolean;
+}
+
+/**
+ * Async atomic replace of `filePath` with JSON-serialized `data` (tmp-write +
+ * rename in the same directory, atomic on the same filesystem) so a concurrent
+ * reader never observes a torn file; an orphaned tmp is unlinked on failure.
+ * The rename is retried a bounded number of times: on Windows a concurrent
+ * reader that opens the destination without delete-sharing (libuv default)
+ * makes MoveFileEx fail EPERM for the few ms the read is in flight.
+ *
+ * The SINGLE shared implementation for the plan-approval writers — audit
+ * WPA-01: writePlanAtomic was triplicated (src/plan-size.ts, src/workflow-
+ * commands.ts, src/integrations/plannotator.ts) and only one copy carried this
+ * retry, so the two un-hardened copies (CLI approve + bridge /approve) could
+ * 500 / silently fail against the same concurrent 250ms waitForStatus poller.
+ */
+export async function writeJsonFileAtomic(
+  filePath: string,
+  data: unknown,
+  options?: WriteJsonFileAtomicOptions,
+): Promise<void> {
+  if (options?.mkdir) await mkdirAsync(dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.${randomUUID()}.${process.pid}.tmp`;
+  await writeFileAsync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
+  let lastError: unknown;
+  for (let attempt = 0; attempt < RENAME_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await renameAsync(tmpPath, filePath);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < RENAME_RETRY_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, RENAME_RETRY_DELAY_MS));
+      }
+    }
+  }
+  try {
+    await rmAsync(tmpPath, { force: true });
+  } catch {
+    // tmp cleanup is best-effort; the rename failure is the real error.
+  }
+  throw lastError;
 }
 
 /**

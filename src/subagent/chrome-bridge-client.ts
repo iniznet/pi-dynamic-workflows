@@ -47,9 +47,26 @@ export interface HeartbeatOptions {
   throwOnError?: boolean;
 }
 
-/** Default bridge host/port, mirroring pi-chrome's DEFAULT_HOST/DEFAULT_PORT. */
+/** Default bridge host, mirroring pi-chrome's DEFAULT_HOST. */
 const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
-const DEFAULT_PORT = Number(process.env.PI_CHROME_BRIDGE_PORT ?? "17318");
+
+/** Fallback bridge port (pi-chrome's DEFAULT_PORT); also the garbage-env fallback. */
+const DEFAULT_CHROME_BRIDGE_PORT = 17318;
+
+/**
+ * Resolve the bridge port from `PI_CHROME_BRIDGE_PORT`. A valid TCP port
+ * (integer, 0 < port <= 65535) wins; anything else — missing, empty,
+ * fractional, negative, out-of-range, or unparseable garbage — falls back to
+ * the default, so a bad env value can never yield `http://127.0.0.1:NaN`.
+ * Mirrors the readEnvLimit leniency (plan-size.ts).
+ */
+export function resolveChromeBridgePort(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_CHROME_BRIDGE_PORT;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 65535 ? parsed : DEFAULT_CHROME_BRIDGE_PORT;
+}
+
+const DEFAULT_PORT = resolveChromeBridgePort(process.env.PI_CHROME_BRIDGE_PORT);
 
 /** The exact globalThis key pi-chrome persists its `/chrome authorize` grant under. */
 export const PI_CHROME_AUTH_GLOBAL_KEY = "__piChromeProfileBridgeAuth__";

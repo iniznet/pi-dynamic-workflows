@@ -266,9 +266,19 @@ async function runDialogTier(
       "warning",
     );
   }
+  // The provider pool is a nested structure edited row-by-row in the visual
+  // form (or by hand in the settings file): a raw-JSON free-text prompt would
+  // always reject (parseFieldInput forbids it), so skip it like env-locked rows.
+  if (FIELD_REGISTRY.some((field) => field.key === "providerPool")) {
+    ctx.ui.notify(
+      "Provider pool skipped in the dialog tier — edit it via the visual form or the settings file.",
+      "warning",
+    );
+  }
   const partial: Record<string, unknown> = {};
   for (const field of FIELD_REGISTRY) {
     if (lockedKeys.has(field.key)) continue;
+    if (field.key === "providerPool") continue;
     const value = await promptFieldValue(ctx, field, effective[field.key]);
     if (value !== undefined) partial[field.key] = value;
   }

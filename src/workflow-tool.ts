@@ -279,7 +279,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // `name` resolves through the same registry the built-in slash commands
       // and saved-workflow commands use (see builtin-workflows.ts /
       // workflow-saved.ts): a project/user saved workflow of that name wins on
-      // a collision, else one of the 5 curated built-in patterns. This lets the
+      // a collision, else one of the 7 curated built-in patterns. This lets the
       // model reach a curated pattern by name instead of having to author an
       // equivalent script from scratch (and, for patterns that need it, the
       // right exec context — e.g. deep-research's web tools — travels with it).

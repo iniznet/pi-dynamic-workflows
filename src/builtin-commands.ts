@@ -16,34 +16,13 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
+import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { backgroundStartedNotify } from "./workflow-notify.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 
 const execFileAsync = promisify(execFile);
-
-/**
- * Cap on the diff-source exec's stdout+stderr buffer. Node's default (1 MB)
- * throws on anything but a small diff — `gh pr diff` on a sizeable PR routinely
- * exceeds it. 64 MB comfortably covers any realistic diff while still bounding
- * worst-case memory; the prompt-side cap (code-review.ts's MAX_DIFF_CHARS) is
- * what actually protects the review from a huge diff, not this buffer.
- */
-const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
-
-/**
- * Hard deadline for the diff-source exec (M12). A hung `gh` (network stall) or
- * a wedged git process must never block /code-review — and with it the session
- * — indefinitely; the previous exec had no timeout at all.
- */
-const DIFF_EXEC_TIMEOUT_MS = 60_000;
-
-/**
- * SIGKILL is uncatchable by the child: a wedged network call dies for real
- * instead of getting a chance to ignore the signal.
- */
-const DIFF_EXEC_KILL_SIGNAL = "SIGKILL" as const;
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   try {

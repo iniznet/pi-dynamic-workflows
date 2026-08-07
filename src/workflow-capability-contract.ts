@@ -606,7 +606,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "mutually exclusive with `script` and `name`",
   ]),
   toolInput("name", "name?: string", [
-    "resolves a project/user saved workflow first, then one of the 5 built-in patterns",
+    "resolves a project/user saved workflow first, then one of the 7 built-in patterns",
     "mutually exclusive with resumeFromRunId",
   ]),
   toolInput("args", "args?: unknown"),
@@ -648,12 +648,13 @@ const capabilities: readonly CapabilityDescriptor[] = [
     origin: CapabilityOrigin.PROJECT,
     lifecycle: PRESENT_AT,
     signature:
-      "export const meta = { name: string, description: string, phases?: Array<{ title: string; detail?: string; model?: string }>, model?: string }",
+      'export const meta = { name: string, description: string, phases?: Array<{ title: string; detail?: string; model?: string }>, gate?: "approve", model?: string }',
     optionShape: null,
     constraints: [
       "must be the first statement",
       "name and description must be nonblank strings",
       "metadata must use literal values; expressions such as string concatenation and template interpolation are rejected",
+      'meta.gate: "approve" publishes the plan to the plannotator bridge and pauses the run for a human verdict before any agent work (the shipped plan-then-execute builtin declares it)',
       "the meta declaration is the only legal export because the remaining body executes inside an async function",
     ],
     enforcementOwner: "parseWorkflowScript",

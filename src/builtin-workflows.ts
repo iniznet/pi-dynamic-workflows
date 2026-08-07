@@ -24,6 +24,7 @@ import {
 } from "./builtin-args.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
+import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
 import { generatePlanThenExecuteWorkflow, PLAN_THEN_EXECUTE_NUMERIC_ARGS } from "./plan-then-execute.js";
 import { generateSpecGenerationWorkflow, SPEC_GENERATION_FORMATS } from "./spec-generation.js";
 import { createWebTools } from "./web-tools.js";
@@ -183,7 +184,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "plan-then-execute",
     description:
-      "Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute each step. args: { objective: string, context?: string, maxSteps?: number, execute?: boolean }.",
+      "Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute each step. Pauses for human approval before any agent work (meta.gate: 'approve'). args: { objective: string, context?: string, maxSteps?: number, execute?: boolean }.",
     resolve(_cwd, args) {
       const record = asRecord(args);
       requireNonEmptyString(record.objective, "objective", "plan-then-execute");
@@ -236,18 +237,10 @@ export function findBuiltinWorkflow(name: string): BuiltinWorkflowDescriptor | u
 // The /code-review slash command fetches the diff itself and passes the
 // resolved args to resolve(); the workflow tool's `name` path reaches the same
 // builtin through prepareArgs() → fetchDiffFromSource(), so `diffSource`
-// behaves identically on both surfaces. Constants and error shapes mirror
-// builtin-commands.ts exactly (same maxBuffer/timeout/killSignal and the same
-// execFile-no-shell security boundary).
-
-/** Cap on the diff-source exec's stdout+stderr buffer (see builtin-commands.ts). */
-const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
-
-/** Hard deadline for the diff-source exec; a hung gh/git must never wedge a run. */
-const DIFF_EXEC_TIMEOUT_MS = 60_000;
-
-/** SIGKILL is uncatchable by the child, so a wedged fetch dies for real. */
-const DIFF_EXEC_KILL_SIGNAL = "SIGKILL" as const;
+// behaves identically on both surfaces. The exec profile constants
+// (maxBuffer/timeout/killSignal) live in diff-exec.ts — the single home both
+// fetch paths import from — and both use the same execFile-no-shell security
+// boundary and error shapes.
 
 const execFileAsync = promisify(execFile);
 

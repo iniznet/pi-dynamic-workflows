@@ -16,9 +16,9 @@
  * import the whole integration module with its server/UI dependencies.
  */
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeJsonFileAtomic } from "./fs-persistence.js";
 
 /** Default execution-step threshold: more steps than this is a LARGE plan. */
 export const PLAN_APPROVAL_STEP_LIMIT_DEFAULT = 8;
@@ -164,8 +164,8 @@ export interface EnsurePendingRunPlanResult {
  * (plannotator.ts waitForStatus). So an existing undecided file is augmented
  * with `status: "pending"` + `submittedAt` (all blueprint fields preserved);
  * a missing file gets a payload-shaped pending plan; an already-decided file
- * (approved/rejected) is never clobbered. Atomic tmp+rename, mirroring the
- * CLI's writePlanAtomic (src/workflow-commands.ts).
+ * (approved/rejected) is never clobbered. Atomic tmp+rename via the shared
+ * writeJsonFileAtomic (fs-persistence.ts, audit WPA-01).
  */
 export async function ensurePendingRunPlan(
   dir: string,
@@ -207,31 +207,14 @@ export async function ensurePendingRunPlan(
 }
 
 /**
- * Atomic replace of a plan file (tmp + rename in the same directory, mirroring
- * src/workflow-commands.ts writePlanAtomic) so a concurrent 250ms poller never
- * observes a torn file; an orphaned tmp is unlinked on failure. The rename is
- * retried a bounded number of times: on Windows a concurrent reader that opens
- * the destination without delete-sharing (libuv default) makes MoveFileEx fail
- * EPERM for the few ms the read is in flight.
+ * Atomic replace of a plan file — thin alias of the shared
+ * {@link writeJsonFileAtomic} (fs-persistence.ts). Audit WPA-01: the retrying
+ * writer was triplicated and only THIS copy carried the bounded rename retry;
+ * consolidating on the shared util gives every plan writer the same semantics,
+ * so a concurrent 250ms waitForStatus poller never observes a torn file and a
+ * Windows-EPERM rename (a reader holding the destination open without
+ * delete-sharing) is retried with the same bounded cadence everywhere.
  */
-const RENAME_RETRY_ATTEMPTS = 5;
-const RENAME_RETRY_DELAY_MS = 20;
-
 async function writePlanAtomic(dir: string, runId: string, plan: unknown): Promise<void> {
-  const path = join(dir, `${runId}.json`);
-  const tmpPath = `${path}.${randomUUID()}.${process.pid}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(plan, null, 2), "utf-8");
-  let lastError: unknown;
-  for (let attempt = 0; attempt < RENAME_RETRY_ATTEMPTS; attempt++) {
-    try {
-      await rename(tmpPath, path);
-      return;
-    } catch (error) {
-      lastError = error;
-      if (attempt < RENAME_RETRY_ATTEMPTS - 1)
-        await new Promise((resolve) => setTimeout(resolve, RENAME_RETRY_DELAY_MS));
-    }
-  }
-  await rm(tmpPath, { force: true }).catch(() => {});
-  throw lastError;
+  await writeJsonFileAtomic(join(dir, `${runId}.json`), plan);
 }

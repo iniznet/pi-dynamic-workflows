@@ -450,6 +450,125 @@ describe("MCPBridge", () => {
     socket.destroy();
   });
 
+  // ─── B2 — per-tool timeouts + timeout propagation via AbortSignal ────────
+
+  it("a slow tool with a declared per-tool timeout surfaces a timeout, not a hang (B2)", async () => {
+    // A signal-oblivious executor that never settles: only the bridge's own
+    // deadline can end the call — if the per-tool timeout were ignored, the
+    // call would wait the flat default and this test would blow its guard.
+    let signalAborted = false;
+    tools.set("glacial", async (_args, signal) => {
+      signal?.addEventListener("abort", () => {
+        signalAborted = true;
+      });
+      await new Promise<void>(() => {});
+      return { content: "unreachable", isError: false };
+    });
+
+    bridge = new MCPBridge({ tools, toolTimeouts: { glacial: 60 } });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "glacial", args: {} },
+      id: "b2-per-tool-timeout",
+    });
+
+    assert.deepStrictEqual(response, {
+      jsonrpc: "2.0",
+      error: {
+        code: TOOL_TIMEOUT,
+        message: "Tool execution timed out after 60ms: glacial",
+        data: { toolName: "glacial" },
+      },
+      id: "b2-per-tool-timeout",
+    });
+    // Requirement 3: the timeout must propagate via AbortSignal so the host
+    // executor can stop cleanly instead of running forever with nobody
+    // listening.
+    assert.strictEqual(signalAborted, true, "the executor's AbortSignal must be aborted on timeout");
+    assert.strictEqual(bridge.pendingTimeoutCount, 0, "no timer should remain after a per-tool timeout");
+
+    socket.destroy();
+  });
+
+  it("a tool without a per-tool entry keeps the default timeout (B2)", async () => {
+    // The per-tool table must not leak: only 'glacial' gets the 60ms override;
+    // 'other' falls back to the bridge-wide 90ms default.
+    let signalAborted = false;
+    tools.set("other", async (_args, signal) => {
+      signal?.addEventListener("abort", () => {
+        signalAborted = true;
+      });
+      await new Promise<void>(() => {});
+      return { content: "unreachable", isError: false };
+    });
+
+    bridge = new MCPBridge({ tools, timeout: 90, toolTimeouts: { glacial: 60 } });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "other", args: {} },
+      id: "b2-default-timeout",
+    });
+
+    assert.deepStrictEqual((response as { error?: { code: number; message: string } }).error, {
+      code: TOOL_TIMEOUT,
+      message: "Tool execution timed out after 90ms: other",
+      data: { toolName: "other" },
+    });
+    assert.strictEqual(signalAborted, true);
+
+    socket.destroy();
+  });
+
+  it("accepts the per-tool timeout table as a plain object shape (feature-detect, B2)", async () => {
+    tools.set("hangs", async () => {
+      await new Promise<void>(() => {});
+      return { content: "unreachable", isError: false };
+    });
+    // Record shape (not a Map): normalizeToolTimeouts must feature-detect it.
+    bridge = new MCPBridge({ tools, toolTimeouts: { hangs: 40 } });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "hangs", args: {} },
+      id: "b2-record-shape",
+    });
+
+    assert.strictEqual((response as { error?: { code: number } }).error?.code, TOOL_TIMEOUT);
+    assert.match((response as { error?: { message: string } }).error?.message ?? "", /after 40ms: hangs/);
+
+    socket.destroy();
+  });
+
+  it("drops non-positive/NaN per-tool timeout entries (a malformed table cannot arm a 0ms deadline, B2)", async () => {
+    tools.set("ok", async () => ({ content: "fine", isError: false }));
+    // 0 and NaN entries are dropped by normalizeToolTimeouts; the tool then
+    // uses the bridge default (500ms here) and completes normally.
+    bridge = new MCPBridge({ tools, timeout: 500, toolTimeouts: { ok: 0, nope: Number.NaN } });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+    const response = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "ok", args: {} },
+      id: "b2-malformed-table",
+    });
+
+    assert.deepStrictEqual((response as { result?: ToolCallResult }).result, { content: "fine", isError: false });
+    socket.destroy();
+  });
+
   // ─── gateway-ipc:i4 — socket auth handshake ───────────────────────────────
 
   it("rejects tool.list before auth.handshake with AUTH_REQUIRED (gateway-ipc:i4)", async () => {
@@ -583,6 +702,85 @@ describe("MCPBridge", () => {
 
     s1.destroy();
     s2.destroy();
+  });
+
+  it("a sequential replay with the same idempotency key returns the first result without re-executing (B2)", async () => {
+    // The B2 shape: a call timed out client-side but ACTUALLY completed on the
+    // host; the retry with the same key must return the cached result instead
+    // of re-running the side-effectful tool (no duplicated write/edit).
+    let executions = 0;
+    tools.set("side-effect", async () => {
+      executions++;
+      return { content: `execution-${executions}`, isError: false };
+    });
+    bridge = new MCPBridge({ tools });
+    await bridge.start();
+
+    const socket = await connectToBridge(bridge);
+
+    const first = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "side-effect", args: {}, idempotencyKey: "b2-key" },
+      id: "first",
+    });
+    assert.strictEqual(executions, 1);
+    assert.deepStrictEqual((first as { result?: ToolCallResult }).result, { content: "execution-1", isError: false });
+
+    // Replay AFTER the first execution already settled: the cached result must
+    // be returned without touching the tool again.
+    const replay = await sendRequest(socket, {
+      jsonrpc: "2.0",
+      method: "tool.call",
+      params: { toolName: "side-effect", args: {}, idempotencyKey: "b2-key" },
+      id: "replay",
+    });
+    assert.strictEqual(executions, 1, "a replayed call after completion must not re-execute the tool");
+    assert.deepStrictEqual((replay as { result?: ToolCallResult }).result, { content: "execution-1", isError: false });
+
+    socket.destroy();
+  });
+
+  it("the proxy client honors a tool's declared per-tool timeout end-to-end (B2)", async () => {
+    // A signal-oblivious host tool that never settles. Both sides carry the
+    // same per-tool table (as the gateway threads it), so the call must end
+    // with a timeout (not a hang) once the declared 80ms deadline passes —
+    // either the client's own wait deadline or the bridge's TOOL_TIMEOUT
+    // response settles it, never the flat 30s default.
+    let hostSignalAborted = false;
+    tools.set("glacial", async (_args, signal) => {
+      signal?.addEventListener("abort", () => {
+        hostSignalAborted = true;
+      });
+      await new Promise<void>(() => {});
+      return { content: "unreachable", isError: false };
+    });
+
+    const table = { glacial: 80 };
+    bridge = new MCPBridge({ tools, toolTimeouts: table });
+    await bridge.start();
+
+    const client = new MCPProxyClient(bridge.getSocketPath(), {
+      authToken: bridge.getAuthToken(),
+      toolTimeouts: table,
+    });
+    await client.connect();
+    try {
+      const startedAt = Date.now();
+      const result = await client.executeToolCall("glacial", {});
+      const elapsed = Date.now() - startedAt;
+
+      assert.equal(result.isError, true, "a timed-out call must surface as an error result, not a hang");
+      assert.match(result.content, /timed out/i);
+      assert.ok(elapsed < 5000, `call must end at the declared deadline, not hang (took ${elapsed}ms)`);
+      // The bridge aborts the host executor's signal on timeout (requirement 3).
+      // The client's own wait deadline can win the race by a tick, so poll
+      // briefly for the bridge-side abort to land.
+      await waitFor(() => hostSignalAborted, 1000, "host executor signal aborted after the declared timeout");
+      assert.strictEqual(hostSignalAborted, true, "the host executor's AbortSignal must be aborted on timeout");
+    } finally {
+      await client.disconnect();
+    }
   });
 
   // ─── gateway-ipc:f8 — hard frame-size cap ─────────────────────────────────

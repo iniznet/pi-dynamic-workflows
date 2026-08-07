@@ -26,6 +26,7 @@ import { createFauxCore, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { WorkflowAgent } from "../src/agent.js";
 import { WorkflowErrorCode } from "../src/errors.js";
+import { ProviderPool } from "../src/gateway/provider-pool.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -173,4 +174,56 @@ return { a, b }`;
     const done = manager.getRun(runId);
     assert.equal((done?.result?.result as { a?: string })?.a, "first-result-text", "agent 1 replayed from journal");
     assert.equal((done?.result?.result as { b?: string })?.b, "second-result-text", "agent 2 ran live after refill");
+  }));
+
+test("D1/D8: through the manager, whole-pool saturation checkpoints the run as paused (not failed)", () =>
+  withFauxSession(async ({ cwd, model, modelRuntime }) => {
+    // A REAL pool in "fail" mode whose single provider is TPM-capped from the
+    // start: every acquire deterministically throws whole-pool
+    // PROVIDER_SATURATED (recoverable:false) BEFORE any session work — the
+    // pool is consulted at each agent()'s model-resolution step (the manager
+    // now forwards its pool into the run, see setProviderPool).
+    const pool = new ProviderPool(
+      {
+        enabled: true,
+        whenSaturated: "fail",
+        saturationWaitTimeoutMs: 0,
+        defaultTpmWindowMs: 60_000,
+        models: {
+          "faux-model": {
+            fauxtest: { modelId: "faux-model", concurrency: 4, weight: 1, tpm: 100 },
+          },
+        },
+      },
+      {
+        find: () => ({ provider: "fauxtest", modelId: "faux-model" }),
+        hasConfiguredAuth: () => true,
+        getAll: () => [{ provider: "fauxtest", modelId: "faux-model" }],
+      } as never,
+    );
+    // Cap the TPM window immediately — placement is impossible from the very
+    // first acquire, so the run deterministically lands on PROVIDER_SATURATED.
+    pool.recordSpend("fauxtest", 100);
+
+    const managerAgent = new WorkflowAgent({ cwd, session: { model: model as never, modelRuntime } });
+    const manager = new WorkflowManager({ cwd, agent: managerAgent });
+    manager.setProviderPool(pool);
+    const pausedReasons: Array<string | undefined> = [];
+    manager.on("paused", (e: { reason?: string }) => pausedReasons.push(e.reason));
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 'sat_integration', description: 'saturation' }
+const a = await agent('work', { label: 'a', model: 'faux-model' })
+return { a }`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+
+    assert.equal(
+      manager.getRun(runId)?.status,
+      "paused",
+      "whole-pool saturation checkpoints the run as paused, not failed",
+    );
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.pauseReason, "provider_saturated", "the pause reason is recorded for the navigator");
+    assert.ok(pausedReasons.includes("provider_saturated"), "a provider_saturated 'paused' event fired");
   }));

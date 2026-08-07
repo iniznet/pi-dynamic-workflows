@@ -23,14 +23,30 @@ import {
   type ExtensionContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { MCPProxyClient, ProxyAbortError, proxiedParameters } from "../agent/mcp-proxy-client.js";
+import {
+  MCPProxyClient,
+  ProxyAbortError,
+  proxiedIdempotencyKey,
+  proxiedParameters,
+} from "../agent/mcp-proxy-client.js";
 import { MCPBridge } from "./mcp-bridge.js";
-import type { ProxiedToolDef, ToolExecutor } from "./types.js";
+import type { ProxiedToolDef, ToolExecutor, ToolTimeoutTable } from "./types.js";
 
 /** Host tool bundle: executor map + serializable metadata for proxy registration. */
 export interface HostToolsBundle {
   tools: Map<string, ToolExecutor>;
   toolDefs: ProxiedToolDef[];
+  /**
+   * Bridge-wide per-tool-call timeout in ms (default: 30000). Threaded to both
+   * the bridge and the shared proxy client so a slow tool's declared deadline
+   * is honored on both sides instead of the flat 30s cap.
+   */
+  timeout?: number;
+  /**
+   * Per-tool timeout overrides (Map or plain object of tool name → ms). A tool
+   * with an entry gets its declared timeout; other tools keep {@link timeout}.
+   */
+  toolTimeouts?: ToolTimeoutTable;
 }
 
 /**
@@ -79,6 +95,7 @@ const FALLBACK_SESSION_MANAGER: SessionManagerLike = {
 export function hostToolsFromDefinitions(
   definitions: ToolDefinition[],
   sessionManager?: SessionManagerLike | SessionManagerProvider,
+  gatewayOptions?: { timeout?: number; toolTimeouts?: ToolTimeoutTable },
 ): HostToolsBundle {
   const tools = new Map<string, ToolExecutor>();
   const toolDefs: ProxiedToolDef[] = [];
@@ -119,7 +136,12 @@ export function hostToolsFromDefinitions(
     });
   }
 
-  return { tools, toolDefs };
+  return {
+    tools,
+    toolDefs,
+    ...(gatewayOptions?.timeout !== undefined ? { timeout: gatewayOptions.timeout } : {}),
+    ...(gatewayOptions?.toolTimeouts !== undefined ? { toolTimeouts: gatewayOptions.toolTimeouts } : {}),
+  };
 }
 
 /**
@@ -128,6 +150,12 @@ export function hostToolsFromDefinitions(
  */
 export class HostToolGateway {
   private bridge: MCPBridge | null = null;
+  /**
+   * The bridge/proxy timeout config from the last started bundle, threaded to
+   * both sides so a slow tool's declared timeout is honored end-to-end.
+   */
+  private timeout?: number;
+  private toolTimeouts?: ToolTimeoutTable;
   /**
    * The single shared MCPProxyClient for the running bridge
    * (mcp-proxy-client-socket-leak fix): created lazily on first toolset
@@ -182,7 +210,13 @@ export class HostToolGateway {
   getProxyClient(): MCPProxyClient | undefined {
     if (!this.bridge) return undefined;
     if (!this.proxiedClient) {
-      const client = new MCPProxyClient(this.bridge.getSocketPath(), { authToken: this.bridge.getAuthToken() });
+      const client = new MCPProxyClient(this.bridge.getSocketPath(), {
+        authToken: this.bridge.getAuthToken(),
+        // The same timeout config the bridge enforces: the client must not give
+        // up at 30s on a tool the bridge allows its declared timeout.
+        timeout: this.timeout,
+        toolTimeouts: this.toolTimeouts,
+      });
       const connecting = client.connect();
       connecting.catch(() => {});
       this.proxiedClient = client;
@@ -202,10 +236,17 @@ export class HostToolGateway {
 
   async start(bundle: HostToolsBundle): Promise<string> {
     if (this.bridge) return this.bridge.getSocketPath();
-    const bridge = new MCPBridge({ tools: bundle.tools, toolDefs: bundle.toolDefs });
+    const bridge = new MCPBridge({
+      tools: bundle.tools,
+      toolDefs: bundle.toolDefs,
+      timeout: bundle.timeout,
+      toolTimeouts: bundle.toolTimeouts,
+    });
     await bridge.start();
     this.bridge = bridge;
     this.knownToolDefs = bundle.toolDefs;
+    this.timeout = bundle.timeout;
+    this.toolTimeouts = bundle.toolTimeouts;
     return bridge.getSocketPath();
   }
 
@@ -293,11 +334,16 @@ export function createGatewayProxiedTools(gateway: HostToolGateway): ToolDefinit
       label: def.name,
       description: `[Proxied host tool] ${def.description}`,
       parameters: proxiedParameters(def.inputSchema),
-      async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+      async execute(toolCallId, params, signal, _onUpdate, _ctx) {
         try {
           await client.connect();
           const result = await client.executeToolCall(def.name, (params ?? {}) as Record<string, unknown>, {
             signal,
+            // Per-(call,attempt) idempotency key generated at the proxy from
+            // the stable toolCallId: a replayed call (client timeout + retry)
+            // joins the original bridge execution instead of re-running the
+            // side-effectful host tool (B2).
+            idempotencyKey: proxiedIdempotencyKey(def.name, toolCallId),
           });
           return {
             content: [{ type: "text", text: result.content }],

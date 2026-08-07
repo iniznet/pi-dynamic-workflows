@@ -272,6 +272,105 @@ test("createGatewayProxiedTools round-trips a call through the running gateway",
   assert.strictEqual(result.content[0].text, JSON.stringify({ hello: "world" }));
 });
 
+// ─── B2 — per-tool timeouts + idempotency keys at the gateway boundary ─────
+
+test("createGatewayProxiedTools dedupes a replayed call by toolCallId (B2 idempotency key at the proxy)", async () => {
+  // The production gap B2 names: the gateway's proxied def used to forward
+  // calls with NO idempotency key, so a timed-out write/edit was re-executed
+  // on retry. The proxied def must now derive a per-(call,attempt) key from
+  // the stable toolCallId — a replay of the same logical call (same id) joins
+  // the original bridge execution instead of re-running the side effect.
+  let executions = 0;
+  const sideEffect: ToolDefinition = {
+    name: "side-effect",
+    label: "side-effect",
+    description: "counts executions",
+    parameters: Type.Object({}),
+    async execute() {
+      executions++;
+      return { content: [{ type: "text", text: `execution-${executions}` }], details: undefined };
+    },
+  } as ToolDefinition;
+
+  const gateway = trackedGateway();
+  await gateway.start(hostToolsFromDefinitions([sideEffect]));
+
+  const defs = createGatewayProxiedTools(gateway);
+  const tool = defs.find((d) => d.name === "side-effect");
+  assert.ok(tool, "side-effect must be proxied");
+  const execute = (tool as unknown as { execute: (id: string, p: unknown) => Promise<unknown> }).execute;
+
+  const first = (await execute("call-abc", {})) as { content: Array<{ type: string; text: string }> };
+  assert.strictEqual(executions, 1);
+  assert.strictEqual(first.content[0].text, "execution-1");
+
+  // Same logical call id → same proxy-generated key → cached result, no
+  // re-execution (the timed-out-but-completed retry shape).
+  const replay = (await execute("call-abc", {})) as { content: Array<{ type: string; text: string }> };
+  assert.strictEqual(executions, 1, "a replay of the same toolCallId must not re-execute the side effect");
+  assert.strictEqual(replay.content[0].text, "execution-1");
+
+  // A DIFFERENT logical call id starts a fresh execution (no cross-call dedupe).
+  const other = (await execute("call-def", {})) as { content: Array<{ type: string; text: string }> };
+  assert.strictEqual(executions, 2, "a distinct toolCallId must execute fresh");
+  assert.strictEqual(other.content[0].text, "execution-2");
+});
+
+test("a slow tool exceeding its configured per-tool timeout surfaces a timeout, not a hang (B2)", async () => {
+  const glacial: ToolDefinition = {
+    name: "glacial",
+    label: "glacial",
+    description: "never settles",
+    parameters: Type.Object({}),
+    async execute() {
+      await new Promise<void>(() => {});
+      return { content: [{ type: "text", text: "unreachable" }], details: undefined };
+    },
+  } as ToolDefinition;
+
+  const gateway = trackedGateway();
+  await gateway.start(hostToolsFromDefinitions([glacial], undefined, { toolTimeouts: { glacial: 80 } }));
+
+  const defs = createGatewayProxiedTools(gateway);
+  const tool = defs.find((d) => d.name === "glacial");
+  assert.ok(tool, "glacial must be proxied");
+
+  const startedAt = Date.now();
+  const result = (await (
+    tool as unknown as {
+      execute: (
+        id: string,
+        p: unknown,
+      ) => Promise<{ content: Array<{ type: string; text: string }>; isError: boolean }>;
+    }
+  ).execute("call-1", {})) as { content: Array<{ type: string; text: string }>; isError: boolean };
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(result.isError, true, "the timed-out call must surface as an isError result");
+  assert.match(result.content[0].text, /timed out/i);
+  assert.ok(elapsed < 5000, `the declared per-tool timeout must end the call, not hang (took ${elapsed}ms)`);
+});
+
+test("the gateway threads the per-tool timeout table to the bridge AND the shared client (B2)", async () => {
+  const gateway = trackedGateway();
+  const table = { glacial: 120 };
+  await gateway.start(hostToolsFromDefinitions([echoTool()], undefined, { timeout: 90, toolTimeouts: table }));
+
+  // The bridge enforces the per-tool deadline (authoritative execution stop).
+  const bridge = (gateway as unknown as { bridge: { perToolTimeouts: Map<string, number>; timeout: number } }).bridge;
+  assert.ok(bridge, "gateway must hold a running bridge");
+  assert.equal(bridge.perToolTimeouts.get("glacial"), 120, "bridge must hold the per-tool timeout");
+  assert.equal(bridge.timeout, 90, "bridge must hold the bundle-wide default timeout");
+
+  // The shared proxy client waits the same deadline (it must not give up at
+  // the flat 30s on a tool the bridge allows its declared timeout).
+  const client = gateway.getProxyClient();
+  assert.ok(client, "a shared proxied client must exist once the toolset resolves");
+  const clientTable = (client as unknown as { perToolTimeouts: Map<string, number>; timeout: number }).perToolTimeouts;
+  assert.equal(clientTable.get("glacial"), 120, "the client must hold the same per-tool timeout");
+  assert.equal((client as unknown as { timeout: number }).timeout, 90, "the client must hold the same default");
+});
+
 test("createGatewayProxiedTools reuses ONE shared client across calls (mcp-proxy-client-socket-leak)", async () => {
   // Every run start AND every resume resolves the toolset again. Each
   // resolution used to create a fresh MCPProxyClient whose live bridge

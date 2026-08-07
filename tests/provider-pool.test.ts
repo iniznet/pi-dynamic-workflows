@@ -427,7 +427,8 @@ test("registry lookup is case-sensitive: a mixed-case provider key must match ex
   // The UI picker seeds the pool key verbatim from the canonical spec (the
   // registry's provider map is keyed case-sensitively). A lowercased key must
   // NOT resolve — isAuthConfigured fails and routing skips the entry, so the
-  // whole pool saturates (non-recoverable) instead of a case-blind match.
+  // whole pool is all-no-auth and acquire fail-fasts (D2) naming the provider
+  // instead of case-blind matching.
   const reg = makeRegistry([{ provider: "MyOllama", modelId: "llama-3.3", concurrency: 5, weight: 1 }]);
   const { pool: verbatimPool } = makePool(
     "llama-3.3",
@@ -446,7 +447,56 @@ test("registry lookup is case-sensitive: a mixed-case provider key must match ex
   );
   await assert.rejects(
     loweredPool.acquire("llama-3.3"),
-    (err: Error & { code?: string }) => err.code === "PROVIDER_SATURATED",
-    "lowercased key never becomes placeable → whole-pool saturation (non-recoverable)",
+    (err: Error & { code?: string }) => {
+      assert.equal(
+        err.code,
+        WorkflowErrorCode.MODEL_NOT_FOUND,
+        "all-no-auth pool fail-fasts (D2) instead of case-blind routing or 'at capacity'",
+      );
+      assert.match(err.message, /\.?\"myollama\"/, "the error names the unauthenticated provider");
+      return true;
+    },
   );
+});
+
+// ─── D2: all-no-auth pool fails fast ─────────────────────────────────────────
+
+test("D2: an all-no-auth pool in wait mode fails fast naming the providers (no saturation-wait stall)", async () => {
+  const { pool } = makePool(
+    "m",
+    [
+      { provider: "noauth-a", modelId: "a", concurrency: 5, weight: 1, auth: false },
+      { provider: "noauth-b", modelId: "b", concurrency: 5, weight: 1, auth: false },
+    ],
+    // A long wait budget that must never be consumed: with no authenticated
+    // entry the wait could never be satisfied, so acquire rejects immediately.
+    { whenSaturated: "wait", saturationWaitTimeoutMs: 300 },
+  );
+  await assert.rejects(pool.acquire("m"), (error: unknown) => {
+    assert.equal(
+      (error as { code: string }).code,
+      WorkflowErrorCode.MODEL_NOT_FOUND,
+      "fail-fast code, not the misleading PROVIDER_SATURATED 'at capacity'",
+    );
+    assert.match((error as Error).message, /no authenticated provider/);
+    assert.match((error as Error).message, /"noauth-a"/, "names the first unauthenticated provider");
+    assert.match((error as Error).message, /"noauth-b"/, "names every unauthenticated provider");
+    assert.equal((error as { recoverable: boolean }).recoverable, false, "a config error never retries");
+    return true;
+  });
+  assert.equal(pool.snapshot().waiting, 0, "no waiter is enqueued for an unsatisfiable pool");
+  assert.equal(pool.snapshot().reservations, 0, "no slot is reserved");
+});
+
+test("D2: an all-no-auth pool in fail mode also names the providers instead of 'at capacity'", async () => {
+  const { pool } = makePool(
+    "m",
+    [{ provider: "noauth-c", modelId: "c", concurrency: 5, weight: 1, auth: false }],
+    { whenSaturated: "fail" },
+  );
+  await assert.rejects(pool.acquire("m"), (error: unknown) => {
+    assert.equal((error as { code: string }).code, WorkflowErrorCode.MODEL_NOT_FOUND);
+    assert.match((error as Error).message, /"noauth-c"/);
+    return true;
+  });
 });

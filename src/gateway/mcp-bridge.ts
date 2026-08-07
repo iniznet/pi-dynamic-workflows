@@ -43,6 +43,7 @@ import {
   METHOD_TOOL_CALL,
   METHOD_TOOL_DESCRIBE,
   METHOD_TOOL_LIST,
+  normalizeToolTimeouts,
   PARSE_ERROR,
   type ProxiedToolDef,
   TOOL_TIMEOUT,
@@ -111,6 +112,8 @@ export class MCPBridge {
   private readonly tools: Map<string, ToolExecutor>;
   private readonly toolDefs: ProxiedToolDef[];
   private readonly timeout: number;
+  /** Per-tool timeout overrides; a tool without an entry uses {@link timeout}. */
+  private readonly perToolTimeouts: ReadonlyMap<string, number>;
   private readonly maxConnections: number;
   private readonly maxFrameSize: number;
   private readonly authToken: string;
@@ -139,10 +142,20 @@ export class MCPBridge {
     this.tools = options.tools;
     this.toolDefs = options.toolDefs ?? [];
     this.timeout = options.timeout ?? DEFAULT_TIMEOUT;
+    this.perToolTimeouts = normalizeToolTimeouts(options.toolTimeouts);
     this.maxConnections = options.maxConnections ?? DEFAULT_MAX_CONNECTIONS;
     this.maxFrameSize = options.maxFrameSize ?? MAX_IPC_FRAME_SIZE;
     this.authToken = options.authToken ?? randomUUID();
     this.socketPath = options.socketPath ?? this.generateSocketPath();
+  }
+
+  /**
+   * The deadline for one tool call: the tool's declared per-tool timeout when
+   * configured, otherwise the bridge-wide default. A slow tool therefore gets
+   * its declared timeout instead of the flat 30s cap.
+   */
+  private timeoutFor(toolName: string): number {
+    return this.perToolTimeouts.get(toolName) ?? this.timeout;
   }
 
   /**
@@ -657,7 +670,7 @@ export class MCPBridge {
     if (idempotencyKey !== undefined && this.idempotentExecutions.has(idempotencyKey)) {
       execution = this.idempotentExecutions.get(idempotencyKey) as Promise<ToolCallResult>;
     } else {
-      execution = this.executeWithTimeout(toolName, executor, args ?? {}, controller);
+      execution = this.executeWithTimeout(toolName, executor, args ?? {}, controller, this.timeoutFor(toolName));
       if (idempotencyKey !== undefined) {
         this.idempotentExecutions.set(idempotencyKey, execution);
         if (this.idempotentExecutions.size > IDEMPOTENCY_CACHE_LIMIT) {
@@ -692,7 +705,7 @@ export class MCPBridge {
   }
 
   /**
-   * Run one executor under the per-call timeout. The signal (owned by the
+   * Run one executor under its per-tool deadline. The signal (owned by the
    * active-call record) is aborted both on timeout and on `tool.abort`, so
    * signal-aware executors can stop promptly instead of running to completion
    * with nobody listening.
@@ -702,16 +715,17 @@ export class MCPBridge {
     executor: ToolExecutor,
     args: Record<string, unknown>,
     controller: AbortController,
+    timeoutMs: number,
   ): Promise<ToolCallResult> {
     // The handle is registered so it can be cleared when the call settles —
-    // otherwise every completed call leaks a live 30s timer.
+    // otherwise every completed call leaks a live timer.
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
         controller.abort();
-        reject(new ToolTimeoutError(toolName, this.timeout));
-      }, this.timeout);
+        reject(new ToolTimeoutError(toolName, timeoutMs));
+      }, timeoutMs);
       this.activeTimeoutHandles.add(timeoutHandle);
     });
 

@@ -571,6 +571,19 @@ function journalSideKey(entry: JournalEntry): string {
 }
 
 /**
+ * Whether a run error is the provider pool's whole-pool saturation
+ * (PROVIDER_SATURATED). Like a usage limit / outage, saturation resolves on
+ * its own (concurrency/TPM slots free as runs finish, cooldowns expire), so
+ * the run is checkpointed (paused) and replayed by resume() instead of
+ * settling FAILED — the docs promise this (gateway/provider-pool.ts module
+ * doc, README). Kept local because errors.ts (home of isProviderUsageLimit /
+ * isProviderOverloaded) is outside this slice's ownership.
+ */
+function isProviderSaturated(error: unknown): error is WorkflowError {
+  return error instanceof WorkflowError && error.code === WorkflowErrorCode.PROVIDER_SATURATED;
+}
+
+/**
  * F03: aggregate the retry-spend ledger of calls that a resume will RE-RUN
  * live, so that spend can be refunded from the resume's spend seed (see
  * resume()). A call with a ledger entry but NO journal entry was interrupted
@@ -1173,6 +1186,13 @@ export class WorkflowManager extends EventEmitter {
         agent: this.agent,
         mainModel: this.mainModel,
         modelRegistry: this.modelRegistry,
+        // The host session's provider pool (see setProviderPool): routed runs
+        // consult it at each agent()'s model-resolution step (D8 — a run-level
+        // pool-saturation test only works if the pool actually reaches the run;
+        // the extension wires it via manager.setProviderPool so subagent runs
+        // route through it). Undefined on manager instances with no pool — the
+        // run degrades to legacy single-resolution exactly as before.
+        providerPool: this.providerPool,
         persistAgentSessions: this.persistAgentSessions,
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
@@ -1497,7 +1517,15 @@ export class WorkflowManager extends EventEmitter {
       // (the endpoint recovers) — checkpoint the run as paused instead of
       // failing it, so resume() replays the journal once the provider is back.
       const overloadedPaused = !managed.controller.signal.aborted && isProviderOverloaded(workflowError);
-      const checkpointPaused = usageLimitPaused || overloadedPaused;
+      // Whole-pool saturation (D1): every provider is at capacity/TPM-capped/
+      // cooling down — same self-resolving class as a usage limit (slots free as
+      // runs finish, cooldowns expire), so checkpoint the run as paused instead
+      // of settling FAILED (the docs promise pause: gateway/provider-pool.ts
+      // module doc + README). The pool's OWN fail-fast for an all-no-auth pool
+      // uses a different code (MODEL_NOT_FOUND) so a misconfiguration settles
+      // failed, never this pause.
+      const saturatedPaused = !managed.controller.signal.aborted && isProviderSaturated(workflowError);
+      const checkpointPaused = usageLimitPaused || overloadedPaused || saturatedPaused;
       // Settle the run to idle in the status this failure warrants. The abort
       // branch is the abort/drain interplay's hinge: pause()/stop() may have
       // already settled THIS SAME object to idle (status flipped + lease
@@ -1527,7 +1555,11 @@ export class WorkflowManager extends EventEmitter {
       if (checkpointPaused) {
         this.emitLive(managed, "paused", {
           runId: managed.runId,
-          reason: overloadedPaused ? "provider_overloaded" : "usage_limit",
+          reason: saturatedPaused
+            ? "provider_saturated"
+            : overloadedPaused
+              ? "provider_overloaded"
+              : "usage_limit",
           error: workflowError,
           resetHint: workflowError.resetHint,
         });
@@ -2214,7 +2246,9 @@ export class WorkflowManager extends EventEmitter {
               ? "usage_limit"
               : managed.status === "paused" && isProviderOverloaded(managed.error)
                 ? "provider_overloaded"
-                : undefined,
+                : managed.status === "paused" && isProviderSaturated(managed.error)
+                  ? "provider_saturated"
+                  : undefined,
           resetHint:
             managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
           phases: managed.snapshot.phases,

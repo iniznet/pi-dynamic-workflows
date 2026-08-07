@@ -95,6 +95,37 @@ export interface ToolCallResult {
 /** Tool executor function signature. */
 export type ToolExecutor = (args: Record<string, unknown>, signal?: AbortSignal) => Promise<ToolCallResult>;
 
+/**
+ * Per-tool timeout table: tool name → per-call timeout in milliseconds.
+ *
+ * Accepts a Map or a plain object so callers can pass either shape
+ * (feature-detected at construction via {@link normalizeToolTimeouts}). A tool
+ * without an entry (or with a non-positive/NaN value) falls back to the
+ * gateway's default timeout instead of being capped by the flat default.
+ */
+export type ToolTimeoutTable = ReadonlyMap<string, number> | Readonly<Record<string, number>>;
+
+/**
+ * Normalize a per-tool timeout table into a lookup Map, feature-detecting the
+ * config shape (Map | plain object | absent). Values that are not positive
+ * finite integers are dropped so a malformed entry can never arm a 0ms or
+ * non-numeric deadline; the caller's default timeout then applies.
+ */
+export function normalizeToolTimeouts(table?: ToolTimeoutTable): ReadonlyMap<string, number> {
+  if (table === undefined || table === null) {
+    return new Map();
+  }
+  const entries: Array<[string, number]> =
+    table instanceof Map ? Array.from(table.entries()) : Object.entries(table as Readonly<Record<string, number>>);
+  const normalized = new Map<string, number>();
+  for (const [name, value] of entries) {
+    if (Number.isFinite(value) && value > 0) {
+      normalized.set(name, Math.floor(value));
+    }
+  }
+  return normalized;
+}
+
 /** Configuration for MCPBridge (host-side). */
 export interface MCPBridgeOptions {
   /** Map of tool name to executor function. */
@@ -105,6 +136,12 @@ export interface MCPBridgeOptions {
   socketPath?: string;
   /** Per-tool-call timeout in milliseconds (default: 30000). */
   timeout?: number;
+  /**
+   * Per-tool timeout overrides (Map or plain object of tool name → ms). A tool
+   * with an entry gets its declared timeout instead of the flat default; tools
+   * without an entry keep {@link timeout}. Absent → no overrides.
+   */
+  toolTimeouts?: ToolTimeoutTable;
   /** Maximum concurrent connections (default: 10). */
   maxConnections?: number;
   /**
@@ -122,6 +159,13 @@ export interface MCPBridgeOptions {
 export interface MCPProxyClientOptions {
   /** Per-request timeout in milliseconds (default: 30000). */
   timeout?: number;
+  /**
+   * Per-tool timeout overrides (Map or plain object of tool name → ms), used
+   * as the wait deadline for that tool's calls. Must agree with the bridge's
+   * table (the gateway threads the same config to both) so a slow tool's
+   * declared timeout is honored on both sides. Absent → no overrides.
+   */
+  toolTimeouts?: ToolTimeoutTable;
   /** Auto-reconnect on disconnect (default: false). */
   reconnect?: boolean;
   /** Maximum reconnect attempts (default: 3). */

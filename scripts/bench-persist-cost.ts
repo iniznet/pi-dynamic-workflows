@@ -4,13 +4,14 @@
  * `journal-budget-stringify`, cpu-leak-audit).
  *
  * Quantifies, for synthetic run states with 10k / 50k / 500k journal entries:
- *   (a) the full `casWrite` path — what every 400ms throttled progress tick
- *       pays while the fast path is dead-coded off (`useFastPath = false`):
- *       pretty-printed serialize of the whole state + secret scan + .tmp/.bak
- *       double write + read-backs, PLUS the capJournalBudget full-journal
- *       stringify once the entry count passes the 10k threshold;
- *   (b) the `saveFastPath` sidecar path — what the same tick pays once the
- *       fast path is re-enabled (S1): an O(delta) `.jdelta` sidecar write.
+ *   (a) the full `casWrite` path — the serialize + secret scan + .tmp/.bak
+ *       double write + read-backs (PLUS the capJournalBudget full-journal
+ *       stringify once the entry count passes the 10k threshold) that
+ *       boundary and checkpoint-fold writes pay;
+ *   (b) the `saveFastPath` sidecar path — what a throttled progress tick pays
+ *       in production now that the journal-delta fast path (S1) is live
+ *       (workflow-manager.ts computes `useFastPath = !compact && keepJournal`
+ *       for every throttled write): an O(delta) `.jdelta` sidecar write.
  *   (c) `capJournalBudget`'s standalone full-journal stringify cost at/over
  *       the 10_000-entry count threshold (finding 2's amplifier).
  *

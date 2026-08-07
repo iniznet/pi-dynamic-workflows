@@ -952,6 +952,33 @@ return { spentAtStart, blocked }`;
   );
 });
 
+test("core-05: phase() re-declare carries forward the phase's attributed spend (sub-budget stays closed)", async () => {
+  // Phase 'A' budget 100; each agent spends 60. Re-declaring A's budget
+  // between agents must NOT reopen the sub-budget: the attributed spend
+  // (60+60=120) carries forward, so the third agent is gated. Before core-05
+  // the re-declare reset phaseSpend to 0 and the third agent ran under a
+  // freshly reopened ceiling (all three completed).
+  const script = `export const meta = { name: 'ph', description: 'phase budget carry-forward' }
+phase('A', { budget: 100 })
+await agent('one', { label: '1', phase: 'A' })
+phase('A', { budget: 100 })
+await agent('two', { label: '2', phase: 'A' })
+let blocked = false
+try { await agent('three', { label: '3', phase: 'A' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { blocked }`;
+
+  const result = await runWorkflow<{ blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    persistLogs: false,
+  });
+
+  assert.equal(
+    result.result.blocked,
+    true,
+    "the re-declared sub-budget still counts spend accrued before the re-declare",
+  );
+});
+
 test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
   // A warm-up agent spends the whole budget (soft gate: spent accrues after it
   // finishes); the agent() inside parallel() then hits the gate and must

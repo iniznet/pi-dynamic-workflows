@@ -489,7 +489,7 @@ test("probe (e): off gate yields no defs; readonly rejects mutating verbs; full 
       const allowed = (rejected.details as { allowedActions?: string[] }).allowedActions ?? [];
       assert.deepEqual(
         [...allowed].sort(),
-        ["agents", "clean", "list", "status"],
+        ["agents", "list", "status"],
         "readonly allowed list is the inspection verbs",
       );
 

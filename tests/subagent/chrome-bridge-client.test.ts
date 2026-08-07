@@ -14,6 +14,7 @@ import {
   PI_CHROME_AUTH_GLOBAL_KEY,
   readChromeAuthGrant,
   requireChromeAuthorized,
+  resolveChromeBridgePort,
 } from "../../src/subagent/chrome-bridge-client.js";
 
 type WireRequest = { url: string; init: { method?: string; body?: string; headers?: Record<string, string> } };
@@ -247,5 +248,33 @@ describe("shared chrome auth grant", () => {
     );
     (globalThis as Record<string, unknown>)[PI_CHROME_AUTH_GLOBAL_KEY] = { until: "indefinite" };
     requireChromeAuthorized(); // does not throw
+  });
+});
+
+describe("resolveChromeBridgePort (PI_CHROME_BRIDGE_PORT parsing)", () => {
+  test("accepts a valid in-range port", () => {
+    assert.equal(resolveChromeBridgePort("17318"), 17318);
+    assert.equal(resolveChromeBridgePort("1"), 1);
+    assert.equal(resolveChromeBridgePort("65535"), 65535);
+    assert.equal(resolveChromeBridgePort(" 8080 "), 8080); // Number() trims whitespace
+  });
+
+  test("rejects out-of-range and fractional ports with the default", () => {
+    assert.equal(resolveChromeBridgePort("0"), 17318);
+    assert.equal(resolveChromeBridgePort("-1"), 17318);
+    assert.equal(resolveChromeBridgePort("65536"), 17318);
+    assert.equal(resolveChromeBridgePort("17318.5"), 17318);
+  });
+
+  test("rejects garbage and missing values with the default", () => {
+    assert.equal(resolveChromeBridgePort("NaN"), 17318);
+    assert.equal(resolveChromeBridgePort("abc"), 17318);
+    assert.equal(resolveChromeBridgePort(""), 17318);
+    assert.equal(resolveChromeBridgePort(undefined), 17318);
+  });
+
+  test("the module default port is derived from the validated parse", () => {
+    // No PI_CHROME_BRIDGE_PORT in the test env ⇒ the default URL stays sane.
+    assert.equal(new ChromeBridgeClient().url, "http://127.0.0.1:17318");
   });
 });

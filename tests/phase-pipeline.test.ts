@@ -358,4 +358,49 @@ describe("runWorkflow pipeline wiring (G4 + G2)", () => {
       "no phase artifacts without the pipeline opt-in",
     );
   });
+
+  it("core-06: a rejected queued transition does not poison later valid stage declarations", async () => {
+    const dir = await tempDir("pipeline-chain-");
+    const stateManager = new WorkflowStateManager(dir);
+    // Stage 2 → backward 1 (rejects, swallowed) → forward 3: the OLD
+    // phaseStateChain.then() wiring would skip the stage-3 transition forever
+    // (poisoned chain) and fail the run at the flush point; the fix lets each
+    // later declaration run, so the machine lands on the valid final stage and
+    // the agent gate opens.
+    const script = `export const meta = { name: 'g', description: 'chain recovery' }
+phase('Plan review', { stage: 2 })
+phase('Revisit plan', { stage: 1 })
+phase('Execute', { stage: 3 })
+const r = await agent('work', { label: 'execute' })
+return r`;
+    const res = await runWorkflow(script, {
+      agent: noopAgent,
+      cwd: dir,
+      persistLogs: false,
+      phaseState: { stateManager },
+    });
+    assert.equal(res.result, "ok", "the run survives the one bad transition and the agent is not blocked");
+    const state = await readState(dir);
+    assert.equal(state.activePhase, 3, "the later valid stage-3 declaration still applied");
+  });
+
+  it("core-06: a backward declaration as the LAST queued transition still fails at the flush point", async () => {
+    const dir = await tempDir("pipeline-chain-backward-");
+    const stateManager = new WorkflowStateManager(dir);
+    const script = `export const meta = { name: 'g', description: 'chain recovery' }
+phase('Execute', { stage: 3 })
+phase('Plan review', { stage: 2 })
+const r = await agent('work', { label: 'execute' })
+return r`;
+    await assert.rejects(
+      () =>
+        runWorkflow(script, {
+          agent: noopAgent,
+          cwd: dir,
+          persistLogs: false,
+          phaseState: { stateManager },
+        }),
+      (error: unknown) => (error as { code?: unknown }).code === WorkflowErrorCode.PHASE_TRANSITION_INVALID,
+    );
+  });
 });

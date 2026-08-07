@@ -36,6 +36,7 @@ import {
   METHOD_TOOL_ABORT,
   METHOD_TOOL_CALL,
   METHOD_TOOL_LIST,
+  normalizeToolTimeouts,
   type PendingRequest,
   type ProxiedToolDef,
   type ToolCallResult,
@@ -71,6 +72,24 @@ export class ProxyAbortError extends Error {
 }
 
 /**
+ * Derive a stable idempotency key for a proxied tool call from the logical
+ * call identity (tool name + toolCallId).
+ *
+ * The subagent runtime executes each tool_use block once under a stable
+ * toolCallId (verified: pi-agent-core agent-loop passes `toolCall.id` straight
+ * through), so every attempt of the same logical call maps to the same key
+ * while distinct calls never collide. The bridge dedupes replays with the same
+ * key (joins the original execution / returns its cached result), so a call
+ * that timed out client-side but actually completed on the host is NOT
+ * re-executed — no duplicated write/edit side effects. Keying on args alone
+ * would wrongly dedupe two legitimate identical calls, so the call identity is
+ * the key basis.
+ */
+export function proxiedIdempotencyKey(toolName: string, toolCallId: string): string {
+  return `host:${toolName}:${toolCallId}`;
+}
+
+/**
  * Convert a serialized JSON Schema into a TypeBox schema for defineTool.
  *
  * The bridge ships the host tool's real argument shape; passing it through
@@ -99,6 +118,8 @@ export function proxiedParameters(inputSchema: unknown): TSchema {
 export class MCPProxyClient {
   private readonly socketPath: string;
   private readonly timeout: number;
+  /** Per-tool timeout overrides; a tool without an entry uses {@link timeout}. */
+  private readonly perToolTimeouts: ReadonlyMap<string, number>;
   private readonly reconnect: boolean;
   private readonly maxReconnectAttempts: number;
   private readonly reconnectDelay: number;
@@ -121,12 +142,24 @@ export class MCPProxyClient {
   constructor(socketPath: string, options?: MCPProxyClientOptions) {
     this.socketPath = socketPath;
     this.timeout = options?.timeout ?? DEFAULT_TIMEOUT;
+    this.perToolTimeouts = normalizeToolTimeouts(options?.toolTimeouts);
     this.reconnect = options?.reconnect ?? false;
     this.maxReconnectAttempts = options?.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS;
     this.reconnectDelay = options?.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.connectTimeout = options?.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT;
     this.maxFrameSize = options?.maxFrameSize ?? MAX_IPC_FRAME_SIZE;
     this.authToken = options?.authToken;
+  }
+
+  /**
+   * The wait deadline for one tool's calls: the tool's declared per-tool
+   * timeout when configured, otherwise the client-wide default. Mirrors the
+   * bridge's `timeoutFor` (the gateway threads the same config to both) so a
+   * slow tool gets its declared timeout on the waiting side too — the client
+   * must not give up at 30s on a tool the bridge allows 120s.
+   */
+  private timeoutFor(toolName: string): number {
+    return this.perToolTimeouts.get(toolName) ?? this.timeout;
   }
 
   /**
@@ -301,13 +334,18 @@ export class MCPProxyClient {
       description: `[Proxied] ${def.description}`,
       parameters: proxiedParameters(def.inputSchema),
       async execute(
-        _toolCallId: string,
+        toolCallId: string,
         params: Record<string, unknown>,
         signal: AbortSignal | undefined,
         _onUpdate: unknown,
         _ctx: ExtensionContext,
       ) {
-        const result = await client.executeToolCall(def.name, params, { signal });
+        const result = await client.executeToolCall(def.name, params, {
+          signal,
+          // Per-(call,attempt) idempotency key generated at the proxy (see
+          // proxiedIdempotencyKey) so a replayed call dedupes on the bridge.
+          idempotencyKey: proxiedIdempotencyKey(def.name, toolCallId),
+        });
         return {
           content: [{ type: "text" as const, text: result.content }],
           details: result.details,
@@ -319,7 +357,11 @@ export class MCPProxyClient {
   /**
    * Send a JSON-RPC request and await the response.
    */
-  private async sendRequest(method: string, params: unknown, options?: { signal?: AbortSignal }): Promise<unknown> {
+  private async sendRequest(
+    method: string,
+    params: unknown,
+    options?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<unknown> {
     if (this.state !== "connected" || !this.socket) {
       throw new Error("Not connected to bridge");
     }
@@ -338,13 +380,15 @@ export class MCPProxyClient {
     };
 
     return new Promise<unknown>((resolve, reject) => {
-      // Set up timeout
+      // Set up timeout: a per-call timeout (e.g. the tool's declared per-tool
+      // timeout) overrides the client-wide default for this one request.
+      const timeoutMs = options?.timeout ?? this.timeout;
       const timeout = setTimeout(() => {
         this.abortCleanups.get(id)?.();
         this.abortCleanups.delete(id);
         this.pendingRequests.delete(id);
-        reject(new Error(`Request timed out after ${this.timeout}ms: ${method}`));
-      }, this.timeout);
+        reject(new Error(`Request timed out after ${timeoutMs}ms: ${method}`));
+      }, timeoutMs);
 
       // Track pending request
       this.pendingRequests.set(id, {
@@ -534,13 +578,16 @@ export class MCPProxyClient {
   async executeToolCall(
     toolName: string,
     args: Record<string, unknown>,
-    options?: { idempotencyKey?: string; signal?: AbortSignal },
+    options?: { idempotencyKey?: string; signal?: AbortSignal; timeout?: number },
   ): Promise<ToolCallResult> {
     try {
+      // The wait deadline honors the tool's declared per-tool timeout when one
+      // is configured; an explicit per-call timeout wins over both.
+      const timeout = options?.timeout ?? this.timeoutFor(toolName);
       const result = await this.sendRequest(
         METHOD_TOOL_CALL,
         { toolName, args, idempotencyKey: options?.idempotencyKey },
-        { signal: options?.signal },
+        { signal: options?.signal, timeout },
       );
       return result as ToolCallResult;
     } catch (error) {
@@ -579,13 +626,19 @@ export function createProxiedTools(client: MCPProxyClient, toolDefs: ProxiedTool
       description: `[Proxied] ${def.description}`,
       parameters: proxiedParameters(def.inputSchema),
       async execute(
-        _toolCallId: string,
+        toolCallId: string,
         params: Record<string, unknown>,
         signal: AbortSignal | undefined,
         _onUpdate: unknown,
         _ctx: ExtensionContext,
       ) {
-        const result = await client.executeToolCall(def.name, params, { signal });
+        // Per-(call,attempt) idempotency key generated at the proxy from the
+        // stable call identity, so a replayed call joins the original bridge
+        // execution instead of re-running a side-effectful host tool.
+        const result = await client.executeToolCall(def.name, params, {
+          signal,
+          idempotencyKey: proxiedIdempotencyKey(def.name, toolCallId),
+        });
         return {
           content: [{ type: "text" as const, text: result.content }],
           details: result.details,

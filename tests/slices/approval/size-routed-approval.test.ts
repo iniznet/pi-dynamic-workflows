@@ -249,6 +249,23 @@ test("plan-size: PLAN_APPROVAL_STEP_LIMIT=2 flips a 3-step plan to LARGE; defaul
   assert.equal(isPlanBig(plan), false, "env is restored after the test");
 });
 
+test("plan-size: PLAN_APPROVAL_BYTES_LIMIT=1000 flips a ~1.4KB plan to LARGE; defaults restore", async () => {
+  // The fixture crosses the tightened 1000-byte override but stays under the
+  // 20_000-byte default, so only the env override changes the verdict.
+  const plan = blueprint(2, 1000);
+  assert.ok(planSizeMetrics(plan).bytes > 1000, "the fixture crosses the 1000-byte override");
+  assert.ok(
+    planSizeMetrics(plan).bytes < PLAN_APPROVAL_BYTES_LIMIT_DEFAULT,
+    "the fixture stays under the default limit",
+  );
+  assert.equal(isPlanBig(plan), false, "baseline default classifies the ~1.4KB plan small");
+  await withEnv({ [PLAN_APPROVAL_BYTES_LIMIT_ENV]: "1000" }, async () => {
+    assert.equal(resolveApprovalLimits().bytesLimit, 1000, "the valid env value is honored");
+    assert.equal(isPlanBig(plan), true, "the env override tightens the byte threshold");
+  });
+  assert.equal(isPlanBig(plan), false, "env is restored after the test");
+});
+
 test("plan-size: explicit overrides beat env", async () => {
   const plan = blueprint(3);
   await withEnv({ [PLAN_APPROVAL_STEP_LIMIT_ENV]: "2" }, async () => {
@@ -356,12 +373,20 @@ test("plan-size: the byte metric strips decision bookkeeping — augmentation ne
     await writeFile(join(dir, "edge.json"), JSON.stringify(raw, null, 2), "utf-8");
     const rawBytes = planSizeMetrics(raw, { bytesLimit: 0 }).bytes; // exact compact bytes
     const nearLimit = rawBytes + 40; // raw is ~40B under; augmented (+~60B) would cross without the strip
-    const classified = await classifyRunPlan({ dir, runId: "edge", blueprint: raw, overrides: { bytesLimit: nearLimit } });
+    const classified = await classifyRunPlan({
+      dir,
+      runId: "edge",
+      blueprint: raw,
+      overrides: { bytesLimit: nearLimit },
+    });
     assert.equal(classified.source, "run-plan", "the prewalk file is the plan under review");
     assert.equal(classified.big, false, "the raw plan is SMALL (under the byte limit)");
     const ensured = await ensurePendingRunPlan(dir, "edge", raw);
     assert.equal(ensured.wrote, true);
-    const onDisk = JSON.parse(await readFile(join(dir, "edge.json"), "utf-8")) as { status?: string; submittedAt?: string };
+    const onDisk = JSON.parse(await readFile(join(dir, "edge.json"), "utf-8")) as {
+      status?: string;
+      submittedAt?: string;
+    };
     assert.equal(onDisk.status, "pending", "augmentation stamps pending");
     // The CLI-side re-measurement of the AUGMENTED file with the SAME limits:
     // the strip makes it equal to the raw measurement — classification is stable.

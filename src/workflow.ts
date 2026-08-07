@@ -965,9 +965,31 @@ export async function runWorkflow<T = unknown>(
   const phaseStateIntegration = options.phaseState;
   const gateAgentCalls = phaseStateIntegration ? (phaseStateIntegration.gateAgentCalls ?? true) : false;
   let phaseStateChain: Promise<void> = Promise.resolve();
+  /**
+   * Run one queued phase transition. Equal-stage declarations are benign
+   * no-ops: the machine may have already reached the stage through another
+   * path (e.g. recordGateVerdict advancing to Phase 3 right after an approved
+   * checkpoint), so a script's later `phase(..., { stage: 3 })` must not throw
+   * as a "backward" transition. Any stage BELOW the current one is a genuine
+   * backward declaration and transitionTo rejects it at the next flush point,
+   * preserving the documented "stages must be declared strictly ascending"
+   * contract (state-machine.ts transitionTo throws on phase <= current).
+   */
+  const runQueuedPhaseTransition = async (stage: PhaseStage): Promise<void> => {
+    if (!phaseStateIntegration) return;
+    const stateManager = phaseStateIntegration.stateManager;
+    const current = await stateManager.getState();
+    if (stage === current.activePhase) return;
+    await stateManager.transitionTo(stage);
+  };
   const queuePhaseTransition = (stage: PhaseStage) => {
     if (!phaseStateIntegration) return;
-    phaseStateChain = phaseStateChain.then(() => phaseStateIntegration.stateManager.transitionTo(stage));
+    // core-06: swallow the PREVIOUS link's rejection so one failed (backward)
+    // transition can never poison the chain for every later declaration — the
+    // next link still runs, and a flush point observes the LAST link's outcome.
+    phaseStateChain = phaseStateChain
+      .catch(() => {})
+      .then(() => runQueuedPhaseTransition(stage));
   };
   const flushPhaseState = () => phaseStateChain;
   /** Record a gate verdict in the persisted state machine (approval only at stage 2). */
@@ -991,6 +1013,21 @@ export async function runWorkflow<T = unknown>(
         if (state.humanApproved) return;
       }
       throw error;
+    }
+    // core-02: a bridge/browser (or in-run) approval must OPEN the agent()
+    // spawn gate — canSpawnSubagents() requires activePhase === 3 AND
+    // humanApproved (state-machine.ts). The CLI approve verb
+    // (workflow-commands.ts) is the only other producer of a Phase 3
+    // transition; when it won the race the approvePlan above threw
+    // APPROVAL_REQUIRED and the catch returned. Here the machine is at
+    // Phase 2 with both Phase-3 prerequisites recorded (plannotatorSubmitted
+    // by the setState above, humanApproved by approvePlan) — advance it,
+    // tolerantly: peek first and only transition when the machine is not
+    // already at Phase 3 (no double-write, no throw). enforcePrerequisites
+    // mirrors the CLI path and is satisfiable — both flags are set.
+    const afterApproval = await stateManager.getState();
+    if (afterApproval.activePhase < 3) {
+      await stateManager.transitionTo(3, { enforcePrerequisites: true });
     }
   };
   /**
@@ -1172,7 +1209,11 @@ export async function runWorkflow<T = unknown>(
     // (M25), so the gate reads the attributed total, not the run-wide counter.
     if (typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0) {
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, warned: false });
-      state.phaseSpend.set(title, 0);
+      // core-05: carry forward spend already attributed to this phase (the
+      // doc above promises re-declare "re-bases from the current
+      // phase-attributed spend") — only the FIRST declaration seeds 0, so a
+      // re-declare / pause-resume never silently reopens a soft sub-budget.
+      if (!state.phaseSpend.has(title)) state.phaseSpend.set(title, 0);
     }
     // Deterministic stage for the persisted phase state machine (opt-in, see
     // PhaseStateIntegration). Queued — phase() stays synchronous — and flushed
@@ -3612,10 +3653,21 @@ function normalizeBoundedCount(value: unknown, fallback: number, max: number, wh
 async function waitForInFlightSettlement(inFlight: Set<Promise<unknown>>, deadline: number): Promise<void> {
   const remainingMs = deadline - Date.now();
   if (remainingMs <= 0) return;
-  await Promise.race([
-    Promise.allSettled(Array.from(inFlight)),
-    new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
-  ]);
+  // core-03: the deadline timer is hoisted, unref'd (a pending drain must
+  // never hold the process open on its own), and cleared on settle — a drain
+  // whose in-flight agents finish early would otherwise leave an orphaned
+  // timer (up to DRAIN_ABORT_TIMEOUT_MS) behind.
+  let deadlineTimer: ReturnType<typeof safeSetTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.allSettled(Array.from(inFlight)),
+      new Promise<void>((resolve) => {
+        deadlineTimer = safeSetTimeout(resolve, remainingMs).unref();
+      }),
+    ]);
+  } finally {
+    deadlineTimer?.clear();
+  }
 }
 
 /**

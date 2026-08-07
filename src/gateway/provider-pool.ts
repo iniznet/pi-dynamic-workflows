@@ -284,6 +284,10 @@ export class ProviderPool {
       return this.toChoice(reservation);
     }
 
+    // D2: fail fast for an all-no-auth pool — placement requires auth, so the
+    // wait could never be satisfied (it would stall the full saturation budget
+    // and then misreport "at capacity"). Name the unauthenticated providers.
+    this.throwIfNoAuthenticatedEntry(logicalModel);
     if (this.config.whenSaturated === "fail") {
       throw this.saturationError(logicalModel, undefined);
     }
@@ -406,6 +410,10 @@ export class ProviderPool {
       // concurrency slot for the whole run).
       return this.toChoice(reservation);
     }
+    // D2: fail fast when no entry has auth — placement requires it, so the
+    // sticky wait could never be satisfied (stalling the full saturation
+    // budget before misreporting "at capacity"). Applies in both modes.
+    this.throwIfNoAuthenticatedEntry(logicalModel);
     if (this.config.whenSaturated === "fail") {
       throw this.saturationError(logicalModel, reservation.provider);
     }
@@ -427,6 +435,8 @@ export class ProviderPool {
       const reservation = this.makeReservation(logicalModel, placed, previous.stickyKey);
       return this.toChoice(reservation);
     }
+    // D2: fail fast for an all-no-auth pool (see throwIfNoAuthenticatedEntry).
+    this.throwIfNoAuthenticatedEntry(logicalModel);
     if (this.config.whenSaturated === "fail") {
       throw this.saturationError(logicalModel, undefined);
     }
@@ -535,6 +545,47 @@ export class ProviderPool {
   }
 
   // ─── Saturation errors ────────────────────────────────────────────────────
+
+  /**
+   * All entries for `logicalModel` when NONE has configured registry auth
+   * (undefined otherwise). Placement requires auth, so such a pool can never
+   * satisfy an acquire — waiting would only stall the full saturation budget
+   * (default 300s, 0 = forever) before misreporting "at capacity".
+   */
+  private noAuthenticatedEntries(logicalModel: string): ProviderPoolEntry[] | undefined {
+    const entries = this.entriesByModel.get(logicalModel);
+    if (!entries || entries.length === 0) return undefined;
+    const unauthenticated = entries.filter((entry) => !this.isAuthConfigured(entry));
+    return unauthenticated.length === entries.length ? unauthenticated : undefined;
+  }
+
+  /**
+   * D2 fail-fast error for an all-no-auth pool: names the unauthenticated
+   * providers. Deliberately NOT PROVIDER_SATURATED — a missing credential is a
+   * configuration error that never resolves on its own, so the run must settle
+   * FAILED (MODEL_NOT_FOUND's deterministic-retry semantics), never checkpoint
+   * paused like a genuine capacity saturation.
+   */
+  private noAuthError(logicalModel: string, entries: ProviderPoolEntry[]): WorkflowError {
+    const names = entries.map((entry) => `"${entry.provider}" (model "${entry.modelId}")`).join(", ");
+    return new WorkflowError(
+      `Provider pool has no authenticated provider for model "${logicalModel}": ${names} — add their ` +
+        "credentials to auth.json or register the provider dynamically to pool it.",
+      WorkflowErrorCode.MODEL_NOT_FOUND,
+      { recoverable: false },
+    );
+  }
+
+  /**
+   * Fail fast when NO entry for the model has registry auth (see
+   * noAuthenticatedEntries): returns true when the caller should stop — the
+   * error has been thrown.
+   */
+  private throwIfNoAuthenticatedEntry(logicalModel: string): boolean {
+    const unauthenticated = this.noAuthenticatedEntries(logicalModel);
+    if (unauthenticated === undefined) return false;
+    throw this.noAuthError(logicalModel, unauthenticated);
+  }
 
   /**
    * PROVIDER_SATURATED with the design's recoverability split: recoverable

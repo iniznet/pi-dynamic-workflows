@@ -34,7 +34,7 @@ test("resolveAgentModelSpec: tier key absent from a PRESENT config returns undef
   // must not collapse onto the main agent's model.
   assert.equal(resolveAgentModelSpec({ tier: "doesnotexist" }, "main/model", loadCfg), undefined);
   // ...even when mainModel is set and a sibling tier exists.
-  const partial = () => ({ tiers: { small: "vendor/small", big: "inherit:main" } } as ModelTierConfig);
+  const partial = () => ({ tiers: { small: "vendor/small", big: "inherit:main" } }) as ModelTierConfig;
   assert.equal(resolveAgentModelSpec({ tier: "medium" }, "session/main-model", partial), undefined);
 });
 
@@ -43,7 +43,7 @@ test("resolveAgentModelSpec: NO config file at all still degrades an explicit ti
 });
 
 test("resolveAgentModelSpec: untagged agent with a config lacking the medium key returns undefined (session default path)", () => {
-  const cfg = () => ({ tiers: { small: "vendor/small" } } as ModelTierConfig);
+  const cfg = () => ({ tiers: { small: "vendor/small" } }) as ModelTierConfig;
   assert.equal(resolveAgentModelSpec({}, "main/model", cfg), undefined);
 });
 

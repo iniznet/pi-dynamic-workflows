@@ -11,8 +11,16 @@ import { checkWorkflowRelease, parseNpmPackFilePaths, runNpmPack } from "../src/
 
 const ROOT = join(import.meta.dirname, "..");
 
+// `npm pack --dry-run --json` takes ~2–6s per spawn and the release-gate tests
+// call publishableFiles() ~19 times (F-T5). Compute the pack output once at
+// module scope; the tmp-tree tests inject their own file lists and never rely
+// on re-spawning the real pack. The function keeps its signature so call sites
+// stay byte-identical.
+let publishableFilesMemo: string[] | undefined;
+
 function publishableFiles(): string[] {
-  return runNpmPack({ cwd: ROOT });
+  publishableFilesMemo ??= runNpmPack({ cwd: ROOT });
+  return publishableFilesMemo;
 }
 
 test("npm pack parsing keeps only valid publishable file paths", () => {

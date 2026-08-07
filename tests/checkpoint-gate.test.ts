@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createPlannotatorBridge } from "../src/integrations/plannotator.js";
+import { WorkflowStateManager } from "../src/phases/state-machine.js";
 import type { CheckpointGate, JournalEntry } from "../src/workflow.js";
 import { runWorkflow } from "../src/workflow.js";
 
@@ -105,6 +106,50 @@ return { r }`;
   });
   assert.equal(second.result.r, true, "the journaled verdict replays unchanged");
   assert.equal(gateContacts, 0, "resume never re-blocks on the gate");
+});
+
+// ─── core-02: browser approval advances the machine to Phase 3 ───────────────
+
+const approvedGate = (): CheckpointGate => ({
+  async submitPlan() {
+    return { id: "plan-1" };
+  },
+  async waitForApproval() {
+    return true;
+  },
+});
+
+test("core-02: a browser-approved checkpoint advances the machine to Phase 3 so a later agent() is not blocked", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "checkpoint-gate-ph3-"));
+  try {
+    const stateManager = new WorkflowStateManager(dir);
+    // The persisted machine sits at Phase 2 with the Phase 0/1 prerequisites
+    // recorded, exactly as the wayfinder→prewalk pipeline leaves it.
+    await stateManager.setState({ activePhase: 2, wayfinderComplete: true, prewalkComplete: true });
+    const script = `export const meta = { name: 'g', description: 'gate' }
+const approved = await checkpoint('Approve the plan?', { kind: 'confirm' })
+const result = await agent('execute the approved plan', { label: 'execute' })
+return { approved, result }`;
+    // No stage-3 declaration in the script: the approval itself must open the
+    // agent() spawn gate (recordGateVerdict's tolerant transitionTo(3)). Before
+    // core-02 the machine stayed at Phase 2 and the agent() threw
+    // SUBAGENT_SPAWN_BLOCKED — the gate was wedged for exactly the big plans
+    // that must be approved through the browser channel.
+    const res = await runWorkflow<{ approved: boolean; result: string }>(script, {
+      agent: noopAgent,
+      checkpointGate: approvedGate(),
+      phaseState: { stateManager },
+      persistLogs: false,
+    });
+    assert.equal(res.result.approved, true);
+    assert.equal(res.result.result, "ok", "agent() is NOT blocked after the browser approval");
+    const state = await stateManager.getState();
+    assert.equal(state.activePhase, 3, "the approval advanced the machine to Phase 3");
+    assert.equal(state.humanApproved, true, "the verdict recorded human approval");
+    assert.equal(state.plannotatorSubmitted, true, "the reviewed plan was recorded as submitted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ─── Real plannotator SSE bridge end-to-end ───────────────────────────────────

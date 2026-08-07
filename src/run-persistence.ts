@@ -10,6 +10,8 @@ import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
   type PersistenceFsLayer,
+  RENAME_RETRY_ATTEMPTS,
+  RENAME_RETRY_DELAY_MS,
   readJsonWithBackupRecovery,
   resolvePersistenceFs,
   unlinkIfExistsSafe,
@@ -266,7 +268,10 @@ export interface RunPersistence {
   delete(runId: string): boolean;
   /**
    * Acquire an exclusive cross-process lease for a run. Returns null when another
-   * live process owns the run; stale/corrupt lock files are removed and retried.
+   * live process owns the run, or when the lock exists but is CORRUPT (its
+   * ownership cannot be verified — never silently re-acquire a runId whose
+   * lease we cannot prove stale; core-01). Genuinely stale lock files (dead
+   * pid / expired / age-stale) are removed and retried.
    */
   acquireRunLease(runId: string): RunLease | null;
   /** Release a lease previously returned by acquireRunLease(). */
@@ -411,6 +416,15 @@ interface LockFile {
    * reclaim. Absent on legacy lock files (pid-based liveness only).
    */
   expiresAt?: string;
+}
+
+/**
+ * Synchronous bounded sleep for the SYNC lease layer (core-01's atomic renewal
+ * retries the rename like the async writeJsonFileAtomic, but the lease path is
+ * synchronous — Atomics.wait is the only non-blocking-forever sync sleep).
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
@@ -1150,13 +1164,24 @@ export function createRunPersistence(
           // expiry; a dead pid, an expired lease (bounded-delay reclaim), or an
           // age-stale lease (recycled PID / runaway renew — L2) is stale and
           // gets replaced below.
-          if (
-            existing &&
-            existing.runPath === path &&
-            pidIsAlive(existing.pid) &&
-            !leaseIsExpired(existing) &&
-            !leaseIsStaleByAge(existing)
-          ) {
+          if (existing) {
+            if (
+              existing.runPath === path &&
+              pidIsAlive(existing.pid) &&
+              !leaseIsExpired(existing) &&
+              !leaseIsStaleByAge(existing)
+            ) {
+              return null;
+            }
+          } else if (_existsSync(lock)) {
+            // core-01: the lock exists (EEXIST) but does not parse — a
+            // torn/corrupt lock (a legacy non-atomic renewal crash, external
+            // tampering). Ownership cannot be verified, so treat the lease as
+            // HELD: never unlink-and-reacquire a runId whose lease we cannot
+            // prove stale. That silent re-acquisition was the double-execution
+            // vector — a torn lock parsed as null → "no lease" → re-acquire →
+            // the SAME runId ran twice (double token spend). A human can
+            // delete a genuinely stuck corrupt lock by hand.
             return null;
           }
           try {
@@ -1183,8 +1208,49 @@ export function createRunPersistence(
         const existing = readLock(lease.runId);
         if (!existing || existing.token !== lease.token) return false;
         existing.expiresAt = new Date(Date.now() + DEFAULT_RUN_LEASE_TTL_MS).toISOString();
-        _writeFileSync(primaryLockPath(lease.runId), JSON.stringify(existing, null, 2));
-        return true;
+        const lockPath = primaryLockPath(lease.runId);
+        // core-01: atomic renewal — write a sibling tmp, then rename over the
+        // live lock. The old truncate-then-write (writeFileSync on the lock
+        // itself) could crash mid-write, leaving a torn lock that readLockAt
+        // parsed as null → acquireRunLease re-acquired → the SAME runId ran
+        // twice (double token spend). A rename is atomic on the same
+        // filesystem, so a reader sees either the old or the new complete
+        // lock, never a half-written one.
+        const tmpPath = `${lockPath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+        _writeFileSync(tmpPath, JSON.stringify(existing, null, 2));
+        // Token/owner guard: re-verify ownership immediately before the rename
+        // so a lease that was stolen (expired → reclaimed by another process)
+        // between our read above and this rename is never clobbered.
+        const current = readLock(lease.runId);
+        if (!current || current.token !== lease.token) {
+          try {
+            _unlinkSync(tmpPath);
+          } catch {
+            // best-effort cleanup; the ownership loss is the real result.
+          }
+          return false;
+        }
+        for (let attempt = 0; attempt < RENAME_RETRY_ATTEMPTS; attempt++) {
+          try {
+            _renameSync(tmpPath, lockPath);
+            return true;
+          } catch {
+            if (attempt < RENAME_RETRY_ATTEMPTS - 1) {
+              // Windows EPERM: a concurrent reader may hold the destination
+              // open without delete-sharing for a few ms; bounded sync sleep
+              // then retry (same cadence as the async writeJsonFileAtomic).
+              sleepSync(RENAME_RETRY_DELAY_MS);
+              continue;
+            }
+            try {
+              _unlinkSync(tmpPath);
+            } catch {
+              // best-effort cleanup; the renewal failure is the real result.
+            }
+            return false;
+          }
+        }
+        return false;
       } catch {
         return false;
       }
@@ -1192,7 +1258,24 @@ export function createRunPersistence(
 
     getLeaseInfo(runId: string): RunLeaseInfo | null {
       const lock = readLock(runId);
-      if (!lock) return null;
+      if (lock === null) {
+        if (!_existsSync(primaryLockPath(runId))) return null;
+        // core-01: a lock file exists but is torn/corrupt. Ownership cannot be
+        // verified, so the lease is treated as HELD by an unknown owner — never
+        // reclaimable. The old reader returned null here ("no lease"), which
+        // let damage-control clean/recover classify the run as unleased and
+        // force-remove state whose orphanhood we cannot prove.
+        return {
+          runId,
+          pid: 0,
+          startedAt: "",
+          expiresAt: "",
+          alive: false,
+          expired: false,
+          staleByAge: false,
+          reclaimable: false,
+        };
+      }
       const alive = pidIsAlive(lock.pid);
       const expired = leaseIsExpired(lock);
       const staleByAge = leaseIsStaleByAge(lock);

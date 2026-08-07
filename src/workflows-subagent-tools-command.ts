@@ -395,4 +395,4 @@ export function registerWorkflowSubagentToolsCommand(
 const COMMAND_NAME = "workflows-subagent-tools";
 
 const COMMAND_DESCRIPTION =
-  "Show the effective workflow subagent toolset: per-tool source and allow status, MCP servers, and host tools that cannot reach subagents on the 0.83.0 ExtensionAPI — no args (read-only listing)";
+  "Show the effective workflow subagent toolset: per-tool source and allow status, MCP servers, and host tools that cannot reach subagents on the 0.83.0 ExtensionAPI. Read-only listing — it modifies no settings, but assembling the toolset starts the host-tools gateway and performs MCP handshakes with configured servers (no args)";

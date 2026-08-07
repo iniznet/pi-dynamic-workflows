@@ -114,7 +114,7 @@ export const DAMAGE_CONTROL_ACTIONS = [
 
 export type DamageControlAction = (typeof DAMAGE_CONTROL_ACTIONS)[number];
 
-export const DAMAGE_CONTROL_READONLY_ACTIONS = ["list", "status", "agents", "clean"] as const;
+export const DAMAGE_CONTROL_READONLY_ACTIONS = ["list", "status", "agents"] as const;
 
 /** "readonly" = inspection verbs only (subagent exposure); "full" = everything. */
 export type DamageControlCapabilities = "readonly" | "full";

@@ -520,6 +520,51 @@ describe("dialog tier (hasUI without tui)", () => {
       );
     });
   });
+
+  it("skips the provider pool row with a notice and never prompts for it", async () => {
+    await withTempDirAsync(async (dir) => {
+      const settingsPath = join(dir, "settings.json");
+      const notified: Array<{ message: string; type?: string }> = [];
+      const inputLabels: string[] = [];
+
+      let selectCall = 0;
+      const ui = {
+        select: async () => {
+          selectCall++;
+          return selectCall === 1 ? "Global" : undefined; // only the scope prompt
+        },
+        input: async (label: string) => {
+          inputLabels.push(label);
+          return undefined; // decline every row — nothing must be saved
+        },
+        notify: (message: string, type?: string) => notified.push({ message, type }),
+      };
+      const ctx = {
+        cwd: dir,
+        mode: "rpc",
+        hasUI: true,
+        isProjectTrusted: () => false,
+        ui,
+      } as unknown as ExtensionCommandContext;
+      const { pi } = makeSendingPi();
+
+      await runWorkflowSettingsCommand(pi, ctx, "", { settingsPath });
+
+      assert.ok(
+        notified.some((n) => /Provider pool skipped/.test(n.message)),
+        "the pool-skip notice must be emitted once",
+      );
+      assert.ok(
+        inputLabels.every((label) => !/Provider pool/.test(label)),
+        "the dialog must never free-text prompt for the provider pool",
+      );
+      assert.ok(
+        notified.some((n) => n.message === "No changes to save"),
+        "declined rows must abort the save",
+      );
+      assert.equal(existsSync(settingsPath), false, "nothing may be written when every row is declined");
+    });
+  });
 });
 
 describe("print tier (no UI)", () => {

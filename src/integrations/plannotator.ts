@@ -5,10 +5,11 @@
 
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { WorkflowError, WorkflowErrorCode } from "../errors.js";
+import { writeJsonFileAtomic } from "../fs-persistence.js";
 import type { WorkflowStateManager } from "../phases/state-machine.js";
 import { type SafeTimer, safeSetInterval, safeSetTimeout } from "../timing.js";
 import { type BrowserOpenOptions, type BrowserOpenResult, openReviewInBrowser } from "./plannotator-ui/browser-open.js";
@@ -229,21 +230,15 @@ function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
 }
 
 /**
- * Atomic replace of a plan file (tmp + rename in the same directory, mirroring
- * the state-machine write pattern) so the 250ms poller never observes a torn
- * file: an orphaned tmp is unlinked on failure.
+ * Atomic replace of a plan file — routes through the shared
+ * {@link writeJsonFileAtomic} (fs-persistence.ts). Audit WPA-01: this was a
+ * private tmp+rename copy WITHOUT the Windows-EPERM rename retry, and the
+ * bridge /approve path ran it against the same concurrent 250ms waitForStatus
+ * poller the retry was built for (observed ~1-in-8 HTTP 500). Dir semantics
+ * stay here: the bridge's own planDir().
  */
 async function writePlanAtomic(plan: ReviewPlan): Promise<void> {
-  const dir = planDir();
-  const path = join(dir, `${plan.id}.json`);
-  const tmpPath = `${path}.${randomUUID()}.${process.pid}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(plan, null, 2), "utf-8");
-  try {
-    await rename(tmpPath, path);
-  } catch (error) {
-    await rm(tmpPath, { force: true }).catch(() => {});
-    throw error;
-  }
+  await writeJsonFileAtomic(join(planDir(), `${plan.id}.json`), plan);
 }
 
 export function waitForApproval(planId: string, timeout?: number, signal?: AbortSignal): Promise<boolean> {
