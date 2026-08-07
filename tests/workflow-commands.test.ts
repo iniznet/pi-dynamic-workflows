@@ -1302,7 +1302,12 @@ test("/workflows implement persists one atomic checkpoint per task via the real 
  * Mirrors prd-runtime-activation: the run-entry pipeline transitions 0 → 1 → 2
  * and stops; only a checkpoint gate would ever set plannotatorSubmitted.
  */
-async function pendingPlanFixture(repo: string, runId: string, stepCount = 2): Promise<WorkflowStateManager> {
+async function pendingPlanFixture(
+  repo: string,
+  runId: string,
+  stepCount = 2,
+  largeBytes = false,
+): Promise<WorkflowStateManager> {
   const plansDir = join(repo, ".pi", "workflows", "plans");
   mkdirSync(plansDir, { recursive: true });
   writeFileSync(
@@ -1310,7 +1315,10 @@ async function pendingPlanFixture(repo: string, runId: string, stepCount = 2): P
     JSON.stringify({
       id: `bp-${runId}`,
       title: `plan for ${runId}`,
-      preconditions: ["p"],
+      // The bytes-big variant embeds a >20_000-char precondition so the
+      // compact serialized blueprint crosses the size rule's byte limit
+      // while staying small in step count (steps-only would miss it).
+      preconditions: largeBytes ? ["p".repeat(24_000)] : ["p"],
       executionSteps: Array.from({ length: stepCount }, (_, i) => ({
         id: `s${i}`,
         description: `step ${i}`,
@@ -1507,6 +1515,79 @@ test("/workflows approve <id> refuses outside Phase 2 (approvePlan's APPROVAL_RE
       status?: string;
     };
     assert.equal(decided.status, undefined, "a phase-mismatched approve must not persist the verdict");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> refuses a LARGE plan (browser review required) and leaves everything pending", async () => {
+  const repo = initRepo("wf-cmd-approve-big-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-big", 10);
+    const planPath = join(repo, ".pi", "workflows", "plans", "run-big.json");
+    const before = readFileSync(planPath, "utf-8");
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-big");
+
+    // The size-route refusal surfaces the review-UI requirement as a warning.
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && /large|requires browser review/i.test(n.message)),
+      "the refusal names the size rule and the browser review requirement",
+    );
+    // Nothing was written: the plan file is byte-identical (no status field
+    // added, no reviewedAt) — a big plan cannot be CLI-approved, ever.
+    assert.equal(readFileSync(planPath, "utf-8"), before, "the large plan file is untouched");
+    // The phase machine stays exactly where the ungated run left it.
+    const after = await phaseState.getState();
+    assert.equal(after.activePhase, 2, "no phase transition for a refused approve");
+    assert.equal(after.humanApproved, false, "no human verdict is recorded");
+    assert.equal(after.plannotatorSubmitted, false, "no submission is recorded");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> refuses a bytes-large plan (small steps, big serialized blueprint)", async () => {
+  const repo = initRepo("wf-cmd-approve-bigbytes-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-bigbytes", 2, true);
+    const planPath = join(repo, ".pi", "workflows", "plans", "run-bigbytes.json");
+    const before = readFileSync(planPath, "utf-8");
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-bigbytes");
+
+    assert.ok(
+      h.notified.some((n) => n.type === "warning" && /large|requires browser review/i.test(n.message)),
+      "the byte dimension triggers the same browser-review refusal",
+    );
+    assert.equal(readFileSync(planPath, "utf-8"), before, "the bytes-large plan file is untouched");
+    const after = await phaseState.getState();
+    assert.equal(after.activePhase, 2);
+    assert.equal(after.humanApproved, false);
+    assert.equal(after.plannotatorSubmitted, false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("/workflows approve <id> still approves an 8-step plan at the size limit (not over)", async () => {
+  const repo = initRepo("wf-cmd-approve-eight-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-eight", 8);
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-eight");
+
+    const decided = JSON.parse(readFileSync(join(repo, ".pi", "workflows", "plans", "run-eight.json"), "utf-8")) as {
+      status?: string;
+      executionSteps?: unknown[];
+    };
+    assert.equal(decided.status, "approved", "at-the-limit plans keep CLI approval");
+    assert.equal(decided.executionSteps?.length, 8, "all eight steps survive the verdict");
+    const state = await phaseState.getState();
+    assert.equal(state.activePhase, 3, "the machine advances to Phase 3");
+    assert.equal(state.humanApproved, true);
+    assert.equal(state.plannotatorSubmitted, true);
+    assert.ok(h.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-eight")));
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

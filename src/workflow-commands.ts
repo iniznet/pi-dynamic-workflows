@@ -26,6 +26,7 @@ import { type EffortState, effortDirective } from "./effort-command.js";
 import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import type { ExecutionBlueprint } from "./phases/prewalk.js";
 import { WorkflowStateManager } from "./phases/state-machine.js";
+import { isPlanBig, planSizeMetrics } from "./plan-size.js";
 import { type PersistedRunState, saveCheckpoint } from "./run-persistence.js";
 import { parametersFromArgs, registerSavedWorkflow } from "./saved-commands.js";
 import { parseWorkflowScript } from "./workflow.js";
@@ -642,6 +643,19 @@ export function registerWorkflowCommands(
           const planStatus = (plan as unknown as { status?: string }).status;
           if (planStatus === "approved" || planStatus === "rejected") {
             ctx.ui.notify(`Plan for run ${id} is already ${planStatus} — nothing to approve.`, "warning");
+            return;
+          }
+          // Size-route enforcement: a plan the size rule classifies LARGE must be
+          // reviewed in the plannotator browser UI — the CLI cannot substitute a
+          // human verdict for it. Refuse BEFORE any write (no decidePlanApproved,
+          // no state-machine mutation) so the plan stays pending and the bridge
+          // path stays authoritative; only small plans keep CLI approval.
+          const size = planSizeMetrics(plan);
+          if (isPlanBig(plan)) {
+            ctx.ui.notify(
+              `approve refused for ${id}: the plan is classified large (${size.steps} execution steps / ${size.bytes} bytes) — large plans require browser review through the workflow approval gate; nothing was written and the plan stays pending.`,
+              "warning",
+            );
             return;
           }
           if (state.activePhase !== 2) {

@@ -64,10 +64,18 @@ export interface PlannotatorBridgeOptions extends Partial<PlannotatorConfig> {
   openBrowser?: (url: string, opts?: BrowserOpenOptions) => Promise<BrowserOpenResult>;
 }
 
+/**
+ * Default human-verdict wait for an approval: 5 minutes. Exported so the
+ * facade's small-plan path (extensions/workflow.ts) polls with the SAME
+ * default the bridge uses for its approvalTimeout, keeping the two routes
+ * consistent for the run's wait deadline.
+ */
+export const DEFAULT_APPROVAL_TIMEOUT_MS = 300_000;
+
 const DEFAULT_CONFIG: PlannotatorConfig = {
   port: 3123,
   autoOpenBrowser: true,
-  approvalTimeout: 300000,
+  approvalTimeout: DEFAULT_APPROVAL_TIMEOUT_MS,
 };
 
 /** Re-read cadence for waitForApproval; responsive for a human gate, bounded, and abortable. */

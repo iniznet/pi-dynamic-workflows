@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import vm from "node:vm";
 import type { Node } from "acorn";
 import { parse } from "acorn";
@@ -33,6 +34,7 @@ import { createMemoizedLoadModelTierConfig, type ModelTierConfig, resolveTierMod
 import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
+import { classifyRunPlan } from "./plan-size.js";
 import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
 import { safeSetTimeout } from "./timing.js";
@@ -652,8 +654,14 @@ interface CheckpointOptions {
  * plannotator bridge writes it to `.pi/workflows/plans/<id>.json`).
  */
 export interface CheckpointGate {
-  /** Publish a checkpoint to the visual gate; resolves with the gate's plan id. */
-  submitPlan(blueprint: unknown): Promise<{ id: string }>;
+  /**
+   * Publish a checkpoint to the visual gate; resolves with the gate's plan id.
+   * `reviewUrl` is optional: a gate that could not auto-open its review UI
+   * (e.g. the plannotator bridge on a headless host) attaches the manual
+   * review URL so the run can surface it to the human. Absent → the gate
+   * auto-opened its UI (or has no URL to offer).
+   */
+  submitPlan(blueprint: unknown): Promise<{ id: string; reviewUrl?: string }>;
   /**
    * Wait for the human verdict; resolves `true` on approval, `false` on denial
    * or when the timeout elapses with no decision.
@@ -967,7 +975,23 @@ export async function runWorkflow<T = unknown>(
     if (!phaseStateIntegration) return;
     const stateManager = phaseStateIntegration.stateManager;
     await stateManager.setState({ plannotatorSubmitted: true });
-    if (approved) await stateManager.approvePlan();
+    if (!approved) return;
+    try {
+      await stateManager.approvePlan();
+    } catch (error) {
+      // Race on the small-plan path: the CLI /workflows approve verb already
+      // recorded the verdict (setState + approvePlan + transitionTo(3), see
+      // src/workflow-commands.ts) while this run was live-waiting on the gate
+      // poll. approvePlan is Phase-2-only and now refuses (APPROVAL_REQUIRED)
+      // — but the approval has already happened, so the re-record is a
+      // success, never a failure. Only when humanApproved is NOT yet true is
+      // the error real.
+      if (error instanceof WorkflowError && error.code === WorkflowErrorCode.APPROVAL_REQUIRED) {
+        const state = await stateManager.getState();
+        if (state.humanApproved) return;
+      }
+      throw error;
+    }
   };
   /**
    * Live PhaseGuard gate for agent(): the persisted machine must be at stage 3
@@ -2767,6 +2791,10 @@ export async function runWorkflow<T = unknown>(
         runId,
         callIndex,
       });
+      // A big-plan bridge that could not auto-open the browser attaches the
+      // manual review URL to the result (plannotator submitPlan's note); log
+      // it so the human sees where to review the plan in the run log.
+      if (plan.reviewUrl !== undefined) log(plan.reviewUrl);
       let approved: boolean;
       try {
         approved = await options.checkpointGate.waitForApproval(plan.id, checkpointOptions.timeoutMs, options.signal);
@@ -2796,6 +2824,32 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     } else {
+      // Headless with no gate and no confirm: SMALL plans keep the documented
+      // auto-approve (take the declared default and journal it). A BIG plan
+      // must NEVER auto-approve — the size rule routes it to the browser
+      // review gate, which is absent here, so the checkpoint aborts the run
+      // instead of silently rubber-stamping a large blueprint. The classify
+      // read sits AFTER the journal cache-hit return above, so resume replay
+      // never re-classifies and never re-blocks (S1 intact).
+      const classified = await classifyRunPlan({
+        dir: join(baseCwd, ".pi", "workflows", "plans"),
+        runId,
+        blueprint: {
+          prompt: promptText,
+          kind: checkpointOptions.kind ?? "confirm",
+          choices: checkpointOptions.choices,
+          default: checkpointOptions.default,
+          runId,
+          callIndex,
+        },
+      });
+      if (classified.big) {
+        throw new WorkflowError(
+          `checkpoint "${promptText}" requires browser review (large plan: ${classified.steps} steps, ${classified.bytes} bytes) but no review gate is available in this headless run`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        );
+      }
       reply = checkpointOptions.default ?? true;
     }
     throwIfAborted();

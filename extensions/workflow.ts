@@ -46,6 +46,8 @@ import {
   WorkflowManager,
   WorkflowStateManager,
 } from "../src/index.js";
+import { DEFAULT_APPROVAL_TIMEOUT_MS, waitForStatus } from "../src/integrations/plannotator.js";
+import { classifyRunPlan, ensurePendingRunPlan } from "../src/plan-size.js";
 import { isChromeAuthorized } from "../src/subagent/chrome-bridge-client.js";
 import {
   createExtensionToolsSupplier,
@@ -354,18 +356,55 @@ export default function extension(pi: ExtensionAPI) {
   // /effort is independent of the manager implementation and can safely
   // survive an extension-version fallback to a fresh manager.
   const effort = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort ?? createEffortState();
-  // G3 wire: lazy plannotator review gate (Phase 2). A run that never calls
-  // checkpoint() starts no server — the facade materializes the real bridge on
-  // the first gated checkpoint and tracks it for dispose. The bridge's default
-  // port (3123) + autoOpenBrowser(true) pop the vendored review page in the
-  // human's browser; waitForApproval polls the plan file until the verdict.
+  // G3 wire: lazy plannotator review gate (Phase 2), SIZE-ROUTED
+  // (tasks/approval-size-routing/design.md). A SMALL plan (execution steps
+  // within the limit AND compact bytes within the limit) never materializes
+  // the bridge — its plan is addressed at the runId-named path the CLI approve
+  // verb reads (.pi/workflows/plans/<runId>.json, workflow-commands.ts
+  // loadRunPlan), and waitForApproval polls that file for the human verdict
+  // (CLI approve flips status via decidePlanApproved). A BIG plan forces the
+  // bridge: it materializes on the first big submitPlan (the existing lazy
+  // semantics), auto-opens the vendored review page, and the CLI /workflows
+  // approve REFUSES big plans. An ungated OR small run starts no server —
+  // port 3123 is never bound.
+  const plansDir = join(cwd, ".pi", "workflows", "plans");
+  // RunIds routed to the small path this generation (per-generation memory:
+  // the plan files are the durable address; this set only dispatches waits).
+  const smallPlanIds = new Set<string>();
   let plannotatorBridge: ReturnType<typeof createPlannotatorBridge> | undefined;
   const checkpointGate: CheckpointGate = {
     async submitPlan(blueprint) {
+      const payload = blueprint as { runId?: unknown } | null | undefined;
+      const runId = typeof payload?.runId === "string" ? payload.runId : undefined;
+      if (runId) {
+        // The prewalk ExecutionBlueprint (when present) wins over the payload
+        // — that is the plan a human reviews, and the file the CLI approve
+        // reads. Small → CLI-addressable, no bridge, no HTTP server.
+        const classified = await classifyRunPlan({ dir: plansDir, runId, blueprint });
+        if (!classified.big) {
+          await ensurePendingRunPlan(plansDir, runId, classified.plan);
+          smallPlanIds.add(runId);
+          return { id: runId };
+        }
+      }
+      // BIG (or runId-less — a direct-SDK submitPlan has no CLI-addressable
+      // file, so the bridge is the only channel): browser review is mandatory.
+      // Materializing here keeps the existing first-submitPlan lazy semantics;
+      // autoOpenBrowser pops the review page, and a browser that cannot open
+      // attaches the manual review URL (plan.note) to the result.
       plannotatorBridge ??= createPlannotatorBridge({ autoOpenBrowser: true });
-      return plannotatorBridge.submitPlan(blueprint);
+      const plan = await plannotatorBridge.submitPlan(blueprint);
+      return { id: plan.id, ...(plan.note !== undefined ? { reviewUrl: plan.note } : {}) };
     },
     waitForApproval(planId, timeoutMs, signal) {
+      if (smallPlanIds.has(planId)) {
+        // Small path: no bridge exists — poll the runId-named plan file for
+        // the CLI-approve verdict, honoring the run's timeout + abort.
+        return waitForStatus(plansDir, planId, {
+          timeoutMs: timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS,
+          signal,
+        });
+      }
       if (!plannotatorBridge) {
         return Promise.reject(new Error("plannotator gate is not materialized (submitPlan must run first)"));
       }
