@@ -11,8 +11,11 @@ import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi
 import { type Component, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { listAvailableModels } from "./agent.js";
 import {
+  agentElapsedMs,
+  agentIdleMs,
   aggregateAgentUsage,
   costPerSecond,
+  DEFAULT_IDLE_AGENT_MS,
   estimatedCost,
   fmtCost,
   fmtTokenSegment,
@@ -510,6 +513,7 @@ function renderRunBody(
   agents: WorkflowAgentSnapshot[],
   maxAgents: number,
   theme: Theme,
+  now: number,
 ): string[] {
   const dim = (t: string) => theme.fg("dim", t);
   const lines: string[] = [];
@@ -531,9 +535,17 @@ function renderRunBody(
     const skipped = phaseAgents.filter((a) => a.status === "skipped").length;
     const complete = done + errors + skipped === phaseAgents.length;
     const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
+    // Idle count: running agents in THIS phase whose last activity is past the
+    // soft-idle threshold. A soft hint only — a long-lived agent is legitimate,
+    // so the header never claims "stuck" (same semantics as the row segment).
+    // Omitted when 0, so fixtures without lastActiveAtMs stay byte-identical.
+    const idleCount = phaseAgents.filter(
+      (a) => a.status === "running" && (agentIdleMs(a, now) ?? 0) >= DEFAULT_IDLE_AGENT_MS,
+    ).length;
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
+      idleCount ? `${idleCount} idle` : "",
       errors ? `${errors} errors` : "",
       fmtTokenSegment(aggregateAgentUsage(phaseAgents), fmtTokensShort),
     ]
@@ -545,9 +557,19 @@ function renderRunBody(
     for (const a of visible) {
       const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
       const tok = segment ? dim(` ${segment}`) : "";
+      let row = `    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}`;
+      if (a.status === "running") {
+        // Live elapsed + idle soft-hint for RUNNING agents only; done/error
+        // rows stay byte-identical to today. Both sit LEFT of the model tail so
+        // fitLine's right-truncation cuts the model first on narrow overlays.
+        const elapsed = agentElapsedMs(a, now);
+        if (elapsed !== undefined) row += dim(` · ${formatElapsed(elapsed)}`);
+        const idleMs = agentIdleMs(a, now);
+        if (idleMs !== undefined && idleMs >= DEFAULT_IDLE_AGENT_MS) row += dim(` · idle ${formatElapsed(idleMs)}`);
+      }
       const mdl = shortModel(a.model);
       const model = mdl ? dim(` · ${mdl}`) : "";
-      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
+      lines.push(row + model);
     }
     if (phaseAgents.length > visible.length) {
       lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
@@ -633,7 +655,7 @@ export function renderPanelDetailed(
       .filter(Boolean)
       .join(" · ");
     if (liveRates) out.push(dim(`  ${liveRates}`));
-    if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
+    if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme, now));
   }
 
   if (sessionCostKnownRuns > 0) {

@@ -1,6 +1,15 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
-import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import type { AgentUsage } from "./agent.js";
+import {
+  agentElapsedMs,
+  agentIdleMs,
+  aggregateAgentUsage,
+  tokenFigures,
+  type WorkflowAgentSnapshot,
+  type WorkflowAgentStatus,
+  type WorkflowSnapshot,
+} from "./display.js";
 import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -59,6 +68,25 @@ export interface WorkflowControlToolOptions {
   manager: WorkflowManager;
 }
 
+/**
+ * Live per-agent detail surfaced by the status action — RUNNING agents only.
+ * Elapsed and idle are computed at read time from the live snapshot's
+ * startedAtMs/lastActiveAtMs (ms since). Every field is optional so a snapshot
+ * without the live-stats fields (legacy/cold rows) degrades to identity +
+ * status; the caller uses this to answer "running or stuck" per agent.
+ */
+export interface WorkflowControlAgentDetails {
+  id: number;
+  callId?: string;
+  label: string;
+  status: WorkflowAgentStatus;
+  elapsedMs?: number;
+  lastActiveAtMs?: number;
+  idleMs?: number;
+  tokens?: number;
+  tokenUsage?: AgentUsage;
+}
+
 export interface WorkflowControlRunDetails {
   runId: string;
   workflowName: string;
@@ -73,6 +101,12 @@ export interface WorkflowControlRunDetails {
   };
   activeLabels: string[];
   tokenTotal: number;
+  /**
+   * Live per-running-agent detail (status action with a live snapshot only).
+   * Absent on list rows and cold/persisted-only runs, so the list action's
+   * details stay byte-identical (deepEqual contract).
+   */
+  agents?: WorkflowControlAgentDetails[];
 }
 
 type ControlResult = {
@@ -223,7 +257,7 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
   const liveUsage = tokenFigures(live?.tokenUsage);
   const persistedUsage = tokenFigures(run.tokenUsage);
   const agentUsage = aggregateAgentUsage(agents);
-  return {
+  const summary: WorkflowControlRunDetails = {
     runId: run.runId,
     workflowName: live?.name ?? run.workflowName,
     status: run.status,
@@ -236,6 +270,35 @@ function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): W
       agentUsage.fresh + agentUsage.cacheRead,
     ),
   };
+  // Per-running-agent live stats ride the status payload only: gated on a live
+  // snapshot so list rows and cold runs keep the exact historical details shape
+  // (deepEqual contract), and the TEXT line never gains per-agent segments
+  // (formatRun is byte-identical — /tokens=<N>$/ end-anchor preserved).
+  if (live) summary.agents = runningAgentDetails(live.agents);
+  return summary;
+}
+
+/** Per-running-agent live detail for the status payload (see {@link WorkflowControlAgentDetails}). */
+function runningAgentDetails(liveAgents: readonly WorkflowAgentSnapshot[]): WorkflowControlAgentDetails[] {
+  const now = Date.now();
+  const details: WorkflowControlAgentDetails[] = [];
+  for (const a of liveAgents) {
+    if (a.status !== "running") continue;
+    const elapsedMs = agentElapsedMs(a, now);
+    const idleMs = agentIdleMs(a, now);
+    details.push({
+      id: a.id,
+      ...(a.callId !== undefined ? { callId: a.callId } : {}),
+      label: a.label,
+      status: a.status,
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(a.lastActiveAtMs !== undefined ? { lastActiveAtMs: a.lastActiveAtMs } : {}),
+      ...(idleMs !== undefined ? { idleMs } : {}),
+      ...(a.tokens !== undefined ? { tokens: a.tokens } : {}),
+      ...(a.tokenUsage !== undefined ? { tokenUsage: a.tokenUsage } : {}),
+    });
+  }
+  return details;
 }
 
 function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): WorkflowControlRunDetails["counts"] {

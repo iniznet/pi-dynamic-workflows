@@ -175,6 +175,21 @@ interface ManagedRunBase {
    */
   seededAgentTimestamps?: Map<string, { startedAt: string; endedAt?: string }>;
   /**
+   * Seed of per-agent LIVE STATS for REPLAYED (cache-hit) agents (live-stats):
+   * keyed by the same agent call id as seededAgentTimestamps, populated by
+   * resume() from the persisted agents[] so a replayed agent reports its
+   * ORIGINAL per-agent figures (tokens/tokenUsage — never zeroed by the
+   * replay's tokens: 0 contract) and its ORIGINAL ms timestamps (L4).
+   * lastActiveAtMs is seeded from the agent's completion moment (endedAt) —
+   * the honest historical last-activity stamp, never a fabricated
+   * resume-time "now". Live agents (calls that never completed before the
+   * pause) keep real captured times and re-stamp from their events.
+   */
+  seededAgentStats?: Map<
+    string,
+    { startedAtMs: number; endedAtMs?: number; lastActiveAtMs: number; tokens?: number; tokenUsage?: AgentUsage }
+  >;
+  /**
    * The run's resolved concurrency (per-run value, else the manager's
    * concurrency at the time), fixed at run start/resume for the same reason
    * as tokenBudget.
@@ -1192,6 +1207,12 @@ export class WorkflowManager extends EventEmitter {
         // so a run paused after a retry doesn't under-count against the budget.
         onRetrySpend: (spend, callId) => {
           this.accumulateTokenUsage(managed, spend.total, spend);
+          // Per-agent live stats: a retried attempt is real agent activity —
+          // stamp the heartbeat. The per-agent FIGURE is intentionally NOT
+          // touched here: retries fold into the run total only (matching the
+          // persisted shape, where an agent's row is the FINAL attempt).
+          const owner = managed.agentsById.get(callId);
+          if (owner) owner.lastActiveAtMs = Date.now();
           // F03: keep the per-call retry ledger (see ManagedRun.retryLedger) so
           // a later pause/resume can refund the spend of calls that re-run —
           // the persisted total includes this spend, and without the ledger a
@@ -1237,6 +1258,21 @@ export class WorkflowManager extends EventEmitter {
             managed.journal.push(entry);
           }
           this.schedulePersist(managed);
+          // Per-agent live stats: the success-path journal payload now carries
+          // the settled call's tokens + usage (workflow.ts), so a completed
+          // call's figure becomes visible on its snapshot row while the run
+          // continues. journalSideKey uses the entry's OWN runId — the same
+          // deltaKey shape agentsById is keyed by, resolving top-level AND
+          // nested workflow() frames. NEVER accumulate into the run-wide
+          // aggregate here (A2): the per-agent figure and the run total are
+          // separate targets; onAgentEnd/onRetrySpend stay the only additive
+          // accumulators, so this path can never double-count a settled call.
+          const owner = managed.agentsById.get(key);
+          if (owner) {
+            if (entry.tokens !== undefined) owner.tokens = entry.tokens;
+            if (entry.tokenUsage !== undefined) owner.tokenUsage = entry.tokenUsage;
+            owner.lastActiveAtMs = Date.now();
+          }
         },
         onLog: (message) => {
           // Bounded like the logger's own ring (pushBoundedLog): snapshot.logs
@@ -1285,6 +1321,22 @@ export class WorkflowManager extends EventEmitter {
             id,
             seeded ? { startedAt: seeded.startedAt, endedAt: seeded.endedAt } : { startedAt: new Date().toISOString() },
           );
+          // Live per-agent stats (live-stats): epoch-ms mirrors of the internal
+          // agentTimestamps map, exposed on the snapshot so every surface can
+          // derive per-agent elapsed/idle. A seeded agent (resume replay) keeps
+          // its ORIGINAL startedAtMs/lastActiveAtMs AND its original per-agent
+          // figures (never 0) until its own events land; a live agent stamps
+          // its start as its first activity.
+          const statsSeed = managed.seededAgentStats?.get(event.id);
+          if (statsSeed) {
+            agentSnapshot.startedAtMs = statsSeed.startedAtMs;
+            agentSnapshot.lastActiveAtMs = statsSeed.lastActiveAtMs;
+            if (statsSeed.tokens !== undefined) agentSnapshot.tokens = statsSeed.tokens;
+            if (statsSeed.tokenUsage !== undefined) agentSnapshot.tokenUsage = statsSeed.tokenUsage;
+          } else {
+            agentSnapshot.startedAtMs = Date.now();
+            agentSnapshot.lastActiveAtMs = agentSnapshot.startedAtMs;
+          }
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
         },
@@ -1300,8 +1352,6 @@ export class WorkflowManager extends EventEmitter {
             agent.errorCode = event.errorCode;
             agent.recoverable = event.recoverable;
             agent.failingOperation = event.failingOperation;
-            agent.tokens = event.tokens;
-            if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
             if (event.model) agent.model = event.model;
             // S1-4: a slow agent that ends AFTER newer siblings pushed it out
             // of the retention window must not re-inflate memory — drop its
@@ -1310,12 +1360,36 @@ export class WorkflowManager extends EventEmitter {
               delete agent.result;
               delete agent.history;
             }
-            // Real per-agent end time — only terminal agents get one; a still-
-            // running agent's entry keeps endedAt undefined. A replayed agent's
-            // seeded endedAt (its original completion time) is preserved; only
-            // agents that genuinely finish in THIS execution get "now" (L4).
+            // Live per-agent stats (live-stats): a cache-hit REPLAY reports
+            // tokens: 0 with NO usage (workflow.ts's replay branch) — restore
+            // the agent's ORIGINAL figures + timestamps from its seed instead
+            // of clobbering them (never fabricated "now", L4). The run-wide
+            // aggregate add below stays a no-op add of 0 for the replay, so the
+            // run total never double-counts already-spent tokens (A2).
+            const seed = managed.seededAgentStats?.get(event.id);
+            const replaySignature = seed !== undefined && event.tokens === 0 && event.tokenUsage === undefined;
             const ts = managed.agentTimestamps.get(agent.id);
-            if (ts) ts.endedAt = ts.endedAt ?? new Date().toISOString();
+            if (replaySignature) {
+              if (seed.tokens !== undefined) agent.tokens = seed.tokens;
+              if (seed.tokenUsage !== undefined) agent.tokenUsage = seed.tokenUsage;
+              agent.endedAtMs = seed.endedAtMs ?? seed.startedAtMs;
+              agent.lastActiveAtMs = seed.lastActiveAtMs;
+            } else {
+              agent.tokens = event.tokens;
+              if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
+              // Real per-agent end time — only terminal agents get one; a
+              // still-running agent's entry keeps endedAt undefined. A
+              // replayed agent's seeded endedAt (its original completion
+              // time) is preserved; only agents that genuinely finish in
+              // THIS execution get "now" (L4).
+              if (ts) {
+                ts.endedAt = ts.endedAt ?? new Date().toISOString();
+                agent.endedAtMs = Date.parse(ts.endedAt);
+              } else {
+                agent.endedAtMs = Date.now();
+              }
+              agent.lastActiveAtMs = Date.now();
+            }
           }
           // Progressive run-wide token aggregate (A2): workflow.ts's onTokenUsage
           // callback below fires exactly once, only when the whole script finishes
@@ -1343,6 +1417,10 @@ export class WorkflowManager extends EventEmitter {
             if (agent.id <= managed.trimmedAgentDetailUpTo) {
               delete agent.history;
             }
+            // The ONLY mid-run per-agent activity signal (F21's 250ms-throttled
+            // live history in agent.ts): stamp the heartbeat so a hung agent's
+            // idle grows while an actively-streaming one keeps re-stamping.
+            agent.lastActiveAtMs = Date.now();
           }
           this.emitLive(managed, "agentHistory", { runId: managed.runId, agentId: agent?.id, ...event });
           progress();
@@ -2145,7 +2223,19 @@ export class WorkflowManager extends EventEmitter {
           // own startedAt or "now" stamped onto every agent on every write. A
           // still-running agent is persisted with no endedAt.
           agents: managed.snapshot.agents.map((a) => {
-            const { result, ...summary } = a;
+            // The ms mirrors (startedAtMs/endedAtMs) and the heartbeat
+            // (lastActiveAtMs) are EPHEMERAL live-state — never persisted
+            // (PersistedAgentState keeps its ISO startedAt/endedAt strings from
+            // agentTimestamps; lastActiveAtMs is recomputed on resume from
+            // journal replay + fresh events). Stripping them here keeps the
+            // on-disk shape byte-identical to the pre-live-stats era.
+            const {
+              result,
+              startedAtMs: _startedAtMs,
+              endedAtMs: _endedAtMs,
+              lastActiveAtMs: _lastActiveAtMs,
+              ...summary
+            } = a;
             const ts = managed.agentTimestamps.get(a.id);
             return {
               ...summary,
@@ -2347,9 +2437,30 @@ export class WorkflowManager extends EventEmitter {
     // id + start time qualify; a call that was interrupted mid-flight before
     // the pause has a seed with no endedAt (its live re-run completes it).
     const seededAgentTimestamps = new Map<string, { startedAt: string; endedAt?: string }>();
+    // Live-stats companion seed (same walk, same qualification): restore a
+    // replayed agent's ORIGINAL per-agent figures (tokens/tokenUsage — never
+    // zeroed by the replay's tokens: 0 contract) and its original ms
+    // timestamps. lastActiveAtMs seeds from the agent's completion moment
+    // (endedAt ?? startedAt) — the honest historical last-activity stamp,
+    // never a fabricated resume-time "now" (L4).
+    const seededAgentStats = new Map<
+      string,
+      { startedAtMs: number; endedAtMs?: number; lastActiveAtMs: number; tokens?: number; tokenUsage?: AgentUsage }
+    >();
     for (const agent of persisted.agents) {
       if (agent.callId && agent.startedAt) {
         seededAgentTimestamps.set(agent.callId, { startedAt: agent.startedAt, endedAt: agent.endedAt });
+        const startedAtMs = Date.parse(agent.startedAt);
+        if (Number.isFinite(startedAtMs)) {
+          const endedAtMs = agent.endedAt ? Date.parse(agent.endedAt) : undefined;
+          seededAgentStats.set(agent.callId, {
+            startedAtMs,
+            ...(Number.isFinite(endedAtMs) ? { endedAtMs } : {}),
+            lastActiveAtMs: Number.isFinite(endedAtMs) ? (endedAtMs as number) : startedAtMs,
+            ...(agent.tokens !== undefined ? { tokens: agent.tokens } : {}),
+            ...(agent.tokenUsage !== undefined ? { tokenUsage: agent.tokenUsage } : {}),
+          });
+        }
       }
     }
 
@@ -2465,6 +2576,7 @@ export class WorkflowManager extends EventEmitter {
       agentsById: new Map(),
       trimmedAgentDetailUpTo: 0,
       seededAgentTimestamps,
+      seededAgentStats,
       retryLedger: seededRetryLedger,
     };
     this.runs.set(runId, managed);
@@ -2702,7 +2814,13 @@ export class WorkflowManager extends EventEmitter {
         snap.errorCode = WorkflowErrorCode.AGENT_KILLED;
         snap.recoverable = false;
         const timestamps = managed.agentTimestamps.get(snap.id);
-        if (timestamps) timestamps.endedAt = timestamps.endedAt ?? new Date().toISOString();
+        if (timestamps) {
+          timestamps.endedAt = timestamps.endedAt ?? new Date().toISOString();
+          // Mirror the terminal stamp onto the live snapshot so the per-agent
+          // elapsed/endedAtMs surfaces reflect the kill, not a stale "running".
+          snap.endedAtMs = Date.parse(timestamps.endedAt);
+          snap.lastActiveAtMs = Date.now();
+        }
         snapshotUpdated = true;
       }
     }

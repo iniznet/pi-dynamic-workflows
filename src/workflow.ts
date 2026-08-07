@@ -108,6 +108,24 @@ export interface JournalEntry {
   hash: string;
   result: unknown;
   /**
+   * Final-attempt scalar tokens (the same canonical count recordTokens folds
+   * into the run aggregate), captured at the success-path journal emit — where
+   * both it and the usage breakdown are already in scope — so a completed
+   * call's per-agent figure lands on the live snapshot (via the manager's
+   * onAgentJournal) while the run continues. Absent on legacy entries, on
+   * checkpoint() entries, and on success-path emits where the runner reported
+   * no usage (estimate-only calls journal without either field, keeping the
+   * persisted shape identical to the pre-live-stats era).
+   */
+  tokens?: number;
+  /**
+   * Final-attempt full usage breakdown, captured at the success-path journal
+   * emit. Absent together with `tokens` whenever usage is unknown (same
+   * gating, same rationale). Resume replay restores per-agent figures from the
+   * persisted agents[] (seededAgentStats), not from this field.
+   */
+  tokenUsage?: AgentUsage;
+  /**
    * The model this agent actually ran on (resolved after onModelResolved).
    * Persisted so a resume replay can report the REAL model instead of
    * re-deriving displayModel = modelSpec ?? mainModel — for untagged agents
@@ -1664,6 +1682,19 @@ export async function runWorkflow<T = unknown>(
               runId,
               hash: callHash,
               result,
+              // Per-agent live stats: capture the settled call's token figures
+              // here, where both values are already in scope (recordTokens just
+              // ran; onUsage set `usage`) — the manager's onAgentJournal stamps
+              // them onto the snapshot while the run continues. Gated on the
+              // runner having reported usage: an estimate-only call journals
+              // WITHOUT either field so the persisted entry shape stays
+              // byte-identical to the pre-live-stats era (the persisted-key
+              // assertion in journal-compaction-persist.test.ts). Canonical key
+              // order (index, runId, hash, result, tokens, tokenUsage, model,
+              // storeDelta, storeCommitSeq, operations) MUST match
+              // reconstructJournal's, or verifyJournalCompaction's byte-diff
+              // gate rejects every usage-bearing compaction.
+              ...(usage !== undefined ? { tokens, tokenUsage: usage } : {}),
               // displayModel at this point is the REAL resolved model —
               // onModelResolved overwrote the initial modelSpec ?? mainModel
               // fallback before the agent session was created (see run's

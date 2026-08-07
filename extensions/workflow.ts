@@ -7,6 +7,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { DEFAULT_IDLE_AGENT_MS, formatElapsed, tokenFigures, type WorkflowAgentSnapshot } from "../src/display.js";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
@@ -82,6 +83,67 @@ try {
   // Deferred: registerToolSafely reports the diagnostic; the subagent supplier
   // yields no defs. This branch only runs if the module is missing or fails to
   // evaluate — a first-party module, so never in practice.
+}
+
+/** One running agent's live stats as surfaced by get_workflow_status. */
+export interface WorkflowRunningAgentDetail {
+  id: number;
+  label: string;
+  status: "running";
+  elapsedMs?: number;
+  lastActiveAtMs?: number;
+  idleMs?: number;
+  tokens?: number;
+}
+
+/**
+ * Per-running-agent status lines + idle fact for get_workflow_status.
+ * Extracted so the query surface is unit-testable without a live manager (the
+ * extension's manager is internal). `idle` renders the raw last-activity
+ * staleness ("-" when the snapshot carries no lastActiveAtMs); `idleAgents`
+ * counts only agents past {@link DEFAULT_IDLE_AGENT_MS} (imported from
+ * display.ts — Slice A owns the canonical constant).
+ */
+export function buildAgentStatusLines(
+  agents: readonly WorkflowAgentSnapshot[],
+  now: number,
+): { lines: string[]; agents: WorkflowRunningAgentDetail[]; idleAgents: number } {
+  const lines: string[] = [];
+  const details: WorkflowRunningAgentDetail[] = [];
+  let idleAgents = 0;
+  for (const a of agents) {
+    if (a.status !== "running") continue;
+    const elapsedMs =
+      typeof a.startedAtMs === "number" && Number.isFinite(a.startedAtMs)
+        ? Math.max(0, now - a.startedAtMs)
+        : undefined;
+    const idleMs =
+      typeof a.lastActiveAtMs === "number" && Number.isFinite(a.lastActiveAtMs)
+        ? Math.max(0, now - a.lastActiveAtMs)
+        : undefined;
+    if (idleMs !== undefined && idleMs >= DEFAULT_IDLE_AGENT_MS) idleAgents++;
+    const figures = tokenFigures(a.tokenUsage, a.tokens);
+    const tokens = figures.fresh + figures.cacheRead;
+    const parts = [
+      `agent=${a.id}`,
+      `label=${JSON.stringify(a.label)}`,
+      "status=running",
+      `elapsed=${elapsedMs !== undefined ? formatElapsed(elapsedMs) : "-"}`,
+      `idle=${idleMs !== undefined ? formatElapsed(idleMs) : "-"}`,
+    ];
+    if (tokens > 0) parts.push(`tokens=${tokens}`);
+    lines.push(parts.join(" "));
+    details.push({
+      id: a.id,
+      label: a.label,
+      status: "running",
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(a.lastActiveAtMs !== undefined ? { lastActiveAtMs: a.lastActiveAtMs } : {}),
+      ...(idleMs !== undefined ? { idleMs } : {}),
+      ...(tokens > 0 ? { tokens } : {}),
+    });
+  }
+  return { lines, agents: details, idleAgents };
 }
 
 export default function extension(pi: ExtensionAPI) {
@@ -452,6 +514,15 @@ export default function extension(pi: ExtensionAPI) {
               `liveAgentCount=${snapshot.agentCount} done=${snapshot.doneCount} running=${snapshot.runningCount} error=${snapshot.errorCount}`,
               `currentPhase=${snapshot.currentPhase ?? "-"}`,
             );
+            // Per-running-agent live stats (elapsed, last-activity idle, live
+            // final-attempt tokens) + the idleAgents fact — only when a live
+            // snapshot shows running agents, so cold runs keep today's output.
+            if (snapshot.runningCount > 0) {
+              const agentStatus = buildAgentStatusLines(snapshot.agents, Date.now());
+              lines.push(...agentStatus.lines);
+              lines.push(`idleAgents=${agentStatus.idleAgents}`);
+              (details as { agents?: WorkflowRunningAgentDetail[] }).agents = agentStatus.agents;
+            }
           }
           if (persisted?.result !== undefined) {
             lines.push(`result=${JSON.stringify(persisted.result).slice(0, 200)}`);

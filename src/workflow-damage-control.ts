@@ -193,6 +193,12 @@ export interface AgentSummary {
   model?: string;
   startedAt?: string;
   endedAt?: string;
+  /**
+   * ISO instant of the agent's latest per-agent event (live snapshot only,
+   * derived from lastActiveAtMs). EPHEMERAL — absent on cold/persisted rows;
+   * recomputed on resume. Drives the idle soft-hint, never a "stuck" claim.
+   */
+  lastActiveAt?: string;
   /** One-line failing-operation summary, when the failed agent made tool calls. */
   failingOperation?: string;
 }
@@ -418,8 +424,18 @@ export function summarizeAgents(
       errorCode: (liveAgent?.errorCode ?? agent.errorCode) as string | undefined,
       recoverable: liveAgent?.recoverable ?? agent.recoverable,
       model: liveAgent?.model ?? agent.model,
-      startedAt: agent.startedAt,
+      // Live startedAtMs wins (resume seeds it from the SAME persisted ISO, so
+      // a replayed agent reports its original start); the persisted ISO is the
+      // cold/legacy fallback. lastActiveAt is live-only by nature.
+      startedAt:
+        typeof liveAgent?.startedAtMs === "number" && Number.isFinite(liveAgent.startedAtMs)
+          ? new Date(liveAgent.startedAtMs).toISOString()
+          : agent.startedAt,
       endedAt: agent.endedAt,
+      lastActiveAt:
+        typeof liveAgent?.lastActiveAtMs === "number" && Number.isFinite(liveAgent.lastActiveAtMs)
+          ? new Date(liveAgent.lastActiveAtMs).toISOString()
+          : undefined,
       failingOperation: failing ? `${failing.op} (line ${failing.line}): ${failing.outcome}` : undefined,
     });
   }
@@ -1037,7 +1053,7 @@ function formatDeepRunLine(summary: DeepRunSummary): string {
 }
 
 function formatAgentLine(agent: AgentSummary): string {
-  return `id=${agent.id} callId=${quote(agent.callId ?? "-")} label=${quote(agent.label)} status=${agent.status} tokens=${agent.tokens ?? 0} retries=${agent.retries}${agent.model ? ` model=${quote(agent.model)}` : ""}${agent.error ? ` error=${quote(agent.error)}` : ""}`;
+  return `id=${agent.id} callId=${quote(agent.callId ?? "-")} label=${quote(agent.label)} status=${agent.status} tokens=${agent.tokens ?? 0} retries=${agent.retries}${agent.model ? ` model=${quote(agent.model)}` : ""}${agent.startedAt ? ` startedAt=${quote(agent.startedAt)}` : ""}${agent.lastActiveAt ? ` lastActive=${quote(agent.lastActiveAt)}` : ""}${agent.error ? ` error=${quote(agent.error)}` : ""}`;
 }
 
 function formatCandidateLine(candidate: CleanCandidate): string {

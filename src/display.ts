@@ -28,6 +28,26 @@ export interface WorkflowAgentSnapshot {
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
   /**
+   * Epoch ms when the agent started (captured at onAgentStart, seeded from
+   * the persisted agents[] on resume replay via seededAgentStats so a
+   * replayed agent keeps its ORIGINAL start time — L4). Absent on legacy /
+   * cold rows, which simply render no per-agent elapsed.
+   */
+  startedAtMs?: number;
+  /**
+   * Epoch ms when the agent finished. Terminal agents only — a still-running
+   * agent has no endedAtMs. Replayed agents keep the seed's (their original
+   * completion time); never a fabricated resume-time stamp (L4).
+   */
+  endedAtMs?: number;
+  /**
+   * Epoch ms of the latest per-agent event (onAgentStart / onAgentJournal /
+   * onAgentHistory / onRetrySpend / onAgentEnd). EPHEMERAL by nature: never
+   * persisted, recomputed on resume from journal replay + fresh events. Drives
+   * the soft "idle" hint for running agents (see DEFAULT_IDLE_AGENT_MS).
+   */
+  lastActiveAtMs?: number;
+  /**
    * The failing tool call (Fabric-style line-numbered failure repair), when
    * this agent failed after making tool calls. Absent on successes.
    */
@@ -524,6 +544,36 @@ export function elapsedMs(snapshot: WorkflowSnapshot, now: number): number | und
   if (typeof snapshot.startedAtMs !== "number" || !Number.isFinite(snapshot.startedAtMs)) return undefined;
   return Math.max(0, now - snapshot.startedAtMs);
 }
+
+/**
+ * Per-agent elapsed (ms) since the agent started, clamped to >= 0 (a clock
+ * skew never renders a negative duration). Undefined when the agent carries no
+ * startedAtMs (legacy/cold rows) so surfaces render no elapsed segment.
+ */
+export function agentElapsedMs(agent: { startedAtMs?: number }, now: number): number | undefined {
+  if (typeof agent.startedAtMs !== "number" || !Number.isFinite(agent.startedAtMs)) return undefined;
+  return Math.max(0, now - agent.startedAtMs);
+}
+
+/**
+ * Per-agent idle (ms) since the last per-agent event (lastActiveAtMs), clamped
+ * to >= 0. Undefined when the agent has no lastActiveAtMs (legacy/cold rows) so
+ * surfaces render no idle segment. Idle is a SOFT hint — a long idle is a
+ * legitimate long agent, never a hard "stuck" claim.
+ */
+export function agentIdleMs(agent: { lastActiveAtMs?: number }, now: number): number | undefined {
+  if (typeof agent.lastActiveAtMs !== "number" || !Number.isFinite(agent.lastActiveAtMs)) return undefined;
+  return Math.max(0, now - agent.lastActiveAtMs);
+}
+
+/**
+ * Idle threshold (ms) past which a RUNNING agent's row/phase-header renders the
+ * dim "· idle <elapsed>" hint. Matches the user's example showing "idle 45s"
+ * (45s > 30s), and onAgentHistory fires on the live message/tool-call cadence
+ * so an actively working agent almost never trips it; a quiet agent past the
+ * threshold gets the soft hint. Never a "stuck" claim — see agentIdleMs.
+ */
+export const DEFAULT_IDLE_AGENT_MS = 30_000;
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
   if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
