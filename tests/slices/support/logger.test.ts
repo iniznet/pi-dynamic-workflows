@@ -6,11 +6,12 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { createWorkflowLogger } from "../../../src/logger.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 describe("logger redaction (L8)", () => {
   it("redacts sk- API keys from log lines", () => {
@@ -63,7 +64,7 @@ describe("logger redaction (L8)", () => {
 });
 
 describe("logger default runId (L8)", () => {
-  it("two default-runId loggers in the same millisecond get distinct log files", () => {
+  it("two default-runId loggers in the same millisecond get distinct log files", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-logger-runid-"));
     try {
       // Back-to-back construction almost always lands in the same millisecond;
@@ -76,7 +77,7 @@ describe("logger default runId (L8)", () => {
       assert.notEqual(fileA, fileB, "same-millisecond default runIds must not collide on the .log file");
       assert.ok(fileA.endsWith(".log") && fileB.endsWith(".log"));
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 });

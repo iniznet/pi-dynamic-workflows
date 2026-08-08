@@ -8,19 +8,20 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
 import { loadMcpConfig } from "../../src/subagent/mcp-config.js";
 import { withFakeHome } from "../helpers/fake-home.js";
+import { rmForce } from "../helpers/rm-force.js";
 
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
     try {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     } catch {
       // Best-effort cleanup.
     }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import { WORKFLOW_SAVED_DIR } from "../src/config.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /**
  * Minimal script that passes parseWorkflowScript (save-time validation, L21):
@@ -25,8 +26,7 @@ function withIsolatedHome(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }

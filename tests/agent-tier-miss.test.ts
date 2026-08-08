@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { resolveAgentModelSpec, WorkflowAgent } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Tier key-miss billing guard (#audit: model-tier-leak)
@@ -95,8 +96,7 @@ test("WorkflowAgent.run(): an explicit tier whose key is missing from model-tier
       });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -141,8 +141,7 @@ test("WorkflowAgent.run(): an UNTAGGED agent (no tier) with a config lacking the
       assert.ok(text.includes("session-default-answer"), "untagged run should complete via the session default");
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -171,7 +170,6 @@ test("WorkflowAgent.run(): regression — an explicit tier PRESENT in config but
       });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });

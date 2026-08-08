@@ -213,11 +213,15 @@ async function waitForPlanFile(dir: string): Promise<string> {
   throw new Error("no plan file appeared in time");
 }
 
-test("meta.gate: the review server (port 3123) starts ONLY for gated scripts", async (t) => {
+// PORT-01: this file binds its OWN review port (3124), never the shared 3123
+// the sibling task6-gate-e2e probe uses — per-file ports de-contend the suite.
+const PORT_3124 = 3124;
+
+test("meta.gate: the review server (port 3124) starts ONLY for gated scripts", async (t) => {
   // The probe's point is RELATIVE behavior: an ungated run must not change the
   // port state, a gated run must bind it. Skip when the port is already taken.
-  if (await isPortOpen(3123)) {
-    t.skip("port 3123 already in use; skipping the bind probe");
+  if (await isPortOpen(PORT_3124)) {
+    t.skip("port 3124 already in use; skipping the bind probe");
     return;
   }
   await inTempDir(async () => {
@@ -227,7 +231,7 @@ test("meta.gate: the review server (port 3123) starts ONLY for gated scripts", a
     // starts for it.
     const lazyGate: CheckpointGate = {
       async submitPlan(blueprint) {
-        bridge ??= createPlannotatorBridge({ port: 3123, autoOpenBrowser: false });
+        bridge ??= createPlannotatorBridge({ port: PORT_3124, autoOpenBrowser: false });
         return bridge.submitPlan(blueprint);
       },
       waitForApproval(planId, timeoutMs, signal) {
@@ -243,13 +247,13 @@ test("meta.gate: the review server (port 3123) starts ONLY for gated scripts", a
       });
       assert.equal(ungated.result, "body-ran");
       assert.equal(bridge, undefined, "an ungated script never materializes the review bridge");
-      assert.equal(await isPortOpen(3123), false, "no review server is bound after an ungated run");
+      assert.equal(await isPortOpen(PORT_3124), false, "no review server is bound after an ungated run");
 
       // A gated script DOES materialize the bridge and pauses for the verdict.
       const run = runWorkflow<string>(GATED_SCRIPT, { agent: noopAgent, checkpointGate: lazyGate, persistLogs: false });
       const plansDir = join(process.cwd(), ".pi", "workflows", "plans");
       const planPath = await waitForPlanFile(plansDir);
-      assert.equal(await isPortOpen(3123), true, "the review server is listening while the gate waits");
+      assert.equal(await isPortOpen(PORT_3124), true, "the review server is listening while the gate waits");
       const plan = JSON.parse(await readFile(planPath, "utf-8")) as { id: string; blueprint?: { prompt?: string } };
       assert.equal(
         plan.blueprint?.prompt,

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { acceptWorkflowGuidance } from "../src/accept-workflow-guidance.js";
 import { WORKFLOW_AUTHORING_FROZEN_FILES } from "../src/workflow-authoring-coverage.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 const ROOT = join(import.meta.dirname, "..");
 const MANIFEST_PATH = "src/workflow-authoring-coverage.ts";
@@ -25,7 +26,7 @@ function writeGuidance(root: string, path: string, source: string): void {
   writeFileSync(absolute, source);
 }
 
-test("accepts only explicitly named frozen workflow guidance", () => {
+test("accepts only explicitly named frozen workflow guidance", async () => {
   const root = createFixture();
   const accepted = WORKFLOW_AUTHORING_FROZEN_FILES[0];
   const untouched = WORKFLOW_AUTHORING_FROZEN_FILES[1];
@@ -47,11 +48,11 @@ test("accepts only explicitly named frozen workflow guidance", () => {
     assert.match(manifest, new RegExp(`path: "${accepted.path}"[\\s\\S]*?sha256: "${REVIEWED_GUIDANCE_SHA256}"`));
     assert.match(manifest, new RegExp(`path: "${untouched.path}"[\\s\\S]*?sha256: "${untouched.sha256}"`));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   }
 });
 
-test("rejects an unknown guidance path without changing the manifest", () => {
+test("rejects an unknown guidance path without changing the manifest", async () => {
   const root = createFixture();
   const before = readFileSync(join(root, MANIFEST_PATH), "utf8");
   try {
@@ -61,15 +62,15 @@ test("rejects an unknown guidance path without changing the manifest", () => {
     );
     assert.equal(readFileSync(join(root, MANIFEST_PATH), "utf8"), before);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   }
 });
 
-test("requires at least one explicit guidance path", () => {
+test("requires at least one explicit guidance path", async () => {
   const root = createFixture();
   try {
     assert.throws(() => acceptWorkflowGuidance(root, []), /pass at least one frozen workflow-authoring path/i);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   }
 });

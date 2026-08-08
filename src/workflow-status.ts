@@ -153,7 +153,7 @@ async function tryAcquireOnce(
     try {
       // Exclusive create (O_EXCL): an atomic check-and-create — racing
       // processes cannot both pass a read-then-write check on the same path.
-      await writeFile(lockPath, JSON.stringify(lock, null, 2), { flag: "wx" });
+      await createLockFileExclusive(lockPath, lock);
       return true;
     } catch (err) {
       if ((err as { code?: string }).code !== "EEXIST") throw err;
@@ -174,6 +174,31 @@ async function tryAcquireOnce(
     if (!(await unlinkIfUnchanged(lockPath, probe.record))) return false;
   }
   return false;
+}
+
+/**
+ * Exclusive-create a lock file with a bounded retry for the transient Windows
+ * race where a path just released (unlinked by the holder) is still held
+ * pending-deletion by the OS for a few ms and CREATE_NEW fails EPERM/EACCES
+ * instead of EEXIST — the poller can land exactly on the release boundary
+ * (same cadence as the WPA-01 rename retry, fs-persistence.ts). EEXIST is NOT
+ * retried here: it means a live holder and is handled by the probe/reclaim
+ * path in {@link tryAcquireOnce}; genuine persistent EPERM/EACCES (permission
+ * problems) survive the bounded window and propagate unchanged.
+ */
+async function createLockFileExclusive(lockPath: string, lock: LockFileRecord): Promise<void> {
+  const payload = JSON.stringify(lock, null, 2);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await writeFile(lockPath, payload, { flag: "wx" });
+      return;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code !== "EPERM" && code !== "EACCES") throw err;
+      if (attempt >= 4) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
 }
 
 export async function acquireFileLock(
@@ -316,13 +341,17 @@ export async function checkFileConflict(
 }
 
 // ---------------------------------------------------------------------------
-// Worktree write-conflict interceptor (PRD Task 9, audit G7)
+// Worktree write-conflict interceptor (PRD Task 9, audit G7 + B3)
 // ---------------------------------------------------------------------------
 // The host bundle's write executors are wrapped so a main-session (or proxied)
 // edit targeting a file claimed by an active worktree queues behind the holder
 // (bounded) or blocks with a structured JSON tool error naming the run/task.
-// Read-only executors are never touched. Lock keys are exact-string, so the
-// caller must claim with the same path spelling the guard checks with.
+// B3 made the interceptor LIVE: guarded writes claim the target file for the
+// edit duration (claimOnWrite, default true), so checkFileConflict sees real
+// locks at runtime and a conflicting concurrent edit is actually blocked — the
+// claimer side is no longer dormant. Read-only executors are never touched.
+// Lock keys are exact-string, so the caller must claim with the same path
+// spelling the guard checks with.
 
 /** Host-bundle tool names that mutate files; everything else is left untouched. */
 export const WORKFLOW_WRITE_TOOL_NAMES: readonly string[] = ["edit", "write"];
@@ -344,10 +373,24 @@ export interface WorktreeWriteGuardOptions {
   pollIntervalMs?: number;
   /** TTL for the lock this seam acquires while performing the guarded edit. */
   lockTtlMs?: number;
-  /** Run identity recorded when the seam takes over a freed lock. */
+  /**
+   * Run identity recorded on the claim this seam holds while a guarded edit
+   * runs (default "interactive-session"). The claim-on-write claimer (B3)
+   * makes every guarded write create a live lock, so a conflicting concurrent
+   * edit sees THIS identity in the block error.
+   */
   ownerRunId?: string;
-  /** Task identity recorded when the seam takes over a freed lock. */
+  /** Task identity recorded on the claim this seam holds during a guarded edit. */
   ownerTaskId?: string;
+  /**
+   * Whether guarded write executors CLAIM the target file for the duration of
+   * every edit (default true, B3): the interceptor is LIVE — the first edit
+   * creates a lock that a concurrent conflicting edit sees and queues behind
+   * (or blocks on after the bounded wait). false restores the legacy G7
+   * contract exactly: the interceptor only fires on an EXISTING claim and an
+   * unclaimed edit creates no lock.
+   */
+  claimOnWrite?: boolean;
 }
 
 /** Structured JSON tool-error payload naming the conflicting worktree run/task. */
@@ -391,29 +434,41 @@ function resolveGuardOptions(options: WorktreeWriteGuardOptions): Required<Workt
     lockTtlMs: options.lockTtlMs ?? DEFAULT_LOCK_TTL_MS,
     ownerRunId: options.ownerRunId ?? INTERACTIVE_SESSION_OWNER.runId,
     ownerTaskId: options.ownerTaskId ?? INTERACTIVE_SESSION_OWNER.taskId,
+    claimOnWrite: options.claimOnWrite ?? true,
   };
 }
 
 /**
- * Wrap one host write executor with the conflict check → bounded queue →
- * block flow. The acquired lock is held only for the duration of the edit, so
- * the check→write window cannot race a concurrent claimer, and a success never
- * leaves a stale interactive-session lock behind.
+ * Wrap one host write executor with the claim → bounded queue → block flow
+ * (B3 live claimer). With claimOnWrite (default true) EVERY guarded write
+ * claims the file for the duration of the edit, so checkFileConflict sees a
+ * live lock at runtime and a concurrent conflicting edit queues behind it or
+ * blocks — the interceptor is no longer inert. The lock is held only for the
+ * edit duration, so the claim→write window cannot race a concurrent claimer
+ * and a success never leaves a stale lock behind. claimOnWrite: false keeps
+ * the legacy G7 flow: check first, pass through unclaimed files untouched.
  */
 function createGuardedWriteExecutor(inner: ToolExecutor, options: Required<WorktreeWriteGuardOptions>): ToolExecutor {
   return async (args, signal) => {
     const filePath = typeof args?.path === "string" && args.path.length > 0 ? args.path : undefined;
     if (!filePath) return inner(args, signal);
-    const conflict = await checkFileConflict(filePath);
-    // Unclaimed file: the interceptor does not fire, and no lock is created.
-    if (!conflict.locked) return inner(args, signal);
-    // Claimed by an active worktree: queue behind the holder (bounded wait;
-    // reclaims an expired/stale holder), then proceed while we own the lock.
+    // Legacy mode: the interceptor fires only when the file is already claimed.
+    if (!options.claimOnWrite) {
+      const conflict = await checkFileConflict(filePath);
+      // Unclaimed file: the interceptor does not fire, and no lock is created.
+      if (!conflict.locked) return inner(args, signal);
+    }
+    // Claim the file for the edit duration (live claimer). A live holder means
+    // queue behind it (bounded wait; reclaims an expired/stale holder), then
+    // proceed while we own the lock.
     const acquired = await acquireFileLock(filePath, options.ownerRunId, options.ownerTaskId, options.lockTtlMs, {
       waitMs: options.waitMs,
       pollIntervalMs: options.pollIntervalMs,
     });
     if (!acquired) {
+      // Re-read the holder AFTER the failed wait so the block names the run
+      // that actually owns the file now (fresher than the pre-wait probe).
+      const conflict = await checkFileConflict(filePath);
       return {
         content: JSON.stringify(buildWorktreeConflictBlockError(filePath, conflict), null, 2),
         isError: true,
@@ -443,4 +498,96 @@ export function guardWorktreeWriteConflicts(
     if (inner) tools.set(name, createGuardedWriteExecutor(inner, resolved));
   }
   return { ...bundle, tools };
+}
+
+/** Options for {@link createWorktreeWriteClaimer}. */
+export interface WorktreeWriteClaimerOptions {
+  /** Run identity recorded on every claim (and named in block errors). */
+  runId: string;
+  /** Task identity recorded on every claim. */
+  taskId: string;
+  /** Lock TTL in ms (default {@link DEFAULT_LOCK_TTL_MS}). */
+  ttlMs?: number;
+}
+
+/** The run-identity claimer surface ({@link createWorktreeWriteClaimer}). */
+export interface WorktreeWriteClaimer {
+  /**
+   * Claim a file for this run: true when claimed (or already owned by this
+   * run — re-entrant), false when a DIFFERENT live run owns it (never stolen).
+   */
+  claim(filePath: string): Promise<boolean>;
+  /** Release one claim depth for the file (outermost release touches the lock). */
+  release(filePath: string): Promise<boolean>;
+  /** Wrap one write executor so it claims the file for the edit duration. */
+  wrapExecutor(inner: ToolExecutor): ToolExecutor;
+}
+
+/**
+ * A run-identity claimer for the worktree side (B3): claims files a worktree
+ * run is editing so the guard's conflict check sees LIVE locks at runtime and
+ * a conflicting subagent edit queues or blocks with the run/task named.
+ *
+ * Claim semantics:
+ *  - Re-entrant: a claim on a file this run already owns just deepens the
+ *    in-memory depth (an outer guard takeover or a nested claimer of the same
+ *    run never self-blocks).
+ *  - Non-stealing: a claim on a file owned by a DIFFERENT live run returns
+ *    false and leaves their lock untouched — their guard is the arbiter that
+ *    serializes us (we queue/block there); this claimer never steals a lock.
+ *  - Balanced: {@link WorktreeWriteClaimer.release} mirrors the claim depth,
+ *    so nested wraps of the same run release only at the outermost level.
+ *
+ * The per-run wiring site (the run's agent() tool construction, where runId
+ * and taskId live) is owned by the runtime layer; this primitive ships the
+ * mechanism plus a wrapExecutor for that wiring.
+ */
+export function createWorktreeWriteClaimer(options: WorktreeWriteClaimerOptions): WorktreeWriteClaimer {
+  const ttlMs = options.ttlMs ?? DEFAULT_LOCK_TTL_MS;
+  /** Per-file claim depth so nested wraps of the same run stay balanced. */
+  const depth = new Map<string, number>();
+
+  return {
+    async claim(filePath: string): Promise<boolean> {
+      const conflict = await checkFileConflict(filePath);
+      // Already owned by this run (an outer claimer / the guard's takeover):
+      // re-entrant — count the nesting, do not re-acquire.
+      if (conflict.locked && conflict.runId === options.runId) {
+        depth.set(filePath, (depth.get(filePath) ?? 0) + 1);
+        return true;
+      }
+      // Owned by a DIFFERENT live run: do not touch their lock — proceeding
+      // unclaimed lets their guard be the arbiter (we queue/block there).
+      if (conflict.locked) return false;
+      const acquired = await acquireFileLock(filePath, options.runId, options.taskId, ttlMs, { waitMs: 0 });
+      if (acquired) depth.set(filePath, (depth.get(filePath) ?? 0) + 1);
+      return acquired;
+    },
+    async release(filePath: string): Promise<boolean> {
+      const current = depth.get(filePath) ?? 0;
+      if (current <= 1) {
+        depth.delete(filePath);
+        return releaseFileLock(filePath, options.runId);
+      }
+      depth.set(filePath, current - 1);
+      return true;
+    },
+    /**
+     * Wrap one write executor: claim the target file for the edit duration,
+     * release in finally (including on failure/abort). A foreign live holder
+     * means the claim yields false and the edit still proceeds — never steal.
+     */
+    wrapExecutor(inner: ToolExecutor): ToolExecutor {
+      return async (args, signal) => {
+        const filePath = typeof args?.path === "string" && args.path.length > 0 ? args.path : undefined;
+        if (!filePath) return inner(args, signal);
+        await this.claim(filePath);
+        try {
+          return await inner(args, signal);
+        } finally {
+          await this.release(filePath);
+        }
+      };
+    },
+  };
 }

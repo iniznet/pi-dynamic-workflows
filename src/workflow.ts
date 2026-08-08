@@ -2,11 +2,18 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import vm from "node:vm";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
 import type { AgentUsage, OperationTrace } from "./agent.js";
-import { type AgentRunOptions, usageComponentsTotal, WorkflowAgent, type WorkflowAgentOptions } from "./agent.js";
+import {
+  type AgentRunOptions,
+  listAvailableModels,
+  usageComponentsTotal,
+  WorkflowAgent,
+  type WorkflowAgentOptions,
+} from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
   type AgentDefinition,
@@ -37,7 +44,7 @@ import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
 import { classifyRunPlan } from "./plan-size.js";
 import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
-import { safeSetTimeout } from "./timing.js";
+import { safeSetTimeout, withTimeout } from "./timing.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from "./worktree.js";
@@ -884,6 +891,16 @@ export async function runWorkflow<T = unknown>(
   // A caller-provided loader (tests, workflow-manager's per-run memo) always
   // wins. Nested workflow() frames inherit the same memo via the spread below.
   const loadTierConfig = options.loadTierConfig ?? createMemoizedLoadModelTierConfig();
+  // core-08: snapshot the registry fingerprint ONCE per run for the
+  // resume-replay identity hash. The no-config prompt-aware tier fallback
+  // (a tier pinned with no model-tiers.json) ranks the model registry via
+  // buildDefaultTierConfig, so a registry change between a live run and its
+  // resume must invalidate the cached journaled result. Frozen at run start
+  // because the sync facade can go from [] to real models mid-run as the disk
+  // fallback builds — per-call reads would make the hash unstable. Undefined
+  // (legacy) when no registry is synchronously available: the pre-fix hash had
+  // no registry input, and hashAgentCall omits the key, so old journals replay.
+  const registryFingerprint = computeRegistryFingerprint(options.modelRegistry);
 
   // Initialize logger
   const logger = createWorkflowLogger({
@@ -1407,6 +1424,15 @@ export async function runWorkflow<T = unknown>(
       agentDefinitionKey(agentDef),
       options.mainModel,
       resolvedIsolation,
+      // core-08: the fingerprint matters only on the no-config prompt-aware
+      // tier fallback path — tier set AND no model-tiers.json, the one path
+      // whose live resolution consults the registry (resolvePromptAwareTier).
+      // A configured tier resolves purely from the config file, which
+      // tierModel already encodes, so a registry change must not invalidate
+      // those calls. `registryFingerprint` itself is undefined when no
+      // registry was synchronously available, in which case hashAgentCall
+      // omits the key and legacy journals replay unchanged.
+      agentOptions.tier != null && loadTierConfig() == null ? registryFingerprint : undefined,
     );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
@@ -1766,7 +1792,21 @@ export async function runWorkflow<T = unknown>(
             // "aborted" once agentController fires; the race has already resolved,
             // so swallow that to avoid an unhandled rejection.
             runPromise.catch(() => {});
-            const result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
+            const result = await withTimeout(
+              runPromise,
+              timeout,
+              label,
+              () => agentController.abort(),
+              (ms, lbl) =>
+                // The AGENT_TIMEOUT semantics the workflow layer pins (message +
+                // code + recoverable) live in this factory; the shared timing.ts
+                // implementation stays domain-free (core-09).
+                new WorkflowError(
+                  `Agent "${lbl}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
+                  WorkflowErrorCode.AGENT_TIMEOUT,
+                  { recoverable: true },
+                ),
+            );
 
             throwIfAborted();
             if (isEmptyTextAgentResult(result, agentOptions.schema)) {
@@ -3426,6 +3466,32 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
   return createHash("sha256").update(identity).digest("hex");
 }
 
+/**
+ * Stable fingerprint of the model-registry state the no-config prompt-aware
+ * tier fallback ranks against (core-08): the same `{spec, costOutput,
+ * contextWindow}` projection `listAvailableModels` feeds `buildDefaultTierConfig`.
+ * Sorted by spec so registry enumeration order can never churn the hash.
+ * Returns undefined (legacy) when no registry is synchronously available — the
+ * pre-fix replay hash had no registry input at all, and omitting the key keeps
+ * old journals replayable (see hashAgentCall's `registryFingerprint` field).
+ */
+function computeRegistryFingerprint(registry: ModelRegistry | undefined): string | undefined {
+  // Explicit-registry-only: the module-level disk fallback is deliberately NOT
+  // consulted. A fallback-derived fingerprint would vary with the user's real
+  // model setup (and with when the fallback happened to build), breaking both
+  // test determinism and legacy-journal replay — old journals were hashed with
+  // no registry input at all, so only an explicitly-supplied registry (the
+  // production path: extensions/workflow.ts → manager → runWorkflow) should
+  // introduce the fingerprint.
+  if (!registry) return undefined;
+  const models = listAvailableModels(registry);
+  if (models.length === 0) return undefined;
+  const canonical = [...models]
+    .map((m) => ({ spec: m.spec, costOutput: m.costOutput ?? null, contextWindow: m.contextWindow ?? null }))
+    .sort((a, b) => (a.spec < b.spec ? -1 : a.spec > b.spec ? 1 : 0));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function hashAgentCall(
   prompt: string,
   model: string | undefined,
@@ -3435,6 +3501,13 @@ function hashAgentCall(
   agentDefKey: string | null,
   mainModel: string | undefined,
   isolation: "worktree" | undefined,
+  // core-08: fingerprint of the registry the no-config prompt-aware tier
+  // fallback ranks against. Included ONLY on the path that actually consults
+  // the registry (tier set, no model-tiers.json — see the call site's
+  // relevance gate); the key is omitted entirely when undefined, so the
+  // encoding is byte-identical to the pre-fix hash and legacy journals (and
+  // registry-less runs) replay unchanged.
+  registryFingerprint?: string,
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -3468,6 +3541,7 @@ function hashAgentCall(
     // not replay in another (M5).
     isolation: isolation ?? null,
     schema: options.schema ?? null,
+    ...(registryFingerprint ? { registryFingerprint } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
@@ -3679,48 +3753,5 @@ async function waitForInFlightSettlement(inFlight: Set<Promise<unknown>>, deadli
     ]);
   } finally {
     deadlineTimer?.clear();
-  }
-}
-
-/**
- * Run a promise with a timeout.
- *
- * `onTimeout` fires when the deadline hits, BEFORE the timeout rejection wins the
- * race — the caller uses it to abort the underlying work (e.g. the subagent
- * session) so it can release its resources instead of streaming on in the
- * background with the whole session graph (messages, etc.) retained (#109). The
- * losing promise still settles later; the caller must swallow its rejection.
- */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number | null,
-  label: string,
-  onTimeout?: () => void,
-): Promise<T> {
-  if (ms === null) return promise;
-
-  let timeoutId: NodeJS.Timeout | undefined;
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
-      try {
-        onTimeout?.();
-      } catch {
-        // Best-effort cleanup; never let it mask the timeout error.
-      }
-      reject(
-        new WorkflowError(
-          `Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`,
-          WorkflowErrorCode.AGENT_TIMEOUT,
-          { recoverable: true },
-        ),
-      );
-    }, ms);
-  });
-
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timeoutId) clearTimeout(timeoutId);
   }
 }

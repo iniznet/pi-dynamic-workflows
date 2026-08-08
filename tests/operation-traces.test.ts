@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,6 +21,7 @@ import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /**
  * Build a WorkflowAgent backed by a faux (no-network) provider so tool calls
@@ -105,7 +106,7 @@ test("operations[] entries carry line, op, and outcome for a real session's tool
       assert.equal(ok.length, 2, "both executed tools should report ok");
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -141,7 +142,7 @@ test("operations[] marks a failed tool call with an error outcome", async () => 
       assert.equal(traces[0].line, 11);
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -240,8 +241,7 @@ return a`;
       );
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
+    await rmForce(cwd, fakeHome);
   }
 });
 

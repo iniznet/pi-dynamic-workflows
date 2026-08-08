@@ -32,12 +32,25 @@ export interface McpToolsManagerOptions {
   fetchImpl?: typeof fetch;
   /** Per-server tool-list cache TTL in milliseconds. */
   listTtlMs?: number;
+  /**
+   * Per-server initialize-handshake deadline in ms (default
+   * {@link HANDSHAKE_TIMEOUT_MS}): a dead server fails the listing in
+   * seconds instead of consuming the long tool-call timeout (B4).
+   */
+  handshakeTimeoutMs?: number;
 }
 
 /** Default per-server tool-list cache TTL. */
 const DEFAULT_LIST_TTL_MS = 5 * 60_000;
 /** Per tool-call deadline: 120s (long-running servers like autofixers). */
 const TOOL_CALL_TIMEOUT_MS = 120_000;
+/**
+ * Per-server initialize-handshake deadline: the SHORTER bound (B4). With N
+ * servers listed in parallel, a dead server costs one handshake timeout
+ * (30s), never N × the 120s call timeout — a run-start stall is bounded by
+ * the slowest single handshake, not the sum of all of them.
+ */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 /** Prefix of every MCP-backed subagent tool name. */
 const MCP_TOOL_PREFIX = "mcp_";
 /** Characters preserved in sanitized server/tool names. */
@@ -76,6 +89,7 @@ interface ServerListCache {
 export class McpToolsManager {
   private readonly options: McpToolsManagerOptions;
   private readonly listTtlMs: number;
+  private readonly handshakeTimeoutMs: number;
   private readonly clients = new Map<string, McpHttpClient>();
   private readonly listCache = new Map<string, ServerListCache>();
   private resolvedConfig: McpServerConfig[] | undefined;
@@ -83,6 +97,7 @@ export class McpToolsManager {
   constructor(options: McpToolsManagerOptions = {}) {
     this.options = options;
     this.listTtlMs = options.listTtlMs ?? DEFAULT_LIST_TTL_MS;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
   }
 
   /**
@@ -93,25 +108,29 @@ export class McpToolsManager {
   }
 
   /**
-   * Fetch every server's tools as subagent ToolDefinitions. Unreachable or
+   * Fetch every server's tools as subagent ToolDefinitions. Servers are
+   * listed IN PARALLEL (B4): with N servers, the run-start cost is bounded by
+   * the slowest single handshake+list, not the sum of all N. Unreachable or
    * misconfigured servers contribute nothing (warned once, skipped); the
-   * result is the union across all reachable servers.
+   * result is the union across all reachable servers. Never throws.
    */
   async listSubagentTools(): Promise<ToolDefinition[]> {
     const servers = this.resolveServers();
-    const all: ToolDefinition[] = [];
-    for (const server of servers) {
-      try {
-        all.push(...(await this.listServerTools(server)));
-      } catch (error) {
-        this.warnOnce(
-          server.name,
-          `MCP server "${server.name}" unavailable (${error instanceof Error ? error.message : String(error)}); ` +
-            "its tools are skipped for subagents. Offline servers recover automatically on the next list.",
-        );
-      }
-    }
-    return all;
+    const perServer = await Promise.all(
+      servers.map(async (server) => {
+        try {
+          return await this.listServerTools(server);
+        } catch (error) {
+          this.warnOnce(
+            server.name,
+            `MCP server "${server.name}" unavailable (${error instanceof Error ? error.message : String(error)}); ` +
+              "its tools are skipped for subagents. Offline servers recover automatically on the next list.",
+          );
+          return [];
+        }
+      }),
+    );
+    return perServer.flat();
   }
 
   /** Forget cached tool lists and session state (extension dispose). */
@@ -154,7 +173,10 @@ export class McpToolsManager {
     if (!client) {
       client = new McpHttpClient(server, {
         fetchImpl: this.options.fetchImpl,
+        // Long bound for actual tool work; the initialize handshake uses the
+        // shorter handshakeTimeoutMs internally (B4 timeout alignment).
         timeoutMs: TOOL_CALL_TIMEOUT_MS,
+        handshakeTimeoutMs: this.handshakeTimeoutMs,
       });
       this.clients.set(server.name, client);
     }

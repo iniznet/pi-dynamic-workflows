@@ -1,13 +1,23 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { WorkflowAgent } from "../src/agent.js";
-import { buildResumeJournal, journalEntryKey, keepsResumeJournal, upsertJournalEntry } from "../src/run-persistence.js";
+import {
+  buildResumeJournal,
+  createRunPersistence,
+  journalEntryKey,
+  keepsResumeJournal,
+  type PersistedRunState,
+  redactText,
+  upsertJournalEntry,
+} from "../src/run-persistence.js";
 import type { JournalEntry } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
+import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /**
  * P2-4 extraction tests: the journal-persistence helpers that moved OUT of
@@ -128,8 +138,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }
@@ -236,3 +245,93 @@ return { a, b }`;
     await origPromise.catch(() => {});
   }),
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// D-03 (slice runtime-opt) — single-pass redacting serializer
+//
+// serializeRedacted used to probe the serialized form for a '.' (a JWT hint)
+// and, on ANY period in prose, fall into a parse + deep-walk + re-stringify
+// round trip — i.e. nearly every write with real agent prose. It now applies
+// redactText inline through JSON.stringify's replacer: one pass, byte-stable,
+// idempotent, and prose with '.'/'@' is never touched.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const D03_PROSE = "The quick brown fox. It jumped over @ the lazy dog's fence. No secrets here.";
+const D03_SK_KEY = "sk-abcDEF1234567890";
+const D03_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+function d03State(runId: string, status: PersistedRunState["status"] = "completed"): PersistedRunState {
+  return {
+    runId,
+    workflowName: "wf",
+    script: "export const meta = { name: 'w', description: 'w' }",
+    status,
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    journal: [
+      { index: 0, runId, hash: "h", result: `env: OPENAI_API_KEY=${D03_SK_KEY}` },
+      { index: 1, runId, hash: "h", result: D03_SK_KEY },
+      { index: 2, runId, hash: "h", result: D03_JWT },
+      { index: 3, runId, hash: "h", result: D03_PROSE },
+    ],
+  };
+}
+
+test("D-03: persisted secrets are redacted; prose with '.'/'@' is preserved byte-for-byte; re-saves are byte-identical", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-d03-"));
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-d03-home-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      const rp = createRunPersistence(cwd);
+      const state = d03State("d03-golden");
+      rp.save(state);
+      const path = join(workflowProjectPaths(cwd).runsDir, "d03-golden.json");
+      const first = readFileSync(path, "utf-8");
+
+      // The sensitive payload must be scrubbed in the persisted bytes.
+      assert.ok(first.includes("[REDACTED]"), "the persisted form must contain redaction markers");
+      assert.ok(!first.includes(D03_SK_KEY), "the provider key must not appear in the persisted bytes");
+      assert.ok(!first.includes(D03_JWT), "the JWT must not appear in the persisted bytes");
+      assert.ok(!first.includes("OPENAI_API_KEY=sk-"), "the KEY=value assignment must not survive");
+      assert.ok(
+        first.includes(`"OPENAI_API_KEY=[REDACTED]"`) || first.includes(`OPENAI_API_KEY=[REDACTED]`),
+        "the KEY=value pair is redacted in place (scanner rule)",
+      );
+
+      // Prose containing '.' and '@' must pass through untouched.
+      assert.ok(
+        first.includes(D03_PROSE),
+        "prose with periods and @ must be persisted byte-for-byte (the old '.' probe misfired here)",
+      );
+
+      // Golden byte-stability: a second save of the same state yields the same
+      // redacted payload bytes. The only permitted drift is the manager's
+      // per-write `updatedAt` timestamp (casWrite stamps now() on every save),
+      // so the comparison normalizes that single field — everything else,
+      // including every redaction decision, must be byte-identical.
+      rp.save(state);
+      const second = readFileSync(path, "utf-8");
+      const stripUpdatedAt = (raw: string) => raw.replace(/"updatedAt": "[^"]*"/, '"updatedAt": "<ts>"');
+      assert.equal(
+        stripUpdatedAt(second),
+        stripUpdatedAt(first),
+        "re-saving the same state must produce byte-identical persisted output (modulo the per-write updatedAt stamp)",
+      );
+    });
+  } finally {
+    await rmForce(cwd, fakeHome);
+  }
+});
+
+test("D-03: redactText is idempotent and a no-op on prose with '.'/'@'", () => {
+  assert.equal(redactText(D03_PROSE), D03_PROSE, "prose is never redacted");
+  assert.equal(redactText(`OPENAI_API_KEY=${D03_SK_KEY}`), "OPENAI_API_KEY=[REDACTED]");
+  // Idempotency — the 'before/after' byte-stability contract at the unit level.
+  for (const sample of [D03_PROSE, D03_SK_KEY, D03_JWT, `OPENAI_API_KEY=${D03_SK_KEY}`]) {
+    const once = redactText(sample);
+    assert.equal(redactText(once), once, `redaction is idempotent for: ${sample}`);
+  }
+});

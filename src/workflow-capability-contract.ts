@@ -191,9 +191,6 @@ const option = (
  */
 export const STANDARD_TIER_NAMES = ["small", "medium", "big"] as const;
 
-/** The closed union of standard tier names declared by the tier option. */
-export type StandardTierName = (typeof STANDARD_TIER_NAMES)[number];
-
 /**
  * Whether a tier name belongs to the contract's closed standard vocabulary.
  * Returns false for invented or typo'd names ("tiny", "smal") — the contract

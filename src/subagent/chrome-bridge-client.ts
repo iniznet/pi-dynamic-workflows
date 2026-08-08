@@ -37,16 +37,6 @@ export interface ChromeBridgeClientOptions {
   fetchImpl?: typeof fetch;
 }
 
-/** Options for {@link ChromeBridgeClient.heartbeat}. */
-export interface HeartbeatOptions {
-  /**
-   * When true, a failed heartbeat (network error or non-2xx response) throws
-   * instead of being swallowed. Defaults to false — heartbeats are best-effort
-   * keepalives and must never take down the calling workflow.
-   */
-  throwOnError?: boolean;
-}
-
 /** Default bridge host, mirroring pi-chrome's DEFAULT_HOST. */
 const DEFAULT_HOST = process.env.PI_CHROME_BRIDGE_HOST ?? "127.0.0.1";
 
@@ -183,31 +173,5 @@ export class ChromeBridgeClient {
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", forwardAbort);
     }
-  }
-
-  /**
-   * POST a keepalive for this session to the bridge `/heartbeat` endpoint
-   * (S5.1) so the owner can track stale grants. Best-effort by default: a
-   * missing bridge must not crash a workflow, so failures are swallowed and
-   * reported as `false` unless {@link HeartbeatOptions.throwOnError} is set.
-   * Returns true when the bridge acked (2xx).
-   */
-  async heartbeat(sessionKey: string, opts: HeartbeatOptions = {}): Promise<boolean> {
-    let response: Response;
-    try {
-      response = await this.fetchImpl(`${this.url}/heartbeat`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sessionKey }),
-      });
-    } catch (error) {
-      if (opts.throwOnError) throw error;
-      return false;
-    }
-    if (!response.ok) {
-      if (opts.throwOnError) throw new Error(`Chrome bridge heartbeat HTTP ${response.status}`);
-      return false;
-    }
-    return true;
   }
 }

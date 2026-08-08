@@ -261,4 +261,17 @@ export class SubagentHostToolsPolicy {
     await this.ensureStarted();
     return createGatewayProxiedTools(this.gateway);
   }
+
+  /**
+   * Deterministic teardown hook for reload/shutdown (B5). A stop racing an
+   * in-flight auto-start must await the shared start FIRST — otherwise the
+   * start completes after the stop returns and leaves an orphaned bridge
+   * bound to a live socket. Mirrors the gateway's own single-flight start:
+   * await the policy's in-flight start, then stop whatever it produced.
+   * Idempotent: no in-flight start and a stopped gateway → no-op.
+   */
+  async stop(): Promise<void> {
+    if (this.starting) await this.starting;
+    if (this.gateway.isRunning()) await this.gateway.stop();
+  }
 }

@@ -824,8 +824,3 @@ async function readWorkflowScriptFile(scriptPath: string, cwd: string): Promise<
   }
   return normalizeWorkflowScript(content);
 }
-
-function _isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /\babort(?:ed)?\b/i.test(error.message);
-}

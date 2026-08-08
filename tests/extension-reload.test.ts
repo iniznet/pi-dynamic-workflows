@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import {
 } from "../src/extension-reload.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /** Agent that stays running until a deferred resolve is called externally. */
 function deferredAgent() {
@@ -46,8 +47,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }

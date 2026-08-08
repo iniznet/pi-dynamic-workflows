@@ -23,6 +23,7 @@ import {
   hostToolsFromDefinitions,
   registerWorkflowGatewayCommand,
 } from "../../src/gateway/host-tool-gateway.js";
+import { MCPBridge } from "../../src/gateway/mcp-bridge.js";
 import type { ProxiedToolDef, ToolCallResult, ToolExecutor } from "../../src/gateway/types.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "../helpers/mock-pi.js";
 
@@ -83,6 +84,61 @@ test("HostToolGateway start/stop are idempotent and expose a socket path while r
 
   // Idempotent stop on an already-stopped gateway.
   await gateway.stop();
+});
+
+test("concurrent start() calls share ONE in-flight bridge bind (B5 single-flight)", async () => {
+  const gateway = trackedGateway();
+  const originalStart = MCPBridge.prototype.start;
+  let bridgeStartCalls = 0;
+  (MCPBridge.prototype as { start: () => Promise<void> }).start = async function (this: MCPBridge) {
+    bridgeStartCalls++;
+    return originalStart.call(this);
+  };
+  try {
+    const [a, b, c] = await Promise.all([
+      gateway.start(hostToolsFromDefinitions([echoTool()])),
+      gateway.start(hostToolsFromDefinitions([echoTool()])),
+      gateway.start(hostToolsFromDefinitions([echoTool()])),
+    ]);
+    assert.equal(a, b, "all concurrent starts must share one socket path");
+    assert.equal(b, c);
+    assert.equal(bridgeStartCalls, 1, "only ONE bridge.start() may run for concurrent gateway.start() calls");
+    assert.equal(gateway.isRunning(), true);
+    await gateway.stop();
+  } finally {
+    (MCPBridge.prototype as { start: () => Promise<void> }).start = originalStart;
+  }
+});
+
+test("stop() during an in-flight start() awaits it and leaves no orphaned bridge (B5 reload race)", async () => {
+  const gateway = trackedGateway();
+  const originalStart = MCPBridge.prototype.start;
+  let releaseStart: (() => void) | undefined;
+  const startGate = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
+  (MCPBridge.prototype as { start: () => Promise<void> }).start = async function (this: MCPBridge) {
+    await startGate;
+    return originalStart.call(this);
+  };
+  try {
+    // The auto-start is now in flight, blocked on startGate.
+    const starting = gateway.start(hostToolsFromDefinitions([echoTool()]));
+    let stopSettled = false;
+    const stopping = gateway.stop().then(() => {
+      stopSettled = true;
+    });
+    // Give stop() time to reach its await on the in-flight start.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(stopSettled, false, "stop() must await the in-flight start, never return before it settles");
+    releaseStart?.();
+    await starting;
+    await stopping;
+    assert.equal(gateway.isRunning(), false, "a stop-during-start must leave no orphaned bridge");
+    assert.equal(gateway.getSocketPath(), undefined, "the socket must be released, not leaked");
+  } finally {
+    (MCPBridge.prototype as { start: () => Promise<void> }).start = originalStart;
+  }
 });
 
 test("hostToolsFromDefinitions adapts ToolDefinition.execute into bridge executors", async () => {

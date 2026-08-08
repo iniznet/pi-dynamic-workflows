@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -20,6 +20,7 @@ import {
   runWorkflowSettingsCommand,
 } from "../src/workflows-settings-command.js";
 import { makeCommandRegistryPi } from "./helpers/mock-pi.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -31,7 +32,7 @@ async function withTempDirAsync(fn: (dir: string) => Promise<void>): Promise<voi
   try {
     await fn(dir);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 }
 

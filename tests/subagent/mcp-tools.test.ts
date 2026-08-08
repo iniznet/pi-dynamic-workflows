@@ -12,7 +12,14 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import type { McpServerConfig } from "../../src/subagent/mcp-config.js";
 import { McpToolsManager } from "../../src/subagent/mcp-tools.js";
-import { createMockMcpServer, jsonRpcError, jsonRpcResult, type MockMcpServer, sseWrap } from "../helpers/mcp-mock.js";
+import {
+  createMockMcpServer,
+  jsonRpcError,
+  jsonRpcResult,
+  type MockMcpServer,
+  sseWrap,
+  standardResponder,
+} from "../helpers/mcp-mock.js";
 
 const servers: MockMcpServer[] = [];
 
@@ -216,5 +223,60 @@ describe("McpToolsManager", () => {
     };
     assert.equal(result.isError, true);
     assert.match(result.content[0].text, /exploded/);
+  });
+
+  test("lists N servers in parallel — total time bounded by one server, not the sum (B4)", async () => {
+    const DELAY_MS = 80;
+    const firstArrivals: number[] = [];
+    const mockServers: MockMcpServer[] = [];
+    for (let i = 0; i < 3; i++) {
+      mockServers.push(
+        track(
+          await createMockMcpServer({
+            respond: async (req) => {
+              // Record the first request's arrival (across all servers) so the
+              // test can prove the handshakes overlapped.
+              if (firstArrivals.length < 3) firstArrivals.push(Date.now());
+              await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+              return standardResponder({
+                tools: [{ name: `tool-${i}`, inputSchema: { type: "object", properties: {} } }],
+              })(req);
+            },
+          }),
+        ),
+      );
+    }
+    const manager = new McpToolsManager({
+      config: mockServers.map((server, i) => ({ name: `server-${i}`, type: "http", url: server.url })),
+    });
+
+    const start = Date.now();
+    const tools = await manager.listSubagentTools();
+    const elapsed = Date.now() - start;
+
+    assert.equal(tools.length, 3, "all three servers' tools must be surfaced");
+    // Parallel proof: every server's FIRST request arrived inside one delay
+    // window. Serial listing would spread them by >= one full request cycle
+    // (initialize+list = 2 × DELAY_MS) each.
+    const spread = Math.max(...firstArrivals) - Math.min(...firstArrivals);
+    assert.ok(spread < DELAY_MS, `handshakes must overlap (spread ${spread}ms >= ${DELAY_MS}ms)`);
+    // A serial implementation needs 3 × 2 × DELAY_MS = 480ms; parallel
+    // completes in ~2 × DELAY_MS = 160ms. Bound at half the serial cost.
+    assert.ok(elapsed < 3 * DELAY_MS, `parallel listing must beat serial time (elapsed ${elapsed}ms)`);
+  });
+
+  test("a dead-slow handshake fails within the shorter handshake bound and skips the server (B4)", async () => {
+    const mock = track(await createMockMcpServer({ respond: () => new Promise<never>(() => {}) }));
+    const manager = new McpToolsManager({ config: configFor("dead-slow", mock), handshakeTimeoutMs: 40 });
+
+    const { value: tools, warnings } = await captureConsoleWarn(() => manager.listSubagentTools());
+    assert.deepEqual(tools, [], "a server whose handshake never answers contributes no tools");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /dead-slow/);
+    assert.match(
+      warnings[0],
+      /timed out after 40ms/,
+      "the handshake must fail at the SHORT bound, not the 120s call bound",
+    );
   });
 });

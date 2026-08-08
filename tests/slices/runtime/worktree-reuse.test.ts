@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createWorktree, pruneWorktrees, removeWorktree } from "../../../src/worktree.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 function initRepo(prefix: string): string {
   const repo = mkdtempSync(join(tmpdir(), prefix));
@@ -32,7 +33,7 @@ test("M14: a deterministic-slug path left behind is REUSED, never a silent share
 
     await removeWorktree(second);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -42,7 +43,7 @@ test("M14: a registered worktree whose directory vanished is recreated fresh, no
     const wt = await createWorktree(repo, "run-2-0-edit");
     assert.equal(wt.isolated, true);
     // A crashed run removed the working directory but git still tracks it.
-    rmSync(wt.cwd, { recursive: true, force: true });
+    await rmForce(wt.cwd);
 
     const recreated = await createWorktree(repo, "run-2-0-edit");
     assert.equal(recreated.isolated, true, "recreated, not degraded");
@@ -52,7 +53,7 @@ test("M14: a registered worktree whose directory vanished is recreated fresh, no
 
     await removeWorktree(recreated);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -63,7 +64,7 @@ test("M14: pruneWorktrees clears stale registrations and never throws outside a 
     const wt = await createWorktree(repo, "run-3-0-edit");
     assert.equal(wt.isolated, true);
     // Wipe the directory the way a crashed run would; the registration lingers.
-    rmSync(wt.cwd, { recursive: true, force: true });
+    await rmForce(wt.cwd);
     // git reports paths with forward slashes on every platform — normalize for
     // the porcelain comparison.
     const normalizedCwd = wt.cwd.replace(/\\/g, "/");
@@ -81,8 +82,8 @@ test("M14: pruneWorktrees clears stale registrations and never throws outside a 
     // Non-repo cwd: best-effort no-op.
     const nonRepo = mkdtempSync(join(tmpdir(), "pi-wt-norepo-"));
     await pruneWorktrees(nonRepo);
-    rmSync(nonRepo, { recursive: true, force: true });
+    await rmForce(nonRepo);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });

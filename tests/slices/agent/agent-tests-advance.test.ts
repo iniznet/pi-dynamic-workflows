@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import { WorkflowError, WorkflowErrorCode } from "../../../src/errors.js";
 import { createProviderPoolFromConfig, type ProviderPool } from "../../../src/gateway/provider-pool.js";
 import { runWorkflow } from "../../../src/workflow.js";
 import { withFakeHomeAsync } from "../../helpers/fake-home.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -401,8 +402,7 @@ async function fauxAgentRun(
     });
     return outcome;
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 }
 
@@ -776,7 +776,7 @@ test("workflow teardown removes the worktree + branch after an isolated agent (d
     assert.ok(!existsSync(wtPath as string), "worktree dir removed after the run");
     assert.equal(git("branch", "--list", branchForWorktree(wtPath as string)), "", "branch deleted after the run");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -806,7 +806,7 @@ test("workflow keepWorktree retains the branch + path with finalized agent edits
     // finalizeWorktree committed the agent edit onto the retained branch.
     assert.equal(git("show", `${branch}:agent-file.txt`), "agent edit");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -986,8 +986,7 @@ async function fauxPoolHarness(
       await run({ cwd, coreA, coreB, registry, pool, agent });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 }
 

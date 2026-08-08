@@ -1109,6 +1109,146 @@ test("restarting a run with a corrupt persisted script notifies an error instead
   assert.match(notifications[0].message, /Failed to restart corrupt-run/);
 });
 
+test("restart refuses a RUNNING run — no silent teardown of a live session (C-10)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  let startCalls = 0;
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [
+      {
+        runId: "run-live",
+        workflowName: "live-run",
+        status: "running",
+        phases: [],
+        agents: [],
+        logs: [],
+        script: "export const meta = { name: 'live-run' }",
+        args: undefined,
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+    startInBackground: () => {
+      startCalls++;
+      return { runId: "should-not-be-reached" };
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput?.("r"), "restart must not throw on a live run");
+
+  assert.equal(startCalls, 0, "a running run must never be silently restarted");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "warning");
+  assert.match(notifications[0].message, /Cannot restart run-live: run is running/);
+});
+
+test("restart refuses a PAUSED run — no silent teardown of a live session (C-10)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  let startCalls = 0;
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [
+      {
+        runId: "run-paused",
+        workflowName: "paused-run",
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        script: "export const meta = { name: 'paused-run' }",
+        args: undefined,
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+    startInBackground: () => {
+      startCalls++;
+      return { runId: "should-not-be-reached" };
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput?.("r"), "restart must not throw on a paused run");
+
+  assert.equal(startCalls, 0, "a paused run must never be silently restarted");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "warning");
+  assert.match(notifications[0].message, /Cannot restart run-paused: run is paused/);
+});
+
+test("restart forwards the frozen exec context of a terminal run (C-10)", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  let startArgs: [string, unknown, Record<string, unknown>?] | undefined;
+  const fakeManager = {
+    on: () => {},
+    off: () => {},
+    listRuns: () => [
+      {
+        runId: "run-done",
+        workflowName: "done-run",
+        status: "completed",
+        phases: [],
+        agents: [],
+        logs: [],
+        script: "export const meta = { name: 'done-run' }",
+        args: { input: "hello" },
+        toolset: "deep-research",
+        maxAgents: 7,
+        agentTimeoutMs: 42_000,
+        drainTimeoutMs: 9_000,
+        concurrency: 3,
+        agentRetries: 2,
+        tokenBudget: 500_000,
+        autoResume: false,
+        failOnExhaustedAgent: true,
+        compactJournal: true,
+      } as unknown as PersistedRunState,
+    ],
+    getRun: () => undefined,
+    startInBackground: (script: string, args?: unknown, exec?: Record<string, unknown>) => {
+      startArgs = [script, args, exec];
+      return { runId: "run-done-2" };
+    },
+  } as unknown as WorkflowManager;
+
+  openWorkflowNavigator({} as ExtensionAPI, fakeManager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const component = getComponent();
+  assert.ok(component, "openWorkflowNavigator should have produced a component");
+  assert.doesNotThrow(() => component?.handleInput?.("r"), "restart must not throw on a terminal run");
+
+  assert.ok(startArgs, "a terminal run's restart must call startInBackground");
+  assert.equal(startArgs[0], "export const meta = { name: 'done-run' }", "the persisted script must be restarted");
+  assert.deepEqual(startArgs[1], { input: "hello" }, "the persisted args must be restarted");
+  const exec = startArgs[2] as Record<string, unknown>;
+  assert.equal(exec.toolset, "deep-research");
+  assert.equal(exec.maxAgents, 7);
+  assert.equal(exec.agentTimeoutMs, 42_000);
+  assert.equal(exec.drainTimeoutMs, 9_000);
+  assert.equal(exec.concurrency, 3);
+  assert.equal(exec.agentRetries, 2);
+  assert.equal(exec.tokenBudget, 500_000);
+  assert.equal(exec.autoResume, false);
+  assert.equal(exec.failOnExhaustedAgent, true);
+  assert.equal(exec.compactJournal, true);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].type, "info");
+  assert.match(notifications[0].message, /Restarted done-run as run-done-2/);
+});
+
 function fakeUiCapturingComponent(): {
   ui: ExtensionUIContext;
   notifications: { message: string; type?: string }[];

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   removeWorktree,
   sweepOrphanWorktrees,
 } from "../src/worktree.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ── Existing tests (unchanged) ──
 
@@ -24,7 +25,7 @@ test("createWorktree no-ops (not isolated) outside a git repo", async () => {
     assert.equal(wt.cwd, dir);
     assert.match(wt.reason ?? "", /not a git repository/);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -53,7 +54,7 @@ test("createWorktree isolates in a git repo, then removeWorktree cleans up", asy
     const branches = execFileSync("git", ["-C", repo, "branch", "--list", wt.branch ?? ""], { encoding: "utf8" });
     assert.equal(branches.trim(), "", "branch deleted");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -68,7 +69,7 @@ test("createWorktree falls back when git fails (non-git directory)", async () =>
     assert.equal(wt.cwd, dir);
     assert.ok(wt.reason, "should provide a fallback reason when git fails");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -87,13 +88,13 @@ test("removeWorktree does not throw when worktree directory is already missing",
     assert.equal(wt.isolated, true);
 
     // Remove the worktree directory so git worktree remove --force fails
-    rmSync(wt.cwd, { recursive: true, force: true });
+    await rmForce(wt.cwd);
     assert.ok(!existsSync(wt.cwd), "worktree dir removed manually before removeWorktree");
 
     // removeWorktree must not throw despite git commands failing
     await assert.doesNotReject(removeWorktree(wt));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -119,7 +120,7 @@ test("createWorktree falls back when target branch already exists", async () => 
     assert.equal(wt.cwd, repo);
     assert.ok(/already exists/i.test(wt.reason ?? ""), `Expected 'already exists' error, got: ${wt.reason}`);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -138,7 +139,7 @@ test("removeWorktree does not throw when git operations fail (corrupted metadata
     assert.equal(wt.isolated, true);
 
     // Remove worktree dir so git worktree remove fails
-    rmSync(wt.cwd, { recursive: true, force: true });
+    await rmForce(wt.cwd);
 
     // Corrupt git worktree metadata so git worktree remove --force also fails
     const branchSuffix = wt.branch?.replace("pi/wf/", "") ?? "";
@@ -150,7 +151,7 @@ test("removeWorktree does not throw when git operations fail (corrupted metadata
     // Both git operations should fail silently — no throw from removeWorktree
     await assert.doesNotReject(removeWorktree(wt));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -205,7 +206,7 @@ test("worktree runner cleanup removes the worktree dir and branch after executeT
     assert.ok(!existsSync(wt.cwd), "worktree dir removed after executeTasks cleanup");
     assertBranchGone(repo, wt.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -229,7 +230,7 @@ test("worktree runner cleanup() removes the worktree dir and branch for every re
     assertBranchGone(repo, wtA.branch as string);
     assertBranchGone(repo, wtB.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -251,7 +252,7 @@ test("sweepOrphanWorktrees reclaims leaked worktrees but keeps active + main", a
     assertBranchExists(repo, active.branch as string);
     assertBranchGone(repo, orphan.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -260,7 +261,7 @@ test("sweepOrphanWorktrees swallows errors outside a git repo", async () => {
   try {
     await assert.doesNotReject(sweepOrphanWorktrees(dir, []));
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -281,7 +282,7 @@ test("worktree runner sweeps orphaned worktrees at run start (init path)", async
     assertBranchGone(repo, leftover.branch as string);
     assertBranchExists(repo, mine.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -308,7 +309,7 @@ test("finalizeWorktree commits agent edits onto the branch before teardown", asy
     assert.ok(!existsSync(wt.cwd), "worktree dir removed after teardown");
     assertBranchGone(repo, wt.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -325,7 +326,7 @@ test("finalizeWorktree creates an empty commit on a clean tree (allow-empty)", a
     });
     assert.match(head, /finalize agent worktree/);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -366,6 +367,6 @@ test("smoke: create → edit → finalize → remove lifecycle on real git", asy
     assert.ok(!existsSync(wt.cwd), "worktree dir removed");
     assertBranchGone(repo, wt.branch as string);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });

@@ -18,7 +18,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -29,6 +29,7 @@ import { WorkflowErrorCode } from "../src/errors.js";
 import { ProviderPool } from "../src/gateway/provider-pool.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 const USAGE_LIMIT_MSG = "Codex usage limit reached (plus plan). Resets in ~3h.";
 
@@ -105,8 +106,7 @@ async function withFauxSession(
       });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 }
 

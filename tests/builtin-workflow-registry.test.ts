@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,7 @@ import { generateCodeReviewWorkflow } from "../src/code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "../src/deep-research.js";
 import { parseWorkflowScript } from "../src/workflow.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /** Look up a built-in descriptor, failing the test clearly if the name is unknown. */
 function requireBuiltin(name: string) {
@@ -32,12 +33,12 @@ function requireBuiltin(name: string) {
 }
 
 function withTempCwd(fn: (cwd: string) => void) {
-  return () => {
+  return async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-dw-registry-"));
     try {
       fn(cwd);
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
+      await rmForce(cwd);
     }
   };
 }

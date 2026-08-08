@@ -39,19 +39,6 @@ export interface JsonRpcError {
   data?: unknown;
 }
 
-// ─── IPC Message Framing ─────────────────────────────────────────────────────
-
-/**
- * Length-prefixed IPC message format.
- * Each message is: [4 bytes big-endian uint32 length][JSON payload]
- */
-export interface IpcFramedMessage {
-  /** Message length in bytes (excluding the 4-byte prefix). */
-  length: number;
-  /** JSON payload (JsonRpcRequest or JsonRpcResponse). */
-  payload: JsonRpcRequest | JsonRpcResponse;
-}
-
 // ─── Tool Proxy Types ────────────────────────────────────────────────────────
 
 /** Serialized tool definition for proxy registration. */
@@ -64,20 +51,6 @@ export interface ProxiedToolDef {
   inputSchema: unknown;
   /** Tool source type. */
   source: "host" | "mcp" | "extension";
-}
-
-/** Parameters for a tool call request. */
-export interface ToolCallParams {
-  /** Tool name to invoke. */
-  toolName: string;
-  /** Tool arguments. */
-  args: Record<string, unknown>;
-  /**
-   * Deduplication key for side-effectful tools. When a client retries a call
-   * (e.g. after its own request timed out) with the same key, the bridge joins
-   * the original execution instead of running the tool a second time.
-   */
-  idempotencyKey?: string;
 }
 
 /** Result from a tool call execution. */
@@ -200,7 +173,6 @@ export const TOOL_NOT_FOUND = -32001;
 export const TOOL_TIMEOUT = -32002;
 export const TOOL_EXECUTION_ERROR = -32003;
 export const CONNECTION_CLOSED = -32004;
-export const BRIDGE_NOT_STARTED = -32005;
 
 /** Custom error codes for channel-level protection. */
 export const AUTH_REQUIRED = -32006;

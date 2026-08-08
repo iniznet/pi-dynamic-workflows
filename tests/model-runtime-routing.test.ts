@@ -16,7 +16,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,6 +33,7 @@ import { buildDefaultTierConfig, type RankableModel } from "../src/model-tier-co
 import { WorkflowStateManager } from "../src/phases/state-machine.js";
 import { runWorkflow } from "../src/workflow.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 test("runtimeOf reaches the ModelRuntime behind pi's real ModelRegistry facade (pi-internals contract)", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-dw-runtimeof-"));
@@ -47,7 +48,7 @@ test("runtimeOf reaches the ModelRuntime behind pi's real ModelRegistry facade (
       );
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
+    await rmForce(home);
   }
 });
 
@@ -97,8 +98,7 @@ test("a shared host ModelRegistry routes subagents to extension-registered provi
       );
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -234,7 +234,6 @@ return { recon, final }`;
       );
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });

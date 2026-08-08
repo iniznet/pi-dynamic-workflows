@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createRunPersistence } from "../../../src/run-persistence.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
-test("L2: a lease older than MAX_RUN_LEASE_AGE_MS is reclaimable even while its pid is alive and its TTL is fresh", () => {
+test("L2: a lease older than MAX_RUN_LEASE_AGE_MS is reclaimable even while its pid is alive and its TTL is fresh", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-dw-l2-"));
   try {
     const persistence = createRunPersistence(cwd);
@@ -32,6 +33,6 @@ test("L2: a lease older than MAX_RUN_LEASE_AGE_MS is reclaimable even while its 
     assert.notEqual(lease.token, "stale-token", "a NEW token replaced the stale lock");
     persistence.releaseRunLease(lease);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });

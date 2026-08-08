@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkflowManager } from "../../../src/workflow-manager.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 /** Isolated cwd per test so run state never leaks between tests. */
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
@@ -12,7 +13,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await fn(cwd);
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
+      await rmForce(cwd);
     }
   };
 }

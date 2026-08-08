@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import { WORKFLOW_AUTHORING_COVERAGE } from "../src/workflow-authoring-coverage.
 import { CAPABILITY_DETAIL_PATH } from "../src/workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
 import { checkWorkflowRelease, parseNpmPackFilePaths, runNpmPack } from "../src/workflow-release-gate.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 const ROOT = join(import.meta.dirname, "..");
 
@@ -306,7 +307,7 @@ test("release gate reports unresolved behavior and reference paths precisely", (
   );
 });
 
-test("release gate reports missing generated artifacts instead of crashing", () => {
+test("release gate reports missing generated artifacts instead of crashing", async () => {
   const tmpRoot = mkdtempSync(join(tmpdir(), "workflow-release-missing-"));
   try {
     const diagnostics = checkWorkflowRelease({ root: tmpRoot, publishableFiles: [] });
@@ -330,11 +331,11 @@ test("release gate reports missing generated artifacts instead of crashing", () 
       ),
     );
   } finally {
-    rmSync(tmpRoot, { recursive: true, force: true });
+    await rmForce(tmpRoot);
   }
 });
 
-test("release gate flags publishable skill resources and installed-skill version when the repository omits them", () => {
+test("release gate flags publishable skill resources and installed-skill version when the repository omits them", async () => {
   // Exercises three defensive existsSync guards that the missing-baseline/context
   // test does not cover: validatePackage's listed-but-absent skill .md loop,
   // skillVersion's absent SKILL.md path, and checkWorkflowCapabilityPublications'
@@ -375,7 +376,7 @@ test("release gate flags publishable skill resources and installed-skill version
       ),
     );
   } finally {
-    rmSync(tmpRoot, { recursive: true, force: true });
+    await rmForce(tmpRoot);
   }
 });
 

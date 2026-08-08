@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, normalize } from "node:path";
 import test from "node:test";
@@ -15,6 +15,7 @@ import type { WorkflowManager } from "../src/workflow-manager.js";
 import type { WorkflowStorage } from "../src/workflow-saved.js";
 import { createWorktree } from "../src/worktree.js";
 import { makeCommandRegistryPi } from "./helpers/mock-pi.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 
@@ -1085,7 +1086,7 @@ test("/workflows implement <id> refuses while humanApproved is false (no phase s
     );
     assert.equal(factoryCalls, 0, "no fan-out while the approval gate is closed");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1119,7 +1120,7 @@ test("/workflows implement <id> refuses in Phase 3 when the plan was never appro
     );
     assert.equal(factoryCalls, 0);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1162,7 +1163,7 @@ test("/workflows implement <id> fans approved plan steps out into isolated workt
     assert.match(h.printed[0], /✓ run-impl-0/);
     assert.match(h.printed[0], /✓ run-impl-1/);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1203,7 +1204,7 @@ test("/workflows implement <id> refuses fan-out when the worktree cannot be isol
     );
     assert.equal(factoryCalls, 0, "no fan-out without worktree isolation");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -1244,7 +1245,7 @@ test("/workflows clean refuses while a run is running or paused", async () => {
       "clean must refuse to reclaim a live run's worktrees",
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1258,7 +1259,7 @@ test("/workflows clean outside a git repository warns and sweeps nothing", async
       "a non-repo cwd must warn instead of sweeping",
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -1295,8 +1296,7 @@ test("/workflows clean prunes orphaned project worktrees + pi/wf branches, keeps
     } catch {
       // foreign worktree already gone — nothing to deregister
     }
-    rmSync(repo, { recursive: true, force: true });
-    rmSync(foreign, { recursive: true, force: true });
+    await rmForce(repo, foreign);
   }
 });
 
@@ -1331,7 +1331,7 @@ test("/workflows implement persists one atomic checkpoint per task via the real 
     assert.match(h.printed[0], /Implement run-ckpt-e2e: 2 task\(s\)/);
     assert.match(h.printed[0], /✗ run-ckpt-e2e-0/, "the honest failure is printed");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1423,7 +1423,7 @@ test("/workflows approve <id> approves a pending Phase 2 plan: file verdict + hu
 
     assert.ok(h.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-app")));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1453,7 +1453,7 @@ test("/workflows approve <id> errors when no plan file exists (unknown plan)", a
     assert.match(h.notified[0].message, /No plan found for run run-x/);
     assert.equal(existsSync(join(repo, ".pi", "workflows", "plans", "run-x.json")), false, "nothing is written");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1499,7 +1499,7 @@ test("/workflows approve <id> rolls back the verdict when the state-machine writ
     assert.equal(decided.status, "approved", "a retry approves the pending plan");
     assert.ok(h2.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-rb")));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1515,7 +1515,7 @@ test("/workflows approve <id> surfaces a wedge hint when the verdict rollback it
     const sabotagingMachine = {
       getState: async () => ({ activePhase: 2 }),
       setState: async () => {
-        rmSync(join(plansDir, "run-rbf.json"), { force: true });
+        await rmForce(join(plansDir, "run-rbf.json"));
         mkdirSync(join(plansDir, "run-rbf.json"));
         throw new Error("state write failed (simulated)");
       },
@@ -1538,7 +1538,7 @@ test("/workflows approve <id> surfaces a wedge hint when the verdict rollback it
       "the wedge hint names what is stuck (implement gate + re-approve verdict)",
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1577,7 +1577,7 @@ test("/workflows approve <id> refuses an already-decided plan (409 semantics) an
     assert.equal(after.activePhase, 2, "no phase transition for a re-approval");
     assert.equal(after.humanApproved, false);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1600,7 +1600,7 @@ test("/workflows approve <id> refuses outside Phase 2 (approvePlan's APPROVAL_RE
     };
     assert.equal(decided.status, undefined, "a phase-mismatched approve must not persist the verdict");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1627,7 +1627,7 @@ test("/workflows approve <id> refuses a LARGE plan (browser review required) and
     assert.equal(after.humanApproved, false, "no human verdict is recorded");
     assert.equal(after.plannotatorSubmitted, false, "no submission is recorded");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1650,7 +1650,7 @@ test("/workflows approve <id> refuses a bytes-large plan (small steps, big seria
     assert.equal(after.humanApproved, false);
     assert.equal(after.plannotatorSubmitted, false);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -1673,7 +1673,101 @@ test("/workflows approve <id> still approves an 8-step plan at the size limit (n
     assert.equal(state.plannotatorSubmitted, true);
     assert.ok(h.notified.some((n) => n.type === "info" && n.message.includes("Approved plan for run-eight")));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
+  }
+});
+
+test("/workflows approve <id> approves the run's pending CHECKPOINT plan (per-checkpoint addressing, D-02)", async () => {
+  const repo = initRepo("wf-cmd-approve-ckpt-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-ckpt", 2);
+    // A gated run's first checkpoint waits at its OWN file
+    // (`<runId>-c<callIndex>.json`); the run-level prewalk plan stays raw.
+    const plansDir = join(repo, ".pi", "workflows", "plans");
+    const runLevel = JSON.parse(readFileSync(join(plansDir, "run-ckpt.json"), "utf-8")) as Record<string, unknown>;
+    writeFileSync(
+      join(plansDir, "run-ckpt-c0.json"),
+      JSON.stringify({ ...runLevel, status: "pending", submittedAt: new Date().toISOString() }, null, 2),
+      "utf-8",
+    );
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-ckpt");
+
+    // The CHECKPOINT file carries the verdict; the run-level plan stays raw.
+    const c0 = JSON.parse(readFileSync(join(plansDir, "run-ckpt-c0.json"), "utf-8")) as {
+      status?: string;
+      executionSteps?: unknown[];
+    };
+    assert.equal(c0.status, "approved", "the pending checkpoint plan is decided");
+    assert.equal(c0.executionSteps?.length, 2, "the blueprint content survives the checkpoint verdict");
+    const runLevelAfter = JSON.parse(readFileSync(join(plansDir, "run-ckpt.json"), "utf-8")) as { status?: string };
+    assert.equal(runLevelAfter.status, undefined, "the run-level plan is NOT decided by a checkpoint approval");
+    assert.ok(
+      h.notified.some(
+        (n) => n.type === "info" && n.message.includes("Approved checkpoint plan run-ckpt-c0 for run run-ckpt"),
+      ),
+      "the notify documents the checkpoint addressing",
+    );
+    // The machine advanced exactly once (2 → 3).
+    const state = await phaseState.getState();
+    assert.equal(state.activePhase, 3);
+    assert.equal(state.humanApproved, true);
+    assert.equal(state.plannotatorSubmitted, true);
+  } finally {
+    await rmForce(repo);
+  }
+});
+
+test("/workflows approve <id> decides ONLY the run's current pending checkpoint — each checkpoint needs its own approve (machine opens once)", async () => {
+  const repo = initRepo("wf-cmd-approve-ckpt2-");
+  try {
+    const phaseState = await pendingPlanFixture(repo, "run-ckpt2", 2);
+    const plansDir = join(repo, ".pi", "workflows", "plans");
+    const runLevel = JSON.parse(readFileSync(join(plansDir, "run-ckpt2.json"), "utf-8")) as Record<string, unknown>;
+    // The run waits at its FIRST checkpoint (c0); c1 does not exist yet — a
+    // later checkpoint is only submitted after c0's verdict releases the wait.
+    writeFileSync(
+      join(plansDir, "run-ckpt2-c0.json"),
+      JSON.stringify({ ...runLevel, status: "pending", submittedAt: new Date().toISOString() }, null, 2),
+      "utf-8",
+    );
+    const h = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h.run("approve run-ckpt2");
+
+    const c0 = JSON.parse(readFileSync(join(plansDir, "run-ckpt2-c0.json"), "utf-8")) as { status?: string };
+    assert.equal(c0.status, "approved", "the FIRST checkpoint is decided by this approve");
+    assert.equal(
+      existsSync(join(plansDir, "run-ckpt2-c1.json")),
+      false,
+      "approving the first checkpoint never materializes or approves a later one",
+    );
+    const runLevelAfter = JSON.parse(readFileSync(join(plansDir, "run-ckpt2.json"), "utf-8")) as { status?: string };
+    assert.equal(runLevelAfter.status, undefined, "the run-level plan is not decided by checkpoint approvals");
+
+    // The run's wait releases; it reaches its SECOND checkpoint (c1 pending).
+    writeFileSync(
+      join(plansDir, "run-ckpt2-c1.json"),
+      JSON.stringify({ ...runLevel, status: "pending", submittedAt: new Date().toISOString() }, null, 2),
+      "utf-8",
+    );
+    const h2 = harness({ getRun: (id: string) => ({ runId: id, status: "running" }) }, { cwd: repo });
+    await h2.run("approve run-ckpt2");
+    const c1After = JSON.parse(readFileSync(join(plansDir, "run-ckpt2-c1.json"), "utf-8")) as { status?: string };
+    assert.equal(c1After.status, "approved", "a second approve decides the remaining checkpoint");
+    assert.equal(c0.status, "approved", "the first checkpoint's verdict survives the second approval untouched");
+    assert.ok(
+      h2.notified.some(
+        (n) => n.type === "info" && n.message.includes("Approved checkpoint plan run-ckpt2-c1 for run run-ckpt2"),
+      ),
+      "the second notify names the decided checkpoint",
+    );
+    // The machine opened exactly once (2 → 3); the second verdict was a
+    // plan-file release, not a second phase transition.
+    const state = await phaseState.getState();
+    assert.equal(state.activePhase, 3, "the machine stays at Phase 3 (opened once)");
+    assert.equal(state.humanApproved, true);
+  } finally {
+    await rmForce(repo);
   }
 });
 
@@ -1736,7 +1830,7 @@ test("E2E: default ungated run state → /workflows approve → /workflows imple
     assert.match(after.printed[0], /✓ run-e2e-0/);
     assert.match(after.printed[0], /✓ run-e2e-1/);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 

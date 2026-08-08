@@ -380,14 +380,17 @@ export {
 } from "./workflow-settings-fields.js";
 // Task 9 convenience exports: raw persistence reads + lock primitives. The
 // canonical live surfaces are the manager-backed `workflow_control` tool
-// (list/status) and guardWorktreeWriteConflicts(), which is already wired into
-// the host tool seams. getWorkflowStatus()/listRunningWorkflows() read persisted
-// state directly; the lock helpers are primitives — worktree agents claim locks
-// today only from tests/library callers (no live claimer yet).
-export type { FileLock, WorkflowStatus } from "./workflow-status.js";
+// (list/status) and guardWorktreeWriteConflicts(), which is wired into the
+// host tool seams and now LIVE: guarded writes claim the target file for the
+// edit duration (claimOnWrite, default true), so a conflicting concurrent edit
+// queues or blocks at runtime. getWorkflowStatus()/listRunningWorkflows() read
+// persisted state directly; the lock helpers are primitives — worktree runs
+// layer run-identity claims on top via createWorktreeWriteClaimer().
+export type { FileLock, WorkflowStatus, WorktreeWriteClaimer, WorktreeWriteClaimerOptions } from "./workflow-status.js";
 export {
   acquireFileLock,
   checkFileConflict,
+  createWorktreeWriteClaimer,
   getWorkflowStatus,
   listRunningWorkflows,
   releaseFileLock,

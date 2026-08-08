@@ -109,6 +109,28 @@ export function isPlanBig(plan: unknown, overrides?: Partial<ApprovalLimits>): b
   return planSizeMetrics(plan, overrides).big;
 }
 
+/**
+ * Checkpoint identity of a plan a run is asking a human to approve: the
+ * journaled call index of the checkpoint() that published it (the payload
+ * built at src/workflow.ts checkpoint()). Per-checkpoint small-path plans are
+ * addressed at `<runId>-c<callIndex>.json` (D-02), so one CLI verdict can
+ * never rubber-stamp a LATER checkpoint of the same run.
+ */
+export interface CheckpointIdentity {
+  /** The journaled call index of the checkpoint within its run. */
+  callIndex: number;
+}
+
+/**
+ * File base (no `.json`) of a plan file. Per-checkpoint plans are addressed
+ * at `<runId>-c<callIndex>`; the run-level prewalk ExecutionBlueprint stays at
+ * `<runId>` — the path the Phase 1 prewalk stage writes (src/phases/prewalk.ts)
+ * and `/workflows implement` fans out from.
+ */
+export function planFileBase(runId: string, checkpoint?: CheckpointIdentity): string {
+  return checkpoint === undefined ? runId : `${runId}-c${checkpoint.callIndex}`;
+}
+
 /** Result of {@link classifyRunPlan}: the effective plan + its size verdict. */
 export interface ClassifiedRunPlan {
   /** The plan that was measured (the run-plan file content, else the payload). */
@@ -131,17 +153,26 @@ export async function classifyRunPlan(options: {
   dir: string;
   runId: string;
   blueprint: unknown;
+  /** Checkpoint identity: the per-checkpoint file `<runId>-c<callIndex>.json` is consulted first. */
+  checkpoint?: CheckpointIdentity;
   overrides?: Partial<ApprovalLimits>;
 }): Promise<ClassifiedRunPlan> {
-  const { dir, runId, blueprint } = options;
+  const { dir, runId, blueprint, checkpoint } = options;
   let plan: unknown = blueprint;
   let source: "run-plan" | "blueprint" = "blueprint";
-  try {
-    plan = JSON.parse(await readFile(join(dir, `${runId}.json`), "utf-8")) as unknown;
-    source = "run-plan";
-  } catch {
-    // Missing or unreadable run plan (never a prewalk run, or mid-write):
-    // classify the payload itself.
+  // A per-checkpoint file (when the payload carries a checkpoint identity)
+  // wins; then the run-level prewalk ExecutionBlueprint; then the payload
+  // itself (never a prewalk run, or mid-write). Missing/unreadable files are
+  // treated as absent and the next candidate is consulted.
+  const candidates = checkpoint ? [planFileBase(runId, checkpoint), runId] : [runId];
+  for (const base of candidates) {
+    try {
+      plan = JSON.parse(await readFile(join(dir, `${base}.json`), "utf-8")) as unknown;
+      source = "run-plan";
+      break;
+    } catch {
+      // Missing or unreadable candidate; fall through to the next one.
+    }
   }
   const metrics = planSizeMetrics(plan, options.overrides);
   return { plan, source, steps: metrics.steps, bytes: metrics.bytes, big: metrics.big };
@@ -158,21 +189,29 @@ export interface EnsurePendingRunPlanResult {
 }
 
 /**
- * Make the runId-named plan file pollable by waitForStatus: the raw prewalk
- * ExecutionBlueprint has NO status field, and waitForStatus resolves on any
- * non-pending status — an unaugmented file would resolve false instantly
- * (plannotator.ts waitForStatus). So an existing undecided file is augmented
- * with `status: "pending"` + `submittedAt` (all blueprint fields preserved);
- * a missing file gets a payload-shaped pending plan; an already-decided file
- * (approved/rejected) is never clobbered. Atomic tmp+rename via the shared
- * writeJsonFileAtomic (fs-persistence.ts, audit WPA-01).
+ * Make the plan file pollable by waitForStatus: the raw prewalk ExecutionBlueprint
+ * has NO status field, and waitForStatus resolves on any non-pending status — an
+ * unaugmented file would resolve false instantly (plannotator.ts waitForStatus).
+ * So an existing undecided file is augmented with `status: "pending"` +
+ * `submittedAt` (all blueprint fields preserved); a missing file gets a
+ * payload-shaped pending plan; an already-decided file (approved/rejected) is
+ * never clobbered. Atomic tmp+rename via the shared writeJsonFileAtomic
+ * (fs-persistence.ts, audit WPA-01).
+ *
+ * Addressing (D-02): a checkpoint identity names the file
+ * `<runId>-c<callIndex>.json`, so each checkpoint of a run is approved
+ * independently; without one the file stays at the run-level `<runId>.json`
+ * (the prewalk plan the CLI `/workflows implement` fans out from). The returned
+ * `id` is the plan-file base the facade dispatches the wait at.
  */
 export async function ensurePendingRunPlan(
   dir: string,
   runId: string,
   blueprint: unknown,
+  checkpoint?: CheckpointIdentity,
 ): Promise<EnsurePendingRunPlanResult> {
-  const path = join(dir, `${runId}.json`);
+  const base = planFileBase(runId, checkpoint);
+  const path = join(dir, `${base}.json`);
   let existing: unknown = null;
   try {
     existing = JSON.parse(await readFile(path, "utf-8")) as unknown;
@@ -184,7 +223,7 @@ export async function ensurePendingRunPlan(
     if (status === "approved" || status === "rejected") {
       // A verdict already exists: never overwrite it. waitForApproval observes
       // the decision directly (approved → true, rejected → false).
-      return { id: runId, wrote: false, decided: true };
+      return { id: base, wrote: false, decided: true };
     }
   }
   const plan =
@@ -202,8 +241,8 @@ export async function ensurePendingRunPlan(
           submittedAt: new Date().toISOString(),
         };
   await mkdir(dir, { recursive: true });
-  await writePlanAtomic(dir, runId, plan);
-  return { id: runId, wrote: true, decided: false };
+  await writePlanAtomic(dir, base, plan);
+  return { id: base, wrote: true, decided: false };
 }
 
 /**
@@ -215,6 +254,6 @@ export async function ensurePendingRunPlan(
  * Windows-EPERM rename (a reader holding the destination open without
  * delete-sharing) is retried with the same bounded cadence everywhere.
  */
-async function writePlanAtomic(dir: string, runId: string, plan: unknown): Promise<void> {
-  await writeJsonFileAtomic(join(dir, `${runId}.json`), plan);
+async function writePlanAtomic(dir: string, base: string, plan: unknown): Promise<void> {
+  await writeJsonFileAtomic(join(dir, `${base}.json`), plan);
 }

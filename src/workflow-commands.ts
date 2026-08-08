@@ -3,7 +3,7 @@
  * Shares the extension's single WorkflowManager so background runs are reachable.
  */
 
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createWorktreeRunner, type WorktreeRunner, type WorktreeTask } from "./agent/worktree-runner.js";
@@ -182,9 +182,53 @@ async function loadRunPlan(dir: string, runId: string): Promise<ExecutionBluepri
   }
 }
 
-/** Canonical plans-dir path for a run's plan file (`.pi/workflows/plans/<runId>.json`). */
-function plansFilePath(dir: string, runId: string): string {
-  return join(dir, ".pi", "workflows", "plans", `${runId}.json`);
+/** Canonical plans-dir path for a plan file (`.pi/workflows/plans/<base>.json`). */
+function plansFilePath(dir: string, base: string): string {
+  return join(dir, ".pi", "workflows", "plans", `${base}.json`);
+}
+
+/**
+ * A run's pending per-checkpoint plan file (D-02): each checkpoint of a gated
+ * run is addressed at its own `.pi/workflows/plans/<runId>-c<callIndex>.json`
+ * so one CLI approve can never rubber-stamp a later checkpoint. checkpoint()
+ * waits sequentially, so at most one per-checkpoint file is pending at a time;
+ * when several exist (a decided earlier checkpoint + a pending later one) the
+ * highest-callIndex pending file is the one the run is currently gated on.
+ * Returns null when the run is not gated at a checkpoint.
+ */
+async function findPendingCheckpointPlan(
+  dir: string,
+  runId: string,
+): Promise<{ base: string; callIndex: number; plan: ExecutionBlueprint } | null> {
+  const plansDir = join(dir, ".pi", "workflows", "plans");
+  let names: string[];
+  try {
+    names = await readdir(plansDir);
+  } catch {
+    return null;
+  }
+  const escaped = runId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const checkpointRe = new RegExp(`^${escaped}-c(\\d+)\\.json$`);
+  const pending: Array<{ base: string; callIndex: number; plan: ExecutionBlueprint }> = [];
+  for (const name of names) {
+    const match = checkpointRe.exec(name);
+    if (!match) continue;
+    let plan: unknown;
+    try {
+      plan = JSON.parse(await readFile(join(plansDir, name), "utf-8"));
+    } catch {
+      continue; // mid-write / unreadable — not a decidable checkpoint yet
+    }
+    const status = (plan as { status?: unknown }).status;
+    if (status === "approved" || status === "rejected") continue;
+    pending.push({
+      base: name.slice(0, -".json".length),
+      callIndex: Number(match[1]),
+      plan: plan as ExecutionBlueprint,
+    });
+  }
+  if (pending.length === 0) return null;
+  return pending.sort((a, b) => b.callIndex - a.callIndex)[0] ?? null;
 }
 
 /**
@@ -195,14 +239,16 @@ function plansFilePath(dir: string, runId: string): string {
  * EPERM rename (a reader holding the destination open) is retried. A prewalk
  * blueprint carries no status field; deciding adds one alongside the untouched
  * blueprint content, so `/workflows implement` still fans out the SAME steps.
+ * `base` is the plan-file base (`<runId>-c<callIndex>` for a checkpoint plan,
+ * `<runId>` for the run-level plan).
  */
-async function decidePlanApproved(dir: string, runId: string, plan: ExecutionBlueprint): Promise<void> {
+async function decidePlanApproved(dir: string, base: string, plan: ExecutionBlueprint): Promise<void> {
   const decided: ExecutionBlueprint & { status: "approved"; reviewedAt: string } = {
     ...plan,
     status: "approved",
     reviewedAt: new Date().toISOString(),
   };
-  await writeJsonFileAtomic(plansFilePath(dir, runId), decided, { mkdir: true });
+  await writeJsonFileAtomic(plansFilePath(dir, base), decided, { mkdir: true });
 }
 
 function oneLineProgress(snapshot: WorkflowSnapshot): string {
@@ -621,15 +667,23 @@ export function registerWorkflowCommands(
           // mutation: the plan file must exist, must be undecided, and the
           // machine must sit at Phase 2 (the only phase where approvePlan is
           // valid — a phase mismatch is the 409 the bridge answers with).
-          const plan = await loadRunPlan(cwd, id);
-          if (!plan) {
+          // D-02 addressing: a run gated at a checkpoint waits on its pending
+          // per-checkpoint plan file (`<runId>-c<callIndex>.json`) — approve
+          // THAT file (releasing this checkpoint only, never rubber-stamping a
+          // later one); a run not gated at a checkpoint (default ungated
+          // pipeline) is approved at its run-level plan (`<runId>.json`, the
+          // file /workflows implement fans out from).
+          const checkpoint = await findPendingCheckpointPlan(cwd, id);
+          const target = checkpoint?.plan ?? (await loadRunPlan(cwd, id));
+          if (!target) {
             ctx.ui.notify(`No plan found for run ${id} — run a Phase 1 prewalk first.`, "error");
             return;
           }
+          const targetBase = checkpoint?.base ?? id;
           // A prewalk blueprint has no status field (still pending); a
           // bridge-submitted ReviewPlan carries one. Any decided status is
           // refused (409 semantics) — approval is a one-shot transition.
-          const planStatus = (plan as unknown as { status?: string }).status;
+          const planStatus = (target as unknown as { status?: string }).status;
           if (planStatus === "approved" || planStatus === "rejected") {
             ctx.ui.notify(`Plan for run ${id} is already ${planStatus} — nothing to approve.`, "warning");
             return;
@@ -638,9 +692,11 @@ export function registerWorkflowCommands(
           // reviewed in the plannotator browser UI — the CLI cannot substitute a
           // human verdict for it. Refuse BEFORE any write (no decidePlanApproved,
           // no state-machine mutation) so the plan stays pending and the bridge
-          // path stays authoritative; only small plans keep CLI approval.
-          const size = planSizeMetrics(plan);
-          if (isPlanBig(plan)) {
+          // path stays authoritative; only small plans keep CLI approval. The
+          // refusal is per-FILE: the plan under review is the target above
+          // (checkpoint file or run-level plan), never a different file.
+          const size = planSizeMetrics(target);
+          if (isPlanBig(target)) {
             ctx.ui.notify(
               `approve refused for ${id}: the plan is classified large (${size.steps} execution steps / ${size.bytes} bytes) — large plans require browser review through the workflow approval gate; nothing was written and the plan stays pending.`,
               "warning",
@@ -648,25 +704,39 @@ export function registerWorkflowCommands(
             return;
           }
           if (state.activePhase !== 2) {
-            ctx.ui.notify(
-              `approve refused for ${id}: plan approval is only valid in Phase 2 (current phase: ${state.activePhase}).`,
-              "warning",
-            );
-            return;
+            // D-02: a LATER checkpoint of an already-approved run is decided
+            // FILE-ONLY — the machine opened once (the first checkpoint's
+            // approval advanced it 2→3), and a remaining pending checkpoint
+            // only releases the run's wait, never re-runs approvePlan/transitionTo
+            // (the forward-only machine would refuse). The run-level plan path
+            // (no pending checkpoint) keeps the strict Phase-2-only ladder.
+            const openPhase3 = checkpoint !== null && state.activePhase >= 3 && state.humanApproved;
+            if (!openPhase3) {
+              ctx.ui.notify(
+                `approve refused for ${id}: plan approval is only valid in Phase 2 (current phase: ${state.activePhase}).`,
+                "warning",
+              );
+              return;
+            }
           }
           try {
             // Verdict first (the bridge's /approve order): the plan file flips
             // to approved before any state-machine write, so a concurrent poll
             // observes the decision exactly once.
-            await decidePlanApproved(cwd, id, plan);
+            await decidePlanApproved(cwd, targetBase, target);
             // The default ungated pipeline never produces plannotatorSubmitted
             // (only a checkpoint gate does, workflow.ts recordGateVerdict) — CLI
             // approval records the submission itself, then humanApproved, so
             // both Phase 3 prerequisites hold and the enforced transition opens
-            // the subagent gate for /workflows implement.
-            await phaseState.setState({ plannotatorSubmitted: true });
-            await phaseState.approvePlan();
-            await phaseState.transitionTo(3, { enforcePrerequisites: true });
+            // the subagent gate for /workflows implement. A checkpoint approval
+            // on an already-open machine (Phase 3 + humanApproved from the
+            // FIRST checkpoint) skips the ladder — the verdict is a plan-file
+            // release, not a second phase transition.
+            if (!(state.activePhase >= 3 && state.humanApproved)) {
+              await phaseState.setState({ plannotatorSubmitted: true });
+              await phaseState.approvePlan();
+              await phaseState.transitionTo(3, { enforcePrerequisites: true });
+            }
           } catch (error) {
             // The run itself may have won the race: its recordGateVerdict
             // (bridge/browser or in-run gate) already approved the plan and
@@ -690,7 +760,7 @@ export function registerWorkflowCommands(
             }
             let rolledBack = true;
             try {
-              await writeJsonFileAtomic(plansFilePath(cwd, id), plan, { mkdir: true });
+              await writeJsonFileAtomic(plansFilePath(cwd, targetBase), target, { mkdir: true });
             } catch {
               rolledBack = false;
             }
@@ -708,7 +778,9 @@ export function registerWorkflowCommands(
             return;
           }
           ctx.ui.notify(
-            `Approved plan for ${id} — Phase 3 open; subagent fan-out unlocked via /workflows implement ${id}`,
+            checkpoint
+              ? `Approved checkpoint plan ${targetBase} for run ${id} — Phase 3 open; subagent fan-out unlocked via /workflows implement ${id}`
+              : `Approved plan for ${id} — Phase 3 open; subagent fan-out unlocked via /workflows implement ${id}`,
             "info",
           );
           return;

@@ -57,6 +57,14 @@ export function safeSetInterval(callback: () => void, ms: number): SafeTimer {
 }
 
 /**
+ * Factory for the error a timed-out {@link withTimeout} rejects with. Callers
+ * that need a domain error (e.g. a WorkflowError with a specific code) inject
+ * one; the default produces the generic `Error` used by the web-tools fetch
+ * path.
+ */
+export type TimeoutErrorFactory = (ms: number, label: string) => Error;
+
+/**
  * Run `promise` with a timeout.
  *
  * `onTimeout` fires when the deadline hits, BEFORE the timeout rejection wins
@@ -65,12 +73,17 @@ export function safeSetInterval(callback: () => void, ms: number): SafeTimer {
  * background. The losing promise still settles later; the caller must swallow
  * its rejection. The deadline timer is unref'd: a pending timeout must never,
  * by itself, hold the process (or a test runner) open.
+ *
+ * `errorFactory` lets callers shape the rejection (workflow.ts injects a
+ * WorkflowError with code AGENT_TIMEOUT); the default keeps the generic
+ * `Error` every non-injecting caller — including web-tools.ts — sees today.
  */
 export async function withTimeout<T>(
   promise: Promise<T>,
   ms: number | null | undefined,
   label: string,
   onTimeout?: () => void,
+  errorFactory: TimeoutErrorFactory = (msValue, l) => new Error(`Timed out after ${msValue}ms: ${l}`),
 ): Promise<T> {
   if (ms === null || ms === undefined) return promise;
 
@@ -83,7 +96,7 @@ export async function withTimeout<T>(
       } catch {
         // Best-effort cleanup; never let it mask the timeout error.
       }
-      reject(new Error(`Timed out after ${ms}ms: ${label}`));
+      reject(errorFactory(ms, label));
     }, ms);
     deadline.unref();
   });

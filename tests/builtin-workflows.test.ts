@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import { parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
 import { createWorkflowTool } from "../src/workflow-tool.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ─── Deep Research ──────────────────────────────────────────────────────────────
 
@@ -322,7 +323,7 @@ test("code-review prepareArgs resolves diffSource:'git diff HEAD' into a non-emp
     const invocation = builtin.resolve(repo, prepared);
     assert.equal(parseWorkflowScript(invocation.script).meta.name, "code_review");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -334,7 +335,7 @@ test("code-review prepareArgs on a clean repo yields a descriptive empty-diff er
       /no diff output from: git diff HEAD/,
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -345,7 +346,7 @@ test("code-review prepareArgs bypasses the resolver entirely when args.diff is s
     const prepared = await prepareBuiltinWorkflowArgs("code-review", args, repo);
     assert.equal(prepared, args, "the exact same object must come back untouched (no fetch, no copy)");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -357,7 +358,7 @@ test("code-review prepareArgs rejects non-git/gh diffSource commands (no shell b
       /diffSource must start with "git" or "gh"/,
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -369,7 +370,7 @@ test("code-review prepareArgs rejects a non-string diffSource with a descriptive
       /args\.diffSource to be a string/,
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -383,7 +384,7 @@ test("code-review prepareArgs leaves a whitespace-only diffSource untouched (res
     assert.ok(builtin);
     assert.throws(() => builtin.resolve(repo, args), /requires args\.diff/);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -426,7 +427,7 @@ test("workflow tool name:'code-review' with diffSource fetches the diff before t
     assert.equal(started[0].args.diffTruncated, undefined);
     assert.equal(parseWorkflowScript(started[0].script).meta.name, "code_review");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -448,7 +449,7 @@ test("workflow tool name:'code-review' on a clean repo fails with the empty-diff
     );
     assert.equal(started.length, 0, "no run should start when the diff fetch fails");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -479,6 +480,6 @@ test("workflow tool: a saved 'code-review' workflow shadows the builtin and skip
     assert.deepEqual(started[0].args, { diffSource: "gh pr diff 999999" }, "raw args forwarded, never prepared");
     assert.ok(!updates.some((t) => t.includes("Fetching diff")), "the shadow must not trigger a diff fetch");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });

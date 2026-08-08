@@ -1861,8 +1861,35 @@ export function openWorkflowNavigator(
                   ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                   break;
                 }
+                // C-10: never restart a live session. A running run is still
+                // executing (a "restart" would silently double-spawn it under a
+                // new runId), and a paused run holds a pause checkpoint / usage
+                // limit — neither may be torn down by a restart. Refuse BEFORE
+                // any start so no silent teardown of live state is possible.
+                if (run.status === "running" || run.status === "paused") {
+                  ui.notify(
+                    `Cannot restart ${id}: run is ${run.status} — stop or wait for it to finish before restarting`,
+                    "warning",
+                  );
+                  break;
+                }
                 try {
-                  const { runId: newId } = manager.startInBackground(run.script, run.args);
+                  // C-10: forward the frozen start-time exec context (the exact
+                  // set resume() re-reads) so a restart runs with the SAME
+                  // toolset/budget/knobs the original run started with instead
+                  // of the manager's current defaults.
+                  const { runId: newId } = manager.startInBackground(run.script, run.args, {
+                    toolset: run.toolset,
+                    maxAgents: run.maxAgents,
+                    agentTimeoutMs: run.agentTimeoutMs,
+                    drainTimeoutMs: run.drainTimeoutMs,
+                    concurrency: run.concurrency,
+                    agentRetries: run.agentRetries,
+                    tokenBudget: run.tokenBudget,
+                    autoResume: run.autoResume,
+                    failOnExhaustedAgent: run.failOnExhaustedAgent,
+                    compactJournal: run.compactJournal,
+                  });
                   ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
                 } catch (error) {
                   ui.notify(

@@ -140,6 +140,10 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+// PORT-01: this file probes its OWN port (3125), never the shared 3123 the
+// task6-gate-*.test.ts files contend on — per-file ports de-contend the suite.
+const PORT_3125 = 3125;
+
 /** Set env for the duration of fn, restoring the prior values afterwards. */
 async function withEnv(env: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
   const prior = new Map<string, string | undefined>();
@@ -162,6 +166,8 @@ async function withEnv(env: Record<string, string | undefined>, fn: () => Promis
  * Mirror of the production size-routed facade (extensions/workflow.ts): real
  * classifyRunPlan/ensurePendingRunPlan/waitForStatus + real plan-dir writes.
  * The bridge slot stays undefined until a BIG (or runId-less) submitPlan.
+ * Per-checkpoint addressing mirrors D-02: each checkpoint of a run is written
+ * at `<runId>-c<callIndex>.json` and waits poll that exact file.
  */
 function createMirrorGate(
   dir: string,
@@ -174,6 +180,7 @@ function createMirrorGate(
 } {
   const plansDir = join(dir, ".pi", "workflows", "plans");
   const smallPlanIds = new Set<string>();
+  const checkpointPlanIds = new Map<string, string>();
   let bridge: ReturnType<typeof createPlannotatorBridge> | undefined;
   let lastSubmitResult: { id: string; reviewUrl?: string } | undefined;
   return {
@@ -182,14 +189,17 @@ function createMirrorGate(
     lastSubmitResult: () => lastSubmitResult,
     gate: {
       async submitPlan(blueprint) {
-        const payload = blueprint as { runId?: unknown } | null | undefined;
+        const payload = blueprint as { runId?: unknown; callIndex?: unknown } | null | undefined;
         const runId = typeof payload?.runId === "string" ? payload.runId : undefined;
+        const callIndex = typeof payload?.callIndex === "number" ? payload.callIndex : undefined;
+        const checkpoint = callIndex !== undefined ? { callIndex } : undefined;
         if (runId) {
-          const classified = await classifyRunPlan({ dir: plansDir, runId, blueprint });
+          const classified = await classifyRunPlan({ dir: plansDir, runId, blueprint, checkpoint });
           if (!classified.big) {
-            await ensurePendingRunPlan(plansDir, runId, classified.plan);
+            const ensured = await ensurePendingRunPlan(plansDir, runId, classified.plan, checkpoint);
             smallPlanIds.add(runId);
-            lastSubmitResult = { id: runId };
+            if (ensured.id !== runId) checkpointPlanIds.set(ensured.id, runId);
+            lastSubmitResult = { id: ensured.id };
             return lastSubmitResult;
           }
         }
@@ -201,7 +211,8 @@ function createMirrorGate(
         return lastSubmitResult;
       },
       waitForApproval(planId, timeoutMs, signal) {
-        if (smallPlanIds.has(planId)) {
+        const runId = checkpointPlanIds.get(planId) ?? planId;
+        if (smallPlanIds.has(runId)) {
           return waitForStatus(plansDir, planId, {
             timeoutMs: timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS,
             signal,
@@ -436,9 +447,11 @@ test("size-route e2e: a SMALL gated run never materializes the bridge and resolv
     await writeRunPlan(dir, "small-run", blueprint(2));
     const plansDir = join(dir, ".pi", "workflows", "plans");
     const mirror = createMirrorGate(dir);
-    // Probe BEFORE the run: if 3123 is already taken by the environment, skip
-    // the port assertion (the bridge slot check below is the real invariant).
-    const portFreeAtStart = !(await isPortOpen(3123));
+    // Probe BEFORE the run: if the file-local probe port is already taken by
+    // the environment, skip the port assertion (the bridge slot check below is
+    // the real invariant). PORT-01: this file probes 3125, its own port — never
+    // the shared 3123 the task6 files contend on.
+    const portFreeAtStart = !(await isPortOpen(PORT_3125));
 
     let settled = false;
     const run = runWorkflow<{ bodyRan: boolean }>(GATED_SCRIPT, {
@@ -451,12 +464,13 @@ test("size-route e2e: a SMALL gated run never materializes the bridge and resolv
       return result;
     });
 
-    // The run blocks at the checkpoint: the runId plan file is pending and no
-    // bridge (and therefore no HTTP server) exists.
+    // The run blocks at the checkpoint: the PER-CHECKPOINT plan file
+    // (`<runId>-c<callIndex>.json`) is pending and no bridge (and therefore no
+    // HTTP server) exists. The run-level prewalk file stays raw/undecided.
     const deadline = Date.now() + 5000;
     let pendingSeen = false;
     while (Date.now() < deadline) {
-      const raw = await readFile(join(plansDir, "small-run.json"), "utf-8").catch(() => null);
+      const raw = await readFile(join(plansDir, "small-run-c0.json"), "utf-8").catch(() => null);
       if (raw !== null && (JSON.parse(raw) as { status?: string }).status === "pending") {
         pendingSeen = true;
         break;
@@ -466,26 +480,27 @@ test("size-route e2e: a SMALL gated run never materializes the bridge and resolv
       // keeps the collision window negligible.
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    assert.equal(pendingSeen, true, "the runId plan file carries status pending while the run waits");
+    assert.equal(pendingSeen, true, "the per-checkpoint plan file carries status pending while the run waits");
+    const runLevel = JSON.parse(await readFile(join(plansDir, "small-run.json"), "utf-8")) as { status?: string };
+    assert.equal(runLevel.status, undefined, "the run-level prewalk plan stays raw — only the checkpoint is addressed");
     assert.equal(settled, false, "the run is still waiting for the human verdict");
     assert.equal(mirror.getBridge(), undefined, "a small plan NEVER materializes the review bridge");
-    assert.equal(mirror.lastSubmitResult()?.id, "small-run", "the facade returns the runId-named plan id");
+    assert.equal(mirror.lastSubmitResult()?.id, "small-run-c0", "the facade returns the per-checkpoint plan id");
     assert.equal(mirror.lastSubmitResult()?.reviewUrl, undefined, "no review URL on the small path");
     if (portFreeAtStart) {
       // The mirror provably holds no bridge (asserted above — the only object
       // that can bind the review port), so an open port right now is a sibling
-      // test process's bridge on the shared 3123 port, not ours. Require a
-      // stable-free sample so a transient sibling bind does not flake the
-      // assertion; the suite treats 3123 as best-effort by design (task6 skips
-      // its probe when the port is already in use).
-      assert.equal(await isPortStableFree(3123), true, "no review server is bound while a small plan waits");
+      // test process's bridge, not ours. Require a stable-free sample so a
+      // transient sibling bind does not flake the assertion; the suite treats
+      // port probes as best-effort by design.
+      assert.equal(await isPortStableFree(PORT_3125), true, "no review server is bound while a small plan waits");
     }
 
     // The CLI approve path (workflow-commands.ts decidePlanApproved) flips the
-    // runId-named file to approved; the poll observes it and the run proceeds.
-    const pending = JSON.parse(await readFile(join(plansDir, "small-run.json"), "utf-8"));
+    // per-checkpoint file to approved; the poll observes it and the run proceeds.
+    const pending = JSON.parse(await readFile(join(plansDir, "small-run-c0.json"), "utf-8"));
     await writeFile(
-      join(plansDir, "small-run.json"),
+      join(plansDir, "small-run-c0.json"),
       JSON.stringify({ ...pending, status: "approved", reviewedAt: new Date().toISOString() }, null, 2),
       "utf-8",
     );
@@ -632,4 +647,68 @@ test("size-route e2e: a big plan is reviewable over HTTP (GET /plan + POST /appr
 
 test("size-route: the exported DEFAULT_APPROVAL_TIMEOUT_MS matches the bridge approvalTimeout (300s)", () => {
   assert.equal(DEFAULT_APPROVAL_TIMEOUT_MS, 300_000);
+});
+
+// ─── (f) per-checkpoint verdicts: one CLI approve never rubber-stamps the next ─
+
+const TWO_CHECKPOINT_SCRIPT = `export const meta = { name: 'gated', description: 'Review the execution plan', gate: 'approve' }
+const approved = await checkpoint('Approve the plan body?', { kind: 'confirm' })
+return { approved }`;
+
+/** Wait until the plan file exists with a pending status. */
+async function waitForPending(dir: string, name: string): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const raw = await readFile(join(dir, name), "utf-8").catch(() => null);
+    if (raw !== null && (JSON.parse(raw) as { status?: string }).status === "pending") return;
+    // 50ms: a fast content poll on Windows can hold the file open across the
+    // writer's atomic rename (EPERM); the writer retries, and this cadence
+    // keeps the collision window negligible.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`plan file ${name} never reached pending`);
+}
+
+/** CLI-approve a plan file: flip it to approved, preserving all fields. */
+async function flipToApproved(dir: string, name: string): Promise<void> {
+  const plan = JSON.parse(await readFile(join(dir, name), "utf-8"));
+  await writeFile(
+    join(dir, name),
+    JSON.stringify({ ...plan, status: "approved", reviewedAt: new Date().toISOString() }, null, 2),
+    "utf-8",
+  );
+}
+
+test("size-route e2e: approving the FIRST checkpoint does NOT auto-approve the SECOND (per-checkpoint verdicts)", async () => {
+  await inTempDir(async () => {
+    const dir = process.cwd();
+    await writeRunPlan(dir, "two-ckpt", blueprint(2));
+    const plansDir = join(dir, ".pi", "workflows", "plans");
+    const mirror = createMirrorGate(dir);
+
+    const run = runWorkflow<{ approved: boolean }>(TWO_CHECKPOINT_SCRIPT, {
+      agent: noopAgent,
+      checkpointGate: mirror.gate,
+      persistLogs: false,
+      runId: "two-ckpt",
+    });
+
+    // Checkpoint 0 (meta.gate) waits at its OWN file; approve it CLI-style.
+    await waitForPending(plansDir, "two-ckpt-c0.json");
+    await flipToApproved(plansDir, "two-ckpt-c0.json");
+
+    // The run proceeds to the body checkpoint (callIndex 1): its file is
+    // pending, NOT approved — one CLI verdict must never rubber-stamp the next
+    // checkpoint (D-02).
+    await waitForPending(plansDir, "two-ckpt-c1.json");
+    const c1 = JSON.parse(await readFile(join(plansDir, "two-ckpt-c1.json"), "utf-8")) as { status?: string };
+    assert.equal(c1.status, "pending", "the second checkpoint waits for its OWN verdict");
+    const runLevel = JSON.parse(await readFile(join(plansDir, "two-ckpt.json"), "utf-8")) as { status?: string };
+    assert.equal(runLevel.status, undefined, "the run-level plan is never decided by checkpoint approvals");
+
+    // Approve the second checkpoint — only now does the run complete.
+    await flipToApproved(plansDir, "two-ckpt-c1.json");
+    const res = await run;
+    assert.equal(res.result.approved, true, "the body checkpoint approved its own verdict");
+  });
 });

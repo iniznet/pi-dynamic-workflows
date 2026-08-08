@@ -14,7 +14,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
@@ -22,6 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discardWorkflowRuntime, handoffWorkflowRuntime, takeWorkflowRuntime } from "../src/extension-reload.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ---------------------------------------------------------------------------
 // Default Pi tools that every Pi install provides (plugin-independent)
@@ -427,7 +428,7 @@ describe("workflow extension - control tool availability", () => {
         assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
       });
     } finally {
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(fakeHome);
     }
   });
 
@@ -483,7 +484,7 @@ describe("workflow extension - control tool availability", () => {
         );
       });
     } finally {
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(fakeHome);
     }
   });
 });

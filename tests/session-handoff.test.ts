@@ -11,7 +11,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,6 +20,7 @@ import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { type HandoffSwapInfo, WorkflowAgent } from "../src/agent.js";
 import { runWorkflow } from "../src/workflow.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /**
  * Build a WorkflowAgent with a faux provider offering BOTH a planner model and
@@ -115,7 +116,7 @@ test("first-edit swap gate: same session id spans the model swap", async () => {
       assert.equal(swaps[0].sessionId, sessionIds[1], "the swap reports the SAME session id (continuation)");
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -150,7 +151,7 @@ test("swap gate fires through an injected tool-call filter (mock)", async () => 
       assert.equal(swaps[0].toModel, "fauxhand/executor");
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -192,7 +193,7 @@ test("a workflow that never edits never swaps (gate stays closed, behavior uncha
       assert.equal(swaps[0].fromModel, "fauxhand/planner", "the session model never changed before the first edit");
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -249,7 +250,7 @@ test("two-phase handoff: phase 2 reuses the session and its input is cached, not
       );
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -287,7 +288,7 @@ test("planning guidance is handoff-only and pruned once the swap gate opens", as
       );
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -376,6 +377,6 @@ return { plan, done }`;
       assert.equal(sessionIds[0], sessionIds[1], "the phase-boundary chain must continue one session");
     });
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });

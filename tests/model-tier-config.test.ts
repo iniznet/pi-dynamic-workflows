@@ -14,10 +14,11 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { rmForce } from "./helpers/rm-force.js";
 
 async function loadModule() {
   return await import("../src/model-tier-config.js");
@@ -441,7 +442,7 @@ describe("model-tier-config", () => {
       saveModelTierConfig(config, cfgPath);
       const loaded = loadModelTierConfig(cfgPath);
       assert.deepEqual(loaded, config);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("refuses to save a degenerate config (all-empty tiers) instead of writing what the loader would reject (#330 audit follow-up)", async () => {
@@ -452,7 +453,7 @@ describe("model-tier-config", () => {
       assert.throws(() => saveModelTierConfig(degenerate, cfgPath), /degenerate/);
       assert.equal(existsSync(cfgPath), false, "no file should be written");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("refuses to save a config whose tiers is an empty object", async () => {
@@ -461,7 +462,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       assert.throws(() => saveModelTierConfig({ tiers: {} }, cfgPath));
       assert.equal(existsSync(cfgPath), false);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when file does not exist", async () => {
@@ -475,7 +476,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, "{invalid json", "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null for non-object JSON", async () => {
@@ -484,7 +485,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '"just a string"', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when tiers is not an object", async () => {
@@ -493,7 +494,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": "not-an-object"}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when a tier value is not a string", async () => {
@@ -502,7 +503,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": {"small": ["gpt-4.1-mini"]}}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null, "array values should be rejected");
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("accepts a config where a tier value is a valid string", async () => {
@@ -512,7 +513,7 @@ describe("model-tier-config", () => {
       writeFileSync(cfgPath, '{"tiers": {"small": "gpt-4.1-mini"}}', "utf-8");
       const result = loadModelTierConfig(cfgPath);
       assert.equal(result?.tiers.small, "gpt-4.1-mini");
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when tiers is an empty array (#330 audit)", async () => {
@@ -521,7 +522,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": []}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when tiers is a non-empty array (#330 audit)", async () => {
@@ -530,7 +531,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": ["openai/gpt-4.1-mini", "openai/gpt-5"]}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when tiers is an empty object (#330 audit)", async () => {
@@ -539,7 +540,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": {}}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("returns null when a tier value is an empty string (#330 audit)", async () => {
@@ -548,7 +549,7 @@ describe("model-tier-config", () => {
       const cfgPath = join(tmpDir, "model-tiers.json");
       writeFileSync(cfgPath, '{"tiers": {"small": ""}}', "utf-8");
       assert.equal(loadModelTierConfig(cfgPath), null);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("still loads a normal valid config (no regression)", async () => {
@@ -558,7 +559,7 @@ describe("model-tier-config", () => {
       writeFileSync(cfgPath, '{"tiers": {"small": "openai/gpt-4.1-mini"}}', "utf-8");
       const result = loadModelTierConfig(cfgPath);
       assert.deepEqual(result, { tiers: { small: "openai/gpt-4.1-mini" } });
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
   });
 
@@ -576,7 +577,7 @@ describe("model-tier-config", () => {
       assert.deepEqual(first, config);
       assert.deepEqual(second, config);
       assert.deepEqual(third, config);
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("re-reads when the file's mtime/size changes and serves the new value", async () => {
@@ -591,7 +592,7 @@ describe("model-tier-config", () => {
       // Changed content → mtime/size differ → the memo must refresh.
       writeFileSync(cfgPath, '{"tiers": {"small": "gpt-5", "big": "gpt-6"}}', "utf-8");
       assert.deepEqual(load(), { tiers: { small: "gpt-5", big: "gpt-6" } });
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
 
     it("mirrors loadModelTierConfig's null for a missing file, and observes a file that appears later", async () => {
@@ -603,7 +604,7 @@ describe("model-tier-config", () => {
       assert.equal(load(), null, "still no file → still null");
       writeFileSync(cfgPath, '{"tiers": {"small": "gpt-4.1-mini"}}', "utf-8");
       assert.deepEqual(load(), { tiers: { small: "gpt-4.1-mini" } }, "file appearing mid-run is observed");
-      rmSync(tmpDir, { recursive: true, force: true });
+      await rmForce(tmpDir);
     });
   });
 

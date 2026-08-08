@@ -654,16 +654,34 @@ export function createRunPersistence(
   // whose state is terminal, since that's the only time the terminal count
   // can grow. Running/paused runs are never candidates: they're filtered out
   // before the cap is even considered.
+  //
+  // core-10: the count is tracked incrementally so the full readdir+stat scan
+  // (computeList) is skipped while it is comfortably below the cap. undefined
+  // means unknown (first terminal write of this process, or a deletion
+  // invalidated it) and forces the authoritative scan; the scan also re-seeds
+  // the counter, so cross-process additions are absorbed whenever a scan does
+  // run (seed time, after a delete, or once the count nears the cap).
+  const RETENTION_NEAR_CAP_FRACTION = 0.9;
+  let terminalRunCount: number | undefined;
+
   const enforceRetention = () => {
-    const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
-      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
-    const excess = terminal.length - maxTerminalRunsOnDisk;
-    if (excess <= 0) return;
-    for (const run of terminal.slice(0, excess)) {
-      deleteRunFiles(run.runId);
+    // Skip computeList until the terminal count is unknown or within 10% of
+    // the cap — below that margin the scan cannot evict anything, so the only
+    // cost of skipping it is a bounded, locally-approximate count (this
+    // instance's own writes, re-synced on the next scan).
+    if (terminalRunCount === undefined || terminalRunCount >= maxTerminalRunsOnDisk * RETENTION_NEAR_CAP_FRACTION) {
+      const terminal = computeList()
+        .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+        .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+      terminalRunCount = terminal.length;
+      const excess = terminal.length - maxTerminalRunsOnDisk;
+      if (excess <= 0) return;
+      for (const run of terminal.slice(0, excess)) {
+        deleteRunFiles(run.runId);
+      }
+      terminalRunCount = Math.max(0, terminalRunCount - excess);
+      invalidateListCache();
     }
-    invalidateListCache();
   };
 
   const deleteRunFiles = (runId: string): boolean => {
@@ -767,18 +785,18 @@ export function createRunPersistence(
     return null;
   };
 
-  // Serialize once; scrub secrets only when the serialized form actually
-  // contains a secret pattern (the common path stays single-stringify). The
-  // hint-gate keeps the scanner-only patterns (JWT/KEY=value) out of the
-  // backtracking-prone union while still detecting them linearly: a multi-MB
-  // journal with long homogeneous runs is exactly where a naive union test
-  // would stall (ReDoS-class), so the precheck never scans a blob that cannot
-  // contain those patterns.
-  const serializeRedacted = (state: PersistedRunState): string => {
-    const json = JSON.stringify(state, null, 2);
-    if (!SECRET_DETECTION_RE.test(json) && !SCANNER_PATTERN_HINT_RE.test(json) && !json.includes(".")) return json;
-    return JSON.stringify(redactSecrets(JSON.parse(json) as PersistedRunState), null, 2);
-  };
+  // Serialize once, scrubbing secrets inline. JSON.stringify's replacer applies
+  // redactText to every string value in the SAME traversal the serializer
+  // already makes — a single pass, no parse/deep-walk/re-stringify round trip.
+  // The old '.' probe (a JWT hint) misfired on ordinary prose, forcing that
+  // round trip on every write whose state contained a period; the replacer
+  // needs no probe because the linear scanner (redactPathologicalRules) runs
+  // per string and is a no-op on prose. Key order, indentation, and non-string
+  // values are byte-identical to a plain stringify, and redaction is idempotent
+  // (redacting an already-redacted payload changes nothing) — the persisted
+  // form is stable across repeated saves of the same state.
+  const serializeRedacted = (state: PersistedRunState): string =>
+    JSON.stringify(state, (_key, value) => (typeof value === "string" ? redactText(value) : value), 2);
 
   // Both checkpoint lists survive a concurrent save: dedupe by taskId keeping
   // the newest timestamp, in first-seen order. An explicit empty array clears.
@@ -940,6 +958,17 @@ export function createRunPersistence(
         // folds. Terminal writes always transition and therefore always
         // invalidate; delete/rename invalidate via their own paths.
         if (current?.status !== next.status) invalidateListCache();
+        // core-10: count the terminal run incrementally — the status-change
+        // guard keeps re-saves of an already-terminal run (progress folds of a
+        // failed run, live-stats re-saves) from double counting. undefined
+        // stays undefined here so enforceRetention's seed scan still runs.
+        if (
+          current?.status !== next.status &&
+          TERMINAL_RUN_STATUSES.has(next.status) &&
+          terminalRunCount !== undefined
+        ) {
+          terminalRunCount++;
+        }
         if (TERMINAL_RUN_STATUSES.has(next.status)) enforceRetention();
         return next;
       }
@@ -973,6 +1002,14 @@ export function createRunPersistence(
     );
     // S1-5: same status-transition-only invalidation rule as the main path.
     if (finalCurrent?.status !== finalNext.status) invalidateListCache();
+    // core-10: same incremental count as the main path (see above).
+    if (
+      finalCurrent?.status !== finalNext.status &&
+      TERMINAL_RUN_STATUSES.has(finalNext.status) &&
+      terminalRunCount !== undefined
+    ) {
+      terminalRunCount++;
+    }
     if (TERMINAL_RUN_STATUSES.has(finalNext.status)) enforceRetention();
     return finalNext;
   };
@@ -1134,6 +1171,11 @@ export function createRunPersistence(
         // folded-journal map behind even if deleteRunFiles' shape changes.
         foldedByRun.delete(runId);
         invalidateListCache();
+        // core-10: a deleted run may have been terminal — the incremental
+        // counter can't know without a read, so invalidate it; the next
+        // terminal write re-seeds with an authoritative scan (catching
+        // external/manager deletions too).
+        terminalRunCount = undefined;
       }
     },
 
@@ -1513,22 +1555,6 @@ const REDACTION_RULES: ReadonlyArray<{ re: RegExp; replace: string }> = [
   { re: /\bAKIA[0-9A-Z]{16}/g, replace: "[REDACTED]" },
   { re: /\bxox[baprs]-[0-9A-Za-z-]{10,}/g, replace: "[REDACTED]" },
 ];
-
-// Non-global union used to decide whether a serialized state needs scrubbing
-// at all — the common (secret-free) persist path stays single-stringify. Only
-// the linear literal-prefixed rules live here; the scanner patterns are hinted
-// separately below (including them in the union would reintroduce the
-// backtracking that the scanner exists to avoid).
-const SECRET_DETECTION_RE = new RegExp(REDACTION_RULES.map((rule) => rule.re.source).join("|"));
-
-/**
- * Linear hint for the scanner-only patterns (JWT dot-tokens, KEY=value pairs):
- * presence of a keyword suffix OR of a `.`. Both are cheap linear checks; a
- * false positive only costs the (linear) scrub, and neither can false-negative
- * the scanner's own preconditions (a JWT always contains a `.`; a KEY=value
- * pair always contains a keyword suffix).
- */
-const SCANNER_PATTERN_HINT_RE = /\b(?:API_KEY|APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|BEARER)\b/;
 
 /** Mask provider API keys/secrets inside a single string. */
 export function redactText(text: string): string {

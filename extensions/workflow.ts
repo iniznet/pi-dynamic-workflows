@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
   createCodingTools,
@@ -18,6 +19,7 @@ import {
 } from "../src/extension-reload.js";
 import type { SessionManagerLike, SessionManagerProvider } from "../src/gateway/host-tool-gateway.js";
 import { buildMergedHostTools, SubagentHostToolsPolicy } from "../src/gateway/subagent-host-tools.js";
+import type { ToolExecutor } from "../src/gateway/types.js";
 import type { CheckpointGate, ProviderPool } from "../src/index.js";
 import {
   applyEnvSettingsOverride,
@@ -56,7 +58,7 @@ import {
 import { McpToolsManager } from "../src/subagent/mcp-tools.js";
 import { SubagentToolsAssembler } from "../src/subagent/subagent-tools-assembler.js";
 import { createVendoredChromeTools } from "../src/subagent/vendored-chrome-tools.js";
-import { guardWorktreeWriteConflicts } from "../src/workflow-status.js";
+import { guardWorktreeWriteConflicts, type WorktreeWriteGuardOptions } from "../src/workflow-status.js";
 
 /**
  * Lazy handle for the damage-control tool factory (design:
@@ -148,6 +150,106 @@ export function buildAgentStatusLines(
   return { lines, agents: details, idleAgents };
 }
 
+/** Fallback session identity for in-process coding tools run under the guard (host-tool-gateway's FALLBACK_SESSION_MANAGER analog). */
+const IN_PROCESS_FALLBACK_SESSION_MANAGER: SessionManagerLike = {
+  getSessionId: () => "workflow-coding-tools",
+  getSessionFile: () => undefined,
+};
+
+/** Options for {@link guardCodingToolDefinitions}: the worktree guard knobs plus an optional session-manager source for the wrapped executors (SDK 0.83.0's bash reads ctx.sessionManager). */
+export interface GuardCodingToolDefinitionsOptions extends WorktreeWriteGuardOptions {
+  /** Per-call session manager (object or provider); falls back to a stable shim. */
+  sessionManager?: SessionManagerLike | SessionManagerProvider;
+}
+
+/**
+ * B3 (CF-4 extension half): decide the AUTO-MODE tool winner and make subagent
+ * edits actually guarded. The merged default toolset resolves coding tools
+ * FIRST (SubagentHostToolsPolicy.defaultTools) and SubagentToolsAssembler
+ * dedupes first-wins by name — so the IN-PROCESS coding defs win over the
+ * proxied/guarded host defs, which is why the guard on the proxied bundle
+ * alone never covered auto-mode subagent edits. This wraps the in-process
+ * coding defs with the SAME guardWorktreeWriteConflicts (workflow-status.ts)
+ * the proxied bundle carries: an edit/write targeting a file claimed by an
+ * active worktree queues behind the holder (bounded) or blocks with the
+ * structured FILE_LOCKED_BY_WORKTREE error.
+ *
+ * The round-trip goes through the guard's executor shape (HostToolsBundle.tools)
+ * and back: non-write tools pass through untouched (executor reference
+ * unchanged), write tools (edit/write) get the guarded executor re-wrapped
+ * into a ToolDefinition.execute. The inner executors run with a minimal
+ * context mirroring hostToolsFromDefinitions (session manager resolved per
+ * call, model undefined), so guarded in-process calls match the proxied path.
+ */
+export function guardCodingToolDefinitions(
+  definitions: ToolDefinition[],
+  options: GuardCodingToolDefinitionsOptions = {},
+): ToolDefinition[] {
+  const resolveSessionManager = (): SessionManagerLike => {
+    const candidate = typeof options.sessionManager === "function" ? options.sessionManager() : options.sessionManager;
+    return candidate ?? IN_PROCESS_FALLBACK_SESSION_MANAGER;
+  };
+  const tools = new Map<string, ToolExecutor>();
+  for (const def of definitions) {
+    tools.set(def.name, async (args, signal) => {
+      const minimalCtx = {
+        model: undefined,
+        sessionManager: resolveSessionManager(),
+      } as unknown as ExtensionContext;
+      try {
+        const result = await def.execute(randomUUID(), (args ?? {}) as never, signal, undefined, minimalCtx);
+        const text = result.content
+          .filter((part) => part.type === "text")
+          .map((part) => (part as { type: "text"; text: string }).text)
+          .join("\n");
+        return { content: text, isError: false, details: result.details };
+      } catch (error) {
+        return {
+          content: `Host tool error: ${error instanceof Error ? error.message : "Unknown error"}`,
+          isError: true,
+          details: undefined,
+        };
+      }
+    });
+  }
+  const guarded = guardWorktreeWriteConflicts({ tools, toolDefs: [] }, options);
+  return definitions.map((def) => {
+    const executor = guarded.tools.get(def.name);
+    const original = tools.get(def.name);
+    if (!executor || executor === original) return def;
+    return {
+      ...def,
+      async execute(_toolCallId, params, signal, _timeout, _ctx) {
+        const result = await executor((params ?? {}) as Record<string, unknown>, signal);
+        // isError rides along exactly like the proxied host defs
+        // (createGatewayProxiedTools) so a blocked edit surfaces as a tool
+        // error to the subagent runtime, not a successful edit.
+        return {
+          content: [{ type: "text", text: result.content }],
+          details: result.details,
+          isError: result.isError,
+        };
+      },
+    };
+  });
+}
+
+/**
+ * Resolve the plannotator review port for the extension's bridge. Env-overridable
+ * (PI_WORKFLOW_PLANNOTATOR_PORT, validated 1..65535) so tests and containers can
+ * relocate the review server off the shared 3123 default — the same pattern as
+ * the chrome bridge's PI_CHROME_BRIDGE_PORT (audit D-06 hardening). Invalid/missing
+ * values fall back to the plannotator default (3123).
+ */
+function plannotatorPort(): number {
+  const raw = process.env.PI_WORKFLOW_PLANNOTATOR_PORT;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+  }
+  return 3123;
+}
+
 export default function extension(pi: ExtensionAPI) {
   // Single manager shared by the workflow tool and /workflows command. Pi loads
   // a fresh extension factory for /reload, so explicitly claim the old live
@@ -215,7 +317,7 @@ export default function extension(pi: ExtensionAPI) {
           excludeSubagentTools: settings.excludeSubagentTools,
         }),
       ),
-    buildCodingTools: () => createCodingTools(cwd),
+    buildCodingTools: () => guardCodingToolDefinitions(createCodingTools(cwd), { sessionManager: hostSessionManager }),
   });
   // SUBAGENT MCP WIRE: the extension-owned MCP client reads the user's
   // ~/.pi/agent/mcp.json (the same file the pi host consumes) and exposes every
@@ -359,32 +461,68 @@ export default function extension(pi: ExtensionAPI) {
   // G3 wire: lazy plannotator review gate (Phase 2), SIZE-ROUTED
   // (tasks/approval-size-routing/design.md). A SMALL plan (execution steps
   // within the limit AND compact bytes within the limit) never materializes
-  // the bridge — its plan is addressed at the runId-named path the CLI approve
-  // verb reads (.pi/workflows/plans/<runId>.json, workflow-commands.ts
-  // loadRunPlan), and waitForApproval polls that file for the human verdict
-  // (CLI approve flips status via decidePlanApproved). A BIG plan forces the
-  // bridge: it materializes on the first big submitPlan (the existing lazy
-  // semantics), auto-opens the vendored review page, and the CLI /workflows
-  // approve REFUSES big plans. An ungated OR small run starts no server —
-  // port 3123 is never bound.
+  // the bridge — each checkpoint's plan is addressed at its OWN per-checkpoint
+  // path the CLI approve verb reads (.pi/workflows/plans/<runId>-c<callIndex>.json,
+  // D-02: one CLI verdict never rubber-stamps a later checkpoint), and
+  // waitForApproval polls that file for the human verdict (CLI approve flips
+  // status via decidePlanApproved). A BIG plan forces the bridge: it
+  // materializes on the first big submitPlan (the existing lazy semantics),
+  // auto-opens the vendored review page, and the CLI /workflows approve REFUSES
+  // big plans. An ungated OR small run starts no server — port 3123 is never
+  // bound (unless PI_WORKFLOW_PLANNOTATOR_PORT relocates it).
   const plansDir = join(cwd, ".pi", "workflows", "plans");
   // RunIds routed to the small path this generation (per-generation memory:
   // the plan files are the durable address; this set only dispatches waits).
+  // B9: FIFO-capped at SMALL_PLAN_IDS_MAX, and a runId whose verdict is still
+  // pending (waitingRunCounts > 0) is NEVER pruned.
+  const SMALL_PLAN_IDS_MAX = 1024;
   const smallPlanIds = new Set<string>();
+  // Per-checkpoint small-path plan ids (`<runId>-c<callIndex>`) → owning runId.
+  // D-02: each checkpoint of a run is addressed at its OWN file, so the wait
+  // dispatch stays runId-keyed while the poll targets the specific checkpoint.
+  const checkpointPlanIds = new Map<string, string>();
+  // runId → number of un-settled submit→wait cycles (B9 "never prunes a
+  // still-waiting runId": the submit→wait gap is covered by the counter).
+  const waitingRunCounts = new Map<string, number>();
+  const rememberSmallRun = (runId: string) => {
+    // Re-adding moves the runId to the newest end of the FIFO order.
+    smallPlanIds.delete(runId);
+    smallPlanIds.add(runId);
+    // FIFO cap: evict the OLDEST entries that are NOT still awaiting a verdict.
+    let excess = smallPlanIds.size - SMALL_PLAN_IDS_MAX;
+    for (const candidate of smallPlanIds) {
+      if (excess <= 0) break;
+      if ((waitingRunCounts.get(candidate) ?? 0) > 0) continue;
+      smallPlanIds.delete(candidate);
+      for (const [planId, owner] of checkpointPlanIds) {
+        if (owner === candidate) checkpointPlanIds.delete(planId);
+      }
+      excess--;
+    }
+  };
   let plannotatorBridge: ReturnType<typeof createPlannotatorBridge> | undefined;
   const checkpointGate: CheckpointGate = {
     async submitPlan(blueprint) {
-      const payload = blueprint as { runId?: unknown } | null | undefined;
+      const payload = blueprint as { runId?: unknown; callIndex?: unknown } | null | undefined;
       const runId = typeof payload?.runId === "string" ? payload.runId : undefined;
+      const callIndex = typeof payload?.callIndex === "number" ? payload.callIndex : undefined;
+      const checkpoint = callIndex !== undefined ? { callIndex } : undefined;
       if (runId) {
         // The prewalk ExecutionBlueprint (when present) wins over the payload
         // — that is the plan a human reviews, and the file the CLI approve
-        // reads. Small → CLI-addressable, no bridge, no HTTP server.
-        const classified = await classifyRunPlan({ dir: plansDir, runId, blueprint });
+        // reads. A per-checkpoint file (a prior submission of the SAME
+        // checkpoint) wins over the run-level blueprint (D-02: each checkpoint
+        // is addressed at `<runId>-c<callIndex>.json`). Small →
+        // CLI-addressable, no bridge, no HTTP server.
+        const classified = await classifyRunPlan({ dir: plansDir, runId, blueprint, checkpoint });
         if (!classified.big) {
-          await ensurePendingRunPlan(plansDir, runId, classified.plan);
-          smallPlanIds.add(runId);
-          return { id: runId };
+          const ensured = await ensurePendingRunPlan(plansDir, runId, classified.plan, checkpoint);
+          // The runId is remembered as small-routed; the checkpoint plan id
+          // (when the payload carried a callIndex) maps back to it for the
+          // runId-keyed wait dispatch.
+          rememberSmallRun(runId);
+          if (ensured.id !== runId) checkpointPlanIds.set(ensured.id, runId);
+          return { id: ensured.id };
         }
       }
       // BIG (or runId-less — a direct-SDK submitPlan has no CLI-addressable
@@ -392,18 +530,30 @@ export default function extension(pi: ExtensionAPI) {
       // Materializing here keeps the existing first-submitPlan lazy semantics;
       // autoOpenBrowser pops the review page, and a browser that cannot open
       // attaches the manual review URL (plan.note) to the result.
-      plannotatorBridge ??= createPlannotatorBridge({ autoOpenBrowser: true });
+      plannotatorBridge ??= createPlannotatorBridge({ autoOpenBrowser: true, port: plannotatorPort() });
       const plan = await plannotatorBridge.submitPlan(blueprint);
       return { id: plan.id, ...(plan.note !== undefined ? { reviewUrl: plan.note } : {}) };
     },
     waitForApproval(planId, timeoutMs, signal) {
-      if (smallPlanIds.has(planId)) {
-        // Small path: no bridge exists — poll the runId-named plan file for
-        // the CLI-approve verdict, honoring the run's timeout + abort.
-        return waitForStatus(plansDir, planId, {
+      const runId = checkpointPlanIds.get(planId) ?? planId;
+      if (smallPlanIds.has(runId)) {
+        // Small path: no bridge exists — poll the SPECIFIC plan file (the
+        // per-checkpoint `<runId>-c<callIndex>.json`, or the run-level file
+        // for a runId-addressed plan) for the CLI-approve verdict, honoring
+        // the run's timeout + abort. Track the un-settled cycle so the FIFO
+        // cap can never prune this run's dispatch while it waits (B9).
+        const wait = waitForStatus(plansDir, planId, {
           timeoutMs: timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS,
           signal,
         });
+        waitingRunCounts.set(runId, (waitingRunCounts.get(runId) ?? 0) + 1);
+        const settle = () => {
+          const remaining = (waitingRunCounts.get(runId) ?? 1) - 1;
+          if (remaining <= 0) waitingRunCounts.delete(runId);
+          else waitingRunCounts.set(runId, remaining);
+        };
+        void wait.then(settle, settle);
+        return wait;
       }
       if (!plannotatorBridge) {
         return Promise.reject(new Error("plannotator gate is not materialized (submitPlan must run first)"));

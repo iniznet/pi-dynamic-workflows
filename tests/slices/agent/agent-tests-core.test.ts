@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -19,6 +19,7 @@ import { WorkflowError, WorkflowErrorCode } from "../../../src/errors.js";
 import { resolveModelSpecWithThinking } from "../../../src/model-spec.js";
 import type { ModelTierConfig, RankableModel } from "../../../src/model-tier-config.js";
 import { withFakeHome, withFakeHomeAsync } from "../../helpers/fake-home.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
 type WorkflowAgentPrivates = {
@@ -44,7 +45,7 @@ test("WorkflowAgent with persistAgentSessions=false explicitly stays in-memory",
   assert.equal(manager.isPersisted(), false);
 });
 
-test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", () => {
+test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-"));
   const projectCwd = join(dir, "project");
   const fakeHome = join(dir, "home");
@@ -60,11 +61,11 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
       assert.equal(manager.getCwd(), projectCwd);
     });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
-test("WorkflowAgent degrades to in-memory when the session directory can't be created", () => {
+test("WorkflowAgent degrades to in-memory when the session directory can't be created", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-fail-"));
   const projectCwd = join(dir, "project");
   const fakeHome = join(dir, "home");
@@ -93,7 +94,7 @@ test("WorkflowAgent degrades to in-memory when the session directory can't be cr
       }
     });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
@@ -371,8 +372,7 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
       );
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -422,8 +422,7 @@ test("WorkflowAgent.run(): a tier configured to inherit:main resolves to the ses
       assert.ok(text.includes("inherited-main-answer"), "run should complete via the inherited session model");
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -457,8 +456,7 @@ test("WorkflowAgent.run(): a genuinely unknown model spec behind another tier st
       });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -543,8 +541,7 @@ test("WorkflowAgent.run() still resolves a known model spec normally (no regress
       assert.ok(text.includes("pinned-model-answer"));
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -587,8 +584,7 @@ test("WorkflowAgent.run() throws MODEL_NOT_FOUND naming the tier when an EXPLICI
       });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -647,8 +643,7 @@ test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degr
       );
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 
@@ -689,8 +684,7 @@ test("WorkflowAgent.run() still completes with a normal object schema (no regres
       assert.deepEqual(result, { verdict: "ok" });
     });
   } finally {
-    rmSync(home, { recursive: true, force: true });
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(home, cwd);
   }
 });
 

@@ -23,7 +23,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync as realReadFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,6 +31,7 @@ import test from "node:test";
 import { createRunPersistence, type PersistedRunState } from "../src/run-persistence.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -40,8 +40,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }
@@ -93,6 +92,71 @@ test(
       rp.renewRunLease?.({ runId: "torn-lock", token: "any" }),
       false,
       "a corrupt lock cannot be renewed (owner token unverifiable)",
+    );
+  }),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// core-10 (slice runtime-opt) — incremental terminal-run counter + retention
+//
+// enforceRetention used to run a full readdir+stat scan (computeList) on
+// EVERY terminal write. It now maintains an incremental terminal count and
+// skips the scan while comfortably below the cap. These tests pin that the
+// cap is still enforced exactly (oldest terminal evicted first, running/paused
+// never candidates) and that re-saving an already-terminal run does not
+// double-count into eviction.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test(
+  "core-10: retention still enforces the terminal cap with the incremental counter (oldest first, running/paused survive)",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
+
+    // Running/paused saved FIRST with the OLDEST timestamps — the worst case:
+    // if the status filter were lost, they would be the first eviction
+    // candidates. They must survive purely because they are non-terminal.
+    rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
+    rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+
+    // Five terminal runs (saved after, so newer) exceed the cap of 3.
+    for (let i = 0; i < 5; i++) {
+      rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
+    }
+
+    const runIds = rp.list().map((r) => r.runId);
+    const terminalKept = runIds.filter((id) => id.startsWith("terminal-"));
+    assert.equal(terminalKept.length, 3, "only maxTerminalRunsOnDisk terminal runs are kept");
+    assert.deepEqual(
+      new Set(terminalKept),
+      new Set(["terminal-2", "terminal-3", "terminal-4"]),
+      "the oldest terminal runs are evicted first among themselves, newest are kept",
+    );
+    assert.ok(runIds.includes("still-running"), "a running run survives with the OLDEST updatedAt");
+    assert.ok(runIds.includes("still-paused"), "a paused run survives with the OLDEST updatedAt");
+    assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
+  }),
+);
+
+test(
+  "core-10: re-saving an already-terminal run does not double-count into retention eviction",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
+    for (let i = 0; i < 5; i++) {
+      rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
+    }
+    const afterFirstBatch = rp.list().filter((r) => r.runId.startsWith("terminal-"));
+    assert.equal(afterFirstBatch.length, 3, "cap enforced after the first batch");
+
+    // Re-save an already-terminal run (same status — e.g. a live-stats or
+    // fold re-write). The status-transition guard must not bump the counter:
+    // the cap stays exactly as enforced.
+    rp.save(baseRunState("terminal-4", "2024-01-05T00:00:00.000Z", "completed"));
+    const afterResave = rp.list().filter((r) => r.runId.startsWith("terminal-"));
+    assert.equal(afterResave.length, 3, "re-saving a terminal run must not evict anything extra");
+    assert.deepEqual(
+      new Set(afterResave.map((r) => r.runId)),
+      new Set(["terminal-2", "terminal-3", "terminal-4"]),
+      "the same terminal set survives a same-status re-save",
     );
   }),
 );

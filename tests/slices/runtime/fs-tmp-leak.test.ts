@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,8 +8,9 @@ import {
   resolvePersistenceFs,
   writeJsonAtomicWithBackup,
 } from "../../../src/fs-persistence.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
-test("L9: a forced rename failure unlinks the orphaned .tmp and rethrows", () => {
+test("L9: a forced rename failure unlinks the orphaned .tmp and rethrows", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dw-l9-"));
   const fs = resolvePersistenceFs({
     renameSync: () => {
@@ -21,11 +22,11 @@ test("L9: a forced rename failure unlinks the orphaned .tmp and rethrows", () =>
     assert.throws(() => writeJsonAtomicWithBackup(fs, path, { a: 1 }), /rename failure/);
     assert.equal(existsSync(`${path}.tmp`), false, "no orphaned .tmp after a failed rename (L9)");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
-test("L9: the .bak sidecar is written atomically (tmp + rename, no half-written sidecar)", () => {
+test("L9: the .bak sidecar is written atomically (tmp + rename, no half-written sidecar)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dw-l9b-"));
   try {
     const path = join(dir, "state.json");
@@ -34,11 +35,11 @@ test("L9: the .bak sidecar is written atomically (tmp + rename, no half-written 
     assert.equal(existsSync(`${path}.tmp`), false, "no leftover primary .tmp");
     assert.equal(existsSync(`${path}.bak.tmp`), false, "no leftover .bak .tmp");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });
 
-test("L9: a primary rename failure leaves a previous good primary untouched", () => {
+test("L9: a primary rename failure leaves a previous good primary untouched", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-dw-l9c-"));
   try {
     const path = join(dir, "state.json");
@@ -53,6 +54,6 @@ test("L9: a primary rename failure leaves a previous good primary untouched", ()
     assert.throws(() => writeJsonAtomicWithBackup(broken, path, { version: "new" }));
     assert.deepEqual(readJsonWithBackupRecovery(good, path), { version: "good" }, "primary untouched");
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 });

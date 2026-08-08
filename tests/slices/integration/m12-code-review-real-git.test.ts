@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { registerBuiltinWorkflows } from "../../../src/builtin-commands.js";
 import { parseWorkflowScript } from "../../../src/workflow.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "../../helpers/mock-pi.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 /** A temp git repo with one committed change to `file.txt`. */
 function initRepoWithChange(): string {
@@ -69,6 +70,6 @@ test("M12: /code-review fetches the diff with real git and starts the review (su
     const { meta } = parseWorkflowScript(started[0].script);
     assert.equal(meta.name, "code_review");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });

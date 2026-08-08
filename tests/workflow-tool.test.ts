@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
   type WorkflowToolInput,
 } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
 function fakeRegistry(models: Array<{ provider: string; id: string }>) {
@@ -445,8 +446,7 @@ function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }

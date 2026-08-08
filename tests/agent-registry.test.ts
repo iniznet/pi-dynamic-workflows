@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -16,6 +16,7 @@ import {
   resolveAgentType,
 } from "../src/agent-registry.js";
 import { runWorkflow } from "../src/workflow.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ── parseAgentDefinition ───────────────────────────────────────────────────
 
@@ -85,7 +86,7 @@ describe("loadAgentRegistry", () => {
     writeFileSync(join(dir, file), content, "utf-8");
   }
 
-  it("loads project + user defs; project wins on a name collision", () => {
+  it("loads project + user defs; project wins on a name collision", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-"));
     const projectDir = join(root, "project");
     const userDir = join(root, "user");
@@ -98,10 +99,10 @@ describe("loadAgentRegistry", () => {
     assert.equal(reg.get("reviewer")?.model, "project/model", "project def wins");
     assert.equal(reg.get("reviewer")?.source, "project");
     assert.equal(reg.get("researcher")?.source, "user");
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 
-  it("returns an empty registry when no dirs exist", () => {
+  it("returns an empty registry when no dirs exist", async () => {
     const reg = loadAgentRegistry("/nonexistent", {
       projectDir: "/nonexistent/a",
       userDir: "/nonexistent/b",
@@ -110,7 +111,7 @@ describe("loadAgentRegistry", () => {
     assert.equal(reg.size, 0);
   });
 
-  it("skips non-.md files and survives an unreadable file", () => {
+  it("skips non-.md files and survives an unreadable file", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-"));
     const projectDir = join(root, "p");
     writeDef(projectDir, "ok.md", "---\nname: ok\n---\nbody");
@@ -121,10 +122,10 @@ describe("loadAgentRegistry", () => {
       legacyUserDir: join(root, "legacy-none"),
     });
     assert.deepEqual([...reg.keys()], ["ok"]);
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 
-  it("comma-separated tools/disallowedTools string form parses like the YAML list form", () => {
+  it("comma-separated tools/disallowedTools string form parses like the YAML list form", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-"));
     const projectDir = join(root, "p");
     writeDef(
@@ -141,10 +142,10 @@ describe("loadAgentRegistry", () => {
     });
     assert.deepEqual(reg.get("scout")?.tools, ["read", "grep", "find"]);
     assert.deepEqual(reg.get("scout")?.disallowedTools, ["write", "bash"]);
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 
-  it("default userDir resolution uses getAgentDir() (~/.pi/agent/agents) with no injected opts", () => {
+  it("default userDir resolution uses getAgentDir() (~/.pi/agent/agents) with no injected opts", async () => {
     const tmpHome = mkdtempSync(join(tmpdir(), "pi-home-"));
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
@@ -161,7 +162,7 @@ describe("loadAgentRegistry", () => {
       const reg = loadAgentRegistry(cwd);
       assert.equal(reg.get("scout")?.source, "user");
       assert.equal(reg.get("scout")?.prompt, "User-level scout.");
-      rmSync(cwd, { recursive: true, force: true });
+      await rmForce(cwd);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
@@ -169,7 +170,7 @@ describe("loadAgentRegistry", () => {
       else process.env.USERPROFILE = originalUserProfile;
       if (originalAgentDirEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = originalAgentDirEnv;
-      rmSync(tmpHome, { recursive: true, force: true });
+      await rmForce(tmpHome);
     }
   });
 });
@@ -196,7 +197,7 @@ describe("loadAgentRegistry legacy ~/.pi/agents fallback", () => {
     }
   }
 
-  it("resolves a definition that exists only in the legacy location and warns once", () => {
+  it("resolves a definition that exists only in the legacy location and warns once", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-legacy-"));
     const legacyUserDir = join(root, "legacy-user");
     writeDef(legacyUserDir, "scout.md", "---\nname: scout\ntools: read, grep\n---\nLegacy scout.");
@@ -217,10 +218,10 @@ describe("loadAgentRegistry legacy ~/.pi/agents fallback", () => {
     assert.equal(warnings.length, 1, "exactly one deprecation warning, not one per legacy file");
     assert.match(warnings[0], /deprecated/i);
     assert.match(warnings[0], new RegExp(legacyUserDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 
-  it("a new-location definition shadows a same-named legacy definition and suppresses its warning", () => {
+  it("a new-location definition shadows a same-named legacy definition and suppresses its warning", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-legacy-"));
     const userDir = join(root, "user");
     const legacyUserDir = join(root, "legacy-user");
@@ -239,10 +240,10 @@ describe("loadAgentRegistry legacy ~/.pi/agents fallback", () => {
     assert.equal(reg.get("scout")?.model, "new/model", "new location wins over legacy");
     assert.equal(reg.get("scout")?.prompt, "New scout.");
     assert.equal(warnings.length, 0, "no deprecation warning when the legacy file is fully shadowed");
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 
-  it("mixes new and legacy-only names: new wins on collision, legacy fills the rest, one warning", () => {
+  it("mixes new and legacy-only names: new wins on collision, legacy fills the rest, one warning", async () => {
     const root = mkdtempSync(join(tmpdir(), "agents-legacy-"));
     const userDir = join(root, "user");
     const legacyUserDir = join(root, "legacy-user");
@@ -262,7 +263,7 @@ describe("loadAgentRegistry legacy ~/.pi/agents fallback", () => {
     assert.equal(reg.get("scout")?.model, "new/model");
     assert.equal(reg.get("researcher")?.source, "user");
     assert.equal(warnings.length, 1, "warns once for the researcher-only legacy resolution");
-    rmSync(root, { recursive: true, force: true });
+    await rmForce(root);
   });
 });
 
@@ -451,7 +452,7 @@ return {}`;
       assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
       assert.ok(seen[0].instructions?.includes("Requested isolation: worktree"));
     } finally {
-      rmSync(repo, { recursive: true, force: true });
+      await rmForce(repo);
     }
   });
 

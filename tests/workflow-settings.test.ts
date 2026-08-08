@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, normalize } from "node:path";
 import { describe, it } from "node:test";
@@ -13,13 +13,14 @@ import {
   saveWorkflowSettingsForCwd,
 } from "../src/workflow-settings.js";
 import { withFakeHome } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
-function withSettingsPath(fn: (settingsPath: string) => void): void {
+async function withSettingsPath(fn: (settingsPath: string) => void): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-settings-"));
   try {
     fn(join(dir, "nested", "settings.json"));
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 }
 
@@ -28,14 +29,14 @@ describe("workflow settings", () => {
     assert.ok(getWorkflowSettingsPath().endsWith(normalize(WORKFLOW_SETTINGS_FILE)));
   });
 
-  it("returns empty settings when the file is missing", () => {
-    withSettingsPath((settingsPath) => {
+  it("returns empty settings when the file is missing", async () => {
+    await withSettingsPath((settingsPath) => {
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
     });
   });
 
-  it("saves and loads keyword trigger preferences", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads keyword trigger preferences", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ keywordTriggerEnabled: false, keywordTriggerWord: "pi-workflow" }, settingsPath);
 
       assert.ok(existsSync(settingsPath), "settings file should be created");
@@ -46,8 +47,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("normalizes keyword trigger word settings", () => {
-    withSettingsPath((settingsPath) => {
+  it("normalizes keyword trigger word settings", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord: "  pi-workflow  " }), "utf-8");
@@ -68,8 +69,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads default agent timeout preference", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads default agent timeout preference", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ defaultAgentTimeoutMs: 600000 }, settingsPath);
       assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultAgentTimeoutMs: 600000 });
 
@@ -78,8 +79,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves, loads, and normalizes defaultTokenBudget (#68)", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves, loads, and normalizes defaultTokenBudget (#68)", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       saveWorkflowSettings({ defaultTokenBudget: 500_000 }, settingsPath);
@@ -100,8 +101,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("loads and normalizes excludeSubagentTools, dropping non-string/blank entries (#107)", () => {
-    withSettingsPath((settingsPath) => {
+  it("loads and normalizes excludeSubagentTools, dropping non-string/blank entries (#107)", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: ["pi-subagents", "spawn"] }), "utf-8");
@@ -120,8 +121,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads subagentHostTools, dropping values outside auto|on|off", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads subagentHostTools, dropping values outside auto|on|off", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       // All three mode literals round-trip.
@@ -143,8 +144,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads subagentTools: the all literal, allowlists, and the empty-allowlist none mode", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads subagentTools: the all literal, allowlists, and the empty-allowlist none mode", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       // The "all" literal round-trips.
@@ -176,8 +177,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("normalizes default concurrency and agent retries", () => {
-    withSettingsPath((settingsPath) => {
+  it("normalizes default concurrency and agent retries", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       writeFileSync(settingsPath, JSON.stringify({ defaultConcurrency: 4.9, defaultAgentRetries: 2.8 }), "utf-8");
@@ -191,7 +192,7 @@ describe("workflow settings", () => {
     });
   });
 
-  it("merges project settings over global settings when cwd is provided", () => {
+  it("merges project settings over global settings when cwd is provided", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -212,11 +213,11 @@ describe("workflow settings", () => {
         });
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 
-  it("saves cwd preferences globally without creating a project override", () => {
+  it("saves cwd preferences globally without creating a project override", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -228,11 +229,11 @@ describe("workflow settings", () => {
         assert.equal(existsSync(getWorkflowProjectSettingsPath(cwd)), false);
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 
-  it("saves cwd preferences into an existing project override", () => {
+  it("saves cwd preferences into an existing project override", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -249,12 +250,12 @@ describe("workflow settings", () => {
         });
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 
-  it("preserves unknown settings when saving known settings", () => {
-    withSettingsPath((settingsPath) => {
+  it("preserves unknown settings when saving known settings", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ keywordTriggerEnabled: true }, settingsPath);
       const current = JSON.parse(readFileSync(settingsPath, "utf-8"));
       writeFileSync(settingsPath, `${JSON.stringify({ ...current, theme: "dark" }, null, 2)}\n`, "utf-8");
@@ -268,8 +269,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads the progress panel mode", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads the progress panel mode", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ progressPanelMode: "detailed" }, settingsPath);
       assert.deepEqual(loadWorkflowSettings(settingsPath), { progressPanelMode: "detailed" });
 
@@ -278,16 +279,16 @@ describe("workflow settings", () => {
     });
   });
 
-  it("rejects an invalid progress panel mode", () => {
-    withSettingsPath((settingsPath) => {
+  it("rejects an invalid progress panel mode", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({ progressPanelMode: "verbose" }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
     });
   });
 
-  it("clamps and floors progressPanelMaxAgents into [1, 1000]", () => {
-    withSettingsPath((settingsPath) => {
+  it("clamps and floors progressPanelMaxAgents into [1, 1000]", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       writeFileSync(settingsPath, JSON.stringify({ progressPanelMaxAgents: 12.7 }), "utf-8");
@@ -305,8 +306,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads persistAgentSessions", () => {
-    withSettingsPath((settingsPath) => {
+  it("saves and loads persistAgentSessions", async () => {
+    await withSettingsPath((settingsPath) => {
       assert.deepEqual(loadWorkflowSettings(settingsPath), {}, "absent by default");
 
       saveWorkflowSettings({ persistAgentSessions: true }, settingsPath);
@@ -317,8 +318,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("rejects non-boolean persistAgentSessions values with ConfigError", () => {
-    withSettingsPath((settingsPath) => {
+  it("rejects non-boolean persistAgentSessions values with ConfigError", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       // Wrong-typed values violate the declared schema: a named ConfigError,
@@ -330,8 +331,8 @@ describe("workflow settings", () => {
     });
   });
 
-  it("clamps and floors deliveredResultMaxChars into [1, 1000000]", () => {
-    withSettingsPath((settingsPath) => {
+  it("clamps and floors deliveredResultMaxChars into [1, 1000000]", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
 
       writeFileSync(settingsPath, JSON.stringify({ deliveredResultMaxChars: 250.9 }), "utf-8");
@@ -349,7 +350,7 @@ describe("workflow settings", () => {
     });
   });
 
-  it("project persistAgentSessions overrides the global setting", () => {
+  it("project persistAgentSessions overrides the global setting", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-settings-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -367,12 +368,12 @@ describe("workflow settings", () => {
         });
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 
-  it("a corrupted settings.json fails at load with ConfigError", () => {
-    withSettingsPath((settingsPath) => {
+  it("a corrupted settings.json fails at load with ConfigError", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, "{not json", "utf-8");
       assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
@@ -383,24 +384,24 @@ describe("workflow settings", () => {
     });
   });
 
-  it("a wrong-typed settings value fails at load with ConfigError", () => {
-    withSettingsPath((settingsPath) => {
+  it("a wrong-typed settings value fails at load with ConfigError", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({ keywordTriggerEnabled: "off" }), "utf-8");
       assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
-  it("an unknown settings key fails at load with ConfigError", () => {
-    withSettingsPath((settingsPath) => {
+  it("an unknown settings key fails at load with ConfigError", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({ bogusKey: "x" }), "utf-8");
       assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
     });
   });
 
-  it("in-range but semantically invalid numbers are dropped, not fatal", () => {
-    withSettingsPath((settingsPath) => {
+  it("in-range but semantically invalid numbers are dropped, not fatal", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       // Numbers pass the type schema; value normalization drops out-of-range ones.
       writeFileSync(settingsPath, JSON.stringify({ defaultAgentTimeoutMs: 0 }), "utf-8");

@@ -1,25 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { runWorktreeCommand } from "../src/agent/worktree-runner.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /**
  * Windows releases a killed child's cwd handle a few ms after process exit —
  * the timeout test's child dies with cwd=dir, so removal can transiently EPERM.
- * Retry briefly instead of failing the test on a cleanup artifact.
+ * Delegate to the shared rmForce helper, which retries EBUSY/EPERM with its own
+ * bounded outer loop (tests/helpers/rm-force.ts) instead of failing the test on
+ * a cleanup artifact.
  */
 async function removeDirRetry(dir: string): Promise<void> {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  rmSync(dir, { recursive: true, force: true });
+  await rmForce(dir);
 }
 
 /**

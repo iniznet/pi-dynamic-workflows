@@ -252,6 +252,9 @@ test("task6 e2e: a denied shipped workflow aborts cleanly with result false and 
 test("task6 e2e: an ungated script never materializes the review bridge, so no server is ever bound", async (t) => {
   // The probe's point is RELATIVE behavior: an ungated run must not change the
   // port state, a gated run must bind it. Skip when the port is already taken.
+  // PORT-01: this file only PROBES the canonical 3123 (it never binds it); the
+  // sibling test files bind their own per-file ports, so the probe only ever
+  // skips on a genuinely foreign process holding the port.
   if (await isPortOpen(3123)) {
     t.skip("port 3123 already in use; skipping the bind probe");
     return;

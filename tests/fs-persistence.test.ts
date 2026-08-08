@@ -11,11 +11,12 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { writeJsonFileAtomic } from "../src/fs-persistence.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 function withTempDir(fn: (dir: string) => Promise<void>) {
   return async () => {
@@ -23,7 +24,7 @@ function withTempDir(fn: (dir: string) => Promise<void>) {
     try {
       await fn(dir);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   };
 }

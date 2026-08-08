@@ -29,7 +29,7 @@ registerHooks({
 });
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { before } from "node:test";
@@ -38,6 +38,7 @@ import { parseWorkflowScript } from "../../../src/workflow.js";
 import type { WorkflowManager } from "../../../src/workflow-manager.js";
 import type { WorkflowStorage } from "../../../src/workflow-saved.js";
 import { makeCommandRegistryPi, makeNotifyCtx } from "../../helpers/mock-pi.js";
+import { rmForce } from "../../helpers/rm-force.js";
 import * as execMock from "./mocks/child-process-mock.mjs";
 
 let registerBuiltinWorkflows: (
@@ -110,7 +111,7 @@ test("M12: /code-review passes a hard timeout + SIGKILL to the diff exec and not
     const { meta } = parseWorkflowScript(started[0].script);
     assert.equal(meta.name, "code_review");
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -134,7 +135,7 @@ test("M12: a hung diff exec surfaces a timeout error — no hang, no started run
       `the timeout must be surfaced with the source and deadline; got: ${JSON.stringify(notified)}`,
     );
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });
 
@@ -154,6 +155,6 @@ test("M12: a diff source that fails to run is surfaced as an error notify, not s
       `the fetch failure must be reported; got: ${JSON.stringify(notified)}`,
     );
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    await rmForce(cwd);
   }
 });

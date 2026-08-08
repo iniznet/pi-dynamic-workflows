@@ -12,7 +12,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -31,6 +31,7 @@ import {
   summarizeAgents,
   summarizeRunDeep,
 } from "../src/workflow-damage-control.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -364,7 +365,7 @@ test("reconcileAgentAfterKill resolves by callId and no-ops on terminal agents",
 // collectCleanCandidates
 // ─────────────────────────────────────────────────────────────────────────────
 
-test("collectCleanCandidates lists stale leases, orphan runs, ghost worktrees, tmp branches (dry-run)", () => {
+test("collectCleanCandidates lists stale leases, orphan runs, ghost worktrees, tmp branches (dry-run)", async () => {
   // A REAL existing directory for the "healthy" worktree — existsSync decides
   // ghost vs alive, so a fake absolute path would always be a ghost.
   const existingWorktree = mkdtempSync(join(tmpdir(), "pi-dw-clean-existing-"));
@@ -406,7 +407,7 @@ test("collectCleanCandidates lists stale leases, orphan runs, ghost worktrees, t
     assert.equal(ghost.length, 1);
     assert.equal(ghost[0]?.path, `${projectDir}/orphan-1`);
   } finally {
-    rmSync(existingWorktree, { recursive: true, force: true });
+    await rmForce(existingWorktree);
   }
 });
 

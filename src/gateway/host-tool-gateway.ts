@@ -157,6 +157,15 @@ export class HostToolGateway {
   private timeout?: number;
   private toolTimeouts?: ToolTimeoutTable;
   /**
+   * In-flight start promise (B5): mirrors SubagentHostToolsPolicy.starting so
+   * the gateway itself is single-flight — concurrent start() callers (the
+   * policy's auto-start racing a manual /workflows-gateway start) share ONE
+   * bridge bind instead of each creating a bridge that orphans the other —
+   * and stop() can await an in-flight start instead of tearing down a
+   * half-started bridge (the reload race that orphaned a live socket).
+   */
+  private starting?: Promise<string>;
+  /**
    * The single shared MCPProxyClient for the running bridge
    * (mcp-proxy-client-socket-leak fix): created lazily on first toolset
    * resolution, reused across every createGatewayProxiedTools() call — a run
@@ -236,6 +245,16 @@ export class HostToolGateway {
 
   async start(bundle: HostToolsBundle): Promise<string> {
     if (this.bridge) return this.bridge.getSocketPath();
+    // Single-flight: concurrent start() calls share the one in-flight bind (B5).
+    if (!this.starting) {
+      this.starting = this.doStart(bundle).finally(() => {
+        this.starting = undefined;
+      });
+    }
+    return this.starting;
+  }
+
+  private async doStart(bundle: HostToolsBundle): Promise<string> {
     const bridge = new MCPBridge({
       tools: bundle.tools,
       toolDefs: bundle.toolDefs,
@@ -251,6 +270,11 @@ export class HostToolGateway {
   }
 
   async stop(): Promise<void> {
+    // B5: a stop racing an in-flight start must WAIT for it — otherwise the
+    // start completes after the stop returns and leaves an orphaned bridge
+    // bound to a live socket (the reload race). Awaiting here means the start
+    // settles first, then the bridge it produced is torn down below.
+    if (this.starting) await this.starting;
     const bridge = this.bridge;
     this.bridge = null;
     const client = this.proxiedClient;

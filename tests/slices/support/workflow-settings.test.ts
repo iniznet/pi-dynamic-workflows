@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -18,19 +18,20 @@ import {
   saveWorkflowSettings,
 } from "../../../src/workflow-settings.js";
 import { withFakeHome } from "../../helpers/fake-home.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
-function withSettingsPath(fn: (settingsPath: string) => void): void {
+async function withSettingsPath(fn: (settingsPath: string) => void): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), "pi-dw-settings-support-"));
   try {
     fn(join(dir, "nested", "settings.json"));
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await rmForce(dir);
   }
 }
 
 describe("settings clearing (M9)", () => {
-  it("excludeSubagentTools: [] clears a previously-saved exclusion list", () => {
-    withSettingsPath((settingsPath) => {
+  it("excludeSubagentTools: [] clears a previously-saved exclusion list", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ excludeSubagentTools: ["pi-subagents", "spawn"] }, settingsPath);
       assert.deepEqual(loadWorkflowSettings(settingsPath), { excludeSubagentTools: ["pi-subagents", "spawn"] });
 
@@ -42,16 +43,16 @@ describe("settings clearing (M9)", () => {
     });
   });
 
-  it("a null tombstone written directly into settings.json loads as cleared", () => {
-    withSettingsPath((settingsPath) => {
+  it("a null tombstone written directly into settings.json loads as cleared", async () => {
+    await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
       writeFileSync(settingsPath, JSON.stringify({ excludeSubagentTools: null }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), { excludeSubagentTools: [] });
     });
   });
 
-  it("defaultTokenBudget: 0 clears a previously-saved budget", () => {
-    withSettingsPath((settingsPath) => {
+  it("defaultTokenBudget: 0 clears a previously-saved budget", async () => {
+    await withSettingsPath((settingsPath) => {
       saveWorkflowSettings({ defaultTokenBudget: 500_000 }, settingsPath);
       assert.equal(loadWorkflowSettings(settingsPath).defaultTokenBudget, 500_000);
 
@@ -63,7 +64,7 @@ describe("settings clearing (M9)", () => {
     });
   });
 
-  it("a project-level empty exclusion list overrides a global exclusion list", () => {
+  it("a project-level empty exclusion list overrides a global exclusion list", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-settings-override-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -82,11 +83,11 @@ describe("settings clearing (M9)", () => {
         );
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 
-  it("a project-level defaultTokenBudget: 0 overrides a global budget", () => {
+  it("a project-level defaultTokenBudget: 0 overrides a global budget", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dw-settings-budget-"));
     const cwd = join(dir, "project");
     const fakeHome = join(dir, "home");
@@ -101,7 +102,7 @@ describe("settings clearing (M9)", () => {
         assert.equal(merged.defaultTokenBudget, null, "a project-level 0 must clear the global budget");
       });
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      await rmForce(dir);
     }
   });
 });

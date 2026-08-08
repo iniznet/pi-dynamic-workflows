@@ -265,9 +265,12 @@ const ENTRY_CONTRACT: Record<string, string> = {
   // ── workflow status / locking ──
   acquireFileLock: "workflow status",
   checkFileConflict: "workflow status",
+  createWorktreeWriteClaimer: "workflow status (B3 live claimer)",
   getWorkflowStatus: "workflow status",
   listRunningWorkflows: "workflow status",
   releaseFileLock: "workflow status",
+  WorktreeWriteClaimer: "workflow status (B3 live claimer)",
+  WorktreeWriteClaimerOptions: "workflow status (B3 live claimer)",
   // ── workflow paths ──
   WORKFLOW_HOME_RELATIVE_DIR: "workflow paths",
   WORKFLOW_PROJECTS_SUBDIR: "workflow paths",

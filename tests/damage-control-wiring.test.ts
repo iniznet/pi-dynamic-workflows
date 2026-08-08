@@ -26,7 +26,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -47,6 +47,7 @@ import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { createMockMcpServer, type MockMcpServer } from "./helpers/mcp-mock.js";
 import type { RegisteredCommand } from "./helpers/mock-pi.js";
 import { makeNotifyCtx } from "./helpers/mock-pi.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 const servers: MockMcpServer[] = [];
 
@@ -244,7 +245,7 @@ describe("subagentDamageControlTools settings matrix", () => {
         }
       });
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      await rmForce(home);
     }
   });
 });
@@ -404,7 +405,7 @@ describe("extension wiring (mock-pi)", () => {
         assert.ok(extension.registeredTools.includes("workflow"), "existing tool must stay registered");
       });
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      await rmForce(home);
     }
   });
 
@@ -420,7 +421,7 @@ describe("extension wiring (mock-pi)", () => {
         assert.match(lastSent(extension), /inspection verbs only/);
       });
     } finally {
-      rmSync(home, { recursive: true, force: true });
+      await rmForce(home);
     }
   });
 });

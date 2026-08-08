@@ -20,7 +20,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, test } from "node:test";
@@ -33,6 +33,7 @@ import { getWorkflowSettingsPath } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import type { RegisteredCommand } from "./helpers/mock-pi.js";
 import { makeNotifyCtx } from "./helpers/mock-pi.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /** A minimal ToolDefinition whose execute echoes its params as text. */
 function echoTool(name = "echo"): ToolDefinition {
@@ -255,6 +256,37 @@ describe("SubagentHostToolsPolicy", () => {
       "the host-tools toolset stays proxied-only (no coding merge)",
     );
   });
+
+  test("policy.stop() awaits an in-flight auto-start and leaves no orphaned bridge (B5 reload race)", async () => {
+    const gateway = track(new HostToolGateway());
+    let releaseStart: (() => void) | undefined;
+    const startGate = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const originalStart = gateway.start.bind(gateway);
+    (gateway as unknown as { start: (bundle: HostToolsBundle) => Promise<string> }).start = (bundle) =>
+      startGate.then(() => originalStart(bundle));
+
+    const policy = makePolicy(gateway, "auto");
+    // defaultTools kicks off the in-flight auto-start; the reload dispose path
+    // then calls policy.stop() while that start is still pending.
+    const defsPromise = policy.defaultTools();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    let stopSettled = false;
+    const stopping = policy.stop().then(() => {
+      stopSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(stopSettled, false, "policy.stop() must await the in-flight auto-start");
+
+    releaseStart?.();
+    const defs = await defsPromise;
+    await stopping;
+    assert.equal(gateway.isRunning(), false, "no orphaned bridge may survive policy.stop() during an in-flight start");
+    assert.equal(gateway.getSocketPath(), undefined);
+    assert.ok(defs.length >= 1, "the run that raced the stop still resolves its toolset");
+  });
 });
 
 describe("extension wiring (mock-pi)", () => {
@@ -337,7 +369,7 @@ describe("extension wiring (mock-pi)", () => {
         cleanupExtension(extension.handlers);
       });
     } finally {
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(fakeHome);
     }
   });
 
@@ -378,7 +410,7 @@ describe("extension wiring (mock-pi)", () => {
         cleanupExtension(extension.handlers);
       });
     } finally {
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(fakeHome);
     }
   });
 
@@ -431,7 +463,7 @@ describe("extension wiring (mock-pi)", () => {
         cleanupExtension(extension.handlers);
       });
     } finally {
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(fakeHome);
     }
   });
 });

@@ -208,12 +208,60 @@ describe("McpHttpClient", () => {
         respond: () => new Promise<never>(() => {}), // hang forever
       }),
     );
-    const client = new McpHttpClient(serverConfig(mock), { timeoutMs: 60 });
+    const client = new McpHttpClient(serverConfig(mock), { timeoutMs: 60, handshakeTimeoutMs: 60 });
 
     await assert.rejects(
       client.initialize(),
       (error: unknown) => error instanceof McpTimeoutError,
       "the client-side deadline must surface as McpTimeoutError",
+    );
+    client.close();
+  });
+
+  test("the initialize handshake uses the SHORTER handshake bound, not the call bound (B4)", async () => {
+    const mock = track(
+      await createMockMcpServer({
+        respond: () => new Promise<never>(() => {}), // hang forever
+      }),
+    );
+    // A 120s call bound must not leak into the handshake: the initialize
+    // deadline is the handshakeTimeoutMs (50ms), far shorter than the call
+    // bound, so a dead server is detected in milliseconds.
+    const client = new McpHttpClient(serverConfig(mock), { timeoutMs: 120_000, handshakeTimeoutMs: 50 });
+
+    await assert.rejects(
+      client.initialize(),
+      (error: unknown) => error instanceof McpTimeoutError && /50ms/.test(error.message),
+      "the handshake must fail at the short bound with that bound named in the error",
+    );
+    client.close();
+  });
+
+  test("tools/call keeps the long call bound after a fast handshake (B4)", async () => {
+    const mock = track(
+      await createMockMcpServer({
+        tools: [{ name: "slow", inputSchema: { type: "object", properties: {} } }],
+        respond: (request) => {
+          const method = request.parsed.method as string;
+          const id = request.parsed.id;
+          const headers = { "Mcp-Session-Id": "sess-call", "Content-Type": "text/event-stream" };
+          if (method === "initialize") {
+            return { headers, body: sseWrap(jsonRpcResult(id, { protocolVersion: "2025-03-26" })) };
+          }
+          if (method === "tools/list") {
+            return { headers, body: sseWrap(jsonRpcResult(id, { tools: [] })) };
+          }
+          return new Promise<never>(() => {}); // the tool call hangs
+        },
+      }),
+    );
+    const client = new McpHttpClient(serverConfig(mock), { timeoutMs: 60, handshakeTimeoutMs: 1000 });
+
+    await client.initialize();
+    await assert.rejects(
+      client.callTool("slow", {}),
+      (error: unknown) => error instanceof McpTimeoutError && /60ms/.test(error.message),
+      "a tool call must honor the call bound (60ms), never the handshake bound",
     );
     client.close();
   });

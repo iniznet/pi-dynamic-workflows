@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
 } from "../src/agent/worktree-runner.js";
 import { createRunPersistence, loadRunState, saveCheckpoint } from "../src/run-persistence.js";
 import { createWorktree as createWorktreeLive } from "../src/worktree.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 /** Minimal git repo with identity + a base commit, like the worktree suite. */
 function initRepo(prefix: string): string {
@@ -119,7 +120,7 @@ test("implementProtocol fixture: TDD write → green tests → typecheck → rev
     // The worktree's tests genuinely pass after the commit (re-run, not trust).
     execFileSync("node", ["--test", join(wt.cwd, "tests", "math.test.mjs")], { encoding: "utf8" });
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -153,7 +154,7 @@ test("implementProtocol honest short-circuit: a task without a spec writes, runs
     const base = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     assert.equal(head, base, "nothing was committed without a spec");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -176,7 +177,7 @@ test("implementProtocol self-review blocks the commit when the diff carries a TO
     assert.equal(results[0].success, false);
     assert.match(protocol.steps[3].output, /TODO marker/);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -198,7 +199,7 @@ test("implementProtocol reports red tests AND a failed typecheck for broken impl
     assert.equal(protocol.committed, false, "red tests + failed typecheck block the commit");
     assert.equal(results[0].success, false);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -220,7 +221,7 @@ test("implementProtocol spec-level command overrides beat runner-config defaults
     assert.equal(protocol.typecheckPassed, true, "spec typecheckCommand wins over config");
     assert.equal(protocol.committed, true);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -235,7 +236,7 @@ test("implementProtocol runs directly with runtime overrides (no runner required
     assert.equal(protocol.committed, true);
     assert.ok(protocol.commitHash);
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -308,7 +309,7 @@ test("G5: onTaskComplete persists an atomic per-subagent checkpoint exactly once
     assert.equal(state?.checkpoints[0].worktreePath, wt.cwd);
     assert.ok(state?.checkpoints[0].timestamp, "the checkpoint carries a timestamp");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -343,7 +344,7 @@ test("G5: state.json writes land after EACH completion, never batched at the end
       "checkpoints keep first-seen order (dedupe by taskId)",
     );
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 
@@ -368,7 +369,7 @@ test("G5: a rejecting onTaskComplete never flips an already-landed task result",
     assert.equal(task.status, "completed");
     assert.ok(task.completedAt, "completedAt is stamped on the task");
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    await rmForce(repo);
   }
 });
 

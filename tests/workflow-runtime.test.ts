@@ -1888,3 +1888,47 @@ test("legacy journals without commit stamps keep the pre-fix callSeq-order repla
     "unstamped journals replay in walk (callSeq) order — the documented pre-fix behavior",
   );
 });
+
+// ─── core-09: merged withTimeout keeps the AGENT_TIMEOUT contract ────────────
+// The workflow layer's timeout semantics (message + code + recoverable) moved
+// into an error factory on the shared timing.ts implementation (the local
+// duplicate was deleted). This pins the observable contract through a real
+// runWorkflow timeout.
+
+test("core-09: an agent timeout surfaces a WorkflowError with code AGENT_TIMEOUT and recoverable:true", async () => {
+  const slow = {
+    async run() {
+      // Unref'd: the deadline timer decides the outcome; this background
+      // promise must not hold the test process open for the full 60s.
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, 60_000);
+        t.unref();
+      });
+      return "never";
+    },
+  };
+  let endErrorCode: WorkflowErrorCode | undefined;
+  let endRecoverable: boolean | undefined;
+  let endMessage: string | undefined;
+  const script = `export const meta = { name: 'timeout_code', description: 'timeout code' }
+const a = await agent('slow', { label: 's', timeoutMs: 5 })
+return { a }`;
+  await runWorkflow(script, {
+    agent: slow,
+    persistLogs: false,
+    onAgentEnd: (event) => {
+      if (event.error) {
+        endMessage = event.error;
+        endErrorCode = event.errorCode;
+        endRecoverable = event.recoverable;
+      }
+    },
+  });
+  assert.equal(
+    endErrorCode,
+    WorkflowErrorCode.AGENT_TIMEOUT,
+    "the merged withTimeout factory must preserve the AGENT_TIMEOUT code",
+  );
+  assert.equal(endRecoverable, true, "a timeout stays recoverable");
+  assert.match(endMessage ?? "", /raise or omit timeoutMs\/agentTimeoutMs/);
+});

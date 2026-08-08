@@ -29,17 +29,6 @@ import type { JournalEntry } from "./workflow.js";
 export const COMPACT_JOURNAL_VERSION = 1 as const;
 
 /**
- * One interned operation-trace array. `JSON.stringify` equality decides the
- * intern key (order-sensitive, exactly like the byte-identical QA diff), so
- * two entries with order-identical traces share one slot and reconstruct with
- * the same bytes.
- */
-export interface CompactInternedTraceTable {
-  /** Distinct operation-trace arrays, in first-seen order. */
-  opTraces: OperationTrace[][];
-}
-
-/**
  * One journal entry record in a compacted summary. Resolved entries are
  * interned (refs into the summary's tables); unresolved entries are kept
  * verbatim. The positional deltaKey surface (`index` + `runId`) is carried

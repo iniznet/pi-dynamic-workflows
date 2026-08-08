@@ -10,11 +10,12 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, mock } from "node:test";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { rmForce } from "./helpers/rm-force.js";
 
 async function loadCommand() {
   const mod = await import("../src/workflows-models-command.js");
@@ -254,7 +255,7 @@ describe("workflows-models-command", () => {
           (handler as (args: unknown, ctx: unknown) => Promise<void>)(undefined, ctx),
         );
       } finally {
-        rmSync(home, { recursive: true, force: true });
+        await rmForce(home);
       }
 
       assert.ok(selectCalls.length >= 1, "the tier menu should have been shown");

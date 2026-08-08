@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,7 @@ import {
 } from "../../../src/run-persistence.js";
 import { workflowProjectPaths } from "../../../src/workflow-paths.js";
 import { withFakeHomeAsync } from "../../helpers/fake-home.js";
+import { rmForce } from "../../helpers/rm-force.js";
 
 function withTempCwd(fn: (cwd: string) => Promise<void>) {
   return async () => {
@@ -31,8 +32,7 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     try {
       await withFakeHomeAsync(fakeHome, () => fn(cwd));
     } finally {
-      rmSync(cwd, { recursive: true, force: true });
-      rmSync(fakeHome, { recursive: true, force: true });
+      await rmForce(cwd, fakeHome);
     }
   };
 }

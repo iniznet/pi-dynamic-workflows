@@ -39,8 +39,17 @@ export interface McpCallResult {
 
 /** Options for {@link McpHttpClient}. */
 export interface McpHttpClientOptions {
-  /** Per-request deadline for initialize/listTools/callTool (ms). */
+  /**
+   * Per-request deadline for listTools/callTool (ms) — the long bound for
+   * actual tool work. Default {@link DEFAULT_TIMEOUT_MS} (30s).
+   */
   timeoutMs?: number;
+  /**
+   * Per-request deadline for the initialize handshake (ms). The handshake is
+   * the SHORTER bound (B4): a dead server must fail the list in seconds, not
+   * consume the full tool-call timeout. Default {@link HANDSHAKE_TIMEOUT_MS}.
+   */
+  handshakeTimeoutMs?: number;
   /** Injectable fetch implementation (test seam); defaults to global fetch. */
   fetchImpl?: typeof fetch;
 }
@@ -81,8 +90,10 @@ export class McpSessionExpiredError extends Error {
   }
 }
 
-/** Default per-request deadline in milliseconds. */
+/** Default per-request deadline in milliseconds (listTools/callTool). */
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** Default initialize-handshake deadline in milliseconds (shorter than the call bound). */
+const HANDSHAKE_TIMEOUT_MS = 30_000;
 /** Primary MCP protocol version; servers rejecting it trigger the fallback. */
 const PROTOCOL_VERSION_PRIMARY = "2025-03-26";
 /** Fallback protocol version for servers that do not support the primary. */
@@ -123,6 +134,7 @@ interface ParsedBody {
 export class McpHttpClient {
   private readonly cfg: McpServerConfig;
   private readonly timeoutMs: number;
+  private readonly handshakeTimeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   /** Cached session id issued by the server; echoed on every request. */
   private sessionId: string | undefined;
@@ -134,6 +146,7 @@ export class McpHttpClient {
   constructor(cfg: McpServerConfig, options: McpHttpClientOptions = {}) {
     this.cfg = cfg;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
@@ -213,6 +226,9 @@ export class McpHttpClient {
         clientInfo: { name: CLIENT_NAME, version: CLIENT_VERSION },
       },
       signal,
+      // The handshake is the SHORTER bound (B4): the initialize exchange must
+      // never consume the long tool-call deadline on a dead server.
+      this.handshakeTimeoutMs,
     );
     void response;
   }
@@ -243,10 +259,16 @@ export class McpHttpClient {
 
   /**
    * Send one JSON-RPC request and return the parsed result. Applies the
-   * per-request timeout plus the caller's signal; session id, content type and
-   * the user's configured headers ride on every request.
+   * per-request deadline (the handshake bound for initialize, the call bound
+   * otherwise) plus the caller's signal; session id, content type and the
+   * user's configured headers ride on every request.
    */
-  private async rpcRequest(method: string, params: unknown, signal?: AbortSignal): Promise<ParsedBody> {
+  private async rpcRequest(
+    method: string,
+    params: unknown,
+    signal?: AbortSignal,
+    deadlineMs: number = this.timeoutMs,
+  ): Promise<ParsedBody> {
     const url = this.cfg.url;
     if (!url) throw new McpRpcError(RPC_TRANSPORT_ERROR, `MCP server "${this.cfg.name}" has no url configured`);
 
@@ -258,7 +280,7 @@ export class McpHttpClient {
     };
     if (this.sessionId) headers[HEADER_SESSION_ID] = this.sessionId;
 
-    const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+    const timeoutSignal = AbortSignal.timeout(deadlineMs);
     const requestSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
 
     let response: Response;
@@ -270,7 +292,7 @@ export class McpHttpClient {
         signal: requestSignal,
       });
     } catch (error) {
-      throw this.mapRequestError(error, signal, timeoutSignal);
+      throw this.mapRequestError(error, signal, timeoutSignal, deadlineMs);
     }
 
     const sessionId = response.headers.get(HEADER_SESSION_ID);
@@ -304,12 +326,17 @@ export class McpHttpClient {
 
   /**
    * Convert a fetch failure into a typed error, honoring the caller signal and
-   * the client timeout, and redacting any user header values that leaked in.
+   * the client deadline, and redacting any user header values that leaked in.
    */
-  private mapRequestError(error: unknown, signal: AbortSignal | undefined, timeoutSignal: AbortSignal): Error {
+  private mapRequestError(
+    error: unknown,
+    signal: AbortSignal | undefined,
+    timeoutSignal: AbortSignal,
+    deadlineMs: number,
+  ): Error {
     if (signal?.aborted) return new McpAbortError(this.cfg.name);
     if (timeoutSignal.aborted || (error instanceof DOMException && error.name === "TimeoutError")) {
-      return new McpTimeoutError(this.cfg.name, this.timeoutMs);
+      return new McpTimeoutError(this.cfg.name, deadlineMs);
     }
     return new McpRpcError(
       RPC_TRANSPORT_ERROR,
