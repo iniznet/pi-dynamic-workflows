@@ -531,6 +531,19 @@ npm test     # Biome, TypeScript (incl. the extension entry), unit tests, releas
 
 The check pipeline type-checks the extension entry (`extensions/workflow.ts`) together with the scripts via `tsconfig.scripts.json`, and `scripts/check-entry-contract.ts` verifies that `src/index.ts` still exports the documented public API (every name the extension entry, README, and tests depend on). Run the contract gate alone with `npm run check:entry-contract`.
 
+### Test suite
+
+The full unit suite runs through `scripts/run-tests.mjs` (`node --test` with the tsx loader, the same runner the node test runner itself uses) — wired in as `test:unit` and therefore part of `npm test` / `release:check`.
+
+The runner **caps file-level concurrency** at `min(availableParallelism() - 1, 4)` so the suite stops saturating every core on a dev machine (the default `availableParallelism() - 1` pegs the box with CPU-bound test workers — the measured cause of a 100%-CPU report; see `tasks/perf-cpu-audit/report.md`). This is a deliberate trade: on this 16-core box the capped suite takes ~108s vs ~66s uncapped (measured: `concurrency=4 wall=107793ms` vs A1 baseline `concurrency=15 wall=65580ms`), in exchange for leaving 12 of 16 cores free during the run. CI can restore full parallelism without edits:
+
+```bash
+PI_TEST_CONCURRENCY=15 npm run test:unit   # e.g. dedicated CI runners
+PI_TEST_TIMEOUT_MS=300000 npm run test:unit # raise the 180s per-test guard
+```
+
+Every run prints `concurrency=N wall=Ms` on exit; a non-zero exit propagates on any failing test. The 180s per-test guard is a backstop only — it sits above the worst observed load-stall self-skip (~63s) and below a true hang, so no healthy test approaches it.
+
 ### Extension load flow (no `npm run dev` preview)
 
 This is a library + Pi extension, not a standalone app — `src/index.ts` is a pure export barrel that exits immediately, so the old `npm run dev` was a silent no-op and has been removed. A Pi host loads the extension by reading the package's [`pi.extensions`](./package.json) field and evaluating `extensions/workflow.ts` (TypeScript extension entries load transparently), which registers the `/workflows*` commands, the `workflow` / `workflow_control` / `get_workflow_status` tools, and the gateway against the host's `ExtensionAPI`. Library embedders instead import the built package: `npm run build` emits `dist/index.js` (from `src/index.ts`) and `dist/index.d.ts`, resolved through the package `main` / `exports` fields. The `release:check` stage of `npm test` builds dist and re-verifies the entry contract against it, so the library surface stays honest on every change.

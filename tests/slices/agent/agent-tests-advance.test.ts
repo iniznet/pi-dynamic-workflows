@@ -912,7 +912,8 @@ async function pollUntil(
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // In-memory state poll: 25ms cadence; default 5s deadline leaves ~200 fires.
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`timed out waiting for ${what}`);
 }

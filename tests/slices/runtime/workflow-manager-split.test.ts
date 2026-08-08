@@ -296,7 +296,7 @@ test(
     const { runId, promise } = manager.startInBackground(twoAgentScript);
     promise.catch(() => {});
     for (let i = 0; i < 200 && secondAttempts === 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
 
@@ -305,7 +305,7 @@ test(
     assert.equal(await manager.resume(runId), true);
 
     for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     const afterResume = manager.getPersistence().load(runId);
     assert.equal(afterResume?.status, "completed", "the resumed execution's outcome");
@@ -365,7 +365,7 @@ test(
     const { runId, promise } = manager.startInBackground(twoAgentScript);
     promise.catch(() => {});
     for (let i = 0; i < 200 && secondAttempts === 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
 
@@ -373,7 +373,7 @@ test(
     assert.equal(await manager.resume(runId), true);
 
     for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(manager.getPersistence().load(runId)?.status, "completed", "the resumed execution completes");
 
@@ -448,7 +448,7 @@ return xs`;
     const { runId, promise } = manager.startInBackground(script);
     promise.catch(() => {});
     for (let i = 0; i < 200 && manager.getRun(runId)?.status !== "failed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(manager.getRun(runId)?.status, "failed", "the run must fail (via 'failer')");
     assert.equal(
@@ -537,7 +537,7 @@ return xs`;
     const { runId, promise } = manager.startInBackground(script);
     promise.catch(() => {});
     for (let i = 0; i < 200 && manager.getRun(runId)?.status !== "failed"; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(manager.getRun(runId)?.status, "failed");
     assert.equal(manager.getRun(runId)?.controller.signal.aborted, false, "managed.controller itself is never aborted");

@@ -47,7 +47,8 @@ async function waitForStatus(
   while (Date.now() < deadline) {
     current = manager.getRun(runId)?.status;
     if (current === status) return current;
-    await sleep(25);
+    // In-memory status poll: 50ms cadence (3s default deadline → 60 fires).
+    await sleep(50);
   }
   return current;
 }

@@ -32,7 +32,9 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function waitFor(cond: () => boolean, timeoutMs: number, label: string): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond() && Date.now() < deadline) {
-    await sleep(5);
+    // In-memory state poll: 25ms cadence (5× fewer timer fires than 5ms);
+    // every call site has a 1000ms deadline, leaving 40 observation windows.
+    await sleep(25);
   }
   assert.ok(cond(), `condition not met within ${timeoutMs}ms: ${label}`);
 }

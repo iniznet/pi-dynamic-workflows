@@ -34,7 +34,8 @@ async function waitForStatus(
   while (Date.now() < deadline) {
     current = manager.getRun(runId)?.status;
     if (current === status) return current;
-    await sleep(25);
+    // In-memory status poll: 50ms cadence (3s default deadline → 60 fires).
+    await sleep(50);
   }
   return current;
 }
@@ -51,7 +52,10 @@ async function waitForCompacted(manager: WorkflowManager, runId: string, deadlin
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
     if (manager.getPersistence().load(runId)?.journalCompacted !== undefined) return true;
-    await sleep(25);
+    // Disk poll (persistence.load) at 200ms: the compacted form lands from the
+    // queued setImmediate fold task within ms, so a 3s deadline (15 fires) is
+    // ample.
+    await sleep(200);
   }
   return false;
 }

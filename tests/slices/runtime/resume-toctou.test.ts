@@ -50,7 +50,9 @@ return { a, b }`;
 
     const { runId, promise } = manager.startInBackground(script, undefined);
     promise.catch(() => {});
-    for (let i = 0; i < 200 && calls.b === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    // In-memory state poll: 50ms cadence; worst-case wait 200×50ms = 10s stays
+    // within the file budget while cutting timer churn 5× vs 10ms.
+    for (let i = 0; i < 200 && calls.b === 0; i++) await new Promise((r) => setTimeout(r, 50));
     assert.equal(calls.b, 1, "'b' is in flight before pausing");
     assert.equal(manager.pause(runId), true);
 

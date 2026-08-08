@@ -93,7 +93,12 @@ async function waitForPlanStatus(dir: string, name: string, status: string): Pro
       const parsed = JSON.parse(raw) as { status?: string };
       if (parsed.status === status) return parsed as Record<string, unknown>;
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Poll at 250ms (not 50ms) to match waitForRunStatus below: these plan files
+    // are read while the manager's terminal persist can rename over the plans
+    // dir on Windows (readers open without delete-sharing — libuv default), so a
+    // tight read cadence overlaps the settle window often enough to flake. The
+    // plan files are written once, well before the 15s deadline (60 fires).
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`plan ${name} never reached status ${status}`);
 }
@@ -118,7 +123,10 @@ async function waitForForeignPlanFile(dir: string, excluded: string[]): Promise<
       if (excluded.includes(name)) continue;
       return name;
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Same 250ms rationale as waitForPlanStatus: the new plan file is written
+    // once by the bridge; a coarser observation cadence cannot miss it within
+    // the 15s deadline (60 fires) and avoids read/rename collisions.
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("no new plan file appeared");
 }

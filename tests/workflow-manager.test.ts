@@ -798,7 +798,7 @@ return { a, b }`;
     const { runId, promise } = manager.startInBackground(script, undefined, { agentRetries: 1, retryBackoffMs: 0 });
     promise.catch(() => {});
     for (let i = 0; i < 200 && aAttempts < 2; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.equal(aAttempts, 2, "'a' should have failed once and be retrying by now");
     // Let 'b' actually start (and begin hanging) before pausing.
@@ -869,7 +869,7 @@ return { a, b, c }`;
     });
     promise.catch(() => {});
     for (let i = 0; i < 200 && aCalls < 2; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     await new Promise((resolve) => setTimeout(resolve, 10)); // let attempt 2 hang
     assert.equal(aCalls, 2, "'a' should have failed once and be hanging on its retry before pausing");
@@ -957,7 +957,7 @@ return { x, y, z }`;
     });
     promise.catch(() => {});
     for (let i = 0; i < 200 && xCalls < 2; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
     await new Promise((resolve) => setTimeout(resolve, 10)); // let x's attempt 2 hang
     assert.equal(manager.pause(runId), true);
@@ -2310,8 +2310,10 @@ test(
     promise.catch(() => {});
     const lockPath = join(pers.getRunsDir(), `${runId}.lock`);
 
-    // Wait until the execution owns its lock file.
-    for (let i = 0; i < 200 && !existsSync(lockPath); i++) await new Promise((r) => setTimeout(r, 10));
+    // Wait until the execution owns its lock file (disk poll; 100ms cadence — the
+    // lock file appears within a few ms of execution start, so the coarser
+    // observation window never delays a healthy run).
+    for (let i = 0; i < 200 && !existsSync(lockPath); i++) await new Promise((r) => setTimeout(r, 100));
     assert.ok(existsSync(lockPath), "the running execution holds its lease lock");
     const initialExpiry = Date.parse((JSON.parse(readFileSync(lockPath, "utf-8")) as { expiresAt: string }).expiresAt);
 

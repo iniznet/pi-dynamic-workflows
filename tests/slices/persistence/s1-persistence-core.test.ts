@@ -53,7 +53,8 @@ async function waitForStatus(
   while (Date.now() < deadline) {
     current = manager.getRun(runId)?.status;
     if (current === status) return current;
-    await sleep(25);
+    // In-memory status poll: 50ms cadence (3s default deadline → 60 fires).
+    await sleep(50);
   }
   return current;
 }
@@ -63,7 +64,10 @@ async function waitForJournalCompacted(manager: WorkflowManager, runId: string, 
   const deadline = Date.now() + deadlineMs;
   while (Date.now() < deadline) {
     if (manager.getPersistence().load(runId)?.journalCompacted) return;
-    await sleep(25);
+    // Disk poll (persistence.load) at 200ms: the fold task lands in ms, so the
+    // 2s deadline (10 fires) is ample; a coarser read cadence also avoids
+    // overlapping the sidecar rename window.
+    await sleep(200);
   }
   assert.fail("the deferred compaction task never landed the compacted form");
 }

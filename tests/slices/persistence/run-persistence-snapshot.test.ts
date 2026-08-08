@@ -7,6 +7,7 @@ import { WORKFLOW_RUNS_DIR } from "../../../src/config.js";
 import {
   createRunPersistence,
   generateRunId,
+  JOURNAL_DELTA_SUFFIX,
   migrateRunState,
   type PersistedRunState,
   RUN_STATE_SCHEMA_VERSION,
@@ -594,7 +595,12 @@ test(
     let readFileCalls = 0;
     const rp = createRunPersistence(cwd, {
       readFileSync: ((...args: Parameters<typeof readFileSync>) => {
-        readFileCalls++;
+        // Count only PRIMARY run-file reads: F3-2 collapsed the sidecar
+        // existsSync probe into a single readFileSync (ENOENT → "no delta"),
+        // so a jdelta check is now an incidental ENOENT read — this test's
+        // signal is that an UNCHANGED primary file is never re-parsed.
+        const [target] = args as [string];
+        if (!target.endsWith(JOURNAL_DELTA_SUFFIX)) readFileCalls++;
         return readFileSync(...args);
       }) as typeof readFileSync,
     });

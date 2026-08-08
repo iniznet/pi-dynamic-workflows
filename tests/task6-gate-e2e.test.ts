@@ -88,7 +88,10 @@ async function waitForPlanFile(dir: string): Promise<string> {
       (name) => name.endsWith(".json") && !name.endsWith(".tmp"),
     );
     if (files.length > 0) return join(dir, files[0]);
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // File/disk poll: 200ms cadence (5s deadline → 25 fires). The plan file is
+    // written once via the bridge's atomic write; the coarser read cadence
+    // cannot miss it and avoids overlapping the write window.
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error("no plan file appeared in time");
 }

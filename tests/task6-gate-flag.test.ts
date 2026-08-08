@@ -94,8 +94,9 @@ test("meta.gate: publishes a plan and pauses the body until the human approves",
   });
 
   // The plan is published with the meta description + run identity...
+  // In-memory state poll: 50ms cadence — exactly ≤100 fires within the 5s deadline.
   const deadline = Date.now() + 5000;
-  while (plans.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  while (plans.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(plans.length, 1, "the gate published exactly one plan");
   assert.equal(plans[0]?.prompt, "Review the objective and approve before any agent work");
   assert.equal(plans[0]?.kind, "confirm");

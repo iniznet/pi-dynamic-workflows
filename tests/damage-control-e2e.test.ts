@@ -126,7 +126,10 @@ async function until(probe: () => boolean, message: string, timeoutMs = 10_000):
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (probe()) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Disk poll (rp.load) with a 10s default deadline: 200ms cadence leaves
+    // 50 observation windows — enough for every call site while cutting timer
+    // churn 8× vs 25ms.
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error(message);
 }

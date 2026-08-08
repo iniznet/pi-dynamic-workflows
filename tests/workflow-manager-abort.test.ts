@@ -84,7 +84,7 @@ test(
     });
 
     // Let the agent start (deferred, so it hangs inside agentRunner.run())
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Abort from outside — this triggers managed.controller.abort()
     ac.abort();
@@ -137,7 +137,7 @@ test(
       const runPromise = manager.runSync(oneAgentScript, undefined, {
         externalSignal: ac.signal,
       });
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 50));
       ac.abort();
       da.resolve("done");
 
@@ -148,7 +148,7 @@ test(
       }
 
       // Give microtasks a chance to settle
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 50));
 
       assert.equal(uncaughtFromTest, null, "abort should NOT produce an uncaught exception");
     } finally {
@@ -186,7 +186,7 @@ const b = await agent('second', { label: 'second' })
 return { a, b }`;
 
     const { runId, promise } = manager.startInBackground(twoAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Let agent 1 complete (gets journaled)
     multiDa.resolve(0, "first-done");
@@ -221,7 +221,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Pause first
     const paused = manager.pause(runId);
@@ -251,7 +251,7 @@ test(
     });
 
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
     manager.stop(runId);
 
     assert.ok(stoppedEvent, "stopped event should fire");
@@ -269,7 +269,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     manager.stop(runId);
     const secondStop = manager.stop(runId);
@@ -295,7 +295,7 @@ test(
     });
 
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
     manager.pause(runId);
 
     assert.ok(pausedEvent, "paused event should fire");
@@ -313,7 +313,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     manager.stop(runId);
     const paused = manager.pause(runId);
@@ -331,7 +331,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     manager.pause(runId);
     const secondPause = manager.pause(runId);
@@ -352,7 +352,7 @@ test(
     manager.on("error", () => {});
 
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Pause while the deferred agent is in-flight
     const paused = manager.pause(runId);
@@ -405,7 +405,7 @@ const b = await agent('second', { label: 'second' })
 return { a, b }`;
 
     const { runId, promise: origPromise } = manager.startInBackground(twoAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Let agent 1 complete
     da.resolve("first-result");
@@ -463,7 +463,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     const run = manager.getRun(runId);
     assert.ok(run, "getRun should return the managed run");
@@ -490,7 +490,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     manager.stop(runId);
     const run = manager.getRun(runId);
@@ -508,7 +508,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Stop first, then delete
     manager.stop(runId);
@@ -532,7 +532,7 @@ test(
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Delete while running — should succeed (removes from tracking)
     const deleted = manager.deleteRun(runId);
@@ -653,7 +653,7 @@ test(
     manager.on("error", () => {});
 
     const { runId, promise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
 
     // Pause
     manager.pause(runId);
@@ -685,7 +685,7 @@ test(
 
     // Track resumed event on the pause→resume cycle
     const { runId, promise: origPromise } = manager.startInBackground(oneAgentScript);
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
     manager.pause(runId);
     await manager.resume(runId);
 
@@ -709,7 +709,7 @@ test(
     const runPromise = manager2.runSync(oneAgentScript, undefined, {
       externalSignal: ac2.signal,
     });
-    await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 50));
     ac2.abort();
     da2.resolve("done");
 

@@ -44,15 +44,18 @@ return { a, b }`;
 
     const { runId, promise } = manager.startInBackground(script, undefined);
     promise.catch(() => {});
-    for (let i = 0; i < 200 && bCalls === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    // In-memory state poll (50ms cadence): wait until first 'b' is in flight.
+    for (let i = 0; i < 200 && bCalls === 0; i++) await new Promise((r) => setTimeout(r, 50));
     assert.equal(bCalls, 1, "first 'b' is in flight before pausing");
     // Let 'a' finish in memory (its journal entry lands on completion), then
     // pause. NOTE: the fast path (journal-delta sidecar) means the PRIMARY's
     // agents array only lands at a boundary write — so 'a''s real timestamps
     // are read from the pause write, not from a pre-pause progress write that
     // never touches the primary.
+    // In-memory poll: 'a' completes in-memory within ms; 50ms cadence only
+    // shifts when the flip is observed, not which boundary write is read (L4).
     for (let i = 0; i < 200 && !(manager.getRun(runId)?.journal.length ?? 0); i++) {
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 50));
     }
     assert.ok((manager.getRun(runId)?.journal.length ?? 0) > 0, "'a' completed in memory before pausing");
     assert.equal(manager.pause(runId), true);
@@ -68,7 +71,7 @@ return { a, b }`;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
     for (let i = 0; i < 300 && manager.getRun(runId)?.status === "running"; i++) {
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 50));
     }
 
     const after = manager.getPersistence().load(runId);

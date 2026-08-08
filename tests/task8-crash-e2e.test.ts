@@ -65,7 +65,10 @@ async function until(probe: () => boolean, message: string, timeoutMs = 5000): P
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (probe()) return;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Mixed in-memory (da.started) and disk (rp.load) probes with a 5s default
+    // deadline: 200ms cadence leaves 25 observation windows and cuts timer
+    // churn 8× vs 25ms.
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error(message);
 }

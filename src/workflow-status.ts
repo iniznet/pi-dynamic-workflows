@@ -8,8 +8,10 @@ import { join } from "node:path";
 // on the gateway layer (same pattern as subagent-host-tools.ts).
 import type { HostToolsBundle } from "./gateway/host-tool-gateway.js";
 import type { ToolExecutor } from "./gateway/types.js";
-import { createRunPersistence, type PersistedRunState, type RunStatus } from "./run-persistence.js";
+import type { PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+import { createRunPersistence } from "./run-persistence.js";
 import { safeSetTimeout } from "./timing.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowStatus {
   runId: string;
@@ -297,16 +299,37 @@ export async function renewFileLock(
 
 export async function getWorkflowStatus(runId?: string): Promise<WorkflowStatus | null> {
   if (!runId) return null;
-  const state = createRunPersistence(process.cwd()).load(runId);
+  const state = sharedRunPersistence().load(runId);
   if (!state) return null;
   return toWorkflowStatus(state, runId);
 }
 
 export async function listRunningWorkflows(): Promise<WorkflowStatus[]> {
-  return createRunPersistence(process.cwd())
+  return sharedRunPersistence()
     .list()
     .filter((run) => RUNNING_OR_PAUSED.has(run.status))
     .map((run) => toWorkflowStatus(run, run.runId));
+}
+
+// Shared persistence instances, keyed by the on-disk project root the
+// instance binds (`workflowProjectPaths(cwd).rootDir` — a namespace that
+// captures BOTH cwd and HOME). Repeated status queries reuse ONE instance so
+// the 300ms list cache and the per-file stat cache (run-persistence.ts)
+// actually serve repeated calls instead of being rebuilt per call; keying by
+// the project root (not raw cwd) keeps parallel tests with fake HOME dirs
+// fully isolated — two tests can never bleed state through this cache. The
+// TTL freshness contract is unchanged: list() never serves data older than
+// its 300ms TTL, and load() is always a fresh primary read.
+const persistenceByProjectRoot = new Map<string, RunPersistence>();
+
+function sharedRunPersistence(): RunPersistence {
+  const rootDir = workflowProjectPaths(process.cwd()).rootDir;
+  let persistence = persistenceByProjectRoot.get(rootDir);
+  if (!persistence) {
+    persistence = createRunPersistence(process.cwd());
+    persistenceByProjectRoot.set(rootDir, persistence);
+  }
+  return persistence;
 }
 
 export async function releaseFileLock(filePath: string, runId: string): Promise<boolean> {

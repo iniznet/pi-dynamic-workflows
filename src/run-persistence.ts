@@ -706,16 +706,29 @@ export function createRunPersistence(
 
   // ── E4: append-only journal-delta sidecar (fast-path writes) ─────────────
 
-  // Read the journal-delta sidecar leniently: a missing OR corrupt sidecar is
-  // [] — a torn delta silently degrades to "nothing new since the last fold"
-  // (those calls re-run live on resume), which is the same degradation the
-  // plain-journal cap already accepts; it never corrupts replay.
-  const readJournalDelta = (runId: string): JournalEntry[] => {
+  // Raw sidecar text (null when absent or unreadable) — the single-syscall
+  // read shared by the parsed form below, the cross-process fold guard
+  // (casWrite folds + clears the sidecar only when its bytes match what the
+  // write merged), and parseFreshest's delta replay. One try/catch
+  // readFileSync replaces the old existsSync-probe + read pair, so the hot
+  // list()/parse path pays one syscall per sidecar check instead of two
+  // whenever the sidecar is present.
+  const readJournalDeltaText = (runId: string): string | null => {
     try {
-      // Avoid an ENOENT syscall on the hot list()/parse path: an absent
-      // sidecar is "nothing new since the last fold", not an error.
-      if (!_existsSync(journalDeltaPath(runId))) return [];
-      const raw = _readFileSync(journalDeltaPath(runId), "utf-8");
+      return _readFileSync(journalDeltaPath(runId), "utf-8");
+    } catch {
+      // A missing sidecar (ENOENT) or a torn/unreadable one is null — "no
+      // pending delta" — the ENOENT throw IS the absent-sidecar signal.
+      return null;
+    }
+  };
+
+  // Parse sidecar text leniently: corrupt-but-readable text is [] — a torn
+  // delta silently degrades to "nothing new since the last fold" (those
+  // calls re-run live on resume), which is the same degradation the
+  // plain-journal cap already accepts; it never corrupts replay.
+  const parseJournalDeltaText = (raw: string): JournalEntry[] => {
+    try {
       const parsed = JSON.parse(raw) as unknown;
       return Array.isArray(parsed) ? (parsed as JournalEntry[]) : [];
     } catch {
@@ -723,18 +736,11 @@ export function createRunPersistence(
     }
   };
 
-  // Raw sidecar text (null when absent) for the cross-process fold guard —
-  // a full write folds + clears the sidecar only when its bytes match what
-  // the write merged (see casWrite).
-  const readJournalDeltaText = (runId: string): string | null => {
-    try {
-      // Absent sidecar → null without probing readFileSync (ENOENT) on the
-      // hot list()/parse path; the caller treats null as "no pending delta".
-      if (!_existsSync(journalDeltaPath(runId))) return null;
-      return _readFileSync(journalDeltaPath(runId), "utf-8");
-    } catch {
-      return null;
-    }
+  // Read the journal-delta sidecar leniently: a missing OR corrupt sidecar
+  // is [] (see parseJournalDeltaText).
+  const readJournalDelta = (runId: string): JournalEntry[] => {
+    const text = readJournalDeltaText(runId);
+    return text === null ? [] : parseJournalDeltaText(text);
   };
 
   // Write the sidecar atomically (tmp + rename): a torn in-place write would
@@ -800,12 +806,16 @@ export function createRunPersistence(
   // primary that also has deltas materializes to the plain journal (resume
   // replay must see the deltas); with no deltas the compacted form is
   // preserved exactly as persisted.
-  const parseFreshest = (runId: string): PersistedRunState | null => {
+  const parseFreshest = (runId: string, sidecarText?: string | null): PersistedRunState | null => {
     for (const path of candidateRunPaths(runId)) {
       const raw = readJsonWithBackupRecovery<unknown>(fs, path);
       if (raw !== null) {
         const state = migrateRunState(raw);
-        const delta = readJournalDelta(runId);
+        // Share a caller-supplied sidecar read (casWrite reads the raw text
+        // once and passes it to its own fold guard baseline) so the same file
+        // is never probed twice in one write; undefined → read it here.
+        const text = sidecarText === undefined ? readJournalDeltaText(runId) : sidecarText;
+        const delta = text === null ? [] : parseJournalDeltaText(text);
         if (delta.length > 0) {
           state.journal = mergeJournalEntries(loadPersistedJournal(state), delta);
           state.journalCompacted = undefined;
@@ -934,8 +944,12 @@ export function createRunPersistence(
     let last: PersistedRunState | undefined;
     for (let attempt = 0; attempt < CAS_MAX_ATTEMPTS; attempt++) {
       const before = readPrimaryText(runId);
-      const current = parseFreshest(runId);
+      // Read the sidecar ONCE and share its raw text between parseFreshest
+      // (the delta merge) and the fold-guard baseline below — the old code
+      // probed the same file twice per CAS iteration (parseFreshest's
+      // readJournalDelta, then readJournalDeltaText), pure syscall overhead.
       const sidecarAtRead = foldSidecar ? readJournalDeltaText(runId) : null;
+      const current = parseFreshest(runId, sidecarAtRead);
       if (requireExisting && current === null) return null;
       const next = produce(current);
       next.updatedAt = new Date().toISOString();
@@ -1074,13 +1088,21 @@ export function createRunPersistence(
     // serialized content — a re-constructed entry with identical content is
     // folded, not re-delted; only a genuine content difference is a delta.
     const delta: JournalEntry[] = [];
-    const nextFolded = folded ? new Map(folded) : new Map<string, JournalEntry>();
+    // Copy-on-write folded map: materialized ONLY when an entry's identity
+    // actually changed — a real delta, or a content-identical re-construction
+    // that must refresh the map so the next save short-circuits on identity.
+    // A no-op save (every entry is still the same object as the last save)
+    // performs no O(|journal|) copy at all; the existing map remains
+    // authoritative for what is on disk.
+    let nextFolded: Map<string, JournalEntry> | undefined;
     for (const entry of journal) {
       const key = journalEntryKey(entry.runId ?? runId, entry.index);
       const known = folded?.get(key);
       if (known === entry) continue; // same object — already on disk
       if (known === undefined || JSON.stringify(known) !== JSON.stringify(entry)) delta.push(entry);
-      nextFolded.set(key, entry); // refresh identity (delta or content-identical)
+      // Identity refresh: copy-then-set only the touched key.
+      nextFolded ??= folded ? new Map(folded) : new Map<string, JournalEntry>();
+      nextFolded.set(key, entry);
     }
     if (delta.length > 0) {
       // Re-read the sidecar (a concurrent full writer may have folded and
@@ -1118,8 +1140,10 @@ export function createRunPersistence(
     }
     // Track what is now on disk for this run (primary-folded ∪ sidecar) so
     // the next fast write stays delta-only. Content-identical re-constructions
-    // refresh the map too, so the next save short-circuits on identity.
-    foldedByRun.set(runId, nextFolded);
+    // refresh the map too, so the next save short-circuits on identity. A
+    // save that touched nothing leaves the existing map in place — it is
+    // still exactly what is on disk.
+    if (nextFolded !== undefined) foldedByRun.set(runId, nextFolded);
   };
 
   return {
