@@ -24,6 +24,8 @@
     "tests/",
     "tsconfig.json",
     "tsconfig.scripts.json",
+    "scripts/suite-constants.mjs",
+    "scripts/suite-constants.d.mts",
     "README.md",
     "LICENSE"
   ],

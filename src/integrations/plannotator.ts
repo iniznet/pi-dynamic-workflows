@@ -80,9 +80,9 @@ const DEFAULT_CONFIG: PlannotatorConfig = {
 };
 
 /** Re-read cadence for waitForApproval; responsive for a human gate, bounded, and abortable. */
-const POLL_INTERVAL_MS = 250;
-/** Default SSE heartbeat cadence: comfortably under typical proxy idle timeouts (60s+). */
-const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+const POLL_INTERVAL_MS = 1000;
+/** Default SSE heartbeat cadence: 30s keeps idle connections alive while staying comfortably under typical proxy idle timeouts (60s+). */
+const DEFAULT_SSE_HEARTBEAT_MS = 30000;
 /** Max POST /approve body: a larger body is a protocol violation, not a review. */
 const MAX_APPROVE_BODY_BYTES = 64 * 1024;
 /** Plan id shape check for /plan and /approve (matches randomUUID output). */

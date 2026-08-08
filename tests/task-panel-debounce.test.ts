@@ -110,12 +110,12 @@ describe("task-panel render coalescing", () => {
     assert.equal(renders.length, 0, "a disposed panel never renders again");
   });
 
-  it("keeps the 2s ticker repainting while a run is active", async () => {
+  it("keeps the 4s ticker repainting while a run is active", async () => {
     const manager = createMockManager({
       listRuns: () => [{ runId: "a", workflowName: "wf", status: "running", agents: [], logs: [] }],
     });
     const { renders, comp } = mountPanel(manager);
-    await sleep(2100);
+    await sleep(4100);
     assert.ok(renders.length >= 1, "the ticker renders even with no run events firing");
     comp?.dispose?.();
   });

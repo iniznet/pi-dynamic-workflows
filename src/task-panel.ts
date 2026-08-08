@@ -762,16 +762,16 @@ export function installTaskPanel(
       for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
       const onRunEnd = ({ runId }: { runId: string }) => clearTokenSamples(runId);
       for (const ev of RUN_END_EVENTS) manager.on(ev, onRunEnd);
-      // In detailed mode, force a redraw every 2s while a run is active so the
+      // In detailed mode, force a redraw every 4s while a run is active so the
       // token/s rate keeps updating between sparse token events — and decays to 0
       // when an agent stalls. Gated + unref'd so it costs nothing when idle;
       // cleared on dispose.
       const timer = safeSetInterval(() => {
-        // Both panel modes now carry a live elapsed readout, so the 2s tick that
+        // Both panel modes now carry a live elapsed readout, so the 4s tick that
         // once refreshed only the detailed token rate must also repaint the
         // compact panel — otherwise its clock freezes between manager events.
         if (hasActiveRun()) tui.requestRender();
-      }, 2000);
+      }, 4000);
       timer.unref();
       // Purely informational: it lists running runs and re-renders on events. To
       // open the navigator, the user runs /workflows (the panel takes no input).

@@ -28,3 +28,15 @@ Read only what the task needs:
 - Bound fan-out, loops, retries, agents, and concurrency to the task. Treat invocation-level token and time caps as opt-in user constraints, not defaults.
 - Use `log()` for new code; `console` is compatibility-only.
 - Write plain JavaScript without imports or filesystem modules. Pass nondeterminism through `args`; `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable.
+
+## Running the suite
+
+Verify workflow changes with the full unit suite through the runner — never a raw uncapped invocation:
+
+```bash
+npm run test:unit        # or: node scripts/run-tests.mjs
+```
+
+`npm run test:unit` caps file-level concurrency (`min(availableParallelism() - 1, 2)`), serializes concurrent invocations via the cross-process suite lock, and honours `PI_TEST_CONCURRENCY` / `PI_TEST_TIMEOUT_MS`. Running `npx tsx --test` or `node --test` directly at default concurrency spawns `availableParallelism() - 1` file workers per invocation and pegs the box.
+
+A workflow `testCommand` override naming a directory or glob runs uncapped (node's default `availableParallelism() - 1` workers per task) — keep overrides to a single test file.

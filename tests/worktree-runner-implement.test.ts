@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { SUITE_CONCURRENCY_CAP } from "../scripts/suite-constants.mjs";
 import type { WorktreeTask } from "../src/agent/worktree-runner.js";
 import {
   createWorktreeRunner,
@@ -375,9 +376,12 @@ test("G5: a rejecting onTaskComplete never flips an already-landed task result",
 
 // ── pure helpers ──
 
-test("resolveProtocolCommands defaults to npx tsx --test and npx tsc --noEmit", () => {
+test("resolveProtocolCommands defaults to the capped node --import tsx --test invocation and npx tsc --noEmit", () => {
   const d = resolveProtocolCommands(undefined, undefined, "tests/math.test.ts");
-  assert.equal(d.testCommand, "npx tsx --test tests/math.test.ts");
+  assert.equal(
+    d.testCommand,
+    `node --import tsx --test --test-concurrency=${SUITE_CONCURRENCY_CAP} tests/math.test.ts`,
+  );
   assert.equal(d.typecheckCommand, "npx tsc --noEmit");
 });
 

@@ -14,6 +14,7 @@ import type { ChildProcess } from "node:child_process";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { SUITE_CONCURRENCY_CAP } from "../../scripts/suite-constants.mjs";
 import { gitExec, removeWorktree, sweepOrphanWorktrees } from "../worktree.js";
 
 /** Max captured bytes per protocol command run (test/typecheck output). */
@@ -22,8 +23,17 @@ const COMMAND_MAX_BUFFER = 16 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 /** How many test-run attempts the protocol may make before declaring red. */
 const MAX_TEST_RUN_ATTEMPTS = 3;
-/** Default test-runner command when neither the task spec nor the runner config overrides it. */
-const DEFAULT_TEST_COMMAND = (testPath: string) => `npx tsx --test ${testPath}`;
+/**
+ * Default test-runner command when neither the task spec nor the runner config
+ * overrides it. Capped like the suite runner (shared SUITE_CONCURRENCY_CAP) so
+ * N parallel /implement tasks spawn N capped processes instead of
+ * N × (availableParallelism() - 1) CPU-bound workers. The full runner
+ * (`npm run test:unit`) is deliberately NOT used here: it always appends the
+ * whole-suite globs, which would blow the 120s per-command timeout on every
+ * TDD step. Single-file invocation keeps per-task semantics.
+ */
+const DEFAULT_TEST_COMMAND = (testPath: string) =>
+  `node --import tsx --test --test-concurrency=${SUITE_CONCURRENCY_CAP} ${testPath}`;
 /** Default typecheck command when neither the task spec nor the runner config overrides it. */
 const DEFAULT_TYPECHECK_COMMAND = "npx tsc --noEmit";
 
@@ -69,7 +79,11 @@ export interface ImplementTaskSpec {
   implCode: string;
   /** Extra files the change is allowed to touch (scope-creep allowlist). */
   allowedPaths?: string[];
-  /** Test-runner command override; default `npx tsx --test <testPath>`. */
+  /**
+   * Test-runner command override; default the capped single-file invocation
+   * (see DEFAULT_TEST_COMMAND). A directory/glob override runs uncapped at
+   * node's default availableParallelism() - 1 workers per task.
+   */
   testCommand?: string;
   /**
    * Typecheck command override; default `npx tsc --noEmit`. Svelte projects

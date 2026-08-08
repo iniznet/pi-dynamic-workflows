@@ -214,7 +214,7 @@ export async function acquireFileLock(
   await mkdir(dir, { recursive: true });
   const lockPath = lockPathFor(filePath);
   const deadline = options.waitMs ? Date.now() + options.waitMs : 0;
-  const pollIntervalMs = options.pollIntervalMs ?? 50;
+  const pollIntervalMs = options.pollIntervalMs ?? 250;
   while (true) {
     if (await tryAcquireOnce(lockPath, filePath, runId, taskId, Date.now(), ttl)) return true;
     // A live holder with no wait budget fails fast (historical behavior).

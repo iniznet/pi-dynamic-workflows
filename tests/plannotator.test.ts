@@ -329,12 +329,12 @@ describe("waitForStatus settle guard", () => {
           return () => {};
         },
       });
-      await sleep(600); // ≥ 2 poll intervals (250ms) — polling is live before settle
+      await sleep(1200); // > 1 poll interval (1000ms) — polling is live before settle
       assert.ok(reads >= 1, `expected the poll to be running, saw ${reads} reads`);
       trigger?.(new Error("server error"));
       await assert.rejects(waiting, /server error/);
       const readsAtSettle = reads;
-      await sleep(600); // a buggy re-arm would read again within this window
+      await sleep(1200); // a buggy re-arm would read again within this window
       assert.equal(reads, readsAtSettle, "no further plan reads after settle — the poll must not re-arm");
     });
   });

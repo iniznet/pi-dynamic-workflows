@@ -535,14 +535,20 @@ The check pipeline type-checks the extension entry (`extensions/workflow.ts`) to
 
 The full unit suite runs through `scripts/run-tests.mjs` (`node --test` with the tsx loader, the same runner the node test runner itself uses) — wired in as `test:unit` and therefore part of `npm test` / `release:check`.
 
-The runner **caps file-level concurrency** at `min(availableParallelism() - 1, 4)` so the suite stops saturating every core on a dev machine (the default `availableParallelism() - 1` pegs the box with CPU-bound test workers — the measured cause of a 100%-CPU report; see `tasks/perf-cpu-audit/report.md`). This is a deliberate trade: on this 16-core box the capped suite takes ~108s vs ~66s uncapped (measured: `concurrency=4 wall=107793ms` vs A1 baseline `concurrency=15 wall=65580ms`), in exchange for leaving 12 of 16 cores free during the run. CI can restore full parallelism without edits:
+The runner **caps file-level concurrency** at `min(availableParallelism() - 1, 2)` so the suite stops saturating every core on a dev machine (the default `availableParallelism() - 1` pegs the box with CPU-bound test workers — the measured cause of a 100%-CPU report; see `tasks/cpu-agent-testing/report.md`). This is a deliberate trade: on this 16-core box the capped suite takes ~4.5 minutes vs ~66s uncapped, in exchange for leaving most cores free during the run. CI can restore full parallelism without edits:
 
 ```bash
 PI_TEST_CONCURRENCY=15 npm run test:unit   # e.g. dedicated CI runners
 PI_TEST_TIMEOUT_MS=300000 npm run test:unit # raise the 180s per-test guard
+PI_TEST_LOCK=0 npm run test:unit           # skip the suite lock entirely
+PI_TEST_LOCK_TIMEOUT_MS=600000 npm run test:unit # raise the 10 min suite-lock wait cap
 ```
 
 Every run prints `concurrency=N wall=Ms` on exit; a non-zero exit propagates on any failing test. The 180s per-test guard is a backstop only — it sits above the worst observed load-stall self-skip (~63s) and below a true hang, so no healthy test approaches it.
+
+**Suite lock.** `test:unit` also takes a cross-invocation lock (`scripts/suite-lock.mjs`): a second `npm run test:unit` on the same repository — any worktree — waits (printing progress every ~15s) instead of stacking CPU-bound workers on top of the first run (the measured 70-100%-CPU source: two stacked capped runs already average 86.8% of 16 cores). The lock keys on the git common dir (`git rev-parse --git-common-dir`, falling back to the resolved cwd outside a repo) and lives in `os.tmpdir()`, so it never touches the worktree. A lock whose holder pid has died is stolen automatically; waiting beyond `PI_TEST_LOCK_TIMEOUT_MS` (default 10 min) exits 2 with a clear message, and `PI_TEST_LOCK=0` disables locking entirely.
+
+**For agents:** verify with `npm run test:unit` — concurrent suite invocations serialize via the lock, so a second run waits rather than stacking.
 
 ### Extension load flow (no `npm run dev` preview)
 
