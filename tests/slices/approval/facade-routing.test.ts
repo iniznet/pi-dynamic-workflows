@@ -132,13 +132,20 @@ async function waitForRunStatus(
 ): Promise<Record<string, unknown>> {
   const runPath = join(runsDir, `${runId}.json`);
   const deadline = Date.now() + 60000;
+  // Poll at 250ms (not 50ms): the run record is the settle-write destination,
+  // and on Windows a read of the destination that is still in flight when the
+  // manager's terminal persist renames over it fails that rename with EPERM
+  // (readers open without delete-sharing — libuv default). At 50ms under
+  // full-suite load the poll's reads overlap the settle window often enough
+  // to flake; 250ms keeps the observation responsive (the run settles in
+  // ~400ms) while leaving the rename room to land.
   while (Date.now() < deadline) {
     const raw = await readFile(runPath, "utf-8").catch(() => null);
     if (raw !== null) {
       const parsed = JSON.parse(raw) as { status?: string };
       if (parsed.status === status) return parsed as Record<string, unknown>;
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
   // Diagnostics for the load-sensitive flake: the plans dir shows whether the
   // verdict flip actually landed on the file the run's poller watches; the

@@ -260,9 +260,13 @@ describe("McpToolsManager", () => {
     // (initialize+list = 2 × DELAY_MS) each.
     const spread = Math.max(...firstArrivals) - Math.min(...firstArrivals);
     assert.ok(spread < DELAY_MS, `handshakes must overlap (spread ${spread}ms >= ${DELAY_MS}ms)`);
-    // A serial implementation needs 3 × 2 × DELAY_MS = 480ms; parallel
-    // completes in ~2 × DELAY_MS = 160ms. Bound at half the serial cost.
-    assert.ok(elapsed < 3 * DELAY_MS, `parallel listing must beat serial time (elapsed ${elapsed}ms)`);
+    // A serial implementation needs 3 × 2 × DELAY_MS = 480ms minimum; parallel
+    // completes in ~2 × DELAY_MS = 160ms. Bound at 4.5 × DELAY_MS: still 25%
+    // under the serial floor, with headroom for event-loop jitter from the
+    // other suites running concurrently in a full `tsx --test` run (observed
+    // 304ms under full-suite load vs the old 3 × DELAY_MS = 240ms bound). The
+    // overlap assertion above is the primary B4 proof.
+    assert.ok(elapsed < 4.5 * DELAY_MS, `parallel listing must beat serial time (elapsed ${elapsed}ms)`);
   });
 
   test("a dead-slow handshake fails within the shorter handshake bound and skips the server (B4)", async () => {

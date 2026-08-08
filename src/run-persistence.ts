@@ -748,6 +748,37 @@ export function createRunPersistence(
 
   // ── Compare-and-swap persistence (core-orchestration:f3/i2) ──────────────
 
+  /**
+   * Windows-EPERM-safe rename for the run-record CAS write (same family as
+   * writeJsonFileAtomic's async retry and renewRunLease's lock rename below):
+   * a concurrent reader — the /workflows status poller, listRuns(), a
+   * list-cache warm, or antivirus scanning the temp dir — opens the
+   * destination without delete-sharing (libuv default) for a few ms, and
+   * MoveFileEx fails EPERM. The window is LONGER than the plan-file/lease
+   * cadence (5×20ms) on purpose: the run record is polled on a 50ms cadence
+   * (vs 250ms for plan files) and the terminal settle is the one write that
+   * must land or the run is left a ghost "running" on disk (M27). Bounded
+   * retry, then propagate (the manager's M27 catch treats a genuinely stuck
+   * disk as best-effort).
+   */
+  const CAS_RENAME_RETRY_ATTEMPTS = 10;
+  const CAS_RENAME_RETRY_DELAY_MS = 50;
+  const renameWithRetry = (from: string, to: string): void => {
+    for (let attempt = 0; attempt < CAS_RENAME_RETRY_ATTEMPTS; attempt++) {
+      try {
+        _renameSync(from, to);
+        return;
+      } catch (err) {
+        if ((err as { code?: string }).code !== "EPERM") throw err;
+        if (attempt < CAS_RENAME_RETRY_ATTEMPTS - 1) {
+          sleepSync(CAS_RENAME_RETRY_DELAY_MS);
+          continue;
+        }
+        throw err;
+      }
+    }
+  };
+
   // The raw text of the PRIMARY run file right now (null when absent). This is
   // the exact-byte fingerprint for concurrent-modification detection — content
   // comparison, deliberately NOT stat mtime/ino: mtime granularity is coarser
@@ -927,7 +958,7 @@ export function createRunPersistence(
       // Another writer replaced the file since our read → re-read and merge
       // onto THEIR snapshot instead of overwriting it.
       if (mid !== before) continue;
-      _renameSync(`${path}.tmp`, path);
+      renameWithRetry(`${path}.tmp`, path);
       const landed = readPrimaryText(runId);
       if (landed === json) {
         if (backup) {
