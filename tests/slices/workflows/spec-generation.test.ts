@@ -344,3 +344,17 @@ test("an unsupported format degrades into an explicit error result", async () =>
   const r = result.result as { error?: string };
   assert.match(r.error ?? "", new RegExp(`format must be one of: ${SPEC_GENERATION_FORMATS.join(", ")}`));
 });
+
+// ─── T2-05: per-phase tier defaults baked into the generated script ─────────
+
+test("spec-generation script bakes the per-phase tier defaults (T2-05)", () => {
+  const body = generateSpecGenerationWorkflow();
+  assert.match(body, /label: 'draft product', tier: "medium"/);
+  assert.match(body, /label: 'draft technical', tier: "medium"/);
+  assert.match(body, /label: 'draft risk', tier: "medium"/);
+  assert.match(body, /label: 'requirements reviewer', tier: "big"/);
+  assert.match(body, /label: 'spec writer', tier: "small"/);
+  const custom = generateSpecGenerationWorkflow({ tierDraft: "small", tierWriter: "medium" });
+  assert.match(custom, /label: 'draft product', tier: "small"/);
+  assert.match(custom, /label: 'spec writer', tier: "medium"/);
+});

@@ -622,3 +622,110 @@ describe("model-tier-config", () => {
     });
   });
 });
+
+describe("T2-11 thinking caps", () => {
+  it("coerceSpecThinkingForTier applies the built-in defaults (small→low, medium→medium, big→unset)", async () => {
+    const { coerceSpecThinkingForTier } = await loadModule();
+    assert.equal(coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "small", null), "openai/gpt-5.5:low");
+    assert.equal(coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "medium", null), "openai/gpt-5.5:medium");
+    assert.equal(
+      coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "big", null),
+      "openai/gpt-5.5:xhigh",
+      "big is unset — the spec's own suffix wins",
+    );
+    assert.equal(
+      coerceSpecThinkingForTier("openai/gpt-5.5:low", "small", null),
+      "openai/gpt-5.5:low",
+      "a suffix already at/below the cap is returned byte-identical",
+    );
+    assert.equal(coerceSpecThinkingForTier("openai/gpt-5.5", "small", null), "openai/gpt-5.5", "no suffix → unchanged");
+    assert.equal(coerceSpecThinkingForTier(undefined, "small", null), undefined);
+  });
+
+  it("coerceSpecThinkingForTier honors explicit thinkingCaps and a null cap (no cap)", async () => {
+    const { coerceSpecThinkingForTier } = await loadModule();
+    const config = {
+      tiers: { small: "x", medium: "y" },
+      thinkingCaps: { small: "off", medium: null } as const,
+    };
+    assert.equal(coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "small", config), "openai/gpt-5.5:off");
+    assert.equal(
+      coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "medium", config),
+      "openai/gpt-5.5:xhigh",
+      "an explicit null cap lifts the built-in default (medium is uncapped)",
+    );
+    // A tier absent from the caps map falls back to the built-in default.
+    assert.equal(coerceSpecThinkingForTier("openai/gpt-5.5:xhigh", "big", config), "openai/gpt-5.5:xhigh");
+  });
+
+  it("capThinkingLevel never raises a level and treats off/null caps as no-ops", async () => {
+    const { capThinkingLevel } = await loadModule();
+    assert.equal(capThinkingLevel("max", "low"), "low");
+    assert.equal(capThinkingLevel("off", "low"), "off");
+    assert.equal(capThinkingLevel("high", null), "high");
+    assert.equal(capThinkingLevel(undefined, "low"), undefined);
+  });
+
+  it("loadModelTierConfig coerces a present thinkingCaps map leniently and keeps an absent one absent", async () => {
+    const { loadModelTierConfig } = await loadModule();
+    const tmpDir = mkdtempSync(join(tmpdir(), "mtc-caps-"));
+    const cfgPath = join(tmpDir, "model-tiers.json");
+    try {
+      writeFileSync(
+        cfgPath,
+        JSON.stringify({
+          tiers: { small: "gpt-4.1-mini" },
+          thinkingCaps: { small: "low", medium: "bogus-level", big: null, garbage: 42 },
+        }),
+        "utf-8",
+      );
+      const loaded = loadModelTierConfig(cfgPath);
+      assert.deepEqual(loaded?.thinkingCaps, { small: "low", big: null }, "invalid entries are dropped on violation");
+      assert.equal(loaded?.tiers.small, "gpt-4.1-mini");
+    } finally {
+      await rmForce(tmpDir);
+    }
+  });
+
+  it("loadModelTierConfig round-trips a config without thinkingCaps unchanged (no default injection)", async () => {
+    const { loadModelTierConfig, saveModelTierConfig } = await loadModule();
+    const tmpDir = mkdtempSync(join(tmpdir(), "mtc-caps2-"));
+    const cfgPath = join(tmpDir, "model-tiers.json");
+    try {
+      const config = { tiers: { small: "gpt-4.1-mini", medium: "gpt-4.1", big: "gpt-5" } };
+      saveModelTierConfig(config, cfgPath);
+      const loaded = loadModelTierConfig(cfgPath);
+      assert.deepEqual(loaded, config, "an absent thinkingCaps key stays absent (round-trip byte-identical)");
+    } finally {
+      await rmForce(tmpDir);
+    }
+  });
+
+  it("formatTierCostPreview shows the effective thinking level when a cap is configured or a suffix is present", async () => {
+    const { formatTierCostPreview } = await loadModule();
+    const config = {
+      tiers: { small: "openai/gpt-5.5:xhigh", medium: "openai/gpt-5.5:medium", big: "openai/gpt-5.5" },
+      thinkingCaps: { small: "low", big: "max" } as const,
+    };
+    const models = [{ spec: "openai/gpt-5.5", costOutput: 10, contextWindow: 128_000 }];
+    const preview = formatTierCostPreview(config, models);
+    // Suffix above the cap → capped with provenance.
+    assert.match(preview, /small tier → openai\/gpt-5\.5:xhigh \(.*thinking low \(capped from xhigh\)\)/);
+    // Suffix at the cap → plain.
+    assert.match(preview, /medium tier → openai\/gpt-5\.5:medium \(.*thinking medium\)/);
+    // No suffix + explicit cap → unset (nothing requested).
+    assert.match(preview, /big tier → openai\/gpt-5\.5 \(.*thinking unset\)/);
+  });
+
+  it("formatTierCostPreview keeps the pre-T2-11 format when no suffix and no explicit cap", async () => {
+    const { formatTierCostPreview } = await loadModule();
+    const config = { tiers: { small: "openai/gpt-4.1-mini", big: "anthropic/claude-3-opus" } };
+    const models = [
+      { spec: "openai/gpt-4.1-mini", costOutput: 4.4, contextWindow: 128_000 },
+      { spec: "anthropic/claude-3-opus", costOutput: 75, contextWindow: 200_000 },
+    ];
+    const preview = formatTierCostPreview(config, models);
+    assert.match(preview, /small tier → openai\/gpt-4\.1-mini \(\$4\.4\/M output, 128000 ctx\)/);
+    assert.match(preview, /big tier → anthropic\/claude-3-opus \(\$75\/M output, 200000 ctx\)/);
+  });
+});

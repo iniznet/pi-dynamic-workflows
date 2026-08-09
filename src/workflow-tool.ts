@@ -152,6 +152,13 @@ const workflowToolSchema = Type?.Object({
         "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
     }),
   ),
+  retryOnlyIfSpendUnder: Type.Optional(
+    Type.Number({
+      minimum: 1,
+      description:
+        "Run-level default for the per-agent retry spend guard (T2-08): skip auto-retry when a failed attempt already recorded more than this many tokens, settling the agent exhausted instead of re-running the whole trajectory at full cost. Opt-in; absent preserves current retry behavior.",
+    }),
+  ),
   failOnExhaustedAgent: Type.Optional(
     Type.Boolean({
       description:
@@ -201,6 +208,12 @@ export type WorkflowToolInput = {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
+  /**
+   * Run-level default for the per-agent retry spend guard (T2-08): skip
+   * auto-retry when a failed attempt already burned more than this many
+   * tokens; the agent settles exhausted instead. Opt-in.
+   */
+  retryOnlyIfSpendUnder?: number;
   /**
    * Strict completion (default true): exhausted agents settle the run failed +
    * resumable instead of completing with silent nulls.
@@ -380,6 +393,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           concurrency: params.concurrency,
           agentRetries: params.agentRetries,
           agentTimeoutMs: params.agentTimeoutMs,
+          retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
           checkpointGate: options.checkpointGate,
           pipeline: options.pipeline,
@@ -416,6 +430,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           failOnExhaustedAgent: params.failOnExhaustedAgent ?? true,
           agentTimeoutMs: params.agentTimeoutMs,
+          retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
           tools: invocationTools,
           toolset: invocationToolset,
@@ -448,6 +463,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentRetries: params.agentRetries,
           failOnExhaustedAgent: params.failOnExhaustedAgent ?? true,
           agentTimeoutMs: params.agentTimeoutMs,
+          retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
           tools: invocationTools,
           toolset: invocationToolset,

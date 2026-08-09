@@ -127,6 +127,7 @@ export interface WorkflowRuntimeImplementations {
   route: unknown;
   timeboxed: unknown;
   elapsedMs: unknown;
+  ctx: unknown;
   consensus: unknown;
   retry: unknown;
   gate: unknown;
@@ -220,8 +221,14 @@ const AGENT_OPTIONS: OptionShape = {
     ),
     option("isolation", '"worktree"', true),
     option("agentType", "string", true, null, ["must come from provided context"], "agent-types"),
+    option("toolNames", "string[]", true, "full toolset", [
+      "restrict this agent's coding tools to these names; an empty array restricts to the schema/structured_output tool only (auto-added)",
+    ]),
     option("timeoutMs", "number | null", true, "run timeout; null disables"),
     option("retries", "number", true, "run retry count", ["finite values are floored and clamped to 0..3"]),
+    option("retryOnlyIfSpendUnder", "number", true, "run-level default", [
+      "skip auto-retry when the failed attempt's recorded spend exceeds this many tokens; the agent settles exhausted instead",
+    ]),
   ],
 };
 const CHECKPOINT_OPTIONS: OptionShape = {
@@ -249,6 +256,9 @@ const VERIFY_OPTIONS: OptionShape = {
     option("reviewers", "number", true, "2", ["authors should provide a finite integer; runtime clamps below 1"]),
     option("threshold", "number", true, "0.5"),
     option("lens", "string | string[]", true),
+    option("maxChars", "number", true, "4000", [
+      "embedded claim payload cap (ellipsis marker + log line when trimmed)",
+    ]),
   ],
 };
 const JUDGE_PANEL_OPTIONS: OptionShape = {
@@ -421,7 +431,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
   }),
   runtimeGlobal("verify", {
     signature:
-      "verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string | string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>",
+      "verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string | string[]; maxChars?: number }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "verify-options",
     constraints: [
@@ -517,6 +527,18 @@ const capabilities: readonly CapabilityDescriptor[] = [
     ],
     evidence: ["tests/slices/helpers/timeboxed.test.ts"],
   }),
+  runtimeGlobal("ctx", {
+    signature: "ctx(sharedText: string | unknown) => string",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    constraints: [
+      "registers sharedText ONCE per run (written to the run's shared store) and returns a compact pointer to embed in agent() prompts instead of re-embedding the full text into every fan-out call",
+      "repeated ctx() with the same text returns the same pointer without re-storing — one blob per run (dedupe guarantee)",
+      "the full blob text is emitted into the FIRST agent's instructions once per run; every later agent gets a store-key note — agents whose prompts reference a pointer can read the text with store_get (injected into every agent)",
+      "the blob fingerprint is a resume-hash identity input: editing the shared text invalidates cached replays of calls downstream of the ctx() registration",
+      "empty/absent text returns '' (no-op); non-string values are JSON-stringified; an oversized blob or the distinct-blob cap degrades to returning the raw text",
+    ],
+    evidence: ["tests/slices/runtime/shared-context.test.ts"],
+  }),
   runtimeGlobal("consensus", {
     signature:
       "consensus(question: string, options?: { panelists?: number; rounds?: number; agreeThreshold?: number; arbitrator?: (context: { question: string; votes: Array<{ verdict: boolean; reasoning?: string } | null>; rounds: number }) => unknown | Promise<unknown> }) => Promise<{ agreed: boolean; verdict: boolean | null; count: number; total: number; votes: Array<{ verdict: boolean; reasoning?: string } | null>; rounds: number; omitted: number; arbitration?: unknown }>",
@@ -580,11 +602,12 @@ const capabilities: readonly CapabilityDescriptor[] = [
   runtimeGlobal("cwd", { signature: "cwd: string" }),
   runtimeGlobal("process", { signature: "process: { cwd(): string }" }),
   runtimeGlobal("budget", {
-    signature: "budget: { total, spent(), remaining() }",
+    signature: "budget: { total, spent(), remaining(), wouldExceed(estimatedTokens) }",
     constraints: [
       "frozen view over shared soft token accounting",
       "spend accrues after agents finish, so in-flight work can overshoot",
       "nested workflows share the same accounting",
+      "wouldExceed(estimatedTokens) is advisory: true when the estimated extra spend would trip the ceiling — use it to gate cheap/optional work before spawning agents",
     ],
   }),
   runtimeGlobal("console", {
@@ -615,6 +638,11 @@ const capabilities: readonly CapabilityDescriptor[] = [
   toolInput("agentRetries", "agentRetries?: number = configured value or 0", [
     "floored and clamped to 0..3",
     "a subagent that still fails after retries is exhausted",
+  ]),
+  toolInput("retryOnlyIfSpendUnder", "retryOnlyIfSpendUnder?: number", [
+    "run-level default for the per-agent retry spend guard: skip auto-retry when the failed attempt already burned more than this many tokens",
+    "skipped retries settle the agent exhausted (AGENT_EXHAUSTED) exactly like retry exhaustion — failOnExhaustedAgent semantics unchanged",
+    "opt-in; absent preserves current retry behavior",
   ]),
   toolInput("agentTimeoutMs", "agentTimeoutMs?: number = configured default or unbounded"),
   toolInput("failOnExhaustedAgent", "failOnExhaustedAgent?: boolean = true", [

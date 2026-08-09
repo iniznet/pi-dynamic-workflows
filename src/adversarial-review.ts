@@ -15,6 +15,16 @@ export interface AdversarialReviewConfig {
 }
 
 /**
+ * T2-05: model-tier knob for the generated adversarial-review script — the
+ * final consensus report is flagship synthesis work (default "big"); the
+ * investigate/refute phases stay untagged (economy default, T2-03). Baked at
+ * generation time so the script text (and resume hashes) is deterministic.
+ */
+export interface AdversarialReviewTierOptions {
+  tierSynthesis?: string;
+}
+
+/**
  * Generate an adversarial-review workflow. The script is static and reads its
  * inputs from `args` (task/reviewers/threshold) — no string interpolation.
  *
@@ -22,7 +32,8 @@ export interface AdversarialReviewConfig {
  * a finding survives only when the share of reviewers calling it real meets the
  * agreement threshold.
  */
-export function generateAdversarialReviewWorkflow(): string {
+export function generateAdversarialReviewWorkflow(options: AdversarialReviewTierOptions = {}): string {
+  const tierSynthesis = JSON.stringify(options.tierSynthesis ?? "big");
   return `export const meta = {
   name: 'adversarial_review',
   description: 'Adversarial review: findings cross-checked by independent skeptics',
@@ -111,7 +122,7 @@ const report = await agent(
   'Write a final review report. Include ONLY the findings that survived adversarial review (listed below), ' +
   'each with a short justification. Note how many were discarded.\\n\\n' +
   'SURVIVING FINDINGS JSON:\\n' + JSON.stringify(survivors),
-  { label: 'consensus' }
+  { label: 'consensus', tier: ${tierSynthesis} }
 )
 
 return { total: findings.length, survivors, report }`;

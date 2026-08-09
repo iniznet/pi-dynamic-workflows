@@ -952,6 +952,143 @@ return { spentAtStart, blocked }`;
   );
 });
 
+test("T1-01: tokenBudgetCountsCacheRead defaults to counting the FULL total (cacheRead included)", async () => {
+  // The knob defaults to TRUE = current behavior: the budget gate reads
+  // shared.spent (input+output+cacheRead+cacheWrite), so a warm-provider run's
+  // cheap cached traffic still counts against the cap exactly as before.
+  // Each agent reports input=10 output=10 cacheRead=80 total=100 (M26 sum);
+  // two agents land at spent 200 > budget 150, so the third must be blocked.
+  const script = `export const meta = { name: 'knob_default', description: 'default full-spend gate' }
+await agent('a', { label: 'a' })
+await agent('b', { label: 'b' })
+let blocked = false
+try { await agent('c', { label: 'c' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { blocked }`;
+
+  const result = await runWorkflow<{ blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 10, output: 10, cacheRead: 80, cacheWrite: 0, total: 100, cost: 0 }),
+    tokenBudget: 150,
+    persistLogs: false,
+  });
+
+  assert.equal(
+    result.result.blocked,
+    true,
+    "default knob: cacheRead counts against the budget, so 2 agents (200) trip a 150 cap",
+  );
+});
+
+test("T1-01: tokenBudgetCountsCacheRead:false gates on FRESH spend (input+output only)", async () => {
+  // Same shape as the default-knob test, but with the fresh-counting knob on:
+  // each agent's fresh spend is 20 (input 10 + output 10), so even after two
+  // agents the fresh counter (40) is far below the 150 cap — 'c' must run.
+  // The full counter (shared.spent) still lands at 200; only the gate's input
+  // changed. M26 aggregate untouched (tokenUsage.total stays 300).
+  const script = `export const meta = { name: 'knob_fresh', description: 'fresh gate' }
+const a = await agent('a', { label: 'a' })
+const b = await agent('b', { label: 'b' })
+const c = await agent('c', { label: 'c' })
+return { a, b, c }`;
+
+  const result = await runWorkflow<{ a: unknown; b: unknown; c: unknown }>(script, {
+    agent: fakeAgent({ input: 10, output: 10, cacheRead: 80, cacheWrite: 0, total: 100, cost: 0 }),
+    tokenBudget: 150,
+    tokenBudgetCountsCacheRead: false,
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.c, "ok", "fresh gate: 60 fresh spend stays under the 150 cap despite 300 total traffic");
+  assert.equal(result.tokenUsage?.total, 300, "M26: the aggregate still counts the full total (3 × 100)");
+  assert.equal(result.tokenUsage?.cacheRead, 240, "cacheRead still accumulates in the aggregate (3 × 80)");
+});
+
+test("T1-01: fresh gate (knob off) trips once fresh spend passes the cap", async () => {
+  // budget.remaining() reads shared.freshSpent: 3 agents × 60 fresh = 180 > 150,
+  // so the fourth must be blocked even though its cacheRead-heavy traffic alone
+  // would not trip the fresh counter. Proves the fresh gate is a REAL gate, not
+  // a no-op.
+  const script = `export const meta = { name: 'knob_fresh_trips', description: 'fresh gate trips' }
+await agent('a', { label: 'a' })
+await agent('b', { label: 'b' })
+await agent('c', { label: 'c' })
+let blocked = false
+try { await agent('d', { label: 'd' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { blocked }`;
+
+  const result = await runWorkflow<{ blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 30, output: 30, cacheRead: 1000, cacheWrite: 0, total: 1060, cost: 0 }),
+    tokenBudget: 150,
+    tokenBudgetCountsCacheRead: false,
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.blocked, true, "fresh gate: 180 fresh spend trips the 150 cap");
+  assert.equal(result.tokenUsage?.total, 3180, "M26: full total reflects the 3 completed agents (3 × 1060)");
+});
+
+test("T1-01: initialFreshSpend seeds the fresh budget so it holds cumulatively across resume (#A2 variant)", async () => {
+  // The fresh-counter variant of the seeded-budget test above: a prior
+  // execution already spent 60 FRESH (input 40 + output 20) plus 940 cached
+  // (total 1000). This execution's fresh SharedRuntime must start counting
+  // fresh spend from 60: 'a' (fresh 60, cacheRead 940) lands at 120 fresh and
+  // 'b' (gate check 120 < 150) is still allowed, reaching 180 — so 'c' is
+  // then blocked. The FULL gate would already be exhausted at the seed (1000
+  // > 150) — which is exactly why a fresh-knob run seeds its fresh counter
+  // instead of the full total.
+  const script = `export const meta = { name: 'seeded_fresh', description: 'fresh seed' }
+const a = await agent('a', { label: 'a' })
+const b = await agent('b', { label: 'b' })
+let blocked = false
+try { await agent('c', { label: 'c' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, b, blocked }`;
+
+  const result = await runWorkflow<{ a: unknown; b: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 30, output: 30, cacheRead: 940, cacheWrite: 0, total: 1000, cost: 0 }),
+    tokenBudget: 150,
+    tokenBudgetCountsCacheRead: false,
+    // Prior execution: 40 input + 20 output = 60 fresh; the rest cached.
+    initialFreshSpend: 60,
+    initialTokenUsage: { input: 40, output: 20, total: 1000, cost: 0, cacheRead: 940, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.a, "ok", "'a' runs: seeded 60 fresh + 60 fresh = 120 < 150");
+  assert.equal(result.result.b, "ok", "'b' runs: pre-call check 120 < 150, then fresh reaches 180");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'c' is blocked once the seeded + this-run fresh spend (180) passes the 150 cap",
+  );
+  assert.equal(
+    result.tokenUsage?.total,
+    3000,
+    "M26: the aggregate total counts the seed (1000) plus 'a' and 'b' (2 × 1000); 'c' never ran",
+  );
+});
+
+test("T1-01: freshSpent lives on the shared runtime, NOT in the emitted tokenUsage shape", async () => {
+  // The A2 single-final-event tokenUsage emit must stay byte-identical: no
+  // freshSpent key leaks into the returned aggregate (M26 shape untouched).
+  const script = `export const meta = { name: 'knob_shape', description: 'shape' }
+await agent('a', { label: 'a' })
+return 1`;
+
+  const result = await runWorkflow(script, {
+    agent: fakeAgent({ input: 10, output: 10, cacheRead: 80, cacheWrite: 0, total: 100, cost: 0 }),
+    tokenBudgetCountsCacheRead: false,
+    persistLogs: false,
+  });
+
+  assert.deepEqual(result.tokenUsage, {
+    input: 10,
+    output: 10,
+    total: 100,
+    cost: 0,
+    cacheRead: 80,
+    cacheWrite: 0,
+  });
+});
+
 test("core-05: phase() re-declare carries forward the phase's attributed spend (sub-budget stays closed)", async () => {
   // Phase 'A' budget 100; each agent spends 60. Re-declaring A's budget
   // between agents must NOT reopen the sub-budget: the attributed spend
@@ -1931,4 +2068,43 @@ return { a }`;
   );
   assert.equal(endRecoverable, true, "a timeout stays recoverable");
   assert.match(endMessage ?? "", /raise or omit timeoutMs\/agentTimeoutMs/);
+});
+
+test("resume hash includes a non-empty per-call toolNames so a toolset edit invalidates the cached result (T1-08)", async () => {
+  const toolScript = (
+    toolNames: string,
+  ) => `export const meta = { name: 'toolnames_replay', description: 'toolnames replay' }
+const a = await agent('inspect', { label: 'i', toolNames: ${toolNames} })
+return { a }`;
+
+  // First run with toolNames ['read']: journal it.
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(toolScript("['read']"), {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "toolnames-replay-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 1);
+
+  // Same script + same toolNames → the hash matches → full replay, no live run.
+  const replay = countingAgent();
+  await runWorkflow(toolScript("['read']"), {
+    agent: replay.runner,
+    persistLogs: false,
+    runId: "toolnames-replay-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(replay.state.calls, 0, "an unchanged toolNames must replay from the journal");
+
+  // Editing ONLY toolNames (['grep']) → hash mismatch → the call re-runs live.
+  const edited = countingAgent();
+  await runWorkflow(toolScript("['grep']"), {
+    agent: edited.runner,
+    persistLogs: false,
+    runId: "toolnames-replay-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(edited.state.calls, 1, "a toolNames change must invalidate the cached call (not replay stale)");
 });

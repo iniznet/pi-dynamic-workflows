@@ -17,10 +17,13 @@ import { Type } from "typebox";
 import type { CapturedSourceResult } from "../src/subagent/extension-tools-capture.js";
 import {
   buildSubagentToolRows,
+  CHROME_TOOLS_APPROX_TOKENS_PER_TURN,
   classifyToolSource,
+  MCP_TOOL_DEFS_WARN_BYTES,
   registerWorkflowSubagentToolsCommand,
   renderSubagentToolsListing,
   type SubagentToolsListingInput,
+  toolDefinitionBytes,
 } from "../src/workflows-subagent-tools-command.js";
 import { makeCommandRegistryPi } from "./helpers/mock-pi.js";
 
@@ -245,6 +248,30 @@ describe("buildSubagentToolRows", () => {
   });
 });
 
+describe("toolDefinitionBytes / MCP guard constants", () => {
+  test("toolDefinitionBytes measures the provider-billed payload", () => {
+    const parameters = Type.Object({ query: Type.String() });
+    const def = {
+      name: "mcp_svelte_get-docs",
+      label: "get-docs",
+      description: "Get the docs",
+      parameters,
+      async execute() {
+        return { content: [], details: undefined };
+      },
+    } as unknown as import("@earendil-works/pi-coding-agent").ToolDefinition;
+    assert.equal(
+      toolDefinitionBytes(def),
+      Buffer.byteLength(JSON.stringify({ name: def.name, description: def.description, parameters }), "utf8"),
+    );
+  });
+
+  test("the MCP warn ceiling is 4 KB and the chrome cost constant is the measured 5,558 tok/turn", () => {
+    assert.equal(MCP_TOOL_DEFS_WARN_BYTES, 4 * 1024);
+    assert.equal(CHROME_TOOLS_APPROX_TOKENS_PER_TURN, 5_558);
+  });
+});
+
 describe("renderSubagentToolsListing", () => {
   test("the header shows the mode, host mode, chrome mode, and configured MCP servers", () => {
     const md = renderSubagentToolsListing(listing());
@@ -280,6 +307,33 @@ describe("renderSubagentToolsListing", () => {
     const md = renderSubagentToolsListing(listing());
     assert.match(md, /Extension tools: \*\*off\*\*/);
     assert.match(md, /set settings\.subagentExtensionTools=on/);
+  });
+
+  test("over-threshold MCP defs warn and recommend per-server tools filters (T1-09)", () => {
+    const md = renderSubagentToolsListing(listing({ mcpToolDefsBytes: MCP_TOOL_DEFS_WARN_BYTES + 1 }));
+    assert.match(md, /MCP tool defs: 4097 B\/turn/);
+    assert.match(md, /over the 4096 B guidance/);
+    assert.match(md, /tools` filters in mcp\.json/);
+  });
+
+  test("under-threshold or absent MCP defs render no warning line (T1-09)", () => {
+    const under = renderSubagentToolsListing(listing({ mcpToolDefsBytes: MCP_TOOL_DEFS_WARN_BYTES - 1 }));
+    assert.doesNotMatch(under, /MCP tool defs:/);
+    const absent = renderSubagentToolsListing(listing());
+    assert.doesNotMatch(absent, /MCP tool defs:/);
+  });
+
+  test("chrome on + granted surfaces the per-task attachment and the ~5.5 ktok/turn cost (T1-09)", () => {
+    const md = renderSubagentToolsListing(listing({ chromeToolsMode: "on", chromeGranted: true }));
+    assert.match(md, /Chrome tools: \*\*on\*\*/);
+    assert.match(md, /attach per-task with toolset: "chrome-tools"/);
+    assert.match(md, new RegExp(`${CHROME_TOOLS_APPROX_TOKENS_PER_TURN} tok/turn while attached`));
+  });
+
+  test("chrome off surfaces the saved cost and the per-task opt-in (T1-09)", () => {
+    const md = renderSubagentToolsListing(listing({ chromeToolsMode: "off" }));
+    assert.match(md, new RegExp(`${CHROME_TOOLS_APPROX_TOKENS_PER_TURN} tok/turn saved`));
+    assert.match(md, /expose them per-task via toolset: "chrome-tools"/);
   });
 
   test("the header shows the allowlist and per-source status when enabled", () => {

@@ -17,7 +17,7 @@ import {
 } from "../../../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../../../src/errors.js";
 import { resolveModelSpecWithThinking } from "../../../src/model-spec.js";
-import type { ModelTierConfig, RankableModel } from "../../../src/model-tier-config.js";
+import { buildDefaultTierConfig, type ModelTierConfig, type RankableModel } from "../../../src/model-tier-config.js";
 import { withFakeHome, withFakeHomeAsync } from "../../helpers/fake-home.js";
 import { rmForce } from "../../helpers/rm-force.js";
 
@@ -229,8 +229,120 @@ test("resolveAgentModelSpec: untagged agent defaults to the configured medium ti
   assert.equal(resolveAgentModelSpec({}, "main/model", loadCfg), "vendor/medium");
 });
 
-test("resolveAgentModelSpec: untagged agent with NO config falls through to session default", () => {
-  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg), undefined);
+// ═══════════════════════════════════════════════════════════════════════════
+// T2-03 economy routing matrix: no-config -> economy; config -> existing
+// precedence; inherit:main opt-out restores the session default.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ECONOMY_MODELS = [
+  { spec: "vendor/a-mini", costOutput: 0.4 },
+  { spec: "vendor/b-mid", costOutput: 5 },
+  { spec: "vendor/c-opus", costOutput: 75 },
+] satisfies RankableModel[];
+const economyList = () => ECONOMY_MODELS;
+
+// buildDefaultTierConfig spreads the ranked registry: small = a-mini, medium =
+// b-mid, big = c-opus (cost-ordered).
+const economyDefaults = buildDefaultTierConfig("main/model", ECONOMY_MODELS);
+
+function economyResolve(
+  prompt: string | undefined,
+  options: { defaultUntaggedTier?: string } = {},
+): string | undefined {
+  return resolveAgentModelSpec(options, "main/model", noCfg, undefined, prompt, economyList, (main) =>
+    buildDefaultTierConfig(main, ECONOMY_MODELS),
+  );
+}
+
+test("T2-03 routing matrix: no-config untagged resolves via the prompt-aware economy default", () => {
+  // scan → small
+  assert.equal(economyResolve("scan the codebase for dead code"), economyDefaults.tiers.small);
+  // edit → medium
+  assert.equal(economyResolve("refactor the loader"), economyDefaults.tiers.medium);
+  // synthesize → big
+  assert.equal(economyResolve("synthesize the findings"), economyDefaults.tiers.big);
+  // analyze → big (tierNameForClassification maps ANALYZE to big)
+  assert.equal(economyResolve("analyze the results"), economyDefaults.tiers.big);
+  // prompt-less → deterministic session default
+  assert.equal(economyResolve(undefined), "main/model");
+});
+
+test("T2-03 routing matrix: inherit:main opt-out restores the session default", () => {
+  assert.equal(economyResolve("scan the codebase", { defaultUntaggedTier: "inherit:main" }), undefined);
+  assert.equal(economyResolve(undefined, { defaultUntaggedTier: "inherit:main" }), undefined);
+});
+
+test("T2-03 routing matrix: a literal tier name resolves against the registry-derived default config", () => {
+  assert.equal(economyResolve("any prompt", { defaultUntaggedTier: "small" }), economyDefaults.tiers.small);
+  assert.equal(economyResolve("any prompt", { defaultUntaggedTier: "big" }), economyDefaults.tiers.big);
+  // An unknown literal tier degrades to the session default.
+  assert.equal(economyResolve("any prompt", { defaultUntaggedTier: "doesnotexist" }), "main/model");
+});
+
+test("T2-03 routing matrix: config present keeps existing precedence (untagged -> configured medium)", () => {
+  // Even with an economy-style prompt, a configured model-tiers.json wins:
+  // untagged defaults to the configured medium tier (plan matrix).
+  assert.equal(
+    resolveAgentModelSpec({}, "main/model", loadCfg, undefined, "synthesize the findings", economyList, (main) =>
+      buildDefaultTierConfig(main, ECONOMY_MODELS),
+    ),
+    "vendor/medium",
+  );
+  // The knob is ignored when a config exists (existing precedence).
+  assert.equal(
+    resolveAgentModelSpec(
+      { defaultUntaggedTier: "inherit:main" },
+      "main/model",
+      loadCfg,
+      undefined,
+      "synthesize the findings",
+      economyList,
+      (main) => buildDefaultTierConfig(main, ECONOMY_MODELS),
+    ),
+    "vendor/medium",
+  );
+});
+
+test("T2-03 routing matrix: explicit model/tier still win over the economy default", () => {
+  assert.equal(
+    resolveAgentModelSpec(
+      { model: "explicit/model" },
+      "main/model",
+      noCfg,
+      undefined,
+      "synthesize the findings",
+      economyList,
+      (main) => buildDefaultTierConfig(main, ECONOMY_MODELS),
+    ),
+    "explicit/model",
+  );
+  // An explicit tier with no config follows the pinned prompt-aware fallback
+  // (classification), NOT the economy default's own prompt-aware path — the
+  // explicit-tier no-config resolution is unchanged (GAP-2 pins it).
+  assert.equal(
+    resolveAgentModelSpec(
+      { tier: "small" },
+      "main/model",
+      noCfg,
+      undefined,
+      "synthesize the findings",
+      economyList,
+      (main) => buildDefaultTierConfig(main, ECONOMY_MODELS),
+    ),
+    economyDefaults.tiers.big,
+    "an explicit tier with no config still classifies the prompt (pinned pre-T2-03 behavior)",
+  );
+});
+
+test("resolveAgentModelSpec: untagged agent with NO config routes through the economy default (T2-03)", () => {
+  // T2-03 plan matrix: "no-config -> economy". A prompt-less resolution
+  // deterministically returns the session main model (the same model an
+  // undefined resolution would bind at runtime); with a prompt it resolves
+  // via the prompt-aware classifyTask fallback (see the routing-matrix
+  // tests) instead of falling through to the session default.
+  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg), "main/model");
+  // The opt-out restores the pre-T2-03 session-default behavior.
+  assert.equal(resolveAgentModelSpec({ defaultUntaggedTier: "inherit:main" }, "main/model", noCfg), undefined);
 });
 
 test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier => session default", () => {

@@ -57,6 +57,15 @@ export interface ProviderPoolEntry {
   tpm?: number;
   /** Cooldown after a recorded 429/limit event, ms (default 60s). */
   cooldownMs?: number;
+  /**
+   * T2-10: per-entry output-token price ($/M) for cost-aware routing. When
+   * absent, the effective cost is derived from the registry model's `cost` at
+   * construction (the same projection listAvailableModels uses). Entries (and
+   * models) with no known cost stay cost-neutral in place().
+   */
+  costOutput?: number;
+  /** T2-10: per-entry input-token price ($/M); registry-derived when absent. */
+  costInput?: number;
 }
 
 /**
@@ -117,6 +126,9 @@ export interface ProviderPoolSnapshotEntry {
   cooldownMs?: number;
   /** Epoch ms when a 429-cooldown expires; absent when not cooling down. */
   cooldownUntil?: number;
+  /** T2-10: effective output/input price ($/M) used by cost-aware routing. */
+  costOutput?: number;
+  costInput?: number;
   /** True when the endpoint is capped, TPM-capped, or in cooldown. */
   blocked: boolean;
 }
@@ -361,6 +373,7 @@ export class ProviderPool {
         const metrics = this.providerMetricsFor(entry.provider);
         const now = Date.now();
         const cooldownUntil = metrics.cooldownUntil > now ? metrics.cooldownUntil : undefined;
+        const costs = this.entryCost(entry);
         entries.push({
           provider: entry.provider,
           modelId: entry.modelId,
@@ -372,6 +385,9 @@ export class ProviderPool {
           measuredTpm: this.measuredTpm(entry.provider),
           cooldownMs: entry.cooldownMs,
           cooldownUntil,
+          // T2-10: effective per-endpoint price (entry value ?? registry cost).
+          ...(costs.output !== undefined ? { costOutput: costs.output } : {}),
+          ...(costs.input !== undefined ? { costInput: costs.input } : {}),
           blocked:
             this.isProviderInCooldown(entry.provider) || this.isTpmCapped(entry) || state.active >= entry.concurrency,
         });
@@ -445,20 +461,54 @@ export class ProviderPool {
 
   /**
    * Route among non-capped, non-cooldown, auth-configured entries: pick
-   * `min(active / weight)` (proportional, with the concurrency floor enforced
-   * per entry). Returns undefined when every candidate is saturated.
+   * `min((active/weight) * (1 + costNormalized))` (T2-10) — proportional load
+   * with a cost penalty that prefers the cheaper endpoint until its cap/TPM
+   * saturates. costNormalized ∈ [0,1] spreads each entry's known output price
+   * across the logical model's price range (min→0, max→1); entries with no
+   * known cost (neither per-entry nor registry-derived) are neutral (0), so a
+   * pool with no cost data routes exactly as before (`active/weight`). Returns
+   * undefined when every candidate is saturated.
    */
   private place(logicalModel: string): { provider: string; modelId: string } | undefined {
+    const candidates = this.entriesByModel.get(logicalModel) ?? [];
+    const costs = candidates
+      .map((entry) => this.entryCost(entry).output)
+      .filter((c): c is number => typeof c === "number" && c > 0);
+    const minCost = costs.length > 0 ? Math.min(...costs) : undefined;
+    const maxCost = costs.length > 1 && minCost !== undefined ? Math.max(...costs) : undefined;
+    const costNormalized = (entry: ProviderPoolEntry): number => {
+      if (minCost === undefined || maxCost === undefined || maxCost === minCost) return 0;
+      const cost = this.entryCost(entry).output;
+      if (typeof cost !== "number" || cost <= 0) return 0;
+      return (cost - minCost) / (maxCost - minCost);
+    };
     let best: { provider: string; modelId: string; score: number } | undefined;
-    for (const entry of this.entriesByModel.get(logicalModel) ?? []) {
+    for (const entry of candidates) {
       if (!this.isEntryPlaceable(entry)) continue;
       const state = this.entryState(entry.provider, entry.modelId);
-      const score = state.active / entry.weight;
+      const score = (state.active / entry.weight) * (1 + costNormalized(entry));
       if (!best || score < best.score) {
         best = { provider: entry.provider, modelId: entry.modelId, score };
       }
     }
     return best ? { provider: best.provider, modelId: best.modelId } : undefined;
+  }
+
+  /**
+   * T2-10: effective per-endpoint price ($/M) for cost-aware routing. A
+   * per-entry `costOutput`/`costInput` wins; otherwise it is derived from the
+   * registry model's `cost` (the same projection `listAvailableModels` feeds
+   * tier ranking — agent.ts). Never throws: an absent/odd registry entry is
+   * simply unknown (neutral in place()).
+   */
+  private entryCost(entry: ProviderPoolEntry): { output?: number; input?: number } {
+    const model = this.registry.find(entry.provider, entry.modelId) as
+      | { cost?: { input?: number; output?: number } }
+      | undefined;
+    return {
+      output: entry.costOutput ?? model?.cost?.output,
+      input: entry.costInput ?? model?.cost?.input,
+    };
   }
 
   /** Whether a fresh acquire may land on this entry right now. */

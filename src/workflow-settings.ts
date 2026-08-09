@@ -40,6 +40,15 @@ export interface WorkflowSettings {
    * project override to cancel a global budget); omitted also means no budget.
    */
   defaultTokenBudget?: number | null;
+  /**
+   * T1-01: whether the run token budget counts cache-read traffic. Default
+   * true = current behavior (the budget gate reads the full total,
+   * input+output+cacheRead+cacheWrite). Set false to make the budget gate
+   * read FRESH spend only (input+output) — proportional to billable work
+   * instead of the ~96% cacheRead-dominated total on warm-provider runs.
+   * Persisted aggregates (M26) are untouched in both modes.
+   */
+  tokenBudgetCountsCacheRead?: boolean;
   /** Default max concurrent agents per run. Clamped to the runtime maximum. */
   defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
@@ -99,10 +108,11 @@ export interface WorkflowSettings {
    * Vendored chrome tools for subagents (design: tasks/subagent-chrome-tools/
    * DESIGN.md): pi-chrome's `chrome_*` set re-created in-process, executed
    * against the host session's shared bridge and gated by its `/chrome
-   * authorize` grant. "on" exposes them in the default subagent toolset and
-   * the "chrome-tools" named toolset when a grant is active; "off" (default)
-   * keeps subagents browser-free. Orthogonal to subagentHostTools and
-   * subagentTools.
+   * authorize` grant. "on" makes them available per-task via the
+   * "chrome-tools" named toolset when a grant is active — they are NOT merged
+   * into the default toolset (T1-09), so untagged runs never pay the ~5.5
+   * ktok/turn chrome defs; "off" (default) keeps subagents browser-free.
+   * Orthogonal to subagentHostTools and subagentTools.
    */
   subagentChromeTools?: "on" | "off";
   /**
@@ -164,6 +174,7 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   keywordTriggerWord: ["string"],
   defaultAgentTimeoutMs: ["number", "null"],
   defaultTokenBudget: ["number", "null"],
+  tokenBudgetCountsCacheRead: ["boolean"],
   defaultConcurrency: ["number"],
   defaultAgentRetries: ["number"],
   progressPanelMode: ["string"],
@@ -350,6 +361,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   } else {
     const defaultTokenBudget = normalizeInteger(raw.defaultTokenBudget, 1, Number.MAX_SAFE_INTEGER);
     if (defaultTokenBudget !== undefined) settings.defaultTokenBudget = defaultTokenBudget;
+  }
+  if (typeof raw.tokenBudgetCountsCacheRead === "boolean") {
+    settings.tokenBudgetCountsCacheRead = raw.tokenBudgetCountsCacheRead;
   }
   const defaultConcurrency = normalizeInteger(raw.defaultConcurrency, 1, MAX_CONCURRENCY);
   if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;

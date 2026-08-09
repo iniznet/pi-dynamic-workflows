@@ -95,7 +95,31 @@ export interface PersistedRunState {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /**
+     * T1-01: the run's fresh spend (input+output only; cacheRead/cacheWrite
+     * excluded) at persist time. Additive — the M26 invariant
+     * `total === input+output+cacheRead+cacheWrite` is untouched. Resume()
+     * seeds the next execution's fresh budget counter from this (falling back
+     * to `total − cacheRead − cacheWrite` on legacy runs without the field).
+     */
+    freshSpend?: number;
   };
+  /**
+   * T1-01: the run's frozen budget-gate knob (false = fresh-counting gate).
+   * Absent (JSON-dropped) on default runs and legacy files — the full-spend
+   * gate. Resume() re-freezes it on the managed run so a fresh-gate run keeps
+   * the same gate across a pause/resume cycle (see ManagedRun).
+   */
+  tokenBudgetCountsCacheRead?: boolean;
+  /**
+   * T1-16: estimator-quality telemetry — the mean absolute error (whole
+   * tokens) between the estimate-only proxy (estimateTokens(prompt) +
+   * estimateTokens(result)) and the provider-reported fresh spend
+   * (input+output) across the run's REPORTED agents (the validation sample).
+   * Read-only: nothing routes on it; its purpose is to surface an estimator
+   * regression in the run JSON. JSON-dropped when absent (no reported agents).
+   */
+  estimatorMAE?: number;
   /**
    * F03: per-call ledger of RETRIED-attempt spend, keyed by the call's
    * deltaKey (`${runId}:${callIndex}` — the same key the journal's

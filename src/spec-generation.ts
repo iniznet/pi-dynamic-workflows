@@ -123,12 +123,27 @@ export interface SpecGenerationConfig {
 }
 
 /**
+ * T2-05: per-phase model-tier knobs for the generated spec-generation script.
+ * Defaults: drafts=medium, reviewer=big, markdown writer=small. Baked at
+ * generation time so the script text (and resume hashes) is deterministic.
+ */
+export interface SpecGenerationTierOptions {
+  tierDraft?: string;
+  tierReview?: string;
+  tierWriter?: string;
+}
+
+/**
  * Generate the spec-generation workflow script. The script is static and
  * reads its inputs from `args` (topic/audience/format) so nothing
  * caller-supplied is ever string-interpolated into source. The artifact
  * normalizer is embedded via normalizeSpecArtifactSource() (see module doc).
+ * T2-05: per-phase tiers are baked at generation time (JSON.stringify).
  */
-export function generateSpecGenerationWorkflow(): string {
+export function generateSpecGenerationWorkflow(options: SpecGenerationTierOptions = {}): string {
+  const tierDraft = JSON.stringify(options.tierDraft ?? "medium");
+  const tierReview = JSON.stringify(options.tierReview ?? "big");
+  const tierWriter = JSON.stringify(options.tierWriter ?? "small");
   return `export const meta = {
   name: 'spec_generation',
   description: 'Draft a specification from product, technical, and risk perspectives, then adversarially review into a structured artifact',
@@ -184,21 +199,21 @@ const draftResults = await parallel([
     'requirements (each with a short unique id and a testable statement), constraints, acceptance criteria, ' +
     'risks, and open questions. Focus on user value, scope, and what success looks like.' +
     '\\n\\nTOPIC: ' + topic + audienceLine,
-    { label: 'draft product', schema: SPEC_SCHEMA }
+    { label: 'draft product', tier: ${tierDraft}, schema: SPEC_SCHEMA }
   ),
   () => agent(
     'You are a technical drafter. Draft a complete technical specification for the topic below using the ' +
     'same sections: goal, requirements (each with a short unique id and a testable statement), constraints, ' +
     'acceptance criteria, risks, and open questions. Focus on architecture, interfaces, and technical feasibility.' +
     '\\n\\nTOPIC: ' + topic + audienceLine,
-    { label: 'draft technical', schema: SPEC_SCHEMA }
+    { label: 'draft technical', tier: ${tierDraft}, schema: SPEC_SCHEMA }
   ),
   () => agent(
     'You are a risk drafter. Draft a complete specification for the topic below with a risk-first eye: ' +
     'requirements that mitigate the main risks (each with a short unique id and a testable statement), ' +
     'constraints, acceptance criteria, risks, and open questions.' +
     '\\n\\nTOPIC: ' + topic + audienceLine,
-    { label: 'draft risk', schema: SPEC_SCHEMA }
+    { label: 'draft risk', tier: ${tierDraft}, schema: SPEC_SCHEMA }
   ),
 ])
 // A null draft (recoverable agent failure) drops that perspective from the
@@ -216,7 +231,7 @@ const reviewOut = await agent(
   'requirements (each with a unique id and a concrete, testable statement), constraints, acceptance criteria, ' +
   'risks, and open questions.\\n\\n' +
   'TOPIC: ' + topic + audienceLine + '\\n\\nDRAFT SPECS JSON:\\n' + JSON.stringify(drafts),
-  { label: 'requirements reviewer', schema: { type: 'object', properties: { review: { type: 'string' }, conflicts: { type: 'array', items: { type: 'string' } }, gaps: { type: 'array', items: { type: 'string' } }, spec: SPEC_SCHEMA }, required: ['review', 'spec'] } }
+  { label: 'requirements reviewer', tier: ${tierReview}, schema: { type: 'object', properties: { review: { type: 'string' }, conflicts: { type: 'array', items: { type: 'string' } }, gaps: { type: 'array', items: { type: 'string' } }, spec: SPEC_SCHEMA }, required: ['review', 'spec'] } }
 )
 const review = reviewOut && typeof reviewOut === 'object' ? reviewOut : null
 // normalizeSpecArtifact enforces the artifact contract deterministically: the
@@ -239,7 +254,7 @@ const artifact = format === 'json'
       'Structure it as: Goal, Requirements (id + statement), Constraints, Acceptance Criteria, Risks, Open Questions. ' +
       'Every requirement must keep its id.\\n\\n' +
       'TOPIC: ' + topic + audienceLine + '\\n\\nCONSOLIDATED SPEC JSON:\\n' + JSON.stringify(spec, null, 2),
-      { label: 'spec writer' }
+      { label: 'spec writer', tier: ${tierWriter} }
     )
 
 return { topic, audience, format, drafts, review: review ? review.review : null, conflicts, gaps, spec, artifact, error: '' }`;

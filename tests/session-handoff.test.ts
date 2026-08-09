@@ -65,6 +65,12 @@ async function makeHandoffAgent(
     cwd,
     modelRegistry: registry,
     mainModel: `${provider}/planner`,
+    // T2-03: these tests verify the swap-GATE mechanics (model bound at first
+    // run, swapped on first edit), not routing policy — pin the documented
+    // opt-out so an untagged planning phase keeps running on the session main
+    // (planner) instead of the economy classifyTask fallback ("analyze" → big
+    // → executor, which would make the gate's fromModel assertion vacuous).
+    defaultUntaggedTier: "inherit:main",
     sessionHandoff: opts.sessionHandoff ?? true,
     handoffExecutionModel: opts.handoffExecutionModel ?? `${provider}/executor`,
     handoffToolFilter: opts.handoffToolFilter,

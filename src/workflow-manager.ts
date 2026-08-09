@@ -34,6 +34,7 @@ import {
 import {
   type AgentKillChannel,
   type CheckpointGate,
+  estimateTokens,
   type JournalEntry,
   type PhasePipelineOptions,
   type PhaseStateIntegration,
@@ -104,6 +105,16 @@ interface ManagedRunBase {
    * default (an explicit `null` opt-out would otherwise regain a budget).
    */
   tokenBudget?: number | null;
+  /**
+   * T1-01: the run's frozen budget-gate knob (see WorkflowManagerOptions.
+   * defaultTokenBudgetCountsCacheRead). Fixed at run start and carried through
+   * resume() like tokenBudget — a resumed run must keep the gate semantics it
+   * started with, or a fresh-gate run resumed under a default-knob manager
+   * would silently flip back to the full-spend gate mid-run (the seeded fresh
+   * counter would then read as only a fraction of the full total and the gate
+   * would misbehave). Absent (undefined) = full-spend gate (default).
+   */
+  tokenBudgetCountsCacheRead?: boolean;
   /**
    * Named toolset tag for this run (see WorkflowManagerOptions.toolsets).
    * ToolDefinitions are functions and can't be persisted, so the tag is what
@@ -230,6 +241,16 @@ interface ManagedRunBase {
    * against the run's tokenBudget (the A2 seed logic).
    */
   retryLedger: Record<string, AgentUsage>;
+  /**
+   * T1-16 estimator-quality telemetry accumulator (see writeRunToDisk's
+   * estimatorMAE). Each LIVE agent that ends with a provider-reported usage
+   * breakdown contributes one sample: |(input+output) − (estimateTokens(prompt)
+   * + estimateTokens(result))|. Replayed (cache-hit) agents report no usage and
+   * contribute nothing; resume() seeds the accumulator from the persisted
+   * agents[] so the telemetry stays cumulative across a pause/resume cycle.
+   */
+  estimatorMaeSum: number;
+  estimatorMaeCount: number;
 }
 
 /** Statuses a run can rest in while it is NOT executing (lease released). */
@@ -292,6 +313,15 @@ export interface ExecOptions {
    * safety-relevant): a resumed run just uses whatever this execution passes.
    */
   retryBackoffMs?: number;
+  /**
+   * T2-08: run-level default for the per-agent retry spend guard (see
+   * AgentOptions.retryOnlyIfSpendUnder in workflow.ts) — skip auto-retry when
+   * a failed attempt already recorded more than this many tokens, settling
+   * the agent exhausted instead of re-running the trajectory at full cost.
+   * Opt-in; a pure behavior knob (deliberately NOT frozen per run, like
+   * retryBackoffMs): a resumed run just uses whatever this execution passes.
+   */
+  retryOnlyIfSpendUnder?: number;
   /**
    * Replay these journaled agent/checkpoint results for the unchanged prefix
    * (resume), keyed by `${runId}:${index}` — see
@@ -393,6 +423,22 @@ export interface ExecOptions {
     cacheRead: number;
     cacheWrite: number;
   };
+  /**
+   * T1-01: seed for the execution's fresh-spend counter (input+output only) —
+   * passed through to runWorkflow's WorkflowRunOptions.initialFreshSpend. Only
+   * resume() sets this (from the persisted run's freshSpend-at-pause, or the
+   * recomputed total−cacheRead−cacheWrite on legacy runs), so the fresh budget
+   * gate (tokenBudgetCountsCacheRead: false) holds cumulatively across a
+   * pause/resume cycle like initialTokenUsage does for the full-spend gate.
+   */
+  initialFreshSpend?: number;
+  /**
+   * T1-01: per-execution budget-gate knob. Absent → the manager's default
+   * (`defaultTokenBudgetCountsCacheRead`, itself true unless configured).
+   * True keeps the legacy full-spend budget (cacheRead counts); false gates
+   * on fresh spend (input+output only).
+   */
+  tokenBudgetCountsCacheRead?: boolean;
 }
 
 export interface WorkflowManagerOptions {
@@ -418,6 +464,14 @@ export interface WorkflowManagerOptions {
   defaultAgentRetries?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
   defaultTokenBudget?: number | null;
+  /**
+   * T1-01: default for the budget-gate knob applied to runs that do not pass
+   * their own tokenBudgetCountsCacheRead. DEFAULT true = legacy behavior: the
+   * budget counts the full total (input+output+cacheRead+cacheWrite), so a
+   * warm-provider run's cached traffic still counts against the cap. Set false
+   * to make the budget gate read fresh spend (input+output only) by default.
+   */
+  defaultTokenBudgetCountsCacheRead?: boolean;
   /**
    * Named toolsets resolvable by ExecOptions.toolset — e.g.
    * `{ "web-research": () => [...createCodingTools(cwd), ...createWebTools()] }`.
@@ -492,6 +546,7 @@ export type WorkflowManagerReloadOptions = Pick<
   | "defaultAgentTimeoutMs"
   | "defaultAgentRetries"
   | "defaultTokenBudget"
+  | "defaultTokenBudgetCountsCacheRead"
   | "toolsets"
   | "defaultTools"
   | "excludeSubagentTools"
@@ -581,6 +636,30 @@ function journalSideKey(entry: JournalEntry): string {
  */
 function isProviderSaturated(error: unknown): error is WorkflowError {
   return error instanceof WorkflowError && error.code === WorkflowErrorCode.PROVIDER_SATURATED;
+}
+
+/**
+ * T1-16: seed the estimator-quality accumulator from persisted agents on
+ * resume. Each agent that persisted a provider-reported breakdown contributes
+ * one MAE sample — |(input+output) − (estimateTokens(prompt) +
+ * estimateTokens(result))| — mirroring the live onAgentEnd sampling in
+ * executeRun, so the telemetry stays cumulative across a pause/resume cycle
+ * instead of resetting for the resumed execution's live agents only. Returns
+ * the { estimatorMaeSum, estimatorMaeCount } fields for the ManagedRun seed
+ * (empty when the run has no reported agents).
+ */
+function seedEstimatorMae(agents: PersistedRunState["agents"]): { estimatorMaeSum: number; estimatorMaeCount: number } {
+  let estimatorMaeSum = 0;
+  let estimatorMaeCount = 0;
+  for (const agent of agents) {
+    const usage = agent.tokenUsage;
+    if (!usage) continue;
+    const actual = usage.input + usage.output;
+    if (actual <= 0) continue;
+    estimatorMaeSum += Math.abs(actual - (estimateTokens(agent.prompt) + estimateTokens(agent.result)));
+    estimatorMaeCount += 1;
+  }
+  return { estimatorMaeSum, estimatorMaeCount };
 }
 
 /**
@@ -734,6 +813,8 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
+  /** T1-01 budget-gate knob default (see WorkflowManagerOptions). */
+  private tokenBudgetCountsCacheRead: boolean;
   private toolsets?: Record<string, () => ToolDefinition[] | Promise<ToolDefinition[]>>;
   private defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private excludeSubagentTools?: string[];
@@ -751,6 +832,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
+    this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
     this.toolsets = options.toolsets;
     this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
@@ -829,6 +911,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
+    this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
     this.toolsets = options.toolsets;
     this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
@@ -926,6 +1009,11 @@ export class WorkflowManager extends EventEmitter {
       // Resolve the budget once at start and freeze it on the run (see
       // ManagedRun.tokenBudget) so resume keeps start-time semantics.
       tokenBudget: startTokenBudget,
+      // T1-01: freeze the budget-gate knob the same way — a fresh-gate run
+      // must resume under the SAME gate (the fresh counter is seeded from the
+      // persisted run; flipping the knob mid-run would make the gate read the
+      // wrong counter).
+      tokenBudgetCountsCacheRead: exec.tokenBudgetCountsCacheRead ?? this.tokenBudgetCountsCacheRead,
       toolset: exec.toolset,
       // Same freeze-at-start pattern as tokenBudget, for the same reason: a
       // resumed run must keep these values, not re-resolve against the
@@ -939,6 +1027,8 @@ export class WorkflowManager extends EventEmitter {
       agentsById: new Map(),
       trimmedAgentDetailUpTo: 0,
       retryLedger: {},
+      estimatorMaeSum: 0,
+      estimatorMaeCount: 0,
     };
 
     this.runs.set(runId, managed);
@@ -964,6 +1054,9 @@ export class WorkflowManager extends EventEmitter {
         // to the pre-compaction shape (undefined keys are dropped by JSON).
         compactJournal: managed.compactJournal === true ? true : undefined,
         tokenBudget: managed.tokenBudget,
+        // T1-01: frozen budget-gate knob (see writeRunToDisk) — persisted at
+        // start too so a run paused before its first agent keeps its gate.
+        tokenBudgetCountsCacheRead: managed.tokenBudgetCountsCacheRead === false ? false : undefined,
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
         agentTimeoutMs: managed.agentTimeoutMs,
@@ -1063,6 +1156,8 @@ export class WorkflowManager extends EventEmitter {
       agentsById: new Map(),
       trimmedAgentDetailUpTo: 0,
       retryLedger: {},
+      estimatorMaeSum: 0,
+      estimatorMaeCount: 0,
     };
   }
 
@@ -1083,12 +1178,15 @@ export class WorkflowManager extends EventEmitter {
       concurrency,
       agentRetries,
       retryBackoffMs,
+      retryOnlyIfSpendUnder,
       confirm,
       checkpointGate,
       pipeline,
       phaseState,
       tools,
       initialTokenUsage,
+      initialFreshSpend,
+      tokenBudgetCountsCacheRead,
     } = exec;
     // maxAgents/agentTimeoutMs/concurrency/agentRetries were resolved (per-run
     // value, else the manager default at the time) and frozen on the managed
@@ -1198,6 +1296,8 @@ export class WorkflowManager extends EventEmitter {
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
         retryBackoffMs,
+        // T2-08: pass-through (not frozen — see ExecOptions.retryOnlyIfSpendUnder).
+        retryOnlyIfSpendUnder,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
         drainTimeoutMs: resolvedDrainTimeoutMs,
@@ -1220,6 +1320,15 @@ export class WorkflowManager extends EventEmitter {
         // runWorkflow only applies this on the fresh-SharedRuntime branch, never
         // overriding an inherited options.sharedRuntime from a nested workflow()).
         initialTokenUsage,
+        // T1-01: seed the fresh-spend counter the same way (see resume()'s
+        // priorFreshSpend), so a fresh-budget gate holds cumulatively across
+        // pause/resume. The knob follows the RUN's frozen value (start-time
+        // semantics, like tokenBudget) so a fresh-gate run resumes under the
+        // same gate; direct executeRun callers that skipped the start paths
+        // fall back to the exec value, else the manager default (true).
+        initialFreshSpend,
+        tokenBudgetCountsCacheRead:
+          managed.tokenBudgetCountsCacheRead ?? tokenBudgetCountsCacheRead ?? this.tokenBudgetCountsCacheRead,
         // Retried-attempt spend (see WorkflowRunOptions.onRetrySpend and A2):
         // recordTokens() in workflow.ts already folded this into
         // shared.spent/tokenUsage, but onAgentEnd never sees a retried
@@ -1397,6 +1506,20 @@ export class WorkflowManager extends EventEmitter {
             } else {
               agent.tokens = event.tokens;
               if (event.tokenUsage) agent.tokenUsage = event.tokenUsage;
+              // T1-16: one estimator-quality sample per LIVE agent with a
+              // provider-reported breakdown (a replay reports no usage and
+              // contributes nothing — its historical share is covered by the
+              // resume-time seedEstimatorMae seed). The MAE compares the
+              // estimate-only proxy (prompt+result) against the reported fresh
+              // spend (input+output) — the same pair the estimate-only budget
+              // path approximates, so the persisted estimatorMAE surfaces
+              // exactly how trustworthy that path is on this run.
+              if (event.tokenUsage && event.tokenUsage.input + event.tokenUsage.output > 0) {
+                const actual = event.tokenUsage.input + event.tokenUsage.output;
+                const estimated = estimateTokens(agent.prompt) + estimateTokens(event.result);
+                managed.estimatorMaeSum += Math.abs(actual - estimated);
+                managed.estimatorMaeCount += 1;
+              }
               // Real per-agent end time — only terminal agents get one; a
               // still-running agent's entry keeps endedAt undefined. A
               // replayed agent's seeded endedAt (its original completion
@@ -1744,6 +1867,12 @@ export class WorkflowManager extends EventEmitter {
       cost: prior?.cost ?? 0,
       cacheRead: prior?.cacheRead ?? 0,
       cacheWrite: prior?.cacheWrite ?? 0,
+      // T1-01: the persisted fresh-spend figure (input+output only) — seeded
+      // from priorTokenUsage on resume and accumulated here so a paused run
+      // can seed the NEXT resume's fresh counter. Mirrors recordTokens' split:
+      // a breakdown folds input+output; the estimate-only path folds the full
+      // estimate (which IS input+output). Never part of the M26 total math.
+      freshSpend: prior?.freshSpend ?? 0,
     };
     if (tokenUsage) {
       usage.input += tokenUsage.input;
@@ -1751,6 +1880,7 @@ export class WorkflowManager extends EventEmitter {
       usage.cost += tokenUsage.cost;
       usage.cacheRead += tokenUsage.cacheRead;
       usage.cacheWrite += tokenUsage.cacheWrite;
+      usage.freshSpend += tokenUsage.input + tokenUsage.output;
       // M26: same invariant as workflow.ts's recordTokens — when a breakdown
       // exists, the aggregate total is the component sum, so the persisted
       // aggregate satisfies total === input+output+cacheRead+cacheWrite by
@@ -1759,6 +1889,7 @@ export class WorkflowManager extends EventEmitter {
       usage.total += components > 0 ? components : tokens;
     } else {
       usage.total += tokens;
+      usage.freshSpend += tokens;
     }
     managed.snapshot.tokenUsage = usage;
   }
@@ -2228,6 +2359,12 @@ export class WorkflowManager extends EventEmitter {
           compactJournal: managed.compactJournal === true ? true : undefined,
           // Start-time execution context, re-read by resume() (see ManagedRun).
           tokenBudget: managed.tokenBudget,
+          // T1-01: the frozen budget-gate knob — persisted ONLY when the run
+          // opted into fresh-counting (false), so default runs' persisted files
+          // stay byte-identical to the pre-knob shape (undefined keys are
+          // JSON-dropped). resume() re-freezes it so a fresh-gate run keeps the
+          // fresh gate across a pause/resume cycle.
+          tokenBudgetCountsCacheRead: managed.tokenBudgetCountsCacheRead === false ? false : undefined,
           toolset: managed.toolset,
           maxAgents: managed.maxAgents,
           agentTimeoutMs: managed.agentTimeoutMs,
@@ -2295,8 +2432,21 @@ export class WorkflowManager extends EventEmitter {
                 cost: managed.snapshot.tokenUsage.cost,
                 cacheRead: managed.snapshot.tokenUsage.cacheRead,
                 cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+                // T1-01: the run's fresh (input+output) spend, so a paused run
+                // can seed the next resume's fresh budget counter. Additive —
+                // M26's total === components identity is untouched.
+                freshSpend: managed.snapshot.tokenUsage.freshSpend,
               }
             : undefined,
+          // T1-16: estimator quality telemetry — mean absolute error (tokens)
+          // between the estimate-only proxy (estimateTokens(prompt) +
+          // estimateTokens(result)) and the provider-reported fresh spend
+          // (input+output) across the run's REPORTED agents (the validation
+          // sample). Read-only surface: nothing routes on it; it exists so a
+          // regression in the estimate-only budget path surfaces in the run
+          // JSON. Absent (JSON-dropped) when no reported agent exists.
+          estimatorMAE:
+            managed.estimatorMaeCount > 0 ? Math.round(managed.estimatorMaeSum / managed.estimatorMaeCount) : undefined,
           // F03 retry ledger (see ManagedRun.retryLedger). JSON-dropped when
           // empty so a default run's persisted file stays byte-identical to the
           // pre-fix shape (same pattern as compactJournal).
@@ -2461,6 +2611,28 @@ export class WorkflowManager extends EventEmitter {
         })()
       : undefined;
 
+    // T1-01: the fresh-spend seed (input+output only) for the fresh budget
+    // gate. Persisted runs carry the field directly (see accumulateTokenUsage);
+    // legacy runs recompute `total − cacheRead − cacheWrite` (which equals
+    // input+output whenever the M26 component sum held). The F03 refund's
+    // fresh portion (input+output of the calls that will re-run) is subtracted
+    // exactly like the full counters above, so a fresh gate never double-charges
+    // an interrupted call's retry spend across the pause/resume boundary.
+    const priorFreshSpend = persisted.tokenUsage
+      ? (() => {
+          const fresh =
+            persisted.tokenUsage.freshSpend ??
+            Math.max(
+              0,
+              persisted.tokenUsage.total -
+                (persisted.tokenUsage.cacheRead ?? 0) -
+                (persisted.tokenUsage.cacheWrite ?? 0),
+            );
+          const refund = refundState?.refund;
+          return refund ? Math.max(0, fresh - refund.input - refund.output) : fresh;
+        })()
+      : undefined;
+
     // L4: seed per-agent timestamps from the persisted agents[] by call id so
     // REPLAYED (cache-hit) agents report their ORIGINAL startedAt/endedAt
     // instead of fabricated resume-time stamps. Only agents with a stored call
@@ -2521,8 +2693,11 @@ export class WorkflowManager extends EventEmitter {
         // Seed the live snapshot's aggregate from the persisted total-at-pause
         // (see A2) so a pause that lands before this resume's first agent
         // completes doesn't lose the prior spend — onAgentEnd accumulates on
-        // top of this rather than starting from scratch.
-        tokenUsage: priorTokenUsage,
+        // top of this rather than starting from scratch. T1-01: the fresh-spend
+        // figure rides along so a paused-then-resumed run keeps it too.
+        tokenUsage: priorTokenUsage
+          ? { ...priorTokenUsage, freshSpend: priorFreshSpend ?? priorTokenUsage.input + priorTokenUsage.output }
+          : undefined,
         // CUMULATIVE start clock: prefer the run's ORIGINAL first-start stamp
         // so elapsed readouts keep counting across pause/resume boundaries
         // instead of resetting; legacy runs without one fall back to now.
@@ -2597,6 +2772,10 @@ export class WorkflowManager extends EventEmitter {
       // silently downgrade failure semantics (see the "resume cannot downgrade"
       // test). The workflow tool therefore does not forward it on resume.
       failOnExhaustedAgent: persisted.failOnExhaustedAgent,
+      // T1-01: the budget-gate knob is frozen at run start exactly like
+      // tokenBudget — a fresh-gate run resumes under the fresh gate, never
+      // silently flipped back to the manager's current default mid-run.
+      tokenBudgetCountsCacheRead: persisted.tokenBudgetCountsCacheRead,
       // Fresh per-resume: agents (and any prior timing) are rebuilt live as
       // onAgentStart/onAgentEnd fire again for this attempt (see `agents: []`
       // above); the journal, not this map, is what makes replayed agents cheap.
@@ -2608,6 +2787,12 @@ export class WorkflowManager extends EventEmitter {
       seededAgentTimestamps,
       seededAgentStats,
       retryLedger: seededRetryLedger,
+      // T1-16: seed the estimator-quality accumulator from the PERSISTED agents
+      // so the metric stays cumulative across pause/resume instead of resetting
+      // to zero for the resumed execution's live agents only. Replayed
+      // (cache-hit) agents report no usage and add no samples during replay,
+      // so this seed is what keeps the historical reported sample in the MAE.
+      ...seedEstimatorMae(persisted.agents),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -2640,9 +2825,17 @@ export class WorkflowManager extends EventEmitter {
     // ExecOptions passthrough: `...exec` is spread FIRST so the manager's own
     // resumeJournal/initialTokenUsage (computed above) always win over any
     // caller-supplied values.
-    void this.executeRun(managed, script, args, { ...exec, resumeJournal, initialTokenUsage: priorTokenUsage }).catch(
-      () => {},
-    );
+    void this.executeRun(managed, script, args, {
+      ...exec,
+      resumeJournal,
+      initialTokenUsage: priorTokenUsage,
+      // T1-01: seed the fresh-spend counter from the persisted freshSpend so a
+      // fresh-budget gate (tokenBudgetCountsCacheRead: false) holds
+      // cumulatively across the pause/resume boundary like the full gate does.
+      // The knob itself follows the manager's current default (the same
+      // start-time semantics concurrency uses — it is not frozen per run).
+      initialFreshSpend: priorFreshSpend,
+    }).catch(() => {});
     return true;
   }
 

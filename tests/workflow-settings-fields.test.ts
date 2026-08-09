@@ -65,7 +65,7 @@ function expectError(key: keyof WorkflowSettings, raw: string): string {
 describe("FIELD_REGISTRY completeness", () => {
   it("has exactly one entry per WorkflowSettings key, mirroring WORKFLOW_ENV_VARS", () => {
     const registryKeys = FIELD_REGISTRY.map((field) => field.key);
-    assert.equal(registryKeys.length, 17, "registry must hold one row per settings key");
+    assert.equal(registryKeys.length, 18, "registry must hold one row per settings key");
     assert.deepEqual(
       new Set(registryKeys),
       new Set(Object.keys(WORKFLOW_ENV_VARS)),
@@ -127,6 +127,7 @@ describe("registry table conformance (design.md §3)", () => {
     assert.equal(fieldOf("keywordTriggerWord").defaultDisplay, "workflow");
     assert.equal(fieldOf("defaultAgentTimeoutMs").defaultDisplay, "null (none)");
     assert.equal(fieldOf("defaultTokenBudget").defaultDisplay, "null (none)");
+    assert.equal(fieldOf("tokenBudgetCountsCacheRead").defaultDisplay, "true");
     assert.equal(fieldOf("defaultConcurrency").defaultDisplay, "(manager default)");
     assert.equal(fieldOf("defaultAgentRetries").defaultDisplay, "0");
     assert.equal(fieldOf("progressPanelMode").defaultDisplay, "compact");

@@ -116,3 +116,12 @@ test("adversarial-review: a mixed null + real vote counts the null as failed (1-
   // reviewer said real; the failed vote still occupies a reviewer slot (H6).
   assert.equal(r.survivors.length, 0);
 });
+
+// ─── T2-05: per-phase tier defaults baked into the generated script ─────────
+
+test("adversarial-review script bakes the consensus/synthesis tier (T2-05)", () => {
+  const body = generateAdversarialReviewWorkflow();
+  assert.match(body, /label: 'consensus', tier: "big"/);
+  const custom = generateAdversarialReviewWorkflow({ tierSynthesis: "medium" });
+  assert.match(custom, /label: 'consensus', tier: "medium"/);
+});

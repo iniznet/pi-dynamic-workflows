@@ -42,11 +42,11 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "2863677d03803ac6fbedb44993730fae205d4718b4f332029f84705ffd8280fc",
+    sha256: "2049a96980596a3e359600e5539682bc1e835ea9e39500cec2a601e532c69c30",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "c81fe157899ca4ef11c734d7133c456a3d6e99e190decf3ce5f2328e0f1ead1d",
+    sha256: "a6b205fa8023e334b6f14f98573f1b18d299407c68ba97d7e7b9378f9f77c277",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -109,7 +109,7 @@ const WRITE_EDIT_ROUTE: ProtectedGuidanceSurface = {
 const HELPER_ROUTE: ProtectedGuidanceSurface = {
   path: SKILL_PATH,
   requiredText:
-    "- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`, and [authoring helpers](references/authoring-helpers.md) for `chunked`, `route`, `timeboxed`/`elapsedMs`, or `consensus`.",
+    "- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`, and [authoring helpers](references/authoring-helpers.md) for `chunked`, `route`, `timeboxed`/`elapsedMs`, `ctx`, or `consensus`.",
 };
 const ROUTING_ROUTE: ProtectedGuidanceSurface = {
   path: SKILL_PATH,
@@ -218,21 +218,21 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     {
       path: RUNTIME_PATH,
       requiredText:
-        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `ctx`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
     },
   ],
   "workflow.runtime.cwd": [
     {
       path: RUNTIME_PATH,
       requiredText:
-        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `ctx`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
     },
   ],
   "workflow.runtime.process": [
     {
       path: RUNTIME_PATH,
       requiredText:
-        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+        "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `ctx`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
     },
   ],
   "workflow.runtime.budget": [

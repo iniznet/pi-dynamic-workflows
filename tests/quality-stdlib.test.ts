@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { runWorkflow } from "../src/workflow.js";
 
 // Fake agents return a schema-shaped object when a schema is requested.
@@ -296,4 +297,160 @@ return { ok: res.ok, value: res.value, attempts: res.attempts, seen, legacyTruth
     { ok: true, value: "legacy", attempts: 1 },
     "legacy truthy validator verdicts remain accepted",
   );
+});
+
+// ─── T1-08: quality-helper votes carry toolNames: [] (schema tool only) ───────
+
+test("quality-helper votes pass toolNames: [] while default agents keep the full toolset (T1-08)", async () => {
+  const seenToolNames: Array<string[] | undefined> = [];
+  const capturing = {
+    async run(_p: string, o?: { schema?: unknown; toolNames?: string[] }) {
+      seenToolNames.push(o?.toolNames);
+      if (o?.schema) return { real: true, score: 1, verdict: true, complete: true, key: "a" } as never;
+      return "ok";
+    },
+  };
+  const script = `export const meta = { name: 'toolset_resolution', description: 'T1-08 toolset resolution' }
+await agent('plain', { label: 'plain' })
+await agent('restricted', { label: 'restricted', toolNames: ['read'] })
+await verify('claim', { reviewers: 1 })
+await judgePanel(['candidate'], { judges: 1 })
+await consensus('statement', { panelists: 1, rounds: 1 })
+await completenessCheck({ task: 1 }, [{ done: true }])
+await route({ kind: 'x' }, { cases: [{ key: 'a', run: () => 'ran' }], fallback: () => 'fb' })
+return {}`;
+  await runWorkflow(script, { agent: capturing, persistLogs: false });
+
+  // agent() with no toolNames → undefined (full toolset); explicit list forwarded as-is.
+  assert.equal(seenToolNames[0], undefined, "default agent keeps the full toolset");
+  assert.deepEqual([...(seenToolNames[1] ?? [])], ["read"], "explicit per-call toolNames forwarded to the runner");
+  // Every quality-helper vote restricts to the schema tool only (structured_output auto-added).
+  for (let i = 2; i < seenToolNames.length; i++) {
+    assert.deepEqual(seenToolNames[i], [], `quality-helper vote ${i} must pass toolNames: []`);
+  }
+});
+
+// ─── T1-03: capEmbedded — boundary, marker, and log line ──────────────────────
+
+test("verify() maxChars caps the embedded claim with an ellipsis marker and a log line (T1-03)", async () => {
+  const prompts: string[] = [];
+  const critic = {
+    async run(prompt: string, o?: { schema?: unknown }) {
+      prompts.push(prompt);
+      return o?.schema ? { real: true } : "ok";
+    },
+  };
+  const longClaim = "x".repeat(4500);
+  const script = `export const meta = { name: 'cap_embedded', description: 'T1-03 cap' }
+const capped = await verify('${longClaim}', { reviewers: 1, maxChars: 4000 })
+const tail = await verify('TAIL-CLAIM', { reviewers: 1, maxChars: 4000 })
+return { capped, tail }`;
+  const res = await runWorkflow<{ capped: { real: boolean }; tail: { real: boolean } }>(script, {
+    agent: critic,
+    persistLogs: false,
+  });
+  assert.equal(res.result.capped.real, true);
+  assert.equal(res.result.tail.real, true);
+  // The long claim is sliced to 4000 chars + a one-char ellipsis marker; the
+  // short claim passes through byte-identical (no marker).
+  assert.match(prompts[0] ?? "", /…$/);
+  assert.ok((prompts[0] ?? "").includes("x".repeat(4000)), "the first 4000 claim chars survive");
+  assert.doesNotMatch(prompts[0] ?? "", /x{4500}/, "the claim tail beyond 4000 chars is cut");
+  assert.doesNotMatch(prompts[1] ?? "", /…$/);
+  assert.ok((prompts[1] ?? "").includes("TAIL-CLAIM"));
+  assert.ok(
+    res.logs.some((l) => l.includes("embedded payload capped at 4000 chars") && l.includes("4500")),
+    "the truncation must be logged, never silent",
+  );
+});
+
+test("judgePanel() and consensus() cap oversized embedded payloads at the default 4000 chars (T1-03)", async () => {
+  const prompts: string[] = [];
+  const scorer = {
+    async run(prompt: string, o?: { schema?: unknown }) {
+      prompts.push(prompt);
+      return o?.schema ? { score: 0.5, verdict: true } : "ok";
+    },
+  };
+  const big = "y".repeat(4100);
+  const script = `export const meta = { name: 'cap_default', description: 'T1-03 default caps' }
+const w = await judgePanel(['${big}'], { judges: 1 })
+const c = await consensus('statement ${big} tail', { panelists: 1, rounds: 1 })
+return { w, c }`;
+  const res = await runWorkflow<{ w: { index: number }; c: { agreed: boolean } }>(script, {
+    agent: scorer,
+    persistLogs: false,
+  });
+  assert.equal(res.result.w.index, 0);
+  assert.equal(res.result.c.agreed, true);
+  assert.match(prompts[0] ?? "", /…$/);
+  assert.match(prompts[1] ?? "", /…$/);
+  assert.ok(
+    res.logs.some((l) => l.includes("embedded payload capped at 4000 chars")),
+    "default-cap truncations must be logged",
+  );
+});
+
+// ─── T2-04: quality helpers bind votes to an economy tier ─────────────────────
+
+test("T2-04: verify/judgePanel/consensus/completenessCheck/route default their votes to tier small", async () => {
+  const tiers: Array<string | undefined> = [];
+  const capturing = {
+    async run(_p: string, o?: { schema?: unknown; tier?: string }) {
+      if (o?.schema) tiers.push(o.tier);
+      return o?.schema ? { real: true, score: 0.9, verdict: true, key: "a" } : "ok";
+    },
+  };
+  const script = `export const meta = { name: 't4', description: 'helper tiers' }
+const v = await verify('claim', { reviewers: 2 })
+const j = await judgePanel(['candidate'], { judges: 1 })
+const c = await consensus('statement', { panelists: 1, rounds: 1 })
+const cc = await completenessCheck({ task: 1 }, [{ done: true }])
+const r = await route({ kind: 'x' }, { cases: [{ key: 'a', run: () => 'ran' }], fallback: () => 'fb' })
+return { v, j, c, cc, r }`;
+  await runWorkflow(script, { agent: capturing, persistLogs: false });
+  assert.ok(tiers.length >= 6, `expected >=6 tiered votes, got ${tiers.length}`);
+  assert.ok(
+    tiers.every((t) => t === "small"),
+    `every helper vote defaults to the economy tier, got: ${JSON.stringify(tiers)}`,
+  );
+});
+
+test("T2-04: opts.tier passthrough overrides the helper economy default", async () => {
+  const tiers: Array<string | undefined> = [];
+  const capturing = {
+    async run(_p: string, o?: { schema?: unknown; tier?: string }) {
+      if (o?.schema) tiers.push(o.tier);
+      return o?.schema ? { real: true, score: 0.9, verdict: true, key: "a" } : "ok";
+    },
+  };
+  const script = `export const meta = { name: 't4b', description: 'helper tier override' }
+const v = await verify('claim', { reviewers: 1, tier: 'medium' })
+const j = await judgePanel(['candidate'], { judges: 1, tier: 'big' })
+const c = await consensus('statement', { panelists: 1, rounds: 1, tier: 'medium' })
+const r = await route({ kind: 'x' }, { cases: [{ key: 'a', run: () => 'ran' }], fallback: () => 'fb', tier: 'big' })
+return { v, j, c, r }`;
+  await runWorkflow(script, { agent: capturing, persistLogs: false });
+  assert.deepEqual(tiers, ["medium", "big", "medium", "big"], "opts.tier must win over the small default");
+});
+
+test("T2-04: a tiered vote that hits the schema wall still yields null, never a run failure", async () => {
+  let call = 0;
+  const reviewer = {
+    async run(_p: string, o?: { schema?: unknown }) {
+      if (!o?.schema) return "ok";
+      call++;
+      if (call === 1) {
+        throw new WorkflowError("vote could not produce valid output", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, {
+          recoverable: false,
+        });
+      }
+      return { real: true };
+    },
+  };
+  const script = `export const meta = { name: 't4c', description: 'helper tier tolerance' }
+return await verify('claim', { reviewers: 2, tier: 'small' })`;
+  const res = await runWorkflow<{ real: boolean; total: number }>(script, { agent: reviewer, persistLogs: false });
+  assert.equal(res.result.total, 1, "the SCHEMA_NONCOMPLIANCE vote is omitted from the denominator");
+  assert.equal(res.result.real, true, "the surviving vote still decides");
 });

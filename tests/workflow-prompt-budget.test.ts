@@ -74,7 +74,14 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // backtick escaping errors). The new string parameter and its description
 // increase the measured definition from 5,168 to 5,608 bytes (+440), and
 // the accepted ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 5_608;
+//
+// Added an optional `retryOnlyIfSpendUnder` input (T2-08: run-level default
+// for the per-agent retry spend guard — skip auto-retry when a failed
+// attempt already burned more than this many tokens, settling the agent
+// exhausted instead). The new numeric parameter and its description increase
+// the measured definition from 5,608 to 5,959 bytes (+351), and the accepted
+// ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 5_959;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

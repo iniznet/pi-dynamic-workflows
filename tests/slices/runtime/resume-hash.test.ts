@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { ROUTING_POLICY_VERSION } from "../../../src/config.js";
 import type { JournalEntry } from "../../../src/workflow.js";
-import { runWorkflow } from "../../../src/workflow.js";
+import { hashAgentCall, runWorkflow } from "../../../src/workflow.js";
 
 const RUN_ID = "hash-run";
 const SCRIPT = `export const meta = { name: 'hash_demo', description: 'resume identity' }
@@ -230,4 +232,111 @@ test("core-08: a configured-tier call is unaffected by a registry change (tierMo
   const registryB = mockRegistry([{ provider: "prov", id: "cheap-2", costOutput: 1, contextWindow: 8000 }]);
   await runWorkflow(TIER_SCRIPT, { ...options(registryB), resumeJournal: journal });
   assert.equal(calls, 1, "a configured-tier call replays despite a registry change");
+});
+
+// ─── T2-03/T2-05/T2-11: routing-policy version + economy hash surface ────────
+
+test("T2-03: the resume hash identity encodes ROUTING_POLICY_VERSION (routing-policy versioning)", () => {
+  // Pin the identity shape: a policy default change bumps ROUTING_POLICY_VERSION,
+  // which changes every hashAgentCall output — so journals persisted under an
+  // older policy mismatch and re-run live instead of replaying a result
+  // computed under the old routing rules. If hashAgentCall's identity surface
+  // changes, this pin test breaks loudly (the whole point).
+  const hash = hashAgentCall(
+    "prompt",
+    undefined, // model
+    undefined, // tierModel
+    undefined, // phase
+    { label: "x" },
+    null, // agentDefKey
+    "prov/main",
+    undefined, // isolation
+  );
+  const expectedIdentity = JSON.stringify({
+    prompt: "prompt",
+    model: null,
+    tierModel: null,
+    defaultModel: "prov/main",
+    tier: null,
+    phase: null,
+    agentType: null,
+    agentDef: null,
+    isolation: null,
+    schema: null,
+    routingPolicyVersion: ROUTING_POLICY_VERSION,
+  });
+  assert.equal(hash, createHash("sha256").update(expectedIdentity).digest("hex"));
+  assert.equal(ROUTING_POLICY_VERSION, 2, "bumped once for the slice-C routing-policy changes");
+});
+
+test("T2-03: an untagged no-config call's hash is registry-dependent (economy fingerprint widening)", async () => {
+  let calls = 0;
+  const agent = {
+    async run() {
+      calls++;
+      return "ok";
+    },
+  };
+  const journal = makeJournal();
+  // Untagged call whose prompt classifies scan→small: with no model-tiers.json
+  // the live resolution ranks THIS registry (economy default), so a registry
+  // change between a live run and its resume must invalidate the cached result
+  // — the same core-08 contract the tier-no-config path already has.
+  const script = `export const meta = { name: 'hash_economy', description: 'economy identity' }
+return await agent('scan the codebase for dead code', { label: 'x' })`;
+  const options = (registry: ModelRegistry) => ({
+    agent,
+    persistLogs: false,
+    runId: RUN_ID,
+    mainModel: "prov/main",
+    loadTierConfig: () => null,
+    modelRegistry: registry,
+    onAgentJournal: (entry: JournalEntry) => journal.set(`${entry.runId ?? RUN_ID}:${entry.index}`, entry),
+  });
+
+  const registryA = mockRegistry([
+    { provider: "prov", id: "cheap-1", costOutput: 1, contextWindow: 8000 },
+    { provider: "prov", id: "capable-1", costOutput: 20, contextWindow: 128000 },
+  ]);
+  await runWorkflow(script, options(registryA));
+  assert.equal(calls, 1, "first run executes live");
+
+  await runWorkflow(script, { ...options(registryA), resumeJournal: journal });
+  assert.equal(calls, 1, "the same registry replays from cache");
+
+  const registryB = mockRegistry([
+    { provider: "prov", id: "cheap-2", costOutput: 1, contextWindow: 8000 },
+    { provider: "prov", id: "capable-1", costOutput: 20, contextWindow: 128000 },
+  ]);
+  await runWorkflow(script, { ...options(registryB), resumeJournal: journal });
+  assert.equal(calls, 2, "a registry change invalidates the cached replay of an economy-routed untagged call");
+});
+
+test("T2-03: the inherit:main opt-out keeps the defaultModel encoding (main-model changes invalidate)", async () => {
+  let calls = 0;
+  const agent = {
+    async run() {
+      calls++;
+      return "ok";
+    },
+  };
+  const journal = makeJournal();
+  const script = `export const meta = { name: 'hash_inherit', description: 'inherit identity' }
+return await agent('scan the codebase for dead code', { label: 'x' })`;
+  const options = (mainModel: string) => ({
+    agent,
+    persistLogs: false,
+    runId: RUN_ID,
+    mainModel,
+    defaultUntaggedTier: "inherit:main",
+    loadTierConfig: () => null,
+    onAgentJournal: (entry: JournalEntry) => journal.set(`${entry.runId ?? RUN_ID}:${entry.index}`, entry),
+  });
+
+  await runWorkflow(script, options("prov/m1"));
+  await runWorkflow(script, { ...options("prov/m1"), resumeJournal: journal });
+  assert.equal(calls, 1, "unchanged identity replays from cache");
+
+  await runWorkflow(script, { ...options("prov/m2"), resumeJournal: journal });
+  assert.equal(calls, 2, "an inherit:main untagged call stays keyed to the session default model (M5 contract)");
 });

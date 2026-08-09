@@ -13,7 +13,7 @@
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-      "bytes": 5608
+      "bytes": 5959
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -33,16 +33,16 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
-      "bytes": 7378
+      "bytes": 7729
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 29,
-      "bytes": 103358
+      "bytes": 109473
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
-      "medianBytes": 15463.5,
+      "medianBytes": 17264.5,
       "profiles": [
         {
           "name": "write",
@@ -54,7 +54,7 @@
             "skills/workflow-authoring/examples/fan-out-and-synthesize.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 14950
+          "bytes": 16751
         },
         {
           "name": "edit",
@@ -66,7 +66,7 @@
             "skills/workflow-authoring/examples/phased-budgets.js",
             "skills/workflow-authoring/examples/saved-nested-workflows.js"
           ],
-          "bytes": 23668
+          "bytes": 25469
         },
         {
           "name": "review",
@@ -77,7 +77,7 @@
             "skills/workflow-authoring/references/quality-helpers.md",
             "skills/workflow-authoring/examples/adversarial-verification.js"
           ],
-          "bytes": 14367
+          "bytes": 16168
         },
         {
           "name": "debug",
@@ -88,7 +88,7 @@
             "skills/workflow-authoring/references/specialized-helpers.md",
             "skills/workflow-authoring/examples/validated-gate.js"
           ],
-          "bytes": 15977
+          "bytes": 17778
         },
         {
           "name": "loop",
@@ -101,7 +101,7 @@
             "skills/workflow-authoring/examples/loop-until-done.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 24204
+          "bytes": 26005
         },
         {
           "name": "retry",
@@ -113,7 +113,7 @@
             "skills/workflow-authoring/examples/bounded-semantic-retry.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 14080
+          "bytes": 15881
         }
       ]
     }

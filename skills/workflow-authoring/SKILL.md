@@ -14,7 +14,7 @@ Load this skill when workflow JavaScript changes. Running an existing workflow n
 Read only what the task needs:
 
 - **Write or edit:** start with [runtime](references/runtime.md). Add [pattern selection](references/pattern-selection.md) for topology, [lifecycle](references/lifecycle.md) for limits or resume, and [focused recipes](references/focused-recipes.md) for the matching concern.
-- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`, and [authoring helpers](references/authoring-helpers.md) for `chunked`, `route`, `timeboxed`/`elapsedMs`, or `consensus`.
+- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`, and [authoring helpers](references/authoring-helpers.md) for `chunked`, `route`, `timeboxed`/`elapsedMs`, `ctx`, or `consensus`.
 - **Review:** use the [review checklist](references/review.md), plus only the matching [quality](references/quality-helpers.md) or [specialized](references/specialized-helpers.md) helper contracts.
 - **Debug:** use the [debugging map](references/debugging.md).
 - **Routing:** read [registry ownership](references/registry-ownership.md) before using `model`, `tier`, phase models, or `agentType`; use environment-specific names only when context supplies them.
@@ -27,6 +27,7 @@ Read only what the task needs:
 - Pair ordered results with stable work IDs before filtering. When one agent consumes another's selected result, include both its stable ID and actual data in the downstream prompt. Treat recoverable `null` as missing coverage and report it.
 - Bound fan-out, loops, retries, agents, and concurrency to the task. Treat invocation-level token and time caps as opt-in user constraints, not defaults.
 - Use `log()` for new code; `console` is compatibility-only.
+- Dedupe shared task/scope/objective text with `ctx(text)`: call it once, embed the returned pointer (e.g. `[[ctx:0]]`) in every agent prompt that needs the text, and let the runtime emit the full blob once. `ctx()` stores each distinct blob exactly once per run (the same text always returns the same pointer — the dedupe guarantee) and the blob is part of the resume identity hash, so editing the shared text invalidates cached replays; agents after the first read the blob from the store with `store_get` when their prompt references a pointer. See the [authoring helpers](references/authoring-helpers.md) reference for the full contract.
 - Write plain JavaScript without imports or filesystem modules. Pass nondeterminism through `args`; `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable.
 
 ## Running the suite

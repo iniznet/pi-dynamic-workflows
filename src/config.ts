@@ -77,6 +77,52 @@ export const MODEL_TIERS_FILE = ".pi/workflows/model-tiers.json";
 /** User-level workflow extension settings file, relative to the home directory. */
 export const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
 
+// ─── Routing economics (T2-03/T2-04/T2-05/T2-11 slice) ────────────────────────
+
+/**
+ * Default tier routing for UNTAGGED agent() calls (no `model`, no `tier`)
+ * when no model-tiers.json is configured (T2-03). "economy" routes through the
+ * prompt-aware classifyTask fallback (scan=small / edit=medium /
+ * synthesize+analyze=big, see model-routing.ts) so untagged calls no longer
+ * collapse onto the session's flagship main model.
+ */
+export const UNTAGGED_TIER_ECONOMY = "economy";
+
+/**
+ * Opt-out value for the untagged-agent default: restore the pre-T2-03
+ * behavior where an untagged call without a tier config resolves to the
+ * session's main model. Same literal as model-tier-config.ts's
+ * TIER_INHERIT_MAIN (kept as a separate constant here because config.ts is a
+ * runtime leaf and importing model-tier-config.ts would form a cycle).
+ */
+export const UNTAGGED_TIER_INHERIT_MAIN = "inherit:main";
+
+/** runWorkflow/WorkflowAgent default for `defaultUntaggedTier`. */
+export const DEFAULT_UNTAGGED_TIER = UNTAGGED_TIER_ECONOMY;
+
+/**
+ * Resume-replay routing-policy version (T2-03/T2-05/T2-11). Included in
+ * hashAgentCall's identity so a routing-policy change (economy default,
+ * builtin per-phase tier defaults, per-tier thinking caps) invalidates cached
+ * journaled results: journals persisted before the bump mismatch and re-run
+ * live instead of silently replaying results computed under the OLD policy.
+ * Bump whenever a routing-policy default changes.
+ */
+export const ROUTING_POLICY_VERSION = 2;
+
+/**
+ * Default tier for the script-API quality helpers' votes (T2-04): verify() /
+ * judgePanel() / consensus() / completenessCheck() / route() bind their
+ * short structured outputs to this tier unless the caller passes opts.tier.
+ */
+export const DEFAULT_HELPER_TIER = "small";
+
+// NOTE (cross-slice, B2-owned): surfacing `defaultUntaggedTier` in
+// settings.json (workflow-settings.ts schema + workflow-settings-fields.ts UI)
+// and wiring it through extensions/workflow.ts is deliberately NOT done here —
+// the run/global option on runWorkflow/WorkflowAgent is the primary channel
+// for this slice. See tasks/token-efficiency-audit/slice-c/handoff.md.
+
 // ─── Environment-var settings override layer (headless/CI/containerized) ─────
 // Env vars are the only settings channel that works without a writable home
 // directory or settings.json. They override the merged global+project file
@@ -96,6 +142,7 @@ export const WORKFLOW_ENV_VARS = {
   keywordTriggerWord: "PI_WORKFLOW_KEYWORD_TRIGGER_WORD",
   defaultAgentTimeoutMs: "PI_WORKFLOW_DEFAULT_AGENT_TIMEOUT_MS",
   defaultTokenBudget: "PI_WORKFLOW_DEFAULT_TOKEN_BUDGET",
+  tokenBudgetCountsCacheRead: "PI_WORKFLOW_TOKEN_BUDGET_COUNTS_CACHE_READ",
   defaultConcurrency: "PI_WORKFLOW_DEFAULT_CONCURRENCY",
   defaultAgentRetries: "PI_WORKFLOW_DEFAULT_AGENT_RETRIES",
   progressPanelMode: "PI_WORKFLOW_PROGRESS_PANEL_MODE",
@@ -166,6 +213,8 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   if (defaultAgentTimeoutMs !== undefined) settings.defaultAgentTimeoutMs = defaultAgentTimeoutMs;
   const defaultTokenBudget = envNullableInteger(env[WORKFLOW_ENV_VARS.defaultTokenBudget], 1, Number.MAX_SAFE_INTEGER);
   if (defaultTokenBudget !== undefined) settings.defaultTokenBudget = defaultTokenBudget;
+  const tokenBudgetCountsCacheRead = envBoolean(env[WORKFLOW_ENV_VARS.tokenBudgetCountsCacheRead]);
+  if (tokenBudgetCountsCacheRead !== undefined) settings.tokenBudgetCountsCacheRead = tokenBudgetCountsCacheRead;
   const defaultConcurrency = envInteger(env[WORKFLOW_ENV_VARS.defaultConcurrency], 1, MAX_CONCURRENCY);
   if (defaultConcurrency !== undefined) settings.defaultConcurrency = defaultConcurrency;
   const defaultAgentRetries = envInteger(env[WORKFLOW_ENV_VARS.defaultAgentRetries], 0, MAX_AGENT_RETRIES);

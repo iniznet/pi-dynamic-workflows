@@ -65,6 +65,14 @@ export interface ProviderPoolEntryInput {
   tpm?: number;
   /** Cooldown after a recorded 429/limit event, ms (default 60s). */
   cooldownMs?: number;
+  /**
+   * T2-10: per-entry output-token price ($/M) for cost-aware routing. When
+   * absent, the effective cost is derived from the registry model's `cost`;
+   * entries with no known cost stay cost-neutral in place().
+   */
+  costOutput?: number;
+  /** T2-10: per-entry input-token price ($/M); registry-derived when absent. */
+  costInput?: number;
 }
 
 /** Raw provider map for one logical model id (key = provider id). */
@@ -190,10 +198,20 @@ function normalizeEntry(provider: string, logicalModel: string, value: unknown):
   const weight = normalizeInteger(raw.weight, 1, Number.MAX_SAFE_INTEGER) ?? DEFAULT_PROVIDER_WEIGHT;
   const tpm = normalizeInteger(raw.tpm, 1, Number.MAX_SAFE_INTEGER);
   const cooldownMs = normalizeInteger(raw.cooldownMs, 1, Number.MAX_SAFE_INTEGER);
+  const costOutput = normalizeCost(raw.costOutput);
+  const costInput = normalizeCost(raw.costInput);
   const entry: ProviderPoolEntry = { provider, modelId, concurrency, weight };
   if (tpm !== undefined) entry.tpm = tpm;
   if (cooldownMs !== undefined) entry.cooldownMs = cooldownMs;
+  if (costOutput !== undefined) entry.costOutput = costOutput;
+  if (costInput !== undefined) entry.costInput = costInput;
   return entry;
+}
+
+/** T2-10: a positive finite $/M price (> 0); non-positive/NaN/garbage is dropped (cost-neutral). */
+function normalizeCost(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return value;
 }
 
 function normalizeInteger(value: unknown, min: number, max: number): number | undefined {

@@ -85,6 +85,8 @@ export interface WorkflowSnapshot {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** T1-01: the run's fresh (input+output) spend, for the fresh budget gate. */
+    freshSpend?: number;
   };
   runId?: string;
 }

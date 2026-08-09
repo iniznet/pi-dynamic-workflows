@@ -122,7 +122,7 @@ function makeAssembler(
 }
 
 describe("SubagentToolsAssembler — damageControlTools supplier", () => {
-  test("an enabled supplier appends workflow_damage_control after chrome/extension tools", async () => {
+  test("an enabled supplier appends workflow_damage_control after extension tools (chrome stays per-task)", async () => {
     const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", {
       chromeTools: () => [fakeTool("chrome_snapshot")],
       extensionTools: () => [fakeTool("web_fetch_md")],
@@ -131,13 +131,12 @@ describe("SubagentToolsAssembler — damageControlTools supplier", () => {
     const tools = await assembler.assemble();
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      [
-        ...HOST_TOOLS.map((tool) => tool.name),
-        "mcp_svelte_get-docs",
-        "chrome_snapshot",
-        "web_fetch_md",
-        DAMAGE_CONTROL_NAME,
-      ],
+      [...HOST_TOOLS.map((tool) => tool.name), "mcp_svelte_get-docs", "web_fetch_md", DAMAGE_CONTROL_NAME],
+    );
+    // T1-09: the chrome supplier feeds the per-task toolset only.
+    assert.deepEqual(
+      (await assembler.chromeToolsOnly()).map((tool) => tool.name),
+      ["chrome_snapshot"],
     );
   });
 

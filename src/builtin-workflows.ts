@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createCodingTools, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createCodingTools, createReadOnlyTools, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 import {
   ADVERSARIAL_REVIEW_NUMERIC_ARGS,
@@ -44,6 +44,38 @@ export interface BuiltinWorkflowInvocation {
   script: string;
   tools?: ToolDefinition[];
   toolset?: string;
+}
+
+/**
+ * Task-fit toolset per builtin pattern (T2-06). Each entry is the exact tool
+ * subset the pattern's agents actually need — verified against the generated
+ * scripts (nothing the scripts call is dropped) — instead of inheriting the
+ * FULL default toolset (host bundle + every mcp_* tool) that untagged runs
+ * pay (~2.8 ktok/turn, up to 5.5 ktok with chrome). deep-research is absent:
+ * it already resolves its own tools/toolset ("web-research", below).
+ */
+export const BUILTIN_TOOLSET_TOOLS: Readonly<Record<string, readonly string[]>> = {
+  "code-review": ["read", "grep", "find"],
+  "spec-generation": ["read", "bash", "write"],
+  "adversarial-review": ["read", "grep"],
+  "codebase-audit": ["read", "grep", "find"],
+  "plan-then-execute": ["read", "write", "bash"],
+  "multi-perspective": ["read", "grep"],
+};
+
+/**
+ * Build a pattern's task-fit coding-tool subset. Both SDK factories overlap
+ * on `read`, so names are deduped first-wins. Unknown tags resolve to an
+ * empty set (the caller should only pass BUILTIN_TOOLSET_TOOLS keys).
+ */
+export function builtinToolsetTools(cwd: string, toolset: string): ToolDefinition[] {
+  const names = BUILTIN_TOOLSET_TOOLS[toolset];
+  if (!names) return [];
+  const available = new Map<string, ToolDefinition>();
+  for (const tool of [...createCodingTools(cwd), ...createReadOnlyTools(cwd)]) {
+    if (!available.has(tool.name)) available.set(tool.name, tool);
+  }
+  return names.map((name) => available.get(name)).filter((tool): tool is ToolDefinition => tool !== undefined);
 }
 
 interface BuiltinWorkflowDescriptor {
@@ -110,11 +142,17 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
     name: "adversarial-review",
     description:
       "Investigate a task, then cross-check each finding with skeptical reviewers. args: { task: string, reviewers?: number, threshold?: number, maxFindings?: number }.",
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       requireNonEmptyString(record.task, "task", "adversarial-review");
       validateNumericArgs(record, ADVERSARIAL_REVIEW_NUMERIC_ARGS, "adversarial-review");
-      return { script: generateAdversarialReviewWorkflow() };
+      return {
+        script: generateAdversarialReviewWorkflow(),
+        // Investigate/refute agents check the task against the codebase with
+        // read/grep; they never need the write/bash/edit surface.
+        tools: builtinToolsetTools(cwd, "adversarial-review"),
+        toolset: "adversarial-review",
+      };
     },
   },
   {
@@ -145,7 +183,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
       const fetched = await fetchDiffFromSource(diffSource, cwd, onNotify);
       return { ...record, diff: fetched, diffSource };
     },
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       // Truncation past MAX_DIFF_CHARS happens inside the generated script at
       // runtime (see code-review.ts); a caller invoking by name either supplies
@@ -153,39 +191,55 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
       // into `diff` before this validation runs (GAP-3).
       requireNonEmptyString(record.diff, "diff", "code-review");
       validateNumericArgs(record, CODE_REVIEW_NUMERIC_ARGS, "code-review");
-      return { script: generateCodeReviewWorkflow() };
+      return {
+        script: generateCodeReviewWorkflow(),
+        // Finders/verifiers pull file context with read/grep (and find to
+        // locate call sites); they never write or run commands.
+        tools: builtinToolsetTools(cwd, "code-review"),
+        toolset: "code-review",
+      };
     },
   },
   {
     name: "multi-perspective",
     description:
       "Analyze a topic from several independent perspectives in parallel, then synthesize. args: { topic: string, perspectives?: string[] }.",
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       const topic = requireNonEmptyString(record.topic, "topic", "multi-perspective");
       const perspectives =
         Array.isArray(record.perspectives) && record.perspectives.length >= 2
           ? requireStringArray(record.perspectives, "perspectives", "multi-perspective")
           : [...DEFAULT_MULTI_PERSPECTIVES];
-      return { script: generateMultiPerspectiveWorkflow(topic, perspectives) };
+      return {
+        script: generateMultiPerspectiveWorkflow(topic, perspectives),
+        // Analysts check the topic against the codebase with read/grep.
+        tools: builtinToolsetTools(cwd, "multi-perspective"),
+        toolset: "multi-perspective",
+      };
     },
   },
   {
     name: "codebase-audit",
     description:
       "Run parallel checks against a codebase scope, then cross-validate and report. args: { scope: string, checks: string[] }.",
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       const scope = requireNonEmptyString(record.scope, "scope", "codebase-audit");
       const checks = requireStringArray(record.checks, "checks", "codebase-audit");
-      return { script: generateCodebaseAuditWorkflow(scope, checks) };
+      return {
+        script: generateCodebaseAuditWorkflow(scope, checks),
+        // Check agents inspect the scoped tree with read/grep/find.
+        tools: builtinToolsetTools(cwd, "codebase-audit"),
+        toolset: "codebase-audit",
+      };
     },
   },
   {
     name: "plan-then-execute",
     description:
       "Decompose an objective into dependency-ordered steps, gate each step with a verifier (bounded rework), optionally execute each step. Pauses for human approval before any agent work (meta.gate: 'approve'). args: { objective: string, context?: string, maxSteps?: number, execute?: boolean }.",
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       requireNonEmptyString(record.objective, "objective", "plan-then-execute");
       validateNumericArgs(record, PLAN_THEN_EXECUTE_NUMERIC_ARGS, "plan-then-execute");
@@ -199,14 +253,20 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
       if (record.execute !== undefined && typeof record.execute !== "boolean") {
         throw new Error(`Built-in workflow "plan-then-execute" requires args.execute to be a boolean when present.`);
       }
-      return { script: generatePlanThenExecuteWorkflow() };
+      return {
+        script: generatePlanThenExecuteWorkflow(),
+        // Implementers read/write files and run commands; the planner/verifier
+        // stages are prompt-only but share the run's toolset.
+        tools: builtinToolsetTools(cwd, "plan-then-execute"),
+        toolset: "plan-then-execute",
+      };
     },
   },
   {
     name: "spec-generation",
     description:
       'Draft a specification from product/technical/risk perspectives, then adversarially review into a structured artifact. args: { topic: string, audience?: string, format?: "markdown" | "json" }.',
-    resolve(_cwd, args) {
+    resolve(cwd, args) {
       const record = asRecord(args);
       requireNonEmptyString(record.topic, "topic", "spec-generation");
       if (record.audience !== undefined && typeof record.audience !== "string") {
@@ -221,7 +281,13 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
           `Built-in workflow "spec-generation" requires args.format to be one of: ${SPEC_GENERATION_FORMATS.join(", ")}.`,
         );
       }
-      return { script: generateSpecGenerationWorkflow() };
+      return {
+        script: generateSpecGenerationWorkflow(),
+        // Drafters/reviewer may inspect existing specs/docs (read), run build
+        // probes (bash), and the writer can persist the artifact (write).
+        tools: builtinToolsetTools(cwd, "spec-generation"),
+        toolset: "spec-generation",
+      };
     },
   },
 ];

@@ -142,22 +142,19 @@ describe("SubagentToolsAssembler", () => {
     );
   });
 
-  test("a chrome supplier appends vendored chrome tools after the MCP tools", async () => {
+  test("a chrome supplier contributes NO chrome tools to the default assemble() (T1-09 per-task split)", async () => {
     const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => [
       fakeTool("chrome_snapshot"),
       fakeTool("chrome_click"),
     ]);
     const tools = await assembler.assemble();
+    // Chrome defs are per-task only: they never ride the default merge (an
+    // untagged run must not pay the ~5.5 ktok/turn chrome defs).
     assert.deepEqual(
       tools.map((tool) => tool.name),
-      [
-        ...HOST_TOOLS.map((tool) => tool.name),
-        "mcp_svelte_get-docs",
-        "mcp_svelte_read-resource",
-        "chrome_snapshot",
-        "chrome_click",
-      ],
+      [...HOST_TOOLS.map((tool) => tool.name), "mcp_svelte_get-docs", "mcp_svelte_read-resource"],
     );
+    assert.ok(!tools.some((tool) => tool.name.startsWith("chrome_")), "no chrome defs in the default toolset");
   });
 
   test("an empty/absent chrome supplier contributes no chrome tools", async () => {
@@ -171,29 +168,40 @@ describe("SubagentToolsAssembler", () => {
     );
   });
 
-  test("chromeToolsOnly yields the supplier's defs without the host/MCP bundle", async () => {
-    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => [
-      fakeTool("chrome_snapshot"),
-    ]);
+  test("chrome-tag wiring: chromeToolsOnly is the ONLY channel chrome defs attach through (T1-09)", async () => {
+    // Setting on + grant held: per-task toolset resolves the chrome set; the
+    // default assemble() stays chrome-free.
+    const on = makeAssembler(makeManager(await mcpServerTools()), "all", [], () => [fakeTool("chrome_launch")]);
     assert.deepEqual(
-      (await assembler.chromeToolsOnly()).map((tool) => tool.name),
-      ["chrome_snapshot"],
+      (await on.chromeToolsOnly()).map((tool) => tool.name),
+      ["chrome_launch"],
     );
-    const without = makeAssembler(makeManager(await mcpServerTools()), "all");
-    assert.deepEqual(await without.chromeToolsOnly(), []);
+    assert.ok(!(await on.assemble()).some((tool) => tool.name === "chrome_launch"));
+    // Setting off (no supplier): no defs anywhere, including the named toolset.
+    const off = makeAssembler(makeManager(await mcpServerTools()), "all");
+    assert.deepEqual(await off.chromeToolsOnly(), []);
+    assert.deepEqual(
+      (await off.assemble()).filter((tool) => tool.name.startsWith("chrome_")),
+      [],
+    );
   });
 
-  test("excluded names are stripped from the chrome set too", async () => {
+  test("excluded names are stripped from the chrome toolset too (chromeToolsOnly respects the deny list)", async () => {
     const assembler = makeAssembler(makeManager(await mcpServerTools()), "all", ["chrome_click"], () => [
       fakeTool("chrome_snapshot"),
       fakeTool("chrome_click"),
     ]);
     const tools = await assembler.assemble();
-    assert.ok(tools.some((tool) => tool.name === "chrome_snapshot"));
-    assert.ok(!tools.some((tool) => tool.name === "chrome_click"));
+    assert.ok(!tools.some((tool) => tool.name.startsWith("chrome_")), "default toolset stays chrome-free");
+    const chromeOnly = await assembler.chromeToolsOnly();
+    assert.deepEqual(
+      chromeOnly.map((tool) => tool.name),
+      ["chrome_snapshot"],
+      "the per-task toolset keeps the allowed chrome tools and strips the denied one",
+    );
   });
 
-  test("an extension supplier appends captured extension tools after chrome tools", async () => {
+  test("an extension supplier appends captured extension tools after MCP tools (chrome stays per-task)", async () => {
     const assembler = makeAssembler(
       makeManager(await mcpServerTools()),
       "all",
@@ -208,10 +216,14 @@ describe("SubagentToolsAssembler", () => {
         ...HOST_TOOLS.map((tool) => tool.name),
         "mcp_svelte_get-docs",
         "mcp_svelte_read-resource",
-        "chrome_snapshot",
         "web_fetch_md",
         "codegraph_search",
       ],
+    );
+    assert.deepEqual(
+      (await assembler.chromeToolsOnly()).map((tool) => tool.name),
+      ["chrome_snapshot"],
+      "the chrome supplier feeds the per-task toolset only",
     );
   });
 

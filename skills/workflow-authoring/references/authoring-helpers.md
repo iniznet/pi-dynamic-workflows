@@ -2,9 +2,10 @@
 
 Deterministic, resume-safe combinators for the workflows the basic `agent()` /
 `parallel()` surface leaves hand-rolled: long-input chunking, classify-and-act
-routing, cooperative time bounds, and panel consensus with arbitration. All of
-them are built purely on `agent()`/`parallel()`, so every agent call they make
-journals under a stable call index and resume keeps working.
+routing, cooperative time bounds, shared-context dedupe, and panel consensus
+with arbitration. All of them are built purely on `agent()`/`parallel()`, so
+every agent call they make journals under a stable call index and resume keeps
+working.
 
 ## Helpers
 
@@ -14,10 +15,19 @@ journals under a stable call index and resume keeps working.
 | `route(value, { cases, fallback })` | One schema'd classification agent picks among the enum of eligible case keys, then pure-JS dispatch runs the matched case. A case whose `when(value)` guard fails never reaches the classification enum; when no case is eligible the `fallback` runs with reason `"no-eligible-case"` and no `agent()` is called. A recoverable-null classification routes to `fallback` with reason `"classification-failed"`; an out-of-enum key routes with reason `"unknown"`. Returns `{ key, result, fallback, reason }`. The classification prompt embeds the value and the eligible key list, so the resume hash is stable per value + case list. |
 | `timeboxed(fn, { maxElapsedMs })` | Cooperative wall-clock bound: `fn(context)` checks `context.expired()` / `context.remaining()` at its own decision points and returns early with partial results. `timeboxed` never interrupts a running fn. After fn settles it returns `{ result, timedOut, elapsedMs, maxElapsedMs }` — `timedOut` truthfully reports whether the deadline was exceeded. Non-finite `maxElapsedMs` throws a `TypeError`; finite values are floored and clamped to at least 0. |
 | `elapsedMs()` | Monotonic non-negative milliseconds since the top-level run start, shared across nested `workflow()` frames. **Never** embed its value in prompts or hashes: wall-clock values are not resume-stable (the determinism prelude blocks clocks, and a resumed run replays cached calls fast and observes different elapsed values). Use a counter seeded from `args` for anything that must be stable across resume. |
+| `ctx(text)` | Runtime shared-context global: register `text` ONCE per run and get back a compact pointer (e.g. `[[ctx:0]]`) to embed in `agent()` prompts instead of re-embedding the full text into every fan-out call. The blob is written to the run's shared store exactly once — the **dedupe guarantee**: calling `ctx()` again with the same text returns the same pointer and never re-stores. The runtime emits the FULL blob into the first agent's instructions (once per run); every later agent gets a store-key note and can read the text with `store_get("wf:ctx:0")` (the store tools are injected into every agent). The blob is part of the resume identity hash: editing the shared text invalidates cached replays of calls downstream of the `ctx()` registration. Empty/absent text returns `""` (no-op); non-string values are JSON-stringified; an oversized blob or the distinct-blob cap degrades to returning the raw text so the script keeps working without `ctx()`. |
 | `consensus(question, { panelists, rounds, agreeThreshold, arbitrator? })` | N independent schema'd verdicts per round via `parallel()` + `tolerantVote`. Each round polls `panelists` (default 3) with a structured `{ verdict: boolean, reasoning? }` schema. Per-vote recoverable nulls are omitted and shrink the denominator (logged) — a failed panelist never vetoes or dilutes surviving votes. The pairwise agreement gate passes when the largest mutually-agreeing group covers at least `agreeThreshold` (default 0.66) of valid votes. Rounds are bounded (default 2). After the round budget, an optional `arbitrator` — typically one structured `agent()` call — may run; its output is returned verbatim in the `arbitration` field while `agreed` stays `false` and `verdict` stays `null` (arbitration never rewrites them). Without an arbitrator the disagreement is returned honestly with `agreed: false`. Returns `{ agreed, verdict, count, total, votes, rounds, omitted, arbitration? }`. Non-finite `panelists`/`rounds` throw a `TypeError`; finite values are floored and clamped to at least 1; `agreeThreshold` is clamped to `[0, 1]`. |
 
 ## Semantics
 
+- **Shared context is stored once, pointed to everywhere.** `ctx()` writes each
+  distinct blob once (same text → same pointer), and the instructions emit the
+  full text into exactly one agent per run — so a 2K-char objective that 42
+  fan-out calls used to re-embed now costs one full copy plus 42 pointers.
+  Agents after the first are told the store key and read the content with
+  `store_get`. The blob fingerprint is a resume-hash identity input, so
+  changing the shared text re-runs only the calls downstream of the `ctx()`
+  registration (same contract as any other identity input).
 - **Chunking is deterministic by construction.** `chunked` partitions with
   `items.slice(i, i + chunkSize)` in item order; the same input array and
   `chunkSize` always produce the same `(chunk, chunkIndex)` pairs. Keep item

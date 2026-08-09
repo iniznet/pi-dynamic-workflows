@@ -81,6 +81,60 @@ describe("resolveStructuredOutput", () => {
     assert.equal(prompts(), 1, "one repair prompt recovered it");
   });
 
+  it("T1-02: the FIRST repair keeps all tools active (no setActiveToolsByName), keeping the provider prefix byte-identical", async () => {
+    let toolRestrictions = 0;
+    let prompts = 0;
+    const capture: StructuredOutputCapture<{ word: string }> = { called: false, value: undefined };
+    const session: StructuredSession = {
+      async prompt() {
+        prompts++;
+        if (prompts >= 1) {
+          capture.called = true;
+          capture.value = { word: "ok" };
+        }
+      },
+      setActiveToolsByName() {
+        toolRestrictions++;
+      },
+      messages: [],
+    };
+    const r = await resolveStructuredOutput(session, capture, Schema, { maxSchemaRetries: 2 }, noText);
+    assert.deepEqual(r, { word: "ok" });
+    assert.equal(prompts, 1);
+    assert.equal(
+      toolRestrictions,
+      0,
+      "the common repair path must NOT rebuild the provider prefix (setActiveToolsByName is a cache-busting system-prompt rebuild)",
+    );
+  });
+
+  it("T1-02: only a SECOND failed repair restricts the session to structured_output", async () => {
+    const toolRestrictions: string[][] = [];
+    let prompts = 0;
+    const capture: StructuredOutputCapture<{ word: string }> = { called: false, value: undefined };
+    const session: StructuredSession = {
+      async prompt() {
+        prompts++;
+        if (prompts >= 2) {
+          capture.called = true;
+          capture.value = { word: "ok" };
+        }
+      },
+      setActiveToolsByName(names: string[]) {
+        toolRestrictions.push(names);
+      },
+      messages: [],
+    };
+    const r = await resolveStructuredOutput(session, capture, Schema, { maxSchemaRetries: 2 }, noText);
+    assert.deepEqual(r, { word: "ok" });
+    assert.equal(prompts, 2, "two repair prompts ran");
+    assert.deepEqual(
+      toolRestrictions,
+      [["structured_output"]],
+      "the restriction fires only between the first and second repair prompt",
+    );
+  });
+
   it("falls back to strict prose extraction when repair fails", async () => {
     const { session, capture } = makeSession();
     const r = await resolveStructuredOutput(session, capture, Schema, opts, () => '{"word":"fromProse"}');

@@ -13,13 +13,35 @@ export interface DeepResearchConfig {
 }
 
 /**
+ * T2-05: per-phase model-tier knobs for the generated deep-research script.
+ * Defaults are the plan's cheapest-adequate routing (plan=small, gather=
+ * medium, cross-check=big, report=big) so the DEFAULT generated script text is
+ * deterministic — the resume hash of a fresh run is a pure function of the
+ * generator version + these baked values.
+ */
+export interface DeepResearchTierOptions {
+  tierPlan?: string;
+  tierGather?: string;
+  tierCrossCheck?: string;
+  tierReport?: string;
+}
+
+/**
  * Generate a deep-research workflow that uses the real web_search/web_fetch tools.
  *
  * The script is static and reads its inputs from `args` (question/angles/minSupport),
  * so the question is never string-interpolated into source — no escaping hazards.
  * Inject the web tools at run time via the agent's `tools` option.
+ *
+ * T2-05: per-phase tiers are GENERATION-time options baked into the script text
+ * (JSON.stringify — the multi-perspective precedent) so resume hashes stay
+ * deterministic for a fixed generator version.
  */
-export function generateDeepResearchWorkflow(): string {
+export function generateDeepResearchWorkflow(options: DeepResearchTierOptions = {}): string {
+  const tierPlan = JSON.stringify(options.tierPlan ?? "small");
+  const tierGather = JSON.stringify(options.tierGather ?? "medium");
+  const tierCrossCheck = JSON.stringify(options.tierCrossCheck ?? "big");
+  const tierReport = JSON.stringify(options.tierReport ?? "big");
   return `export const meta = {
   name: 'deep_research',
   description: 'Deep research with real web search and cross-checked claims',
@@ -42,7 +64,7 @@ phase('Queries')
 const plan = await agent(
   'You are planning web research for this question:\\n' + question +
   '\\n\\nProduce ' + angles + ' diverse, specific search queries that together cover the question from different angles.',
-  { label: 'plan queries', schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } }
+  { label: 'plan queries', tier: ${tierPlan}, schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } }
 )
 // The planner agent() can return null (e.g. a subagent that died on a terminal
 // provider error) or omit a usable queries array. Mirror the null-tolerance the
@@ -66,12 +88,40 @@ const gathered = await parallel(queries.map((q, i) => () =>
     '\\n\\nSteps: (1) call web_search with the query; (2) web_fetch the 2 most relevant result URLs; ' +
     '(3) extract concrete, verifiable factual claims, each tagged with the exact source URL it came from. ' +
     'Do NOT invent sources or claims — report only what the fetched pages actually say.',
-    { label: 'research ' + (i + 1), schema: { type: 'object', properties: { sources: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, claims: { type: 'array', items: { type: 'string' } } }, required: ['url', 'claims'] } } }, required: ['sources'] } }
+    { label: 'research ' + (i + 1), tier: ${tierGather}, schema: { type: 'object', properties: { sources: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, claims: { type: 'array', items: { type: 'string' } } }, required: ['url', 'claims'] } } }, required: ['sources'] } }
   )
 ))
 const allSources = gathered.filter(Boolean).flatMap((g) => (g && g.sources) || [])
 
 phase('Verify')
+// Token-economy cap for the embedded source list (T1-03): each claim is
+// truncated to 400 chars and the list is bounded by a 4000-char total budget
+// (max 40 sources) so the cross-check prompt can't re-bill unbounded JSON
+// (measured up to 41K tokens). Deterministic — the same sources always yield
+// the same prompt, so resume hashes stay stable; the cross-checker can
+// web_fetch any URL to re-confirm truncated text.
+const embeddedSources = []
+let embedBudget = 4000
+for (const s of allSources) {
+  if (embeddedSources.length >= 40 || embedBudget <= 0) break
+  const claims = (Array.isArray(s.claims) ? s.claims : []).map((c) => (typeof c === 'string' && c.length > 400 ? c.slice(0, 397) + '…' : c))
+  const entry = { url: s.url, claims }
+  const size = JSON.stringify(entry).length
+  if (size > embedBudget) {
+    if (embeddedSources.length === 0) {
+      embeddedSources.push({ url: s.url, claims: claims.slice(0, 1).map((c) => (typeof c === 'string' && c.length > 200 ? c.slice(0, 197) + '…' : c)) })
+    }
+    break
+  }
+  embeddedSources.push(entry)
+  embedBudget -= size
+}
+if (embeddedSources.length < allSources.length) {
+  log(
+    'Deep research: embedded ' + embeddedSources.length + ' of ' + allSources.length +
+    ' sources for cross-check (token cap); tail sources are omitted — web_fetch any source URL to re-confirm.'
+  )
+}
 const verdict = await agent(
   'You are a fact-checking cross-checker. Sources below list claims extracted from fetched pages.\\n' +
   'Group claims that assert the SAME fact into one normalized claim — paraphrase-equivalent wording, not identical text.\\n' +
@@ -83,8 +133,8 @@ const verdict = await agent(
   '- supported: each normalized claim with the DISTINCT source URLs that state it (at least ' + minSupport + ').\\n' +
   '- discarded: claims found in fewer than ' + minSupport + ' sources, or whose sources you could not verify on the fetched pages.\\n' +
   '- conflicts: claims that contradict a supported claim, with the claim text and the contradictory evidence.\\n' +
-  '\\n\\nSOURCES JSON:\\n' + JSON.stringify(allSources),
-  { label: 'cross-check', schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } }, conflicts: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, contradicting: { type: 'string' } }, required: ['claim'] } } }, required: ['supported'] } }
+  '\\n\\nSOURCES JSON:\\n' + JSON.stringify(embeddedSources),
+  { label: 'cross-check', tier: ${tierCrossCheck}, schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } }, conflicts: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, contradicting: { type: 'string' } }, required: ['claim'] } } }, required: ['supported'] } }
 )
 // minSupport is enforced HERE, deterministically, not only in the prompt: the
 // cross-check LLM may still keep an under-supported claim or count the same
@@ -128,7 +178,7 @@ const report = await agent(
   'section listing the entries below and why each was excluded — never present them as fact.\\n\\n' +
   'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify(supported) +
   '\\n\\nCONFLICTS JSON:\\n' + JSON.stringify(conflicts),
-  { label: 'write report' }
+  { label: 'write report', tier: ${tierReport} }
 )
 
 return { question, queries, supported, conflicts, report }`;

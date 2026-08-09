@@ -20,8 +20,10 @@ Every exact fact below is projected from the installed extension's capability co
 - `tier`: "small" | "medium" | "big" (optional; standard vocabulary is the closed union 'small' | 'medium' | 'big'; a user-configured route outside it is honored only when context supplies its name and purpose; dynamic reference: model-routes)
 - `isolation`: "worktree" (optional)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
+- `toolNames`: string[] (optional; default: full toolset; restrict this agent's coding tools to these names; an empty array restricts to the schema/structured_output tool only (auto-added))
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)
 - `retries`: number (optional; default: run retry count; finite values are floored and clamped to 0..3)
+- `retryOnlyIfSpendUnder`: number (optional; default: run-level default; skip auto-retry when the failed attempt's recorded spend exceeds this many tokens; the agent settles exhausted instead)
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries
 - Constraint: per-agent retries override invocation retries; retries are floored and clamped to 0..3
@@ -67,11 +69,12 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>`
+- Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[]; maxChars?: number }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>`
 - Option shape: `verify-options`
 - `reviewers`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
 - `threshold`: number (optional; default: 0.5)
 - `lens`: string | string[] (optional)
+- `maxChars`: number (optional; default: 4000; embedded claim payload cap (ellipsis marker + log line when trimmed))
 - Constraint: reviewer failures are omitted; successful votes form the denominator in realCount / total
 - Constraint: threshold comparison is inclusive and real is false when no reviewer succeeds
 - Constraint: multiple lenses cycle across reviewers
@@ -167,6 +170,18 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `elapsedMs() => number`
 - Constraint: monotonic non-negative milliseconds since the top-level run start, shared across nested workflow() frames
 - Constraint: NEVER inside prompts or hashes: wall-clock values are not resume-stable; use a counter seeded from args
+
+<a id="ctx"></a>
+## ctx
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `ctx(sharedText: string \| unknown) => string`
+- Constraint: registers sharedText ONCE per run (written to the run's shared store) and returns a compact pointer to embed in agent() prompts instead of re-embedding the full text into every fan-out call
+- Constraint: repeated ctx() with the same text returns the same pointer without re-storing — one blob per run (dedupe guarantee)
+- Constraint: the full blob text is emitted into the FIRST agent's instructions once per run; every later agent gets a store-key note — agents whose prompts reference a pointer can read the text with store_get (injected into every agent)
+- Constraint: the blob fingerprint is a resume-hash identity input: editing the shared text invalidates cached replays of calls downstream of the ctx() registration
+- Constraint: empty/absent text returns '' (no-op); non-string values are JSON-stringified; an oversized blob or the distinct-blob cap degrades to returning the raw text
 
 <a id="consensus"></a>
 ## consensus
@@ -274,10 +289,11 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `budget: { total, spent(), remaining() }`
+- Signature: `budget: { total, spent(), remaining(), wouldExceed(estimatedTokens) }`
 - Constraint: frozen view over shared soft token accounting
 - Constraint: spend accrues after agents finish, so in-flight work can overshoot
 - Constraint: nested workflows share the same accounting
+- Constraint: wouldExceed(estimatedTokens) is advisory: true when the estimated extra spend would trip the ceiling — use it to gate cheap/optional work before spawning agents
 
 <a id="console"></a>
 ## console
@@ -354,6 +370,16 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `agentRetries?: number = configured value or 0`
 - Constraint: floored and clamped to 0..3
 - Constraint: a subagent that still fails after retries is exhausted
+
+<a id="tool-input-retryonlyifspendunder"></a>
+## retryOnlyIfSpendUnder
+
+- Classification: `workflow-tool-input`
+- Support: `supported`
+- Signature: `retryOnlyIfSpendUnder?: number`
+- Constraint: run-level default for the per-agent retry spend guard: skip auto-retry when the failed attempt already burned more than this many tokens
+- Constraint: skipped retries settle the agent exhausted (AGENT_EXHAUSTED) exactly like retry exhaustion — failOnExhaustedAgent semantics unchanged
+- Constraint: opt-in; absent preserves current retry behavior
 
 <a id="tool-input-agenttimeoutms"></a>
 ## agentTimeoutMs

@@ -41,6 +41,18 @@ test("deep-research script enforces minSupport deterministically and routes to C
   assert.match(body, /return \{ question, queries, supported, conflicts, report \}/);
 });
 
+test("deep-research script caps the embedded source list before JSON.stringify (T1-03)", () => {
+  const body = generateDeepResearchWorkflow();
+  // The Verify phase computes a deterministic capped projection, then embeds it.
+  assert.match(body, /const embeddedSources = \[\]/);
+  assert.match(body, /c\.slice\(0, 397\) \+ '…'/);
+  assert.match(body, /JSON\.stringify\(embeddedSources\)/);
+  assert.match(body, /embedBudget -= size/);
+  assert.match(body, /token cap\); tail sources are omitted/);
+  // Small inputs are untouched: the claim cap only fires above 400 chars.
+  assert.doesNotMatch(body, /JSON\.stringify\(allSources\)/);
+});
+
 // ─── Runtime: fabricated claims discarded; minSupport enforced; Conflicts built ─
 
 test("deep-research: fabricated/conflicting claims are discarded and under-supported claims move to Conflicts", async () => {
@@ -135,4 +147,76 @@ test("deep-research: a null cross-check verdict degrades to empty supported/conf
   const r = result.result as { supported?: unknown[]; conflicts?: unknown[] };
   assert.equal(r.supported?.length, 0, "no sources → no supported claims");
   assert.equal(r.conflicts?.length, 0, "no cross-check output → no conflicts");
+});
+
+test("deep-research: the cross-check source payload is capped for large lists and byte-identical for small ones (T1-03)", async () => {
+  const smallSourceList = [
+    { url: "https://a.example", claims: ["short claim one", "short claim two"] },
+    { url: "https://b.example", claims: ["another short claim"] },
+  ];
+  const claimPad = "x".repeat(120);
+  const bigSourceList = Array.from({ length: 60 }, (_, i) => ({
+    url: `https://s${i}.example`,
+    claims: Array.from({ length: 5 }, (_c, j) => `claim ${i}.${j} ${claimPad}`),
+  }));
+
+  async function runOnce(sources: Array<{ url: string; claims: string[] }>) {
+    let crossCheckPrompt = "";
+    const result = await runWorkflow(generateDeepResearchWorkflow(), {
+      agent: {
+        async run(prompt: string) {
+          if (prompt.includes("planning web research")) return { queries: ["q"] };
+          if (prompt.includes("Research this query")) return { sources };
+          if (prompt.includes("fact-checking cross-checker")) {
+            crossCheckPrompt = prompt;
+            return { supported: [] };
+          }
+          return "report";
+        },
+      } as never,
+      persistLogs: false,
+      args: { question: "Q?", angles: 2, minSupport: 2 },
+    });
+    return { payload: crossCheckPrompt.split("SOURCES JSON:")[1] ?? "", logs: result.logs };
+  }
+
+  // Small input: the embedded SOURCES JSON is byte-identical to the raw list.
+  const small = await runOnce(smallSourceList);
+  assert.equal(
+    small.payload.trim(),
+    JSON.stringify(smallSourceList),
+    "a small source list must embed unchanged (no cap, no marker — snapshot stability)",
+  );
+
+  // Large input: capped and logged, never silently truncated.
+  const big = await runOnce(bigSourceList);
+  const parsed = JSON.parse(big.payload.trim()) as Array<{ url: string; claims: string[] }>;
+  assert.ok(parsed.length < 60, "the embedded source count must be capped below the 60-source input");
+  assert.ok(parsed.length >= 1, "at least one source survives the cap");
+  assert.ok(
+    JSON.stringify(bigSourceList).length > big.payload.trim().length,
+    "the embedded payload must be smaller than the raw list",
+  );
+  assert.ok(
+    big.logs.some((l) => l.includes("for cross-check (token cap)") && l.includes("60")),
+    "capping the embedded source list must be logged, never silent",
+  );
+});
+
+// ─── T2-05: per-phase tier defaults baked into the generated script ─────────
+
+test("deep-research script bakes the per-phase tier defaults (T2-05)", () => {
+  const body = generateDeepResearchWorkflow();
+  assert.match(body, /label: 'plan queries', tier: "small"/);
+  assert.match(body, /label: 'research '\s*\+ \(i \+ 1\), tier: "medium"/);
+  assert.match(body, /label: 'cross-check', tier: "big"/);
+  assert.match(body, /label: 'write report', tier: "big"/);
+});
+
+test("deep-research per-phase tiers are generator options (T2-05)", () => {
+  const body = generateDeepResearchWorkflow({ tierPlan: "medium", tierReport: "small" });
+  assert.match(body, /label: 'plan queries', tier: "medium"/);
+  assert.match(body, /label: 'write report', tier: "small"/);
+  // Untouched phases keep their defaults.
+  assert.match(body, /label: 'cross-check', tier: "big"/);
 });

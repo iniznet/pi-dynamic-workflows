@@ -189,7 +189,13 @@ export function resolveAgentType(name: string | undefined, registry: AgentRegist
  */
 export function applyToolPolicy<T extends { name: string }>(tools: T[], allow?: string[], deny?: string[]): T[] {
   let out = tools;
-  if (allow?.length) {
+  // `allow !== undefined` (not `allow?.length`): an EMPTY allowlist is a real
+  // policy — it means "no coding tools" (T1-08 quality-helper votes pass
+  // `toolNames: []` so a vote agent keeps only structured_output + systemTools,
+  // never the full ~2.8 ktok set). Undefined remains "all tools". Definitions
+  // can't accidentally produce `[]` (toStringArray maps empty frontmatter to
+  // undefined), so only explicit empty arrays are affected.
+  if (allow !== undefined) {
     const allowSet = new Set(allow);
     out = out.filter((t) => allowSet.has(t.name));
   }

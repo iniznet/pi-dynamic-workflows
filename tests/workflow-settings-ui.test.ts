@@ -156,8 +156,8 @@ describe("form interactions (buildFormComponent)", () => {
     const trusted = makeModel();
     const untrustedForm = buildForm(untrusted);
     const trustedForm = buildForm(trusted, { trustedProject: true });
-    navigateTo(untrustedForm.root, 17); // scope row (17 fields, then scope, then save)
-    navigateTo(trustedForm.root, 17);
+    navigateTo(untrustedForm.root, 18); // scope row (18 fields, then scope, then save)
+    navigateTo(trustedForm.root, 18);
     untrustedForm.root.handleInput?.(KEY_CONFIRM);
     trustedForm.root.handleInput?.(KEY_CONFIRM);
     assert.equal(untrusted.scope, "global");
@@ -167,7 +167,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("number submenu stages valid input and closes", () => {
     const model = makeModel();
     const { root } = buildForm(model);
-    navigateTo(root, 4); // defaultConcurrency
+    navigateTo(root, 5); // defaultConcurrency (tokenBudgetCountsCacheRead is row 4)
     root.handleInput?.(KEY_CONFIRM); // open the submenu
     for (const char of "12") root.handleInput?.(char);
     root.handleInput?.(KEY_SUBMIT);
@@ -178,7 +178,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("number submenu keeps the form open on invalid input", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
-    navigateTo(root, 4);
+    navigateTo(root, 5);
     root.handleInput?.(KEY_CONFIRM);
     for (const char of "abc") root.handleInput?.(char);
     root.handleInput?.(KEY_SUBMIT);
@@ -191,7 +191,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("escaping the submenu leaves the draft unchanged", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
-    navigateTo(root, 4);
+    navigateTo(root, 5);
     root.handleInput?.(KEY_CONFIRM);
     for (const char of "7") root.handleInput?.(char);
     root.handleInput?.(KEY_CANCEL);
@@ -234,7 +234,7 @@ describe("form interactions (buildFormComponent)", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
     root.handleInput?.(KEY_CONFIRM); // stage keywordTriggerEnabled=false
-    navigateTo(root, 18); // save row (17 fields, scope, then save)
+    navigateTo(root, 19); // save row (18 fields, scope, then save)
     root.handleInput?.(KEY_CONFIRM); // open save confirm
     root.handleInput?.(KEY_CONFIRM); // confirm
     assert.deepEqual(done.mock.calls[0]?.arguments[0], {
@@ -247,7 +247,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("save row with no changes resolves an empty payload", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
-    navigateTo(root, 18);
+    navigateTo(root, 19);
     root.handleInput?.(KEY_CONFIRM);
     root.handleInput?.(KEY_CONFIRM);
     assert.deepEqual(done.mock.calls[0]?.arguments[0], { cancelled: false, settings: {}, scope: "global" });
@@ -255,7 +255,7 @@ describe("form interactions (buildFormComponent)", () => {
 });
 
 describe("provider pool visual editor", () => {
-  const POOL_ROW = 16; // providerPool is the 17th registry row (0-based)
+  const POOL_ROW = 17; // providerPool is the 18th registry row (0-based)
   const modelPool = (models: Record<string, Record<string, unknown>>) =>
     ({ models }) as WorkflowSettings["providerPool"];
   // Two providers for the same logical model (gpt-5.5) + one fresh model: the

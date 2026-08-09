@@ -32,6 +32,17 @@ export interface McpServerConfig {
    * Optional tool-name filter (`["*"]`/absent = all tools; explicit names =
    * allowlist). Normalized: "*" entries and invalid values are dropped; an
    * empty result means "all" (undefined).
+   *
+   * RECOMMENDED (T1-09): name the tools a subagent actually uses. Every MCP
+   * def is billed per turn, and a server with many tools (measured: a svelte
+   * MCP server's 4 defs ≈ 1,262 tok/turn) costs those tokens on EVERY
+   * subagent turn even when nothing calls MCP. `mcp-tools.ts` honors this
+   * filter when listing; `/workflows-subagent-tools` warns past 4 KB of MCP
+   * defs and points here. Example mcp.json entry:
+   *
+   * ```json
+   * { "mcpServers": { "svelte": { "url": "http://localhost:…", "tools": ["get-docs", "read-resource"] } } }
+   * ```
    */
   tools?: string[];
   /** Extra request headers, passed through verbatim. Values are never logged. */

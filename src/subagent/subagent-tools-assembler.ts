@@ -12,9 +12,11 @@
  *    "all" appends every reachable server's tools; a string[] appends only the
  *    exact `mcp_*` names listed; [] appends nothing.
  *  - Vendored chrome tools (pi-chrome's `chrome_*` set re-created for
- *    subagents, design: tasks/subagent-chrome-tools/DESIGN.md) are appended
- *    after MCP tools when a supplier is provided; they respect the host's
- *    shared `/chrome authorize` grant (the supplier decides at call time).
+ *    subagents, design: tasks/subagent-chrome-tools/DESIGN.md) are NOT part
+ *    of the default merge (T1-09): they attach per-task ONLY via the explicit
+ *    "chrome-tools" named toolset ({@link chromeToolsOnly}), so untagged runs
+ *    never pay the ~5.5 ktok/turn chrome defs. The supplier still respects the
+ *    host's shared `/chrome authorize` grant (it decides at call time).
  *
  * Safety invariants (mirror the host policy): construction is side-effect free;
  * nothing touches the network until the first assemble()/mcpToolsOnly(); MCP
@@ -46,7 +48,9 @@ export interface SubagentToolsAssemblerOptions {
   mcpTools: McpToolsManager;
   /**
    * Vendored chrome tool defs (subagent-chrome-tools). Resolved lazily per
-   * assemble() so the supplier can re-check the shared chrome auth grant.
+   * chromeToolsOnly() so the supplier can re-check the shared chrome auth
+   * grant. Consumed ONLY by the "chrome-tools" named toolset — T1-09 keeps
+   * chrome defs out of the default assemble() merge (per-task opt-in).
    */
   chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   /**
@@ -124,24 +128,24 @@ export class SubagentToolsAssembler {
 
   /**
    * The merged default toolset for untagged runs: host bundle + MCP tools
-   * (mode-filtered) + vendored chrome tools (auth-gated by the supplier) +
-   * captured extension tools (setting-gated by the supplier) + damage-control
-   * tools (setting-gated by the supplier). Never throws — MCP failures
+   * (mode-filtered) + captured extension tools (setting-gated by the supplier)
+   * + damage-control tools (setting-gated by the supplier). Chrome defs are
+   * deliberately ABSENT (T1-09): they attach per-task via chromeToolsOnly()
+   * (the "chrome-tools" toolset), so a task that never drives the browser
+   * does not pay the ~5.5 ktok/turn chrome defs. Never throws — MCP failures
    * degrade to host-only tools, and suppliers are expected to swallow their
    * own failures (the damage-control supplier yields [] on a missing module).
    */
   async assemble(): Promise<ToolDefinition[]> {
-    const [host, mcp, chrome, extension, damageControl] = await Promise.all([
+    const [host, mcp, extension, damageControl] = await Promise.all([
       this.hostTools(),
       this.mcpTools.listSubagentTools(),
-      this.chromeTools?.() ?? [],
       this.extensionTools?.() ?? [],
       this.damageControlTools?.() ?? [],
     ]);
     const merged = [
       ...host,
       ...filterMcpTools(mcp, this.mode, this.excludeTools),
-      ...filterChromeTools(chrome, this.excludeTools),
       ...filterExtensionTools(extension, this.excludeTools),
       ...filterDamageControlTools(damageControl, this.excludeTools),
     ];
@@ -169,10 +173,10 @@ export class SubagentToolsAssembler {
   }
 
   /**
-   * Vendored chrome tools only (the "chrome-tools" named toolset). Resolved
-   * per call so it reflects the CURRENT grant — a revoked grant yields an
-   * empty list (mirrors pi-chrome only registering chrome tools when
-   * authorized).
+   * Vendored chrome tools only (the "chrome-tools" named toolset — the ONLY
+   * channel chrome defs attach through since T1-09). Resolved per call so it
+   * reflects the CURRENT grant — a revoked grant yields an empty list (mirrors
+   * pi-chrome only registering chrome tools when authorized).
    */
   async chromeToolsOnly(): Promise<ToolDefinition[]> {
     const chrome = (await this.chromeTools?.()) ?? [];

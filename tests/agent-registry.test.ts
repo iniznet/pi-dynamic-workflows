@@ -297,6 +297,12 @@ describe("applyToolPolicy", () => {
       ["read"],
     );
   });
+  it("an EMPTY allowlist is a real policy: it removes every coding tool (T1-08)", () => {
+    assert.deepEqual(
+      applyToolPolicy(tools, []).map((t) => t.name),
+      [],
+    );
+  });
   it("removes the denylist", () => {
     assert.deepEqual(
       applyToolPolicy(tools, undefined, ["write", "bash"]).map((t) => t.name),

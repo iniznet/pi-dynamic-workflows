@@ -6,7 +6,7 @@ Use this page for routine scripts. Open the generated capability index only when
 
 Start with the only legal export: `export const meta = { name, description, phases?: [{ title, detail?, model? }] }`. Values are nonblank literals; declare only used phases and call `phase()` before each phase's work. The remaining body already runs inside an async function: write helpers as ordinary declarations; `export default` and other exports are invalid. Return the result explicitly.
 
-The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
+The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `ctx`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
 
 ## Script source
 
@@ -27,6 +27,26 @@ Syntax-gate a file before handing it over with `npx tsx scripts/check-workflow-s
 Call `agent(prompt, { label, schema? })`; it returns text, a schema-validated value, or recoverable `null`. Nonrecoverable limit, validation, and budget failures throw. Record each intended work ID before filtering. A `null` means missing coverage, never a negative finding.
 
 When JavaScript reads fields, pass a small plain JSON Schema. Schema noncompliance after repair throws and bypasses agent retries. Catch it only to return an explicit incomplete outcome without reading missing fields. Return objects, arrays, strings, numbers, booleans, and `null`—not functions, promises, cycles, `BigInt`, or runtime handles.
+
+## Shared context
+
+Fan-out scripts (reviewers, finders, gatherers, per-step verifiers) used to
+re-embed the same task/scope/objective text into every `agent()` prompt. Use
+`ctx(text)` instead: call it ONCE, keep the returned pointer, and embed the
+pointer in every prompt that needs the text.
+
+- **Dedupe guarantee:** each distinct text is stored exactly once per run; a
+  repeated `ctx()` with the same text returns the same pointer and never
+  re-stores. The full blob is emitted into the first agent's instructions;
+  every later agent gets a store-key note and reads the text with
+  `store_get("wf:ctx:0")` (store tools are injected into every agent).
+- **Resume safety:** the blob is part of the resume identity hash (like model,
+  phase, and agentType). Editing the shared text invalidates cached replays of
+  calls downstream of the `ctx()` registration; an unchanged script replays
+  byte-identically.
+- **Degradation:** empty/absent text returns `""` (no-op); non-string values
+  are JSON-stringified; an oversized blob or the distinct-blob cap returns the
+  raw text so the script keeps working exactly as it would without `ctx()`.
 
 ## Routing and support
 

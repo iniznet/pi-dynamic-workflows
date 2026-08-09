@@ -282,6 +282,7 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["reviewers", "2"],
       ["threshold", "0.5"],
       ["lens", null],
+      ["maxChars", "4000"],
     ],
   );
   assert.match(verify?.constraints.join(" ") ?? "", /successful votes.*denominator/i);

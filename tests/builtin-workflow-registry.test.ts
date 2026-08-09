@@ -13,6 +13,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "../src/adversarial-review.js";
 import {
+  BUILTIN_TOOLSET_TOOLS,
   BUILTIN_WORKFLOW_NAMES,
   BUILTIN_WORKFLOWS,
   DEFAULT_MULTI_PERSPECTIVES,
@@ -88,11 +89,16 @@ test("deep-research resolve() rejects a missing/blank question", () => {
   assert.throws(() => resolve("/tmp", { question: "   " }), /question/);
 });
 
-test("adversarial-review resolve() produces the real generator script with no special exec context", () => {
+test("adversarial-review resolve() produces the real generator script with its task-fit toolset", () => {
   const invocation = requireBuiltin("adversarial-review").resolve("/tmp", { task: "investigate this" });
   assert.equal(invocation.script, generateAdversarialReviewWorkflow());
-  assert.equal(invocation.tools, undefined);
-  assert.equal(invocation.toolset, undefined);
+  // T2-06: the pattern no longer inherits the FULL default toolset — it gets
+  // the read/grep subset and the persistable "adversarial-review" tag.
+  assert.deepEqual(
+    (invocation.tools ?? []).map((t) => t.name),
+    ["read", "grep"],
+  );
+  assert.equal(invocation.toolset, "adversarial-review");
 });
 
 test("adversarial-review resolve() rejects a missing task", () => {
@@ -127,6 +133,59 @@ test("multi-perspective resolve() falls back to the default perspective set belo
 
 test("multi-perspective resolve() rejects a missing topic", () => {
   assert.throws(() => requireBuiltin("multi-perspective").resolve("/tmp", { perspectives: ["a", "b"] }), /topic/);
+});
+
+// ─── T2-06 per-pattern toolset tags ────────────────────────────────────────────
+
+test("every pattern's resolve() carries its task-fit toolset tag and exact tool subset", () => {
+  // The plan's assignment (plan.md §3 T2-06); deep-research keeps web-research.
+  const expectedTags: Record<string, { toolset: string; tools: string[] }> = {
+    "adversarial-review": { toolset: "adversarial-review", tools: ["read", "grep"] },
+    "code-review": { toolset: "code-review", tools: ["read", "grep", "find"] },
+    "codebase-audit": { toolset: "codebase-audit", tools: ["read", "grep", "find"] },
+    "plan-then-execute": { toolset: "plan-then-execute", tools: ["read", "write", "bash"] },
+    "spec-generation": { toolset: "spec-generation", tools: ["read", "bash", "write"] },
+    "multi-perspective": { toolset: "multi-perspective", tools: ["read", "grep"] },
+  };
+  const validArgs: Record<string, Record<string, unknown>> = {
+    "adversarial-review": { task: "t" },
+    "code-review": { diff: "d" },
+    "codebase-audit": { scope: "s", checks: ["c"] },
+    "plan-then-execute": { objective: "o" },
+    "spec-generation": { topic: "t" },
+    "multi-perspective": { topic: "t" },
+  };
+  for (const name of Object.keys(expectedTags)) {
+    const { toolset, tools } = expectedTags[name];
+    const invocation = requireBuiltin(name).resolve("/tmp", validArgs[name]);
+    assert.equal(invocation.toolset, toolset, `${name} should carry the ${toolset} tag`);
+    assert.deepEqual(
+      (invocation.tools ?? []).map((t) => t.name),
+      tools,
+      `${name} should resolve exactly ${tools.join("/")}`,
+    );
+    // The tag's registered subset (what a resumed run re-resolves) matches the
+    // same registry the resolve() output builds from.
+    assert.deepEqual(
+      [...BUILTIN_TOOLSET_TOOLS[toolset]],
+      tools,
+      `${name}'s tag must be registered in BUILTIN_TOOLSET_TOOLS`,
+    );
+  }
+});
+
+test("BUILTIN_TOOLSET_TOOLS covers exactly the 6 toolset-tagged patterns (deep-research keeps web-research)", () => {
+  assert.deepEqual([...Object.keys(BUILTIN_TOOLSET_TOOLS)].sort(), [
+    "adversarial-review",
+    "code-review",
+    "codebase-audit",
+    "multi-perspective",
+    "plan-then-execute",
+    "spec-generation",
+  ]);
+  // deep-research is unchanged: it already resolves tools + the web-research tag.
+  const dr = requireBuiltin("deep-research").resolve("/tmp", { question: "q" });
+  assert.equal(dr.toolset, "web-research");
 });
 
 test("codebase-audit resolve() bakes the given scope/checks into the same generator output", () => {

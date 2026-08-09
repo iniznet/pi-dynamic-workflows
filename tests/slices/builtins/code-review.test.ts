@@ -293,3 +293,17 @@ test("code-review end-to-end: sharded finders, per-angle verifiers, severity-ran
     );
   }
 });
+
+// ─── T2-05: verify-batch tier defaults baked into the generated script ───────
+
+test("code-review script bakes the per-angle verify-tier map (T2-05)", () => {
+  const body = generateCodeReviewWorkflow();
+  assert.match(
+    body,
+    /const VERIFY_TIER = \{"A":"medium","B":"medium","C":"medium","D":"small","E":"small","F":"small","G":"medium","H":"medium"\}/,
+  );
+  assert.match(body, /tier: VERIFY_TIER\[batch\.angle\] \|\| 'medium'/);
+  // The custom-option path overrides individual angles.
+  const custom = generateCodeReviewWorkflow({ tierVerify: { G: "small" } });
+  assert.match(custom, /"G":"small"/);
+});

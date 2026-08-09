@@ -8,6 +8,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { builtinToolsetTools } from "../src/builtin-workflows.js";
 import { DEFAULT_IDLE_AGENT_MS, formatElapsed, tokenFigures, type WorkflowAgentSnapshot } from "../src/display.js";
 import {
   claimWorkflowRuntime,
@@ -270,14 +271,26 @@ export default function extension(pi: ExtensionAPI) {
     // Named toolsets survive on the persisted run (the tag, not the functions),
     // so a resumed run re-resolves the tools it started with — e.g. a paused
     // /deep-research keeps web access instead of degrading to coding tools.
+    // The builtin-pattern tags (T2-06) resolve the same task-fit subsets the
+    // registry hands the first execution, so a resumed run keeps the exact
+    // toolset (not the full default bundle).
     toolsets: {
       "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
+      "code-review": () => builtinToolsetTools(cwd, "code-review"),
+      "spec-generation": () => builtinToolsetTools(cwd, "spec-generation"),
+      "adversarial-review": () => builtinToolsetTools(cwd, "adversarial-review"),
+      "codebase-audit": () => builtinToolsetTools(cwd, "codebase-audit"),
+      "plan-then-execute": () => builtinToolsetTools(cwd, "plan-then-execute"),
+      "multi-perspective": () => builtinToolsetTools(cwd, "multi-perspective"),
     },
     // On top of the always-on workflow/workflow_control denial in subagents
     // (#107), let users block additional recursive-orchestration tools.
     excludeSubagentTools: settings.excludeSubagentTools,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
     defaultTokenBudget: settings.defaultTokenBudget ?? null,
+    // T1-01: budget-gate knob. Default true keeps the legacy full-spend budget
+    // (cacheRead counts); false gates on fresh spend (input+output only).
+    defaultTokenBudgetCountsCacheRead: settings.tokenBudgetCountsCacheRead ?? true,
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
@@ -334,10 +347,13 @@ export default function extension(pi: ExtensionAPI) {
   // tasks/subagent-chrome-tools/DESIGN.md). The supplier is gated twice: the
   // `subagentChromeTools` setting decides whether chrome tools exist at all
   // (off → no defs anywhere, including the "chrome-tools" toolset), and the
-  // shared grant decides whether they are attached to a given assemble (no
-  // grant → empty set, degrading gracefully). Every wire action is tagged with
-  // the HOST session key + group title so subagent automation joins the main
-  // session's tab group.
+  // shared grant decides whether a chromeToolsOnly() resolve yields the set
+  // (no grant → empty set, degrading gracefully). T1-09: chrome defs are
+  // PER-TASK ONLY — they attach via the explicit "chrome-tools" toolset tag
+  // (scripts/agentTypes opt in), never through the default merged toolset, so
+  // untagged runs never pay the ~5.5 ktok/turn chrome defs. Every wire action
+  // is tagged with the HOST session key + group title so subagent automation
+  // joins the main session's tab group.
   const vendoredChromeTools = () =>
     createVendoredChromeTools({
       sessionKey: () => {
@@ -429,8 +445,10 @@ export default function extension(pi: ExtensionAPI) {
       "mcp-tools": () => subagentToolsAssembler.mcpToolsOnly(),
       // Chrome-only toolset: vendored chrome defs (auth-gated by the shared
       // /chrome authorize grant; empty until one is held). Works in every
-      // host-tools mode. With subagentChromeTools "off" the supplier is
-      // undefined, so this resolves to [] (script intent recorded, no tools).
+      // host-tools mode. This is the ONLY channel chrome defs attach through
+      // (T1-09) — they are never merged into the default toolset. With
+      // subagentChromeTools "off" the supplier is undefined, so this resolves
+      // to [] (script intent recorded, no tools).
       "chrome-tools": () => subagentToolsAssembler.chromeToolsOnly(),
       // Captured-extension-tools-only toolset: works in every host-tools
       // mode, including "off". With subagentExtensionTools off the supplier

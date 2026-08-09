@@ -13,6 +13,8 @@ type EntrySpec = Omit<ProviderPoolEntry, "provider" | "modelId"> & {
   modelId: string;
   /** hasConfiguredAuth result for this provider (default true). */
   auth?: boolean;
+  /** T2-10: registry-side model cost, returned by the stub registry's find(). */
+  modelCost?: { input?: number; output?: number };
 };
 
 /** Build a normalized ProviderPoolConfig keyed logical-model → provider → entry. */
@@ -24,7 +26,7 @@ function makeConfig(
   for (const [logicalModel, specs] of Object.entries(models)) {
     normalized[logicalModel] = {};
     for (const spec of specs) {
-      const { auth: _auth, ...entry } = spec;
+      const { auth: _auth, modelCost: _modelCost, ...entry } = spec;
       normalized[logicalModel][entry.provider] = entry;
     }
   }
@@ -41,13 +43,20 @@ function makeConfig(
 function makeRegistry(specs: EntrySpec[]): ModelRegistry {
   const registered = new Set<string>();
   const authByProvider = new Map<string, boolean>();
+  const costByKey = new Map<string, { input?: number; output?: number }>();
   for (const spec of specs) {
     registered.add(`${spec.provider}\u0000${spec.modelId}`);
     authByProvider.set(spec.provider, spec.auth ?? true);
+    if (spec.modelCost !== undefined) costByKey.set(`${spec.provider}\u0000${spec.modelId}`, spec.modelCost);
   }
   return {
-    find: (provider: string, modelId: string) =>
-      registered.has(`${provider}\u0000${modelId}`) ? ({ provider, modelId } as never) : undefined,
+    find: (provider: string, modelId: string) => {
+      const key = `${provider}\u0000${modelId}`;
+      if (!registered.has(key)) return undefined;
+      const model = { provider, modelId } as { provider: string; modelId: string };
+      const cost = costByKey.get(key);
+      return (cost === undefined ? model : { ...model, cost }) as never;
+    },
     hasConfiguredAuth: (model: { provider: string }) => authByProvider.get(model.provider) ?? false,
   } as unknown as ModelRegistry;
 }
@@ -494,4 +503,88 @@ test("D2: an all-no-auth pool in fail mode also names the providers instead of '
     assert.match((error as Error).message, /"noauth-c"/);
     return true;
   });
+});
+
+// ─── T2-10: cost-aware routing ───────────────────────────────────────────────
+
+test("acquire tilts the load equilibrium toward the cheaper endpoint (T2-10)", async () => {
+  // Same weight (1), same concurrency. With no cost data min(active/weight)
+  // alternates (2/2); the cost factor (1 + costNormalized) makes the cheap
+  // endpoint the lower-scored pick at equal load, so it takes 3 of 4.
+  const { pool } = makePool("m", [
+    { provider: "budget", modelId: "b", concurrency: 10, weight: 1, costOutput: 10 },
+    { provider: "pricey", modelId: "p", concurrency: 10, weight: 1, costOutput: 100 },
+  ]);
+  const picks: string[] = [];
+  for (let i = 0; i < 4; i++) picks.push((await pool.acquire("m"))?.provider ?? "");
+  // budget: 1,0,1,1 → 3; pricey: 0,1,0,0 → 1 (config order wins the idle tie).
+  assert.equal(picks.filter((p) => p === "budget").length, 3, `expected the cheap endpoint to take 3/4, got ${picks}`);
+  assert.equal(picks.filter((p) => p === "pricey").length, 1);
+});
+
+test("cost is a soft tiebreak — a saturated cheap endpoint routes to the pricier one", async () => {
+  const { pool } = makePool("m", [
+    { provider: "budget", modelId: "b", concurrency: 1, weight: 1, costOutput: 10 },
+    { provider: "pricey", modelId: "p", concurrency: 10, weight: 1, costOutput: 100 },
+  ]);
+  const first = await pool.acquire("m");
+  assert.equal(first?.provider, "budget");
+  // budget is now at its concurrency cap → pricey takes the next acquire.
+  const second = await pool.acquire("m");
+  assert.equal(second?.provider, "pricey");
+});
+
+test("cost does not override a weight advantage that keeps the cheap endpoint at capacity", async () => {
+  // budget: weight 1, cost 10 (cheap) but concurrency 1; pricey: weight 10,
+  // cost 100. After budget saturates, pricey's huge weight keeps it preferred.
+  const { pool } = makePool("m", [
+    { provider: "budget", modelId: "b", concurrency: 1, weight: 1, costOutput: 10 },
+    { provider: "pricey", modelId: "p", concurrency: 10, weight: 10, costOutput: 100 },
+  ]);
+  const first = await pool.acquire("m");
+  assert.equal(first?.provider, "budget");
+  const second = await pool.acquire("m");
+  assert.equal(second?.provider, "pricey", "only the cheap endpoint is saturated; the weighted one is preferred");
+});
+
+test("registry model cost is used when the entry carries no cost fields (T2-10 default)", async () => {
+  const { pool } = makePool("m", [
+    { provider: "budget", modelId: "b", concurrency: 10, weight: 1, modelCost: { output: 10 } },
+    { provider: "pricey", modelId: "p", concurrency: 10, weight: 1, modelCost: { output: 100 } },
+  ]);
+  const picks: string[] = [];
+  for (let i = 0; i < 4; i++) picks.push((await pool.acquire("m"))?.provider ?? "");
+  assert.equal(
+    picks.filter((p) => p === "budget").length,
+    3,
+    `the registry-derived output price must drive routing, got ${picks}`,
+  );
+});
+
+test("an entry cost beats the registry-derived cost", async () => {
+  // budget's ENTRY cost is high (500) even though its registry model cost is
+  // low (1) — the explicit per-entry price must win, so the cheap endpoint is
+  // now pricey (registry 100). pricey is listed FIRST and ends up the
+  // equilibrium winner (3/4).
+  const { pool } = makePool("m", [
+    { provider: "pricey", modelId: "p", concurrency: 10, weight: 1, modelCost: { output: 100 } },
+    { provider: "budget", modelId: "b", concurrency: 10, weight: 1, costOutput: 500, modelCost: { output: 1 } },
+  ]);
+  const picks: string[] = [];
+  for (let i = 0; i < 4; i++) picks.push((await pool.acquire("m"))?.provider ?? "");
+  assert.equal(picks.filter((p) => p === "pricey").length, 3, `per-entry costOutput must win, got ${picks}`);
+});
+
+test("snapshot surfaces the effective per-endpoint cost (entry ?? registry)", async () => {
+  const { pool } = makePool("m", [
+    { provider: "a", modelId: "a", concurrency: 10, weight: 1, costOutput: 12, costInput: 3 },
+    { provider: "b", modelId: "b", concurrency: 10, weight: 1, modelCost: { output: 45 } },
+    { provider: "c", modelId: "c", concurrency: 10, weight: 1 },
+  ]);
+  const entries = pool.snapshot().entries;
+  const byProvider = new Map(entries.map((e) => [e.provider, e]));
+  assert.equal(byProvider.get("a")?.costOutput, 12);
+  assert.equal(byProvider.get("a")?.costInput, 3);
+  assert.equal(byProvider.get("b")?.costOutput, 45, "registry-derived cost appears in the snapshot");
+  assert.equal(byProvider.get("c")?.costOutput, undefined, "unknown cost stays absent");
 });

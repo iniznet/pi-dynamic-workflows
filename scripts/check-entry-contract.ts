@@ -95,6 +95,12 @@ const ENTRY_CONTRACT: Record<string, string> = {
   MAX_CONCURRENCY: "config constant",
   MAX_NESTED_WORKFLOW_DEPTH: "config constant",
   MAX_AGENT_RETRIES: "config constant",
+  // T2-03/T2-04/T2-05/T2-11 routing-economics constants (slice C).
+  UNTAGGED_TIER_ECONOMY: "config constant (T2-03 economy default sentinel)",
+  UNTAGGED_TIER_INHERIT_MAIN: "config constant (T2-03 opt-out sentinel)",
+  DEFAULT_UNTAGGED_TIER: "config constant (T2-03 run default)",
+  ROUTING_POLICY_VERSION: "config constant (T2-03/05/11 resume-hash policy version)",
+  DEFAULT_HELPER_TIER: "config constant (T2-04 quality-helper vote tier)",
   DEFAULT_TOKEN_BUDGET: "config constant",
   WORKFLOW_RUNS_DIR: "config constant",
   WORKFLOW_SAVED_DIR: "config constant",

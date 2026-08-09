@@ -74,6 +74,12 @@ export interface SubagentToolsListingInput {
   extensionToolSources: CapturedSourceResult[];
   /** Effective subagentDamageControlTools mode ("off" default | "readonly" | "on"). Optional so pre-existing call sites (and the command tests' listing() helper) keep compiling — the renderer treats an absent value as "off". */
   damageControlMode?: "off" | "readonly" | "on";
+  /**
+   * Serialized bytes of the assembled `mcp_*` tool defs (provider-billed
+   * payload). Optional so pre-existing call sites keep compiling; an absent
+   * value renders no MCP size line.
+   */
+  mcpToolDefsBytes?: number;
 }
 
 /** The executable coding builtins (createCodingTools) — host-bundle sources. */
@@ -108,6 +114,33 @@ const CHROME_TOOLS = new Set([
 ]);
 /** Names a builtin/sdk host tool can take (metadata source check). */
 const HOST_SOURCE_NAMES = new Set([...BUILTIN_HOST_TOOLS, ...BUILTIN_READONLY_TOOLS, ...WEB_TOOLS]);
+
+/**
+ * Serialized size of one tool definition — the exact payload the provider
+ * bills (`JSON.stringify({name, description, parameters})` as UTF-8 bytes,
+ * the same measure the workflow-context surfaces use).
+ */
+export function toolDefinitionBytes(def: ToolDefinition): number {
+  return Buffer.byteLength(
+    JSON.stringify({ name: def.name, description: def.description, parameters: def.parameters }),
+    "utf8",
+  );
+}
+
+/**
+ * MCP tool-def byte ceiling (T1-09): when the assembled `mcp_*` defs exceed
+ * this, the listing warns and recommends per-server `tools` filters — one svelte
+ * MCP server was measured at 4 defs / 5,046 B ≈ 1,262 tok/turn on code-review
+ * finders that never call MCP.
+ */
+export const MCP_TOOL_DEFS_WARN_BYTES = 4 * 1024;
+
+/**
+ * Approximate chrome toolset cost per turn (T1-09/E4): the 22 vendored
+ * chrome_* defs measure 22,231 B ≈ 5,558 tok/turn when attached. Surfaced in
+ * the listing so per-task opt-in decisions are informed.
+ */
+export const CHROME_TOOLS_APPROX_TOKENS_PER_TURN = 5_558;
 
 /** Classify an assembled tool's source by its name. */
 export function classifyToolSource(name: string): SubagentToolSource {
@@ -280,6 +313,15 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
   lines.push("### Effective subagent toolset (workflow subagents)");
   lines.push("");
   lines.push(`- MCP tools: ${modeLine}`);
+  // T1-09 size-aware guard: warn when the assembled MCP defs exceed the 4 KB
+  // ceiling and point at the per-server `tools` filter that trims them
+  // (mcp-tools.ts honors it already). Only rendered when the handler supplied
+  // the measurement.
+  if (input.mcpToolDefsBytes !== undefined && input.mcpToolDefsBytes > MCP_TOOL_DEFS_WARN_BYTES) {
+    lines.push(
+      `- ⚠ MCP tool defs: ${input.mcpToolDefsBytes} B/turn (over the ${MCP_TOOL_DEFS_WARN_BYTES} B guidance) — trim with per-server \`tools\` filters in mcp.json (e.g. \`"my-server": { "url": …, "tools": ["only-what-you-use"] }\`) so unused defs stop riding every turn`,
+    );
+  }
   lines.push(
     `- Host tools: **${input.hostToolsMode}** (${input.hostToolsMode === "off" ? "legacy opt-in — untagged runs get coding tools only" : "merged coding + proxied host tools in untagged runs"})`,
   );
@@ -287,7 +329,13 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
     `- MCP servers configured: ${input.mcpServerNames.length > 0 ? input.mcpServerNames.join(", ") : "(none — add HTTP servers to ~/.pi/agent/mcp.json)"}`,
   );
   lines.push(
-    `- Chrome tools: **${input.chromeToolsMode}** (${input.chromeToolsMode === "off" ? "vendored chrome defs hidden — set settings.subagentChromeTools=on to expose them" : input.chromeGranted ? "shared /chrome authorize grant active — chrome defs attach to runs" : "setting on but no /chrome authorize grant — chrome defs stay empty until the host authorizes"})`,
+    `- Chrome tools: **${input.chromeToolsMode}** (${
+      input.chromeToolsMode === "off"
+        ? `vendored chrome defs hidden (~${CHROME_TOOLS_APPROX_TOKENS_PER_TURN} tok/turn saved) — set settings.subagentChromeTools=on to expose them per-task via toolset: "chrome-tools"`
+        : input.chromeGranted
+          ? `shared /chrome authorize grant active — attach per-task with toolset: "chrome-tools" (~${CHROME_TOOLS_APPROX_TOKENS_PER_TURN} tok/turn while attached)`
+          : "setting on but no /chrome authorize grant — chrome defs stay empty until the host authorizes"
+    })`,
   );
   lines.push(
     `- Extension tools: **${renderExtensionToolsMode(input.extensionToolsMode)}** (${input.extensionToolsMode === "off" ? "captured defs hidden — set settings.subagentExtensionTools=on to capture supi-web + pi-codegraph tools" : "captured in-process from installed sources; per-source status below"})`,
@@ -368,6 +416,12 @@ export function registerWorkflowSubagentToolsCommand(
         Promise.resolve(options.getHostToolInfos()),
         options.getExtensionToolSources().catch(() => [] as CapturedSourceResult[]),
       ]);
+      // T1-09: measure the provider-billed bytes of the assembled mcp_* defs so
+      // the listing can warn past the 4 KB ceiling and recommend per-server
+      // `tools` filters.
+      const mcpToolDefsBytes = assembled
+        .filter((tool) => tool.name.startsWith("mcp_"))
+        .reduce((sum, tool) => sum + toolDefinitionBytes(tool), 0);
       const listing = renderSubagentToolsListing({
         mode: settings.subagentTools ?? "all",
         hostToolsMode: settings.subagentHostTools ?? "auto",
@@ -380,6 +434,7 @@ export function registerWorkflowSubagentToolsCommand(
         extensionToolsMode: settings.subagentExtensionTools ?? "off",
         extensionToolSources,
         damageControlMode: settings.subagentDamageControlTools ?? "off",
+        mcpToolDefsBytes,
       });
       // fallback: a host without sendMessage still surfaces the rows via the
       // notify channel; ctx.cwd keeps the listing project-scoped.

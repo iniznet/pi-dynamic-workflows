@@ -24,20 +24,31 @@ import {
 } from "./agent-registry.js";
 import {
   DEFAULT_AGENT_TIMEOUT_MS,
+  DEFAULT_HELPER_TIER,
   DEFAULT_RETRY_BACKOFF_MS,
+  DEFAULT_UNTAGGED_TIER,
   DRAIN_ABORT_TIMEOUT_MS,
   MAX_AGENT_RETRIES,
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
   MAX_NESTED_WORKFLOW_DEPTH,
   MAX_RETRY_BACKOFF_MS,
+  ROUTING_POLICY_VERSION,
+  UNTAGGED_TIER_ECONOMY,
+  UNTAGGED_TIER_INHERIT_MAIN,
 } from "./config.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
 import { createWorkflowLogger, pushBoundedLog } from "./logger.js";
-import { parseModelRoutingFromMeta, resolveModelForPhase } from "./model-routing.js";
+import { parseModelRoutingFromMeta, resolveModelForPhase, tierNameForTask } from "./model-routing.js";
 import { providerFromCanonicalSpec } from "./model-spec.js";
-import { createMemoizedLoadModelTierConfig, type ModelTierConfig, resolveTierModel } from "./model-tier-config.js";
+import {
+  buildDefaultTierConfig,
+  coerceSpecThinkingForTier,
+  createMemoizedLoadModelTierConfig,
+  type ModelTierConfig,
+  resolveTierModel,
+} from "./model-tier-config.js";
 import { runPrewalkStage } from "./phases/prewalk.js";
 import { type PhaseStage, SUBAGENT_SPAWN_BLOCKED, type WorkflowStateManager } from "./phases/state-machine.js";
 import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
@@ -69,6 +80,19 @@ import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from 
  * the breaching fan-out's own queue is short-circuited.
  */
 const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
+
+/**
+ * T2-07 shared-context (ctx()) constants. `ctx(text)` writes each DISTINCT
+ * blob once into the run's shared store under a reserved `wf:ctx:<n>` key and
+ * hands the script a compact pointer to embed in prompts. The pointer marker
+ * is deliberately ASCII and bracket-shaped so it is cheap to tokenize, stable
+ * across toolchains, and unlikely to collide with task text.
+ */
+const SHARED_CONTEXT_KEY_PREFIX = "wf:ctx:";
+const SHARED_CONTEXT_POINTER_PREFIX = "[[ctx:";
+const SHARED_CONTEXT_POINTER_SUFFIX = "]]";
+/** Cap on distinct ctx() blobs per run; past it ctx() degrades to returning the raw text. */
+const MAX_SHARED_CONTEXT_BLOBS = 16;
 
 export interface WorkflowMetaPhase {
   title: string;
@@ -206,6 +230,20 @@ export interface SharedRuntime {
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   agentCount: number;
   spent: number;
+  /**
+   * T1-01 fresh-spend counter: input+output only (cacheRead and cacheWrite
+   * excluded). Always tracked, but only read by the budget gate when the
+   * `tokenBudgetCountsCacheRead: false` knob is set (opt-in fresh-counting;
+   * default keeps the full `spent` counter so current behavior is unchanged).
+   * NOT part of SharedRuntime.tokenUsage — the M26 persisted aggregate
+   * (`total === input+output+cacheRead+cacheWrite`) and the A2 single-final
+   * tokenUsage emit are untouched. On the estimate-only path the estimated
+   * tokens ARE input+output (there is no cache split), so they fold into
+   * freshSpent 1:1. Note this is intentionally distinct from display.ts's
+   * `fresh` figure, which counts cacheWrite as fresh (display's goal is
+   * honest spend display; the budget's goal is billable-fresh counting).
+   */
+  freshSpent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
   /**
    * Number of live nested workflow() frames (incremented around the nested
@@ -280,6 +318,26 @@ export interface SharedRuntime {
    * globally across the whole run tree.
    */
   pendingReplayDeltas: Array<{ delta: Record<string, unknown>; seq: number | undefined }>;
+  /**
+   * T2-07 shared-context registry: every DISTINCT blob the script's ctx()
+   * global registered, in first-call order. Each entry carries the reserved
+   * store key the blob was written to exactly once and the compact pointer
+   * scripts embed in prompts instead of re-embedding the full text. Lives on
+   * the SharedRuntime (not the frame closure) so nested workflow() frames —
+   * which share the runtime AND the store — register into one collision-free
+   * key space for the whole run tree. Rebuilt deterministically on resume:
+   * the script body re-runs and re-registers the same blobs in the same order.
+   */
+  sharedContext: Array<{ key: string; pointer: string; text: string }>;
+  /**
+   * T2-07: whether the run's shared-context section has been emitted into an
+   * agent's instructions yet. buildAgentInstructions emits the FULL blob text
+   * into the first agent whose instructions are built (once per run) and a
+   * compact store-key note into every later agent's instructions — the dedupe
+   * that stops fan-out scripts from paying to re-embed the same shared text
+   * per agent. Never part of any resume hash (instructions are not identity).
+   */
+  sharedContextEmitted: boolean;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -340,6 +398,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   concurrency?: number;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
+  /**
+   * T2-08: run-level default for the per-agent `retryOnlyIfSpendUnder` knob
+   * (see AgentOptions) — applied to every agent() call that doesn't set its
+   * own. Skipping a retry because the failed attempt's recorded spend exceeded
+   * the threshold settles the agent exhausted like any other retry-exhausted
+   * failure. Opt-in; absent (default) preserves current retry behavior
+   * byte-for-byte. Wired from the workflow tool's input of the same name.
+   */
+  retryOnlyIfSpendUnder?: number;
   /**
    * Base exponential-backoff delay (ms) between retry attempts after a
    * recoverable agent failure: attempt N→N+1 waits base × 2^(N-1), capped at
@@ -462,6 +529,25 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     cacheRead: number;
     cacheWrite: number;
   };
+  /**
+   * T1-01: seed the FRESH SharedRuntime's `freshSpent` counter (input+output
+   * only) on resume, alongside initialTokenUsage. Only resume() sets this,
+   * from the persisted run's freshSpend-at-pause (or the recomputed
+   * `total - cacheRead - cacheWrite` on legacy runs). Applied only on the
+   * fresh-SharedRuntime branch — never when `sharedRuntime` is supplied.
+   */
+  initialFreshSpend?: number;
+  /**
+   * T1-01 budget-gate knob: when true (DEFAULT — current behavior), the
+   * budget's spent()/remaining() read the full `spent` counter
+   * (input+output+cacheRead+cacheWrite), so a warm-provider run's cheap
+   * cached traffic counts against the cap exactly as before. When false
+   * (opt-in fresh-counting), the gate reads `freshSpent` (input+output only)
+   * so the budget is proportional to billable work instead of the ~96%
+   * cacheRead-dominated total. Persisted aggregates (M26) are untouched in
+   * BOTH modes — only the budget counter's input changes.
+   */
+  tokenBudgetCountsCacheRead?: boolean;
   /**
    * Shared store for this run. One instance is created per top-level run and
    * propagated into nested workflow() calls. Pass an existing instance to share
@@ -624,10 +710,33 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
    * and falls back to default tools/model (with the name as a prose hint).
    */
   agentType?: string;
+  /**
+   * Restrict this agent's coding tools to these names (T1-08). Additive: absent
+   * (default) = the full current toolset; an empty array restricts to the
+   * schema/structured_output tool only (auto-added) — the intended shape for
+   * pure-reasoning votes that must not pay the full ~2.8 ktok toolset. An
+   * explicit per-call list overrides an agentType definition's allowlist, the
+   * same precedence `model` has over the definition's model. System tools
+   * (store_put/store_get) are always injected after this filter.
+   */
+  toolNames?: string[];
   /** Override timeout for this specific agent. null means no hard timeout. */
   timeoutMs?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
+  /**
+   * T2-08: skip auto-retry when this agent's FAILED attempt already recorded
+   * more than this many tokens — a huge-context agent that burns a long
+   * trajectory before failing would otherwise retry at full cost, doubling
+   * the input burn. The guard only skips the retry branch: the attempt
+   * settles exhausted exactly like a retry-exhausted failure (AGENT_EXHAUSTED
+   * / failOnExhaustedAgent semantics unchanged), its spend is folded into the
+   * run aggregate and reported via onAgentEnd as usual, and onRetrySpend only
+   * fires for attempts that ARE retried (the M26 full-breakdown invariant is
+   * untouched). Opt-in; the run-level default is the workflow tool's
+   * `retryOnlyIfSpendUnder`. Absent = current retry behavior byte-for-byte.
+   */
+  retryOnlyIfSpendUnder?: number;
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
@@ -901,6 +1010,17 @@ export async function runWorkflow<T = unknown>(
   // (legacy) when no registry is synchronously available: the pre-fix hash had
   // no registry input, and hashAgentCall omits the key, so old journals replay.
   const registryFingerprint = computeRegistryFingerprint(options.modelRegistry);
+  // T2-03: precomputed registry-derived default tier map for the resume-hash
+  // mirror of the no-config economy path (resolveRoutingModelSignature). The
+  // map is a pure function of (mainModel, registry) and is frozen at run start
+  // like the fingerprint, so per-agent() hash reads stay O(1) instead of
+  // re-scanning + re-ranking the registry on every call (F23-style). Undefined
+  // when no registry is synchronously available — the economy mirror then
+  // falls back to the legacy mainModel/defaultModel encoding.
+  const promptAwareDefaults =
+    options.modelRegistry !== undefined
+      ? buildDefaultTierConfig(options.mainModel, listAvailableModels(options.modelRegistry))
+      : undefined;
 
   // Initialize logger
   const logger = createWorkflowLogger({
@@ -951,6 +1071,7 @@ export async function runWorkflow<T = unknown>(
     limiter: createLimiter(concurrency),
     agentCount: 0,
     spent: options.initialTokenUsage?.total ?? 0,
+    freshSpent: options.initialFreshSpend ?? 0,
     tokenUsage: options.initialTokenUsage
       ? { ...options.initialTokenUsage }
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
@@ -959,6 +1080,10 @@ export async function runWorkflow<T = unknown>(
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     pendingReplayDeltas: [],
+    // T2-07: the ctx() registry starts empty per run; the script's ctx() calls
+    // populate it as the body executes (same order on resume replay).
+    sharedContext: [],
+    sharedContextEmitted: false,
     // Seed the elapsedMs() global from the true top-level start; a nested
     // workflow() frame inherits this exact value via options.sharedRuntime.
     runStartedAtMs: Date.now(),
@@ -1265,10 +1390,27 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
+  // T1-01: the budget gate's counter depends on the tokenBudgetCountsCacheRead
+  // knob (default true = current behavior: full spend incl. cacheRead). The
+  // shared.freshSpent counter is tracked regardless so a mid-run flip never
+  // loses data — the knob only picks which counter the gate reads.
+  const budgetCountsCacheRead = options.tokenBudgetCountsCacheRead !== false;
   const budget = Object.freeze({
     total: options.tokenBudget ?? null,
-    spent: () => shared.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
+    spent: () => (budgetCountsCacheRead ? shared.spent : shared.freshSpent),
+    remaining: () =>
+      options.tokenBudget == null
+        ? Infinity
+        : Math.max(0, options.tokenBudget - (budgetCountsCacheRead ? shared.spent : shared.freshSpent)),
+    // T2-02: gate CHEAP work before spawning it — true when `tokens` of
+    // additional spend would trip the budget ceiling (never true when no
+    // budget is configured). Unlike remaining() <= 0 (the hard pre-call gate),
+    // this is advisory: scripts use it to skip optional fan-out work, not to
+    // guarantee a ceiling.
+    wouldExceed: (tokens: number) =>
+      options.tokenBudget == null
+        ? false
+        : (budgetCountsCacheRead ? shared.spent : shared.freshSpent) + tokens > options.tokenBudget,
   });
 
   const agentLimitError = () =>
@@ -1402,6 +1544,14 @@ export async function runWorkflow<T = unknown>(
       modelSpec,
       options.mainModel,
       loadTierConfig,
+      // T2-03: the hash mirror of the no-config economy resolution needs the
+      // same inputs live resolution uses (prompt, phase, registry, the
+      // precomputed default tier map, and the run's untagged-default knob).
+      prompt,
+      assignedPhase,
+      options.modelRegistry,
+      promptAwareDefaults,
+      options.defaultUntaggedTier,
     );
 
     // For display in /workflows: the model this agent runs on — its explicit/
@@ -1415,6 +1565,13 @@ export async function runWorkflow<T = unknown>(
     // wins there).
     let displayModel = tierModel ?? modelSpec ?? options.mainModel;
 
+    // T2-07: the ctx() blobs registered BEFORE this agent() call are part of
+    // its resume identity — an edited script that changes the shared text must
+    // invalidate cached replays of every call downstream of the registration.
+    // Omitted entirely when no blob was registered yet (byte-identical legacy
+    // encoding, scripts that never call ctx() replay unchanged).
+    const sharedContextFingerprint = computeSharedContextFingerprint(shared.sharedContext);
+
     const callHash = hashAgentCall(
       prompt,
       modelSpec,
@@ -1424,15 +1581,24 @@ export async function runWorkflow<T = unknown>(
       agentDefinitionKey(agentDef),
       options.mainModel,
       resolvedIsolation,
-      // core-08: the fingerprint matters only on the no-config prompt-aware
-      // tier fallback path — tier set AND no model-tiers.json, the one path
-      // whose live resolution consults the registry (resolvePromptAwareTier).
-      // A configured tier resolves purely from the config file, which
-      // tierModel already encodes, so a registry change must not invalidate
-      // those calls. `registryFingerprint` itself is undefined when no
-      // registry was synchronously available, in which case hashAgentCall
-      // omits the key and legacy journals replay unchanged.
-      agentOptions.tier != null && loadTierConfig() == null ? registryFingerprint : undefined,
+      // core-08 + T2-03: the fingerprint matters on every no-config path whose
+      // LIVE resolution consults the registry (resolvePromptAwareTier) — an
+      // explicit tier with no model-tiers.json, OR an untagged call under the
+      // economy default (untagged default != inherit:main, no explicit model).
+      // A configured tier (or configured untagged default) resolves purely
+      // from the config file, which tierModel already encodes, so a registry
+      // change must not invalidate those calls. `registryFingerprint` itself
+      // is undefined when no registry was synchronously available, in which
+      // case hashAgentCall omits the key and legacy journals replay unchanged.
+      loadTierConfig() == null &&
+        (agentOptions.tier != null ||
+          (modelSpec == null &&
+            !explicitModel &&
+            (options.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER) !== UNTAGGED_TIER_INHERIT_MAIN))
+        ? registryFingerprint
+        : undefined,
+      // T2-07: the ctx() blobs registered before this call (omitted when none).
+      sharedContextFingerprint,
     );
     // Store delta key: callIndex alone is NOT run-unique. A nested workflow()
     // call (see workflowFn below) shares this run's SharedStore instance but
@@ -1573,6 +1739,11 @@ export async function runWorkflow<T = unknown>(
           shared.tokenUsage.cost += usage.cost;
           shared.tokenUsage.cacheRead += usage.cacheRead;
           shared.tokenUsage.cacheWrite += usage.cacheWrite;
+          // T1-01: fresh spend = input+output only. cacheWrite (the one-time
+          // cache fill) is deliberately excluded too — it is not recurring
+          // billable work. The M26 aggregate above keeps its full component
+          // sum untouched.
+          shared.freshSpent += usage.input + usage.output;
           const components = usageComponentsTotal(usage);
           tokens =
             components > 0
@@ -1581,7 +1752,11 @@ export async function runWorkflow<T = unknown>(
                 ? usage.total
                 : estimateTokens(result) + estimateTokens(prompt);
         } else {
+          // Estimate-only path: the estimate approximates input+output (there
+          // is no cache split on a non-reporting provider), so the full
+          // estimate is fresh spend.
           tokens = estimateTokens(result) + estimateTokens(prompt);
+          shared.freshSpent += tokens;
         }
         shared.tokenUsage.total += tokens;
         shared.spent += tokens;
@@ -1726,9 +1901,22 @@ export async function runWorkflow<T = unknown>(
               sessionName: `workflow:${runId} ${label}`,
               schema: agentOptions.schema,
               signal: agentController.signal,
-              instructions: buildAgentInstructions(assignedPhase, agentOptions, agentDef, resolvedIsolation),
+              instructions: buildAgentInstructions(
+                assignedPhase,
+                agentOptions,
+                agentDef,
+                resolvedIsolation,
+                // T2-07: the run's shared-context registry; buildAgentInstructions
+                // emits the full blob once (first agent) and store-key notes to
+                // every later agent.
+                shared,
+              ),
               model: modelSpec,
               tier: agentOptions.tier,
+              // T2-03: the run's untagged-agent default tier knob (economy /
+              // inherit:main / literal tier name); undefined lets the
+              // WorkflowAgent fall back to its own constructor/global default.
+              defaultUntaggedTier: options.defaultUntaggedTier,
               // GAP-2: the run's pipeline stage (clamped 0..1) so the
               // prompt-aware tier fallback classifies wayfinder/prewalk recon
               // to the cheap tier. Undefined on non-pipeline runs (unchanged
@@ -1741,7 +1929,7 @@ export async function runWorkflow<T = unknown>(
               // attempt below, never on recoverable retry-continue.
               providerPool: options.providerPool,
               poolStickyKey: deltaKey,
-              toolNames: agentDef?.tools,
+              toolNames: agentOptions.toolNames ?? agentDef?.tools,
               disallowedToolNames: agentDef?.disallowedTools,
               // Typed operation traces: the script line of THIS call (the
               // differentiator across journal entries) plus the callback that
@@ -1910,49 +2098,67 @@ export async function runWorkflow<T = unknown>(
             store.discardDelta(deltaKey);
 
             if (workflowError.recoverable && attempt < maxAttempts) {
-              const delayMs = retryBackoffDelayMs(retryBackoffMs, attempt);
-              log(
-                `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying` +
-                  (delayMs > 0 ? ` in ${delayMs}ms` : ""),
-              );
-              // This attempt's spend already accrued into shared.spent/tokenUsage
-              // above (recordTokens) — but it will never reach onAgentEnd (only
-              // the final attempt does), so report it on the dedicated channel
-              // instead (see WorkflowRunOptions.onRetrySpend). M26: ship the FULL
-              // breakdown, not a scalar, so a persisted aggregate keeps the
-              // invariant total === input+output+cacheRead+cacheWrite across
-              // retried attempts too. (`usage` is re-widened here — the CFA
-              // narrows it to never after the onUsage closure assignment;
-              // runtime value is the real attempt usage.)
-              const attemptUsage = usage as AgentUsage | undefined;
-              const retrySpend: AgentUsage = {
-                input: attemptUsage?.input ?? 0,
-                output: attemptUsage?.output ?? 0,
-                cacheRead: attemptUsage?.cacheRead ?? 0,
-                cacheWrite: attemptUsage?.cacheWrite ?? 0,
-                total: tokens,
-                cost: attemptUsage?.cost ?? 0,
-              };
-              safeCallback("onRetrySpend", options.onRetrySpend, retrySpend, deltaKey);
-              // F11: count this failed attempt's output in the call's pool
-              // spend (settled once at the final attempt, see
-              // settleProviderPool) so a retried provider's TPM window sees it.
-              if (typeof attemptUsage?.output === "number" && attemptUsage.output > 0) {
-                retryOutputTokens += attemptUsage.output;
+              // T2-08 retry spend guard: an attempt that already recorded more
+              // than `retryOnlyIfSpendUnder` tokens (per-call override, else the
+              // run-level default) is NOT retried — retrying a huge-context
+              // agent re-runs the whole trajectory at full cost, doubling/tripling
+              // the input burn. The guard only skips the retry branch: the
+              // attempt settles exhausted below, exactly like a retry-exhausted
+              // failure (AGENT_EXHAUSTED / failOnExhaustedAgent semantics
+              // unchanged), its spend is already folded into
+              // shared.spent/tokenUsage by recordTokens and reported via
+              // onAgentEnd, and onRetrySpend stays reserved for attempts that ARE
+              // retried (the M26 full-breakdown invariant is untouched).
+              const spendGuard = agentOptions.retryOnlyIfSpendUnder ?? options.retryOnlyIfSpendUnder;
+              if (spendGuard !== undefined && tokens > spendGuard) {
+                log(
+                  `agent "${label}" attempt ${attempt}/${maxAttempts} failed spending ${tokens} tokens (retryOnlyIfSpendUnder ${spendGuard}); skipping auto-retry — the agent settles exhausted`,
+                );
+              } else {
+                const delayMs = retryBackoffDelayMs(retryBackoffMs, attempt);
+                log(
+                  `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying` +
+                    (delayMs > 0 ? ` in ${delayMs}ms` : ""),
+                );
+                // This attempt's spend already accrued into shared.spent/tokenUsage
+                // above (recordTokens) — but it will never reach onAgentEnd (only
+                // the final attempt does), so report it on the dedicated channel
+                // instead (see WorkflowRunOptions.onRetrySpend). M26: ship the FULL
+                // breakdown, not a scalar, so a persisted aggregate keeps the
+                // invariant total === input+output+cacheRead+cacheWrite across
+                // retried attempts too. (`usage` is re-widened here — the CFA
+                // narrows it to never after the onUsage closure assignment;
+                // runtime value is the real attempt usage.)
+                const attemptUsage = usage as AgentUsage | undefined;
+                const retrySpend: AgentUsage = {
+                  input: attemptUsage?.input ?? 0,
+                  output: attemptUsage?.output ?? 0,
+                  cacheRead: attemptUsage?.cacheRead ?? 0,
+                  cacheWrite: attemptUsage?.cacheWrite ?? 0,
+                  total: tokens,
+                  cost: attemptUsage?.cost ?? 0,
+                };
+                safeCallback("onRetrySpend", options.onRetrySpend, retrySpend, deltaKey);
+                // F11: count this failed attempt's output in the call's pool
+                // spend (settled once at the final attempt, see
+                // settleProviderPool) so a retried provider's TPM window sees it.
+                if (typeof attemptUsage?.output === "number" && attemptUsage.output > 0) {
+                  retryOutputTokens += attemptUsage.output;
+                }
+                // Exponential backoff before the next attempt: a provider mid-outage
+                // gets spaced retries instead of an immediate hammer. Abort-aware — a
+                // pause/stop/Esc or a sealed run fate during the wait bails out and
+                // rethrows rather than sleeping through the abort (throwIfAborted
+                // below also honors an abort that fired during the sleep).
+                if (delayMs > 0) {
+                  await backoffSleep(delayMs, [options.signal, shared.runFatalController.signal]);
+                  throwIfAborted();
+                }
+                // This attempt is continuing as a retry: keep the pool reservation
+                // (settled only at the final attempt, see settleProviderPool).
+                poolRetryPending = true;
+                continue;
               }
-              // Exponential backoff before the next attempt: a provider mid-outage
-              // gets spaced retries instead of an immediate hammer. Abort-aware — a
-              // pause/stop/Esc or a sealed run fate during the wait bails out and
-              // rethrows rather than sleeping through the abort (throwIfAborted
-              // below also honors an abort that fired during the sleep).
-              if (delayMs > 0) {
-                await backoffSleep(delayMs, [options.signal, shared.runFatalController.signal]);
-                throwIfAborted();
-              }
-              // This attempt is continuing as a retry: keep the pool reservation
-              // (settled only at the final attempt, see settleProviderPool).
-              poolRetryPending = true;
-              continue;
             }
 
             const failingOperation =
@@ -2235,16 +2441,49 @@ export async function runWorkflow<T = unknown>(
   let qualityCallSeq = 0;
 
   /**
+   * Default cap for capEmbedded — mirrors completenessCheck's 4,000-char
+   * evidence truncation so quality helpers never re-embed unbounded
+   * JSON.stringify blobs (measured 15K–41K tokens per helper pass).
+   */
+  const DEFAULT_EMBED_MAX_CHARS = 4000;
+
+  /**
+   * Deterministic prompt-embedding cap (T1-03): serializes `value` and slices it
+   * to `maxChars` with an ellipsis marker, logging the truncation. Pure function
+   * of the input, so the same value always yields the same prompt and the resume
+   * hash stays stable. Trims prompt text only — schemas and result shapes are
+   * untouched. Large items lose tail detail by design; the marker + log line
+   * make the loss visible.
+   */
+  const capEmbedded = (value: unknown, maxChars: number = DEFAULT_EMBED_MAX_CHARS): string => {
+    const text = typeof value === "string" ? value : String(JSON.stringify(value));
+    if (text.length <= maxChars) return text;
+    log(`embedded payload capped at ${maxChars} chars (was ${text.length}); tail detail omitted (marker added)`);
+    return `${text.slice(0, maxChars)}…`;
+  };
+
+  /**
    * Per-vote tolerance wrapper (M4): a single reviewer/judge hitting the schema
    * wall (SCHEMA_NONCOMPLIANCE) or an execution failure (AGENT_EXECUTION_ERROR)
    * must not abort the whole verify()/judgePanel() — the documented contract is
    * "failed reviewers are omitted" — so those two classes log and yield a null
    * vote. Budget/limit/abort classes still fail the run: they are run-wide
    * conditions, not per-vote noise.
+   *
+   * `voteOptions` (T1-08): quality helpers pass `{ toolNames: [] }` so a pure-
+   * reasoning vote agent carries ONLY the schema tool (structured_output is
+   * auto-added after the filter) instead of the full ~2.8 ktok toolset — the
+   * highest-volume agent class in every run. File-reading verifiers are not
+   * affected: no builtin uses the stdlib verify() (see src/code-review.ts).
    */
-  const tolerantVote = async (prompt: string, label: string, schema: TSchema | undefined): Promise<unknown> => {
+  const tolerantVote = async (
+    prompt: string,
+    label: string,
+    schema: TSchema | undefined,
+    voteOptions: { toolNames?: string[]; tier?: string } = {},
+  ): Promise<unknown> => {
     try {
-      return await agent(prompt, { label, schema });
+      return await agent(prompt, { label, schema, ...voteOptions });
     } catch (error) {
       if (
         isWorkflowError(error) &&
@@ -2272,7 +2511,14 @@ export async function runWorkflow<T = unknown>(
   };
   const verify = async (
     item: unknown,
-    opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
+    opts: {
+      reviewers?: number;
+      threshold?: number;
+      lens?: string | string[];
+      maxChars?: number;
+      /** T2-04: model tier for the reviewer votes (default "small"). */
+      tier?: string;
+    } = {},
   ) => {
     const callSeq = ++qualityCallSeq;
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
@@ -2283,7 +2529,15 @@ export async function runWorkflow<T = unknown>(
     const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
-    const claim = typeof item === "string" ? item : JSON.stringify(item);
+    // T1-03: the claim is capped before embedding (default 4000 chars) so a
+    // large item can't re-bill its full JSON to every reviewer.
+    const claim = capEmbedded(item, opts.maxChars ?? DEFAULT_EMBED_MAX_CHARS);
+    // T2-04: verify votes are short structured boolean outputs — bind them to
+    // the economy tier (default "small") unless the author passes opts.tier.
+    // QUALITY CAVEAT: a too-small verifier can raise false negatives; keep the
+    // reviewers/threshold knobs (or pass tier: "medium") when the item is
+    // large or the cost of a missed real is high.
+    const voteTier = opts.tier ?? DEFAULT_HELPER_TIER;
     const votes = (
       await parallel(
         Array.from(
@@ -2295,6 +2549,9 @@ export async function runWorkflow<T = unknown>(
               // across invocations while the trailing counter makes labels unique (L14).
               `verify ${i + 1}.${callSeq}`,
               VERIFY_SCHEMA,
+              // T1-08: a pure-reasoning vote needs only the schema tool; the
+              // full coding toolset (~2.8 ktok/turn) is never paid for a boolean.
+              { toolNames: [], tier: voteTier },
             ),
         ),
       )
@@ -2319,7 +2576,15 @@ export async function runWorkflow<T = unknown>(
     properties: { score: { type: "number" }, reason: { type: "string" } },
     required: ["score"],
   };
-  const judgePanel = async (attempts: unknown[], opts: { judges?: number; rubric?: string } = {}) => {
+  const judgePanel = async (
+    attempts: unknown[],
+    opts: {
+      judges?: number;
+      rubric?: string;
+      /** T2-04: model tier for the judge votes (default "small"). */
+      tier?: string;
+    } = {},
+  ) => {
     const callSeq = ++qualityCallSeq;
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
@@ -2328,10 +2593,13 @@ export async function runWorkflow<T = unknown>(
     });
     const judges = Math.max(1, opts.judges ?? 3);
     const rubric = opts.rubric ?? "overall quality and correctness";
+    // T2-04: judge votes are 0..1 scores — economy tier unless overridden.
+    const voteTier = opts.tier ?? DEFAULT_HELPER_TIER;
     const scored = (
       await parallel(
         (Array.isArray(attempts) ? attempts : []).map((att, idx) => async () => {
-          const text = typeof att === "string" ? att : JSON.stringify(att);
+          // T1-03: the candidate is capped before embedding (default 4000 chars).
+          const text = capEmbedded(att);
           const js = (
             await parallel(
               Array.from(
@@ -2344,6 +2612,8 @@ export async function runWorkflow<T = unknown>(
                     // the trailing per-invocation counter makes labels unique (L14).
                     `judge ${idx + 1}.${j + 1}.${callSeq}`,
                     JUDGE_SCHEMA,
+                    // T1-08: a scoring vote needs only the schema tool.
+                    { toolNames: [], tier: voteTier },
                   ),
               ),
             )
@@ -2446,7 +2716,7 @@ export async function runWorkflow<T = unknown>(
     properties: { complete: { type: "boolean" }, missing: { type: "array", items: { type: "string" } } },
     required: ["complete"],
   };
-  const completenessCheck = async (taskArgs: unknown, results: unknown) => {
+  const completenessCheck = async (taskArgs: unknown, results: unknown, opts: { tier?: string } = {}) => {
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
       stage: "start",
@@ -2454,7 +2724,14 @@ export async function runWorkflow<T = unknown>(
     });
     const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
-      { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
+      // T1-08: a structured critique needs only the schema tool. T2-04: a
+      // short structured gap list is economy-tier work.
+      {
+        label: "completeness critic",
+        schema: COMPLETENESS_SCHEMA,
+        toolNames: [],
+        tier: opts.tier ?? DEFAULT_HELPER_TIER,
+      },
     );
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
@@ -2483,6 +2760,59 @@ export async function runWorkflow<T = unknown>(
    * resume (see timeboxed's docs).
    */
   const elapsedMs = () => Math.max(0, Date.now() - shared.runStartedAtMs);
+
+  /**
+   * T2-07 runtime shared-context global: register `sharedText` ONCE per run
+   * and return a compact pointer scripts embed in agent() prompts instead of
+   * re-embedding the full text into every fan-out call. The blob is written
+   * to the run's shared store exactly once (dedupe: re-registering the same
+   * text returns the existing pointer without a second write); the full text
+   * is emitted into the FIRST agent's instructions and every later agent gets
+   * a store-key note (store_get is injected into every agent — the ~200
+   * tok/agent store tools already exist), so fan-out scripts stop paying to
+   * duplicate shared task/scope/objective text per agent.
+   *
+   * Resume determinism: registration is a pure function of the script's
+   * control flow (synchronous, no clocks), so replay re-registers the same
+   * blobs in the same order; the blob fingerprint is a hashAgentCall identity
+   * input (see computeSharedContextFingerprint), so editing the shared text
+   * invalidates cached replays of calls downstream of the ctx() call.
+   *
+   * Degrades gracefully: empty/absent text returns "" (no-op pointer); a
+   * non-string value is JSON-stringified; an oversized blob (store write
+   * rejected by the store's caps) or the distinct-blob cap returns the RAW
+   * text so the script keeps working exactly as it would without ctx().
+   */
+  const ctx = (sharedText: unknown): string => {
+    const text =
+      sharedText === undefined || sharedText === null
+        ? ""
+        : typeof sharedText === "string"
+          ? sharedText
+          : JSON.stringify(sharedText);
+    if (text.length === 0) return "";
+    const existing = shared.sharedContext.find((entry) => entry.text === text);
+    if (existing) return existing.pointer;
+    if (shared.sharedContext.length >= MAX_SHARED_CONTEXT_BLOBS) {
+      log(
+        `ctx(): shared-context blob limit reached (${MAX_SHARED_CONTEXT_BLOBS}); embedding the raw text instead of a pointer`,
+      );
+      return text;
+    }
+    const index = shared.sharedContext.length;
+    const key = `${SHARED_CONTEXT_KEY_PREFIX}${index}`;
+    try {
+      store.put(key, text);
+    } catch (error) {
+      log(
+        `ctx(): shared-store write failed (${error instanceof Error ? error.message : String(error)}); embedding the raw text instead of a pointer`,
+      );
+      return text;
+    }
+    const pointer = `${SHARED_CONTEXT_POINTER_PREFIX}${index}${SHARED_CONTEXT_POINTER_SUFFIX}`;
+    shared.sharedContext.push({ key, pointer, text });
+    return pointer;
+  };
 
   /** One chunk whose work failed recoverably, with its stable identity. */
   interface ChunkedFailure {
@@ -2583,6 +2913,8 @@ export async function runWorkflow<T = unknown>(
         value: unknown,
         context: { reason: RouteOutcome["reason"]; classification: string | null },
       ) => Promise<unknown> | unknown;
+      /** T2-04: model tier for the classification vote (default "small"). */
+      tier?: string;
     },
   ): Promise<RouteOutcome> => {
     const callSeq = ++qualityCallSeq;
@@ -2614,9 +2946,12 @@ export async function runWorkflow<T = unknown>(
     const classification = await tolerantVote(
       `Classify the following value into exactly one of these categories: ${keys.join(
         ", ",
-      )}. Reply with the matching category key.\n\nValue:\n${JSON.stringify(value)}`,
+      )}. Reply with the matching category key.\n\nValue:\n${capEmbedded(value)}`,
       `route ${callSeq}`,
       { type: "object", properties: { key: { type: "string", enum: keys } }, required: ["key"] },
+      // T1-08: a classification vote needs only the schema tool. T2-04: an
+      // enum pick is economy-tier work.
+      { toolNames: [], tier: opts.tier ?? DEFAULT_HELPER_TIER },
     );
     if (classification === null) {
       const result = await opts.fallback(value, { reason: "classification-failed", classification: null });
@@ -2690,6 +3025,8 @@ export async function runWorkflow<T = unknown>(
       panelists?: number;
       rounds?: number;
       agreeThreshold?: number;
+      /** T2-04: model tier for the panel votes (default "small"). */
+      tier?: string;
       arbitrator?: (context: {
         question: string;
         votes: Array<ConsensusVote | null>;
@@ -2720,6 +3057,9 @@ export async function runWorkflow<T = unknown>(
     if (typeof rawThreshold !== "number" || !Number.isFinite(rawThreshold))
       throw new TypeError(`consensus() agreeThreshold must be finite, got ${String(rawThreshold)}`);
     const threshold = Math.max(0, Math.min(1, rawThreshold));
+    // T1-03: the statement is capped once per consensus() call (default 4000
+    // chars) so a long question isn't re-billed to every panelist every round.
+    const statement = capEmbedded(question);
     let omitted = 0;
     let lastRound: Array<ConsensusVote | null> = [];
     let executedRounds = 0;
@@ -2729,6 +3069,9 @@ export async function runWorkflow<T = unknown>(
       helper: "consensus",
     });
     try {
+      // T2-04: panel votes are bounded true/false outputs — economy tier
+      // unless the author overrides (arbitrator stays author-supplied).
+      const voteTier = opts.tier ?? DEFAULT_HELPER_TIER;
       for (let round = 1; round <= rounds; round++) {
         executedRounds = round;
         const votes = (await parallel(
@@ -2736,13 +3079,15 @@ export async function runWorkflow<T = unknown>(
             { length: panelists },
             (_v, i) => () =>
               tolerantVote(
-                `Independent panelist ${i + 1} of ${panelists} (round ${round}). Do you AGREE or DISAGREE with the statement below? Reply with your verdict.\n\nStatement:\n${question}`,
+                `Independent panelist ${i + 1} of ${panelists} (round ${round}). Do you AGREE or DISAGREE with the statement below? Reply with your verdict.\n\nStatement:\n${statement}`,
                 `consensus ${round}.${i + 1}.${callSeq}`,
                 {
                   type: "object",
                   properties: { verdict: { type: "boolean" }, reasoning: { type: "string" } },
                   required: ["verdict"],
                 },
+                // T1-08: a panel vote needs only the schema tool.
+                { toolNames: [], tier: voteTier },
               ),
           ),
         )) as Array<ConsensusVote | null>;
@@ -3002,6 +3347,7 @@ export async function runWorkflow<T = unknown>(
     checkpoint,
     log,
     phase,
+    ctx,
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
     process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
@@ -3492,7 +3838,35 @@ function computeRegistryFingerprint(registry: ModelRegistry | undefined): string
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
-function hashAgentCall(
+/**
+ * T2-07: stable fingerprint of the ctx() blobs registered SO FAR in this run
+ * — the resume-identity input for shared run context, mirroring how
+ * registryFingerprint/toolNames are folded into hashAgentCall. Omitted
+ * entirely when no blob was registered before the agent() call (byte-identical
+ * legacy encoding, old journals replay unchanged); when blobs exist, editing
+ * the script's shared text (or the order in which ctx() registers) changes
+ * the fingerprint and invalidates every cached replay downstream of the
+ * registration. First-call order is already deterministic for a fixed script
+ * (ctx() is synchronous), so `[{key, text}]` is stable across live and replay
+ * runs; pointer/index are derived from registration order and deliberately
+ * not hashed (the text IS the content identity).
+ */
+function computeSharedContextFingerprint(
+  blobs: ReadonlyArray<{ key: string; pointer: string; text: string }>,
+): string | undefined {
+  if (blobs.length === 0) return undefined;
+  return createHash("sha256")
+    .update(JSON.stringify(blobs.map((blob) => ({ key: blob.key, text: blob.text }))))
+    .digest("hex");
+}
+
+/**
+ * Stable identity hash for one agent() call — the resume-replay cache key.
+ * Exported for the routing-policy version pin test (T2-03/T2-05/T2-11): the
+ * identity includes ROUTING_POLICY_VERSION, so a policy change invalidates
+ * journals persisted under an older version.
+ */
+export function hashAgentCall(
   prompt: string,
   model: string | undefined,
   tierModel: string | undefined,
@@ -3508,6 +3882,11 @@ function hashAgentCall(
   // encoding is byte-identical to the pre-fix hash and legacy journals (and
   // registry-less runs) replay unchanged.
   registryFingerprint?: string,
+  // T2-07: fingerprint of the ctx() blobs registered before this call (see
+  // computeSharedContextFingerprint). Omitted entirely when no blob was
+  // registered yet, so the encoding stays byte-identical to the legacy hash
+  // and scripts that never call ctx() replay unchanged.
+  sharedContextFingerprint?: string,
 ): string {
   const identity = JSON.stringify({
     prompt,
@@ -3541,7 +3920,21 @@ function hashAgentCall(
     // not replay in another (M5).
     isolation: isolation ?? null,
     schema: options.schema ?? null,
+    // T2-03/T2-05/T2-11: routing-policy version. The resolved model of an
+    // untagged call and the thinking cap of a tiered call are policy-derived;
+    // bumping this constant when a policy default changes (economy default,
+    // builtin per-phase tiers, per-tier thinking caps) makes saved journals
+    // mismatch and re-run live instead of replaying a result computed under an
+    // older policy.
+    routingPolicyVersion: ROUTING_POLICY_VERSION,
+    // T1-08: a per-call tool restriction changes which tools the agent can use,
+    // so a non-empty list is part of call identity — editing toolNames must
+    // invalidate a cached journaled result on resume. Omitted entirely when
+    // empty/absent (the common path) so the encoding stays byte-identical to
+    // the legacy hash and old journals replay unchanged.
+    ...(options.toolNames?.length ? { toolNames: options.toolNames } : {}),
     ...(registryFingerprint ? { registryFingerprint } : {}),
+    ...(sharedContextFingerprint ? { sharedContextFingerprint } : {}),
   });
   return createHash("sha256").update(identity).digest("hex");
 }
@@ -3554,9 +3947,19 @@ function hashAgentCall(
  * phase/`model` spec already computed by the call site (which itself encodes
  * the phase-routing config). The mainModel fallback matches the session's.
  *
+ * T2-03/T2-11 additions, mirroring the live resolver: an untagged call with no
+ * model-tiers.json follows the run's `defaultUntaggedTier` knob (economy =
+ * prompt-aware classifyTask against the supplied registry + precomputed
+ * default tier map; literal tier name = that tier; "inherit:main" = session
+ * main); every tier-sourced spec has its `:thinking` suffix coerced by the
+ * tier's thinking cap. Without an explicit registry the economy mirror cannot
+ * rank anything, so it returns undefined — the legacy defaultModel=mainModel
+ * encoding (a main-model change still invalidates, matching M5).
+ *
  * Side-effect-free and deterministic over a fixed config: it reads only the
- * tier config and mainModel, never the live model registry, so it cannot vary
- * across calls within a single run — exactly the property the replay hash needs
+ * tier config, mainModel, the precomputed default tier map, and the supplied
+ * registry, never the live module-level registry, so it cannot vary across
+ * calls within a single run — exactly the property the replay hash needs
  * (a miss must reflect a genuine config change, not registry drift).
  */
 function resolveRoutingModelSignature(
@@ -3565,8 +3968,14 @@ function resolveRoutingModelSignature(
   modelSpec: string | undefined,
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null,
+  prompt?: string,
+  phase?: string,
+  registry?: ModelRegistry,
+  promptAwareDefaults?: ModelTierConfig,
+  untaggedDefault?: string,
 ): string | undefined {
   const explicitModel = options.model ?? agentDef?.model;
+  // T2-11: an explicit model is never thinking-capped (explicit > tier).
   if (explicitModel) return explicitModel;
   const config = loadConfig();
   if (options.tier) {
@@ -3576,16 +3985,34 @@ function resolveRoutingModelSignature(
     // encode undefined — not mainModel — or a stale journaled result would
     // replay a call the live path refuses. inherit:main still resolves to
     // mainModel (passed through), matching live resolution.
-    return resolveTierModel(options.tier, config, mainModel);
+    return coerceSpecThinkingForTier(resolveTierModel(options.tier, config, mainModel), options.tier, config);
   }
   // Untagged agent with a tier config present: the session routes it through
   // the configured default ("medium") tier, so include that resolved model so
-  // editing model-tiers.json invalidates untagged agents too.
+  // editing model-tiers.json invalidates untagged agents too. A PHASE-routed
+  // call (modelSpec != null) never reaches the tier branch live — the phase
+  // model is passed as an explicit `model` — so its tierModel keeps the raw
+  // medium (byte-identical to the pre-T2-11 encoding); a truly untagged call
+  // (modelSpec == null) is capped like the live resolution, so a
+  // thinkingCaps change invalidates its cached replay.
   if (config) {
-    const medium = resolveTierModel("medium", config);
-    if (medium) return medium;
+    const medium = resolveTierModel("medium", config, mainModel);
+    if (medium) return modelSpec == null ? coerceSpecThinkingForTier(medium, "medium", config) : medium;
+    return modelSpec;
   }
-  return modelSpec;
+  // T2-03: no config — mirror the economy default for untagged calls.
+  const knob = untaggedDefault ?? DEFAULT_UNTAGGED_TIER;
+  if (knob === UNTAGGED_TIER_INHERIT_MAIN || registry === undefined || !prompt) return undefined;
+  if (knob === UNTAGGED_TIER_ECONOMY) {
+    const classifiedTier = tierNameForTask(phase ?? "runtime", prompt);
+    const model =
+      resolveTierModel(classifiedTier, promptAwareDefaults ?? buildDefaultTierConfig(mainModel, []), mainModel) ??
+      mainModel;
+    return coerceSpecThinkingForTier(model, classifiedTier, null);
+  }
+  const model = resolveTierModel(knob, promptAwareDefaults ?? buildDefaultTierConfig(mainModel, []), mainModel);
+  if (model) return coerceSpecThinkingForTier(model, knob, null);
+  return mainModel;
 }
 
 function buildAgentInstructions(
@@ -3593,6 +4020,7 @@ function buildAgentInstructions(
   options: AgentOptions,
   def: AgentDefinition | undefined,
   resolvedIsolation?: "worktree",
+  sharedCtx?: Pick<SharedRuntime, "sharedContext" | "sharedContextEmitted">,
 ): string | undefined {
   const lines: string[] = [];
   // A resolved agentType binds a real role prompt (the definition body). Only
@@ -3604,6 +4032,27 @@ function buildAgentInstructions(
   // the call site or from the agentDef's isolation field.
   if (resolvedIsolation) lines.push(`Requested isolation: ${resolvedIsolation}`);
   // Note: options.model is applied for real via the session, not injected as prose.
+  // T2-07 shared-context section: the FULL blob text is emitted exactly ONCE
+  // per run (into the first agent whose instructions are built) so fan-out
+  // scripts stop paying to re-embed shared task/scope/objective text per agent;
+  // every later agent gets a compact note pointing at the reserved store key
+  // (store_get is injected into every agent's toolset, so the content stays
+  // reachable without re-billing it). The flag flip is atomic (JS single
+  // thread; instructions are built synchronously right before the run call).
+  if (sharedCtx && sharedCtx.sharedContext.length > 0) {
+    const contextLines: string[] = [];
+    for (const blob of sharedCtx.sharedContext) {
+      if (!sharedCtx.sharedContextEmitted) {
+        contextLines.push(`${blob.pointer} — shared run context (${blob.key}):\n${blob.text}`);
+      } else {
+        contextLines.push(
+          `${blob.pointer} refers to shared run context stored under "${blob.key}" — call store_get("${blob.key}") to read it before doing work when your task references it.`,
+        );
+      }
+    }
+    sharedCtx.sharedContextEmitted = true;
+    lines.push(`Shared run context:\n\n${contextLines.join("\n\n")}`);
+  }
   return lines.length ? lines.join("\n\n") : undefined;
 }
 
@@ -3619,6 +4068,80 @@ function isEmptyTextAgentResult(result: unknown, schema: TSchema | undefined): b
  * multi-MB JSON.stringify on the event loop just to count tokens.
  */
 const TOKEN_ESTIMATE_STRINGIFY_BUDGET = 200_000;
+
+/**
+ * T1-16 segment classes for the estimate-only token path. Each class carries
+ * its own chars-per-token divisor, calibrated against real provider-reported
+ * usage by scripts/calibrate-estimator.ts (see
+ * tasks/a-accounting-estimator/measurements.md for the probe run).
+ */
+export type TokenSegmentClass = "prose" | "code" | "json" | "tool";
+
+/**
+ * T1-16 per-segment chars-per-token divisors (chars ÷ divisor ≈ tokens).
+ * Calibrated per segment class against real provider-reported usage by
+ * scripts/calibrate-estimator.ts (see tasks/a-accounting-estimator/
+ * measurements.md for the probe run). Code/JSON/tool payloads are denser than
+ * prose (more tokens per char), so their divisors sit below the prose one.
+ * The probe also measures the END-TO-END budget gap (estimate-only proxy vs
+ * reported input+output): that gap is dominated by the per-agent context
+ * overhead the estimator cannot see (system prompt / tool defs / history on
+ * input; reasoning + intermediate assistant turns on output) and is surfaced
+ * per run by the persisted estimatorMAE telemetry (T1-16c).
+ */
+export const TOKEN_ESTIMATE_SEGMENT_DIVISORS: Record<TokenSegmentClass, number> = {
+  // T1-16 text-density calibration (probe: scripts/calibrate-estimator.ts +
+  // tasks/a-accounting-estimator/measurements.md). Prose is the chars/4
+  // reference; code/JSON/tool payloads tokenize DENSER (more tokens per char:
+  // identifiers, operators, quoted keys, braces) so their divisors sit below
+  // the prose one. The probe's per-segment measurement is noisy because the
+  // reported input/output also carry the unseen per-agent context overhead
+  // (system prompt + tool defs + history on input; reasoning + intermediate
+  // assistant turns + tool-call serialization on output) that no char-count
+  // estimator can see from prompt+result alone — the residual is surfaced per
+  // run by the persisted estimatorMAE telemetry (T1-16c). These divisors keep
+  // the estimator honest per text-chunk while the segment ordering matches the
+  // measured density direction.
+  prose: 4.0,
+  code: 3.2,
+  json: 3.4,
+  tool: 3.0,
+};
+
+/**
+ * T1-16 cheap whole-value segment classifier (pure, allocation-free for the
+ * common string path). Non-string structured values are JSON payloads; strings
+ * are sniffed in order: JSON envelope ({ or [ after trim) → json; tool-call
+ * envelope (a compact record with "name"+"input"/"arguments"/"tool" keys) →
+ * tool; code markers (fences, language keywords, signature shapes) → code;
+ * everything else → prose.
+ */
+export function classifyTokenSegment(value: unknown): TokenSegmentClass {
+  if (value === null || value === undefined) return "prose";
+  if (typeof value === "object") return "json";
+  if (typeof value !== "string") return "prose";
+  const text = value;
+  const trimmed = text.trimStart();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    // Compact record with tool-call keys (name + input/arguments) is a tool
+    // payload; a bare JSON envelope is plain JSON.
+    if (/"(name|tool|function)"\s*:\s*"/.test(text) && /"(input|arguments|parameters)"\s*:/.test(text)) {
+      return "tool";
+    }
+    return "json";
+  }
+  if (
+    /```/.test(text) ||
+    /\b(function|class|interface|export|import|const|let|var|def|async|await|=>)\b/.test(text) ||
+    /^\s*(import|from|export)\s/.test(trimmed)
+  ) {
+    return "code";
+  }
+  if (/"(name|tool|function)"\s*:\s*"/.test(text) && /"(input|arguments)"\s*:/.test(text)) {
+    return "tool";
+  }
+  return "prose";
+}
 
 /**
  * Cheap one-level serialized-length probe (no allocation): string length,
@@ -3645,19 +4168,38 @@ function probeSerializedLength(value: unknown): number {
   return String(value).length;
 }
 
-function estimateTokens(value: unknown): number {
+/**
+ * T1-16 detailed estimate: the serialized char count (same stringify/probe
+ * logic estimateTokens uses) plus the segment class of the whole value. Shared
+ * by the runtime estimator and the calibration probe so both count chars
+ * identically (probe: scripts/calibrate-estimator.ts).
+ */
+export function estimateTokensDetailed(value: unknown): { chars: number; segment: TokenSegmentClass } {
   const source = value ?? "";
-  if (typeof source === "string") return Math.ceil(source.length / 4);
-  if (typeof source !== "object") return Math.ceil(String(source).length / 4);
+  const segment = classifyTokenSegment(source);
+  if (typeof source === "string") return { chars: source.length, segment };
+  if (typeof source !== "object") return { chars: String(source).length, segment };
   const probe = probeSerializedLength(source);
   if (probe <= TOKEN_ESTIMATE_STRINGIFY_BUDGET) {
     try {
-      return Math.ceil(JSON.stringify(source).length / 4);
+      return { chars: JSON.stringify(source).length, segment };
     } catch {
       // Circular/bigint values can't stringify — the probe estimate is close enough.
     }
   }
-  return Math.ceil(probe / 4);
+  return { chars: probe, segment };
+}
+
+/**
+ * T1-16 segment-aware estimate: chars ÷ the calibrated per-segment divisor,
+ * instead of the old flat chars/4. Applies ONLY on the estimate-only path
+ * (recordTokens' provider-reported branch never calls it), so M26 stays
+ * byte-identical on reported runs and the T1-04-style estimated-marker
+ * semantics are untouched.
+ */
+export function estimateTokens(value: unknown): number {
+  const { chars, segment } = estimateTokensDetailed(value);
+  return Math.ceil(chars / TOKEN_ESTIMATE_SEGMENT_DIVISORS[segment]);
 }
 
 function normalizeConcurrency(value: unknown): number {

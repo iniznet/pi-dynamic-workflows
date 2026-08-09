@@ -185,6 +185,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "keywordTriggerWord",
     "defaultAgentTimeoutMs",
     "defaultTokenBudget",
+    "tokenBudgetCountsCacheRead",
     "defaultConcurrency",
     "defaultAgentRetries",
     "progressPanelMode",

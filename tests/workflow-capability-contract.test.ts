@@ -23,6 +23,7 @@ const EXPECTED_RUNTIME_GLOBALS = [
   "completenessCheck",
   "consensus",
   "console",
+  "ctx",
   "cwd",
   "elapsedMs",
   "gate",
@@ -51,6 +52,7 @@ const EXPECTED_TOOL_INPUTS = [
   "maxAgents",
   "name",
   "resumeFromRunId",
+  "retryOnlyIfSpendUnder",
   "script",
   "scriptPath",
   "tokenBudget",
@@ -274,18 +276,25 @@ test("alignment diagnostics compare declared and observed project globals", () =
 test("runtime assembly refuses a missing implementation with a precise diagnostic", () => {
   const supplied = implementations();
   delete supplied.agent;
+  delete supplied.ctx;
 
   assert.throws(
     () => WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(supplied),
     (error: unknown) => {
       assert.ok(error instanceof WorkflowCapabilityContractError);
-      assert.match(error.message, /missing declared runtime implementation: agent/);
+      assert.match(error.message, /missing declared runtime implementation: agent, ctx/);
       assert.deepEqual(error.diagnostics, [
         {
           code: "MISSING_RUNTIME_IMPLEMENTATION",
           severity: "error",
           subject: "agent",
           message: 'Declared workflow global "agent" has no supplied implementation "agent".',
+        },
+        {
+          code: "MISSING_RUNTIME_IMPLEMENTATION",
+          severity: "error",
+          subject: "ctx",
+          message: 'Declared workflow global "ctx" has no supplied implementation "ctx".',
         },
       ]);
       return true;
@@ -296,18 +305,25 @@ test("runtime assembly refuses a missing implementation with a precise diagnosti
 test("runtime assembly treats an undefined required implementation as missing", () => {
   const supplied = implementations();
   supplied.agent = undefined;
+  supplied.ctx = undefined;
 
   assert.throws(
     () => WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(supplied),
     (error: unknown) => {
       assert.ok(error instanceof WorkflowCapabilityContractError);
-      assert.match(error.message, /missing declared runtime implementation: agent/);
+      assert.match(error.message, /missing declared runtime implementation: agent, ctx/);
       assert.deepEqual(error.diagnostics, [
         {
           code: "MISSING_RUNTIME_IMPLEMENTATION",
           severity: "error",
           subject: "agent",
           message: 'Declared workflow global "agent" has no supplied implementation "agent".',
+        },
+        {
+          code: "MISSING_RUNTIME_IMPLEMENTATION",
+          severity: "error",
+          subject: "ctx",
+          message: 'Declared workflow global "ctx" has no supplied implementation "ctx".',
         },
       ]);
       return true;

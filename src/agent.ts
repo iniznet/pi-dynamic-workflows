@@ -19,6 +19,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
+import { DEFAULT_UNTAGGED_TIER, UNTAGGED_TIER_ECONOMY, UNTAGGED_TIER_INHERIT_MAIN } from "./config.js";
 import {
   classifyContextOverflow,
   classifyProviderLimit,
@@ -35,6 +36,7 @@ import {
 } from "./model-spec.js";
 import {
   buildDefaultTierConfig,
+  coerceSpecThinkingForTier,
   formatTierFallbackNotice,
   loadModelTierConfig,
   type ModelTierConfig,
@@ -236,15 +238,22 @@ export async function resolveStructuredOutput<T>(
   if (capture.called) return capture.value as T;
 
   const maxRetries = Math.max(0, options.maxSchemaRetries ?? 2);
-  // Restrict to the schema tool so the only useful next action is calling it
-  // (takes effect on the next prompt turn). Best-effort.
-  try {
-    session.setActiveToolsByName?.(["structured_output"]);
-  } catch {
-    // ignore — the re-prompt alone still drives most models to comply
-  }
   for (let attempt = 0; attempt < maxRetries && !capture.called; attempt++) {
     if (options.signal?.aborted) throw new Error("Subagent was aborted");
+    // T1-02: keep the provider prefix byte-identical on the FIRST repair — the
+    // nudge alone drives most models to call structured_output, and the SDK
+    // rebuilds the system prompt on every setActiveTools change, which re-prices
+    // the whole trajectory at full input cost instead of cacheRead. Only a
+    // SECOND failed repair restricts the toolset (last resort when the model
+    // keeps calling other tools). Best-effort: the re-prompt alone still drives
+    // most models to comply if setActiveToolsByName is absent or throws.
+    if (attempt >= 1) {
+      try {
+        session.setActiveToolsByName?.(["structured_output"]);
+      } catch {
+        // ignore — the re-prompt alone still drives most models to comply
+      }
+    }
     await session.prompt(
       "You did not call the structured_output tool. Call structured_output now as your only action, with the required fields filled in. Do not write a prose answer.",
     );
@@ -319,7 +328,7 @@ export function resolvePromptAwareTier(
 }
 
 export function resolveAgentModelSpec(
-  options: { model?: string; tier?: string },
+  options: { model?: string; tier?: string; defaultUntaggedTier?: string },
   mainModel: string | undefined,
   loadConfig: () => ModelTierConfig | null = loadModelTierConfig,
   onTierWithoutConfig?: (tier: string) => void,
@@ -336,6 +345,8 @@ export function resolveAgentModelSpec(
   // the generic "runtime" default exactly as before.
   phase?: string,
 ): string | undefined {
+  // T2-11: an EXPLICIT opts.model always wins and is never thinking-capped
+  // (explicit > tier precedence) — returned before any tier resolution.
   if (options.model) return options.model;
   const config = loadConfig();
   if (options.tier) {
@@ -349,7 +360,14 @@ export function resolveAgentModelSpec(
     // pinned tier can never silently bill the main agent's model.
     if (!config) {
       onTierWithoutConfig?.(options.tier);
-      if (prompt) return resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel), phase);
+      if (prompt) {
+        // T2-11: cap the prompt-aware fallback's thinking by the tier the
+        // CLASSIFIER picked (the requested tier name is a hint; classification
+        // decides the actual small/medium/big slot under no config).
+        const classifiedTier = tierNameForTask(phase ?? "runtime", prompt);
+        const model = resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel), phase);
+        return coerceSpecThinkingForTier(model, classifiedTier, null);
+      }
       return mainModel;
     }
     // An "inherit:main" configured tier resolves to the session's main model
@@ -359,14 +377,41 @@ export function resolveAgentModelSpec(
     // config returns undefined here (never mainModel), so run()'s tier guard
     // throws a named MODEL_NOT_FOUND instead of silently billing the main
     // agent's model for a call the user pinned to a configured tier.
-    return resolveTierModel(options.tier, config, mainModel);
+    return coerceSpecThinkingForTier(resolveTierModel(options.tier, config, mainModel), options.tier, config);
   }
-  // Untagged agent: default to the configured medium tier when one exists.
+  // Untagged agent: default to the configured medium tier when one exists
+  // (T2-03 plan matrix: "config -> existing precedence").
   if (config) {
     const medium = resolveTierModel("medium", config, mainModel);
-    if (medium) return medium;
+    if (medium) return coerceSpecThinkingForTier(medium, "medium", config);
+    return undefined;
   }
-  return undefined;
+  // T2-03: no model-tiers.json at all — untagged calls route through the
+  // economy default instead of collapsing onto the session's flagship main
+  // model. The run/global knob (defaultUntaggedTier) selects the mode:
+  //   "economy" (default)    → prompt-aware classifyTask (scan=small /
+  //                            edit=medium / synthesize+analyze=big)
+  //   "inherit:main"         → opt-out: session main model (pre-T2-03)
+  //   any other tier name    → that tier against the registry-derived
+  //                            default config
+  const untaggedDefault = options.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER;
+  if (untaggedDefault === UNTAGGED_TIER_INHERIT_MAIN) return undefined;
+  if (prompt) {
+    if (untaggedDefault === UNTAGGED_TIER_ECONOMY) {
+      const classifiedTier = tierNameForTask(phase ?? "runtime", prompt);
+      const model = resolvePromptAwareTier(prompt, mainModel, listModels(), buildDefaults?.(mainModel), phase);
+      return coerceSpecThinkingForTier(model, classifiedTier, null);
+    }
+    // A literal tier name with no config: resolve it against the registry-
+    // derived default config (same ranking the prompt-aware fallback uses).
+    const tierConfig = buildDefaults?.(mainModel) ?? buildDefaultTierConfig(mainModel, listModels());
+    const model = resolveTierModel(untaggedDefault, tierConfig, mainModel);
+    if (model) return coerceSpecThinkingForTier(model, untaggedDefault, null);
+    return mainModel;
+  }
+  // No prompt (unit-test surface): deterministic — the session default, which
+  // is the same model an undefined resolution would bind at runtime.
+  return mainModel;
 }
 
 /**
@@ -416,6 +461,18 @@ export interface WorkflowAgentOptions {
    * to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * T2-03: routing for UNTAGGED agent() calls (no `model`, no `tier`) when no
+   * model-tiers.json is configured. "economy" (default) routes untagged calls
+   * through the prompt-aware classifyTask fallback (scan=small / edit=medium /
+   * synthesize+analyze=big) instead of collapsing onto the session's main
+   * model; "inherit:main" restores the pre-T2-03 session-default behavior; any
+   * other value is treated as a literal tier name resolved against the
+   * registry-derived default config. A per-run `defaultUntaggedTier` on
+   * AgentRunOptions overrides this. With a model-tiers.json present this knob
+   * is ignored — the configured "medium" default keeps its existing precedence.
+   */
+  defaultUntaggedTier?: string;
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -752,6 +809,15 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    */
   tier?: string;
   /**
+   * T2-03: per-run override of the untagged-agent default tier (no `model`,
+   * no `tier` set, no model-tiers.json). "economy" (default) uses the
+   * prompt-aware classifyTask fallback; "inherit:main" opts out to the session
+   * main model; any other value is a literal tier name. Ignored when a
+   * model-tiers.json config exists (the configured "medium" default keeps its
+   * existing precedence) or when `model`/`tier` are set explicitly.
+   */
+  defaultUntaggedTier?: string;
+  /**
    * Pipeline stage of the top-level pipeline/phaseState run this agent belongs
    * to ("0"|"1" — the persisted state machine's activePhase clamped to 0..1;
    * wayfinder/prewalk reconnaissance). Threaded into the prompt-aware tier
@@ -788,8 +854,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   disallowedToolNames?: string[];
   /**
    * With `schema`: how many extra repair turns to allow if the model finishes
-   * without calling structured_output. Each retry re-prompts (tools restricted to
-   * structured_output) before falling back to strict prose extraction. Default 2.
+   * without calling structured_output. Each retry re-prompts before falling back
+   * to strict prose extraction. The FIRST repair keeps the full toolset so the
+   * provider prefix stays byte-identical (repair turns bill history at cacheRead,
+   * T1-02); only a second failed repair restricts the session to
+   * structured_output. Default 2.
    */
   maxSchemaRetries?: number;
   /**
@@ -843,6 +912,19 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * to pin the legacy immediate-throw behavior.
    */
   emptyOutputNudge?: boolean;
+  /**
+   * T2-02: optional ceiling on this run's ESTIMATED input tokens (chars/4
+   * heuristic over the system-prefix estimate + tool defs + session history +
+   * the rendered prompt). When the estimate exceeds the ceiling, run() throws
+   * CONTEXT_OVERFLOW BEFORE any prompt is sent — fail fast instead of paying a
+   * provider-side context-overflow round-trip mid-stream. Deliberately the
+   * same non-recoverable class as a real overflow (the run settles failed +
+   * resumable with the same guidance: shorten the prompt or use a larger-
+   * context model); retrying the same estimate hits the identical wall, so
+   * this is never retried into the same failure. Soft guard: absent, or an
+   * unknowable estimate, falls through to today's behavior exactly.
+   */
+  maxInputTokens?: number;
   /**
    * Called once, when this run's first-edit swap gate fires — i.e. the first
    * file-edit tool call observed in the handoff session. Carries the model
@@ -929,6 +1011,23 @@ const PLANNING_GUIDANCE =
   "You are in the PLANNING phase: explore and produce a plan. Do not modify project files yet — your analysis must be read-only.";
 
 /**
+ * T2-02: fixed chars estimate of the loader-produced system prefix (system
+ * prompt + AGENTS.md + skills stubs) that the preflight cannot measure
+ * directly — the token-efficiency audit measured ~13.4 KiB ≈ 3,435 tok for the
+ * static per-agent prefix. chars/4 over this + tool defs + session history + the
+ * rendered prompt is the preflight's incoming-context estimate. Advisory only.
+ */
+const SYSTEM_PREFIX_ESTIMATE_CHARS = 14_000;
+
+/**
+ * T2-02: the reserve kept below the resolved model's context window, matching
+ * the SDK's reactive auto-compaction trigger (window − 16,384). The preflight
+ * acts (proactive compact / ceiling throw) only when the estimate crosses into
+ * the reserve — the same wall the SDK would otherwise hit reactively.
+ */
+const CONTEXT_HEADROOM_RESERVE_TOKENS = 16_384;
+
+/**
  * Compress a failed tool call's result payload into a short, log-safe reason
  * string for an operation trace's `outcome` field. Never includes raw file
  * contents or secrets — only a truncated text snippet from the tool result.
@@ -964,6 +1063,8 @@ export class WorkflowAgent {
   private sessionDirWritableProbed = false;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  /** T2-03: untagged-agent default routing when no model-tiers.json exists. */
+  private readonly defaultUntaggedTier?: string;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -1023,6 +1124,7 @@ export class WorkflowAgent {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.defaultUntaggedTier = options.defaultUntaggedTier;
     this.sharedRegistry = options.modelRegistry;
     this.sessionHandoff = options.sessionHandoff ?? false;
     this.handoffExecutionModel = options.handoffExecutionModel;
@@ -1094,6 +1196,26 @@ export class WorkflowAgent {
       });
     }
     return this.sharedResourceLoaderPromise;
+  }
+
+  /**
+   * T2-03: the tier name behind an UNTAGGED agent's implicit default, for the
+   * onModelFallback degrade label. Mirrors resolveAgentModelSpec's branches:
+   * configured "medium" when a model-tiers.json exists, else the prompt-aware
+   * classification tier (economy default). Purely diagnostic — the resolved
+   * spec itself is what matters.
+   */
+  private implicitTierName(
+    options: { defaultUntaggedTier?: string; pipelineStage?: "0" | "1" },
+    prompt: string,
+  ): string {
+    if (this.loadTierConfig() != null) return "medium";
+    const untaggedDefault = options.defaultUntaggedTier ?? this.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER;
+    if (untaggedDefault === UNTAGGED_TIER_ECONOMY) {
+      return tierNameForTask(options.pipelineStage ?? "runtime", prompt);
+    }
+    if (untaggedDefault === UNTAGGED_TIER_INHERIT_MAIN) return "medium";
+    return untaggedDefault;
   }
 
   /**
@@ -1236,7 +1358,14 @@ export class WorkflowAgent {
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
     let modelSpec = resolveAgentModelSpec(
-      options,
+      // T2-03: merge the constructor-level untagged-default knob under the
+      // per-call override (the option object is per-call, so the spread is
+      // cheap and the merged value is what the economy branch reads).
+      {
+        model: options.model,
+        tier: options.tier,
+        defaultUntaggedTier: options.defaultUntaggedTier ?? this.defaultUntaggedTier,
+      },
       this.mainModel,
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
@@ -1334,7 +1463,13 @@ export class WorkflowAgent {
         }
         if (!this.warnedDefaultTierUnavailable) {
           this.warnedDefaultTierUnavailable = true;
-          options.onModelFallback?.({ tier: "medium", requestedSpec: modelSpec });
+          // T2-03: label the degrade with the tier that actually produced the
+          // spec — the configured "medium" default, or the prompt-aware
+          // classification tier under the no-config economy default.
+          options.onModelFallback?.({
+            tier: this.implicitTierName(options, prompt),
+            requestedSpec: modelSpec,
+          });
         }
       } else {
         resolvedModel = resolved.model;
@@ -1536,6 +1671,23 @@ export class WorkflowAgent {
         removeHistoryListener = session.subscribe(() => maybeEmitHistory());
       }
 
+      // T2-02 context-window headroom preflight: estimate the incoming context
+      // BEFORE prompting so a long trajectory fails fast (maxInputTokens) or
+      // compacts proactively instead of paying a provider-side CONTEXT_OVERFLOW
+      // round-trip mid-stream. Advisory and soft-guarded — an unknowable
+      // estimate/window falls through to today's behavior exactly, and the
+      // CONTEXT_OVERFLOW class stays non-recoverable (the ceiling only fires it
+      // earlier).
+      await this.maybePreflightContextHeadroom(
+        session,
+        prompt,
+        options as AgentRunOptions<any>,
+        customTools,
+        Boolean(options.schema),
+        modelRegistry,
+        resolvedModel,
+      );
+
       await session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
 
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
@@ -1667,6 +1819,137 @@ export class WorkflowAgent {
         disposeRunSession();
       }
       removeToolListener();
+    }
+  }
+
+  /**
+   * T2-02: the resolved model's context window, when the registry reports one.
+   * Uses the same listAvailableModels projection the tier fallback ranks
+   * against (read-only — never mutates model resolution; slice C owns the
+   * resolution semantics). Resolves via the session's current model when no
+   * explicit model was resolved (handoff continuations keep the session's
+   * model). undefined = unknown window → the preflight is a no-op (soft guard).
+   */
+  private resolvedContextWindow(
+    modelRegistry: ModelRegistry | undefined,
+    resolvedModel: Model<any> | undefined,
+    session: AgentSession,
+  ): number | undefined {
+    try {
+      const spec = resolvedModel
+        ? canonicalModelSpec(resolvedModel)
+        : session.model
+          ? canonicalModelSpec(session.model)
+          : undefined;
+      if (!spec) return undefined;
+      return listAvailableModels(modelRegistry).find((m) => m.spec === spec)?.contextWindow;
+    } catch {
+      // A registry/refresh failure must never break the run — advisory only.
+      return undefined;
+    }
+  }
+
+  /**
+   * T2-02: chars/4 estimate of the incoming context for the NEXT prompt: the
+   * rendered prompt (system instructions + planning guidance + task + schema
+   * contract), the JSON of the tool definitions this run serves, the existing
+   * session history (handoff trajectories), and a documented fixed estimate of
+   * the loader-produced system prefix the code cannot measure directly.
+   * Returns undefined when nothing knowable is comparable (never throws) —
+   * the soft guard that falls through to today's behavior.
+   */
+  private estimateIncomingInputTokens(
+    prompt: string,
+    options: AgentRunOptions<any>,
+    tools: ToolDefinition[],
+    session: AgentSession,
+    structured: boolean,
+  ): number | undefined {
+    try {
+      let chars = SYSTEM_PREFIX_ESTIMATE_CHARS + this.buildPrompt(prompt, options, structured).length;
+      try {
+        chars += JSON.stringify(tools).length;
+      } catch {
+        // Tool defs are plain objects; a stringify failure is not worth failing on.
+      }
+      const history = session.messages;
+      if (Array.isArray(history)) {
+        try {
+          chars += JSON.stringify(history).length;
+        } catch {
+          // History may hold non-stringifiable content — skip it.
+        }
+      }
+      return Math.ceil(chars / 4);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * T2-02 context-window headroom preflight: estimate the incoming context
+   * BEFORE prompting so a long trajectory fails fast or compacts instead of
+   * paying a provider-side CONTEXT_OVERFLOW round-trip mid-stream. Advisory by
+   * design — chars/4 heuristics + a fixed system-prefix estimate; any
+   * unknowable input (no window reported, estimate failure, no model) falls
+   * through to today's behavior exactly. Never changes model resolution and
+   * never converts CONTEXT_OVERFLOW into a recoverable class: the
+   * maxInputTokens ceiling throws the SAME non-recoverable CONTEXT_OVERFLOW
+   * the provider would, just earlier (workflow-prompt-budget tests rely on the
+   * non-recoverable semantics).
+   *
+   * Actions:
+   * - estimate > maxInputTokens → throw before any prompt is sent.
+   * - estimate > window − 16,384 (the SDK's auto-compact reserve) with real
+   *   history → proactively session.compact(custom summary) so the next prompt
+   *   fits; a fresh/empty session has nothing to compact (the oversized part
+   *   is the static prefix + prompt, which compaction cannot shrink) and gets
+   *   a warning instead.
+   */
+  private async maybePreflightContextHeadroom(
+    session: AgentSession,
+    prompt: string,
+    options: AgentRunOptions<any>,
+    tools: ToolDefinition[],
+    structured: boolean,
+    modelRegistry: ModelRegistry | undefined,
+    resolvedModel: Model<any> | undefined,
+  ): Promise<void> {
+    const estimate = this.estimateIncomingInputTokens(prompt, options, tools, session, structured);
+    if (estimate === undefined) return; // soft guard: nothing knowable to compare
+    if (options.maxInputTokens !== undefined && estimate > options.maxInputTokens) {
+      throw new WorkflowError(
+        `Estimated input (${estimate} tokens) exceeds agentOptions.maxInputTokens (${options.maxInputTokens}); the agent never started — shorten the prompt, reduce the session history, or raise the ceiling`,
+        WorkflowErrorCode.CONTEXT_OVERFLOW,
+        { recoverable: false, agentLabel: options.label },
+      );
+    }
+    const window = this.resolvedContextWindow(modelRegistry, resolvedModel, session);
+    if (window === undefined || !Number.isFinite(window) || window <= 0) return; // soft guard
+    const reserve = Math.max(0, window - CONTEXT_HEADROOM_RESERVE_TOKENS);
+    if (estimate <= reserve) return;
+    const historyCount = Array.isArray(session.messages) ? session.messages.length : 0;
+    if (historyCount < 2) {
+      // Fresh session: the static prefix + prompt dominate and cannot be
+      // compacted — advise, don't act (a compact of an empty trajectory is a
+      // no-op anyway and the SDK refuses tiny sessions).
+      console.warn(
+        `[workflow] agent "${options.label ?? ""}" estimated input ${estimate} tokens is over the ${window}-token context window's reserve (${reserve}); the static prefix dominates — prefer a shorter prompt or a larger-context model`,
+      );
+      return;
+    }
+    try {
+      await session.compact(
+        "The conversation is approaching the context window. Keep only the essential plan, decisions, and pending work; discard raw exploration and tool output.",
+      );
+      console.warn(
+        `[workflow] agent "${options.label ?? ""}" proactively compacted ${historyCount} history messages before prompting (estimated ${estimate} tokens vs a ${window}-token window)`,
+      );
+    } catch (error) {
+      // Best-effort: an SDK compaction refusal degrades to the reactive path.
+      console.warn(
+        `[workflow] proactive compaction failed for agent "${options.label ?? ""}": ${error instanceof Error ? error.message : String(error)}; relying on reactive auto-compaction`,
+      );
     }
   }
 

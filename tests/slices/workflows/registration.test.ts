@@ -40,11 +40,15 @@ test("findBuiltinWorkflow resolves both new names", () => {
 
 // ─── Per-pattern resolve(): defaults + parseability ───────────────────────────
 
-test("plan-then-execute resolve() works with only the required objective and no special exec context", () => {
+test("plan-then-execute resolve() works with only the required objective and carries its task-fit toolset", () => {
   const invocation = requireBuiltin("plan-then-execute").resolve("/tmp", { objective: "build a thing" });
   assert.equal(invocation.script, generatePlanThenExecuteWorkflow());
-  assert.equal(invocation.tools, undefined);
-  assert.equal(invocation.toolset, undefined);
+  // T2-06: read/write/bash subset + persistable tag instead of the full default toolset.
+  assert.deepEqual(
+    (invocation.tools ?? []).map((t) => t.name),
+    ["read", "write", "bash"],
+  );
+  assert.equal(invocation.toolset, "plan-then-execute");
   const { meta } = parseWorkflowScript(invocation.script);
   assert.equal(meta.name, "plan_then_execute");
 });
@@ -70,11 +74,15 @@ test("plan-then-execute resolve() rejects missing objective and invalid optional
   assert.throws(() => resolve("/tmp", { objective: "o", context: 42 }), /context/);
 });
 
-test("spec-generation resolve() works with only the required topic", () => {
+test("spec-generation resolve() works with only the required topic and carries its task-fit toolset", () => {
   const invocation = requireBuiltin("spec-generation").resolve("/tmp", { topic: "an app" });
   assert.equal(invocation.script, generateSpecGenerationWorkflow());
-  assert.equal(invocation.tools, undefined);
-  assert.equal(invocation.toolset, undefined);
+  // T2-06: read/bash/write subset + persistable tag instead of the full default toolset.
+  assert.deepEqual(
+    (invocation.tools ?? []).map((t) => t.name),
+    ["read", "bash", "write"],
+  );
+  assert.equal(invocation.toolset, "spec-generation");
   const { meta } = parseWorkflowScript(invocation.script);
   assert.equal(meta.name, "spec_generation");
 });

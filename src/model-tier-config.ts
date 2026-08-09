@@ -27,6 +27,10 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { listAvailableModels } from "./agent.js";
 import { MODEL_TIERS_FILE } from "./config.js";
+// Type-only + a pure string helper: model-spec.ts never imports this module,
+// so importing from it cannot create a cycle.
+import type { ModelThinkingLevel } from "./model-spec.js";
+import { splitModelSpecThinking } from "./model-spec.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,9 +40,84 @@ import { MODEL_TIERS_FILE } from "./config.js";
  * Model tier configuration. Maps tier names (e.g. "small", "medium", "big")
  * to a single model spec string (e.g. "gpt-4.1-mini", "openai/gpt-4.1-mini",
  * or "openai-codex/gpt-5.5:xhigh").
+ *
+ * Optional `thinkingCaps` (T2-11): per-tier ceiling on the reasoning level a
+ * tier-sourced model spec may carry. A tier whose resolved spec ends in a
+ * `:thinking` suffix above its cap is coerced DOWN to the cap at tier
+ * resolution time (never in model-spec.ts parsing — the parser is pinned by
+ * tests/model-spec.test.ts). `null` = no cap (the spec's own suffix wins); a
+ * tier absent from the map falls back to the built-in defaults
+ * (small→"low", medium→"medium", big→unset). Explicit `opts.model` with a
+ * `:thinking` suffix always wins over any cap (explicit > tier precedence).
  */
 export interface ModelTierConfig {
   tiers: Record<string, string>;
+  /** T2-11: tier name → reasoning ceiling (null = no cap). Invalid entries are dropped on load. */
+  thinkingCaps?: Record<string, ModelThinkingLevel | null>;
+}
+
+/**
+ * Built-in per-tier thinking ceilings applied when model-tiers.json carries no
+ * `thinkingCaps` entry for a tier (T2-11): a "small" tier pinned to
+ * `claude-opus:xhigh` must not pay flagship-reasoning output tokens for
+ * scan/edit work, so it is coerced to "low"; "medium" to "medium"; "big" is
+ * unset (no cap — synthesis phases keep whatever the tier spec asks for).
+ */
+export const DEFAULT_TIER_THINKING_CAPS: Record<string, ModelThinkingLevel | null> = {
+  small: "low",
+  medium: "medium",
+  // big: unset
+};
+
+/** Reasoning levels in ascending intensity — the order `coerceSpecThinkingForTier` caps against. */
+const THINKING_LEVEL_ORDER: readonly ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Effective thinking ceiling for a tier: an explicit `config.thinkingCaps[tier]`
+ * entry (including `null` = no cap) wins; otherwise the built-in default for
+ * the tier name (small→low, medium→medium, everything else unset).
+ */
+export function thinkingCapForTier(
+  tier: string,
+  config: ModelTierConfig | null | undefined,
+): ModelThinkingLevel | null {
+  if (config?.thinkingCaps && Object.hasOwn(config.thinkingCaps, tier)) {
+    return config.thinkingCaps[tier] ?? null;
+  }
+  return DEFAULT_TIER_THINKING_CAPS[tier] ?? null;
+}
+
+/**
+ * Cap a thinking level at a ceiling (lower of the two by THINKING_LEVEL_ORDER;
+ * an "off"/undefined cap never raises anything). Pure and deterministic.
+ */
+export function capThinkingLevel(
+  level: ModelThinkingLevel | undefined,
+  cap: ModelThinkingLevel | null,
+): ModelThinkingLevel | undefined {
+  if (level === undefined || cap === null) return level;
+  return THINKING_LEVEL_ORDER.indexOf(level) > THINKING_LEVEL_ORDER.indexOf(cap) ? cap : level;
+}
+
+/**
+ * Coerce a TIER-SOURCED model spec's `:thinking` suffix down to the tier's
+ * thinking ceiling (T2-11). Explicit `opts.model` specs are never passed here
+ * — resolveAgentModelSpec returns them before the tier branches — so the
+ * "explicit > tier" precedence is preserved structurally. A spec with no
+ * suffix, a tier with no cap, or a suffix already at/below the cap is returned
+ * byte-identical (resume-hash determinism).
+ */
+export function coerceSpecThinkingForTier(
+  spec: string | undefined,
+  tier: string,
+  config: ModelTierConfig | null | undefined,
+): string | undefined {
+  if (!spec) return spec;
+  const { modelSpec, thinkingLevel } = splitModelSpecThinking(spec);
+  if (thinkingLevel === undefined) return spec;
+  const cap = thinkingCapForTier(tier, config);
+  const capped = capThinkingLevel(thinkingLevel, cap);
+  return capped === thinkingLevel ? spec : `${modelSpec}:${capped}`;
 }
 
 /**
@@ -276,6 +355,13 @@ function isValidTiersMap(value: unknown): value is Record<string, string> {
 /**
  * Load the model tier config from disk. Returns null if the file does not
  * exist or is unparseable (callers fall back to a default).
+ *
+ * T2-11: a present `thinkingCaps` map is validated/coerced leniently — valid
+ * values (a `null` or a known THINKING_LEVELS member) are kept, everything
+ * else is dropped on violation. An absent map is left absent (the loader
+ * never injects defaults, so an existing config round-trips byte-identically
+ * and the built-in caps still apply at resolution time via
+ * `thinkingCapForTier`).
  */
 export function loadModelTierConfig(configPath?: string): ModelTierConfig | null {
   const path = configPath ?? getModelTierConfigPath();
@@ -285,11 +371,32 @@ export function loadModelTierConfig(configPath?: string): ModelTierConfig | null
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
     if (!isValidTiersMap(parsed.tiers)) return null;
-    return parsed as ModelTierConfig;
+    const config = parsed as ModelTierConfig;
+    const rawCaps = (parsed as Record<string, unknown>).thinkingCaps;
+    if (rawCaps !== undefined) {
+      if (!rawCaps || typeof rawCaps !== "object" || Array.isArray(rawCaps)) {
+        delete (config as unknown as Record<string, unknown>).thinkingCaps;
+      } else {
+        const caps: Record<string, ModelThinkingLevel | null> = {};
+        for (const [tier, value] of Object.entries(rawCaps as Record<string, unknown>)) {
+          if (value === null) {
+            caps[tier] = null;
+          } else if (typeof value === "string" && (THINKING_LEVELS_SET as ReadonlySet<string>).has(value)) {
+            caps[tier] = value as ModelThinkingLevel;
+          }
+          // Anything else (wrong type, unknown level) is dropped on violation.
+        }
+        config.thinkingCaps = caps;
+      }
+    }
+    return config;
   } catch {
     return null;
   }
 }
+
+/** Set of valid thinking level literals (see model-spec.ts THINKING_LEVELS). */
+const THINKING_LEVELS_SET: ReadonlySet<string> = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /**
  * Per-run memoized wrapper around `loadModelTierConfig`, used by the
@@ -386,8 +493,13 @@ export function sortedTierNames(config: ModelTierConfig): string[] {
 /**
  * Human-readable per-tier cost preview for /workflows-models: each tier line
  * carries the configured model's output price and context window when the
- * registry reports them ("cost unknown" otherwise). Pure — the command renders
- * the returned string directly.
+ * registry reports them ("cost unknown" otherwise). T2-11: when the tier spec
+ * carries a `:thinking` suffix or an explicit thinking cap is configured, the
+ * line also shows the EFFECTIVE reasoning level after tier-cap coercion
+ * ("thinking low (capped from xhigh)", "thinking off (capped from medium)",
+ * or plainly "thinking xhigh" when no cap applies). Lines without a suffix and
+ * without an explicit cap keep the pre-T2-11 format exactly. Pure — the
+ * command renders the returned string directly.
  */
 export function formatTierCostPreview(config: ModelTierConfig, models: readonly RankableModel[]): string {
   const bySpec = new Map(models.map((model) => [model.spec, model]));
@@ -399,7 +511,20 @@ export function formatTierCostPreview(config: ModelTierConfig, models: readonly 
       const ctx = typeof info?.contextWindow === "number" && info.contextWindow > 0 ? info.contextWindow : undefined;
       const costText = cost === undefined ? "cost unknown" : `$${cost}/M output`;
       const ctxText = ctx === undefined ? "" : `, ${ctx} ctx`;
-      return `${name} tier → ${modelSpec} (${costText}${ctxText})`;
+      const { thinkingLevel } = splitModelSpecThinking(modelSpec);
+      const explicitCap = config.thinkingCaps && Object.hasOwn(config.thinkingCaps, name);
+      const cap = thinkingCapForTier(name, config);
+      const thinkingText =
+        thinkingLevel === undefined && !explicitCap ? "" : `, thinking ${formatEffectiveThinking(thinkingLevel, cap)}`;
+      return `${name} tier → ${modelSpec} (${costText}${ctxText}${thinkingText})`;
     })
     .join("\n");
+}
+
+/** Render the effective thinking level for a tier line (T2-11 preview). */
+function formatEffectiveThinking(level: ModelThinkingLevel | undefined, cap: ModelThinkingLevel | null): string {
+  const effective = capThinkingLevel(level, cap);
+  const base = effective ?? "unset";
+  if (level === undefined || effective === level) return base;
+  return `${base} (capped from ${level})`;
 }

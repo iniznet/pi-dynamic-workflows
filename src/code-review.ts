@@ -162,6 +162,30 @@ function diffShardSource(): string {
 }
 
 /**
+ * T2-05: verify-batch tier overrides for the generated code-review script.
+ * Defaults follow the plan's small/medium split: cleanup angles (D/E/F) verify
+ * on the small tier, correctness/security/altitude angles (A/B/C/G/H) on
+ * medium. Baking the effective map into the script keeps the generated text
+ * deterministic for a fixed generator version (resume-hash stability).
+ */
+export interface CodeReviewTierOptions {
+  /** Per-angle verify-batch tier overrides (defaults: D/E/F small, rest medium). */
+  tierVerify?: Partial<Record<CodeReviewAngle, string>>;
+}
+
+/** Default per-angle verify-batch tier map (T2-05). */
+const DEFAULT_VERIFY_TIER: Record<CodeReviewAngle, string> = {
+  A: "medium",
+  B: "medium",
+  C: "medium",
+  D: "small",
+  E: "small",
+  F: "small",
+  G: "medium",
+  H: "medium",
+};
+
+/**
  * Generate a code-review workflow script.
  *
  * The workflow expects `args` to be passed with shape:
@@ -184,9 +208,11 @@ function diffShardSource(): string {
  *   Finders D/E/F   → small  (cleanup)
  *   Finder  G       → big    (altitude / abstraction)
  *   Synthesis       → big
+ *   Verify batches  → per-angle map (D/E/F small, rest medium) — T2-05
  */
-export function generateCodeReviewWorkflow(): string {
+export function generateCodeReviewWorkflow(options: CodeReviewTierOptions = {}): string {
   const angleListJs = `[${CODE_REVIEW_ANGLES.map((a) => JSON.stringify(a)).join(", ")}]`;
+  const verifyTierJs = JSON.stringify({ ...DEFAULT_VERIFY_TIER, ...options.tierVerify });
   return `export const meta = {
   name: 'code_review',
   description: 'Multi-angle parallel code review: 8 finder angles + verify pass → ranked findings',
@@ -244,6 +270,10 @@ const candidateSchema = {
 }
 const base = 'Use the read/grep tools to pull in any additional file context you need. ' +
   'Rate every candidate with a severity of critical, high, medium, or low.'
+// T2-05: per-angle verify-batch tier (cleanup angles D/E/F verify on small,
+// correctness/security/altitude on medium) — baked at generation time so the
+// script text (and thus resume hashes) is deterministic per generator version.
+const VERIFY_TIER = ${verifyTierJs}
 
 phase('Find')
 const finders = await parallel([
@@ -361,6 +391,7 @@ const batchResults = verifyBatches.length > 0
         ).join('\\n\\n') + '\\n\\n' + shardBlock(batch.angle),
         {
           label: 'verify-batch-' + (b + 1),
+          tier: VERIFY_TIER[batch.angle] || 'medium',
           schema: {
             type: 'object',
             properties: {

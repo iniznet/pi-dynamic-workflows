@@ -2396,3 +2396,176 @@ test(
     assert.equal(originalLoad(runId)?.status, "running", "the freshest on-disk state is unchanged");
   }),
 );
+
+test(
+  "T1-01: fresh-budget gate holds cumulatively across resume (freshSpend seeded from the persisted run)",
+  withTempCwd(async (cwd) => {
+    // Same pause/resume shape as the A2 seed test, but with the fresh-counting
+    // knob (tokenBudgetCountsCacheRead: false): each agent reports
+    // input=30 output=30 cacheRead=940 (fresh 60, full total 1000). The budget
+    // is 100 FRESH. Pre-pause: agent 1 spends fresh 60 (persisted freshSpend
+    // must be 60). Post-resume: agent 2's pre-call check (60 < 100) passes and
+    // its 60 lands at fresh 120; agent 3's pre-call check (120 ≥ 100) blocks
+    // it. If the fresh seed were lost, the resumed gate would let agent 3 run
+    // — the assertions catch exactly that reset.
+    let secondAttempts = 0;
+    let thirdRan = false;
+    const zeroUsage = { cacheRead: 940, cacheWrite: 0, cost: 0 };
+    const agent: Pick<WorkflowAgent, "run"> = {
+      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
+        if (prompt === "first") {
+          options?.onUsage?.({ ...zeroUsage, input: 30, output: 30, total: 1000 });
+          return "first-result";
+        }
+        if (prompt === "second") {
+          if (++secondAttempts === 1) return new Promise(() => {}); // hang until paused
+          options?.onUsage?.({ ...zeroUsage, input: 30, output: 30, total: 1000 });
+          return "second-result";
+        }
+        if (prompt === "third") {
+          thirdRan = true;
+          options?.onUsage?.({ ...zeroUsage, input: 30, output: 30, total: 1000 });
+          return "third-result";
+        }
+        options?.onUsage?.({ ...zeroUsage, input: 30, output: 30, total: 1000 });
+        return "other-result";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+
+    const script = `export const meta = { name: 't1_01_fresh_seed', description: 'fresh resume seed' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+const c = await agent('third', { label: 'third' })
+return { a, b, c }`;
+
+    const { runId, promise } = manager.startInBackground(script, undefined, {
+      tokenBudget: 100,
+      tokenBudgetCountsCacheRead: false,
+    });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && secondAttempts === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(secondAttempts, 1, "'second' should be in flight before pausing");
+    assert.equal(manager.pause(runId), true);
+
+    const paused = manager.getPersistence().load(runId);
+    assert.equal(paused?.status, "paused");
+    assert.equal(paused?.tokenUsage?.total, 1000, "pre-pause full spend persisted");
+    assert.equal(
+      paused?.tokenUsage?.freshSpend,
+      60,
+      "pre-pause FRESH spend (30 input + 30 output) persisted so the fresh gate can be seeded",
+    );
+
+    assert.equal(await manager.resume(runId), true);
+    for (let i = 0; i < 400 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const resumed = manager.getPersistence().load(runId);
+    // Fresh spend: 60 (pre-pause) + 60 (second) = 120; 'third' hits 120 ≥ 100
+    // against the fresh cap → the run fails instead of completing, proving the
+    // fresh counter was seeded from the persisted run, not reset to zero.
+    assert.equal(resumed?.status, "failed", "the FRESH budget must hold cumulatively across resume");
+    assert.equal(manager.getRun(runId)?.error?.code, WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED);
+    assert.equal(resumed?.tokenUsage?.freshSpend, 120, "persisted freshSpend reflects the seeded + resumed spend");
+    assert.equal(thirdRan, false, "'third' never ran — the fresh gate blocked it after the seed carried over");
+  }),
+);
+
+test(
+  "T1-01: default knob persists the M26 aggregate plus the additive freshSpend figure",
+  withTempCwd(async (cwd) => {
+    // No tokenBudgetCountsCacheRead passed → default true → full-spend gate.
+    // The persisted tokenUsage keeps the M26 identity (total === input+output
+    // +cacheRead+cacheWrite) and gains only the additive freshSpend field
+    // (input+output) that resume()'s fresh gate seed reads.
+    let calls = 0;
+    const agent: Pick<WorkflowAgent, "run"> = {
+      async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }): Promise<any> {
+        calls++;
+        if (calls === 1) {
+          options?.onUsage?.({ input: 10, output: 10, cacheRead: 80, cacheWrite: 0, total: 100, cost: 0 });
+          return "a";
+        }
+        return new Promise(() => {}); // hang -> pause point
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 't1_01_default_shape', description: 'shape' }
+await agent('a', { label: 'a' })
+await agent('b', { label: 'b' })
+return 1`;
+    const { runId, promise } = manager.startInBackground(script, undefined, { tokenBudget: 500 });
+    promise.catch(() => {});
+    for (let i = 0; i < 200 && calls === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(manager.pause(runId), true);
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.tokenUsage?.total, 100);
+    assert.equal(persisted?.tokenUsage?.input, 10);
+    assert.equal(persisted?.tokenUsage?.output, 10);
+    assert.equal(persisted?.tokenUsage?.cacheRead, 80);
+    assert.equal(persisted?.tokenUsage?.cacheWrite, 0);
+    assert.equal(
+      persisted?.tokenUsage?.freshSpend,
+      20,
+      "freshSpend is additive bookkeeping (input+output), never a replacement for total",
+    );
+  }),
+);
+
+test(
+  "T1-16: estimatorMAE telemetry persists for reported agents and is absent on estimate-only runs",
+  withTempCwd(async (cwd) => {
+    // Two runs: one whose agents report usage (validation sample exists →
+    // estimatorMAE is a finite whole-token number), one whose agents report
+    // nothing (estimate-only → no sample → absent).
+    const script = `export const meta = { name: 't1_16_mae', description: 'estimator MAE telemetry' }
+await agent('a', { label: 'a' })
+await agent('b', { label: 'b' })
+return 1`;
+
+    const reported = {
+      async run(_p: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        // 1000 fresh reported vs a small prompt/result estimate -> large MAE.
+        options?.onUsage?.({ input: 500, output: 500, cacheRead: 0, cacheWrite: 0, total: 1000, cost: 0 });
+        return "ok";
+      },
+    } as unknown as Pick<WorkflowAgent, "run">;
+    const manager = new WorkflowManager({ cwd, agent: reported });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(script);
+    await promise;
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.ok(
+      typeof persisted?.estimatorMAE === "number" && persisted.estimatorMAE > 0,
+      `reported agents produce a positive estimatorMAE (got ${persisted?.estimatorMAE})`,
+    );
+    assert.equal(persisted?.estimatorMAE, Math.round(persisted.estimatorMAE as number), "estimatorMAE is whole tokens");
+
+    const estimateOnly = {
+      async run(_p: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+        // total 0 -> usageFromStats returns undefined -> estimate-only path.
+        options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 });
+        return "ok";
+      },
+    } as unknown as Pick<WorkflowAgent, "run">;
+    const manager2 = new WorkflowManager({ cwd: join(cwd, "estimate-only"), agent: estimateOnly });
+    manager2.on("error", () => {});
+    const { runId: runId2, promise: promise2 } = manager2.startInBackground(script);
+    await promise2;
+    const persisted2 = manager2.getPersistence().load(runId2);
+    assert.equal(
+      persisted2?.estimatorMAE,
+      undefined,
+      "estimate-only runs have no validation sample -> no estimatorMAE",
+    );
+  }),
+);

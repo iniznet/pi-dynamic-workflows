@@ -188,6 +188,15 @@ ${orderStepsByDependenciesSource()}
 
 const objective = (args && args.objective) || ''
 const context = (args && args.context) || ''
+// T2-07: register the objective (and optional context) into the run's shared
+// context ONCE via ctx() — which returns a compact pointer — instead of
+// re-embedding the full text into every planner/verifier/rework/execute/report
+// agent call (the audit measured ~21K tokens of objective re-embedding across
+// ~42 calls on a 2K-char objective). The runtime emits the full blob into the
+// first agent's instructions and gives every later agent a store key note;
+// agents whose prompts reference the pointer read the text with store_get.
+const objectiveCtx = ctx(objective)
+const contextCtx = context ? ctx(context) : ''
 const execute = (args && args.execute) === true
 if (!objective) {
   return { objective, plan: [], planError: 'objective is required (a non-empty string)', verdicts: [], results: [], report: null }
@@ -218,7 +227,7 @@ const PLAN_SCHEMA = {
 }
 
 phase('Plan')
-const contextLine = context ? '\\nAdditional context: ' + context : ''
+const contextLine = contextCtx ? '\\nAdditional context: ' + contextCtx : ''
 let planError = ''
 let steps = []
 // Bounded replan: a structurally invalid plan (cycle, duplicate id, unknown
@@ -235,7 +244,7 @@ for (let attempt = 0; attempt < MAX_PLAN_ATTEMPTS; attempt++) {
     'dependsOn (the ids of steps that must complete first; only steps defined elsewhere in the plan). ' +
     'Steps must be topologically ordered — every dependency must come before the step that depends on it. ' +
     'Emit at most ' + maxSteps + ' steps; fewer is better when the objective is small.' +
-    '\\n\\nOBJECTIVE: ' + objective + contextLine + rejectionLine,
+    '\\n\\nOBJECTIVE: ' + objectiveCtx + contextLine + rejectionLine,
     { label: 'planner ' + (attempt + 1), schema: PLAN_SCHEMA }
   )
   const rawSteps = (plan && Array.isArray(plan.steps)) ? plan.steps : []
@@ -271,7 +280,7 @@ for (const step of workSteps) {
       : agent(
           'You are a step rewriter. The planned step below was REJECTED by a verifier. ' +
           'Rewrite ONLY its description so it addresses the feedback; keep id, title, and dependsOn unchanged.\\n\\n' +
-          'OBJECTIVE: ' + objective + '\\nSTEP: ' + JSON.stringify(step) +
+          'OBJECTIVE: ' + objectiveCtx + '\\nSTEP: ' + JSON.stringify(step) +
           '\\nVERIFIER FEEDBACK: ' + (feedback || ''),
           { label: 'rework ' + step.id, schema: STEP_SCHEMA }
         ),
@@ -280,7 +289,7 @@ for (const step of workSteps) {
         'You are a step verifier. Decide whether the planned step below is well-defined, correctly scoped, ' +
         'moves the objective forward, and lists complete dependencies. Return ok:true ONLY when it is ready ' +
         'to be executed as written; otherwise ok:false with concrete, actionable feedback.\\n\\n' +
-        'OBJECTIVE: ' + objective + '\\nSTEP: ' + JSON.stringify(candidate),
+        'OBJECTIVE: ' + objectiveCtx + '\\nSTEP: ' + JSON.stringify(candidate),
         { label: 'verify ' + step.id, schema: VERIFY_SCHEMA }
       )
       if (verdict && verdict.ok === true) return { ok: true }
@@ -308,7 +317,7 @@ if (execute) {
     const value = await agent(
       'You are an implementer. Execute the step below against the objective using the available tools, ' +
       'then return the concrete result of this step.\\n\\n' +
-      'OBJECTIVE: ' + objective + '\\nSTEP: ' + JSON.stringify(finalStep) +
+      'OBJECTIVE: ' + objectiveCtx + '\\nSTEP: ' + JSON.stringify(finalStep) +
       '\\nRESULTS OF COMPLETED DEPENDENCY STEPS: ' + (depResults.length ? JSON.stringify(depResults) : '(none)'),
       { label: 'execute ' + step.id }
     )
@@ -321,7 +330,7 @@ const report = await agent(
   'You are a report writer. Write the final report for this plan-then-execute run: the objective, ' +
   'the dependency-ordered plan, the verification verdict per step (including steps rejected after bounded rework and why), ' +
   'the execution results (if any), and recommended next actions.\\n\\n' +
-  'OBJECTIVE: ' + objective + '\\nPLAN: ' + JSON.stringify(workSteps) +
+  'OBJECTIVE: ' + objectiveCtx + '\\nPLAN: ' + JSON.stringify(workSteps) +
   '\\nVERDICTS: ' + JSON.stringify(verdicts) + '\\nRESULTS: ' + JSON.stringify(results),
   { label: 'report writer' }
 )

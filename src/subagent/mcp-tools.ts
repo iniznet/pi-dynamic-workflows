@@ -158,6 +158,10 @@ export class McpToolsManager {
     const client = this.getClient(server);
     await client.initialize();
     const rawTools = await client.listTools();
+    // Per-server `tools` filter (T1-09): an explicit allowlist in mcp.json
+    // trims the defs a server contributes, so a big server's unused tools
+    // never ride every subagent turn (see McpServerConfig.tools docs in
+    // mcp-config.ts for the recommended shape). Absent filter = all tools.
     const filter = server.tools;
     const defs = rawTools
       .filter((tool) => filter === undefined || filter.includes(tool.name))

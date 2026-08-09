@@ -112,8 +112,13 @@ export function registerWorkflowModelsCommand(pi: ExtensionAPI, options?: Workfl
               entry.cooldownUntil !== undefined && entry.cooldownUntil > now
                 ? ` · cooldown ${Math.ceil((entry.cooldownUntil - now) / 1000)}s`
                 : "";
+            // T2-10: surface the effective per-endpoint output price so the
+            // menu explains cost-aware routing (which endpoint is preferred
+            // and why).
+            const cost =
+              typeof entry.costOutput === "number" && entry.costOutput > 0 ? ` · $${entry.costOutput}/M` : "";
             menuOptions.push(
-              `  ${entry.provider.padEnd(12)} ${entry.modelId}  ${entry.active}/${entry.concurrency} · w${entry.weight}${cooldown}`,
+              `  ${entry.provider.padEnd(12)} ${entry.modelId}  ${entry.active}/${entry.concurrency} · w${entry.weight}${cost}${cooldown}`,
             );
           }
           if (poolSnapshot.waiting > 0) {
