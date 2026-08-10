@@ -113,6 +113,30 @@ test("subagentTools env accepts the all literal or a comma-separated allowlist",
   }
 });
 
+test("subagentExtensionTools env accepts on|off or a comma-separated known-source allowlist", () => {
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "on" }), {
+    subagentExtensionTools: "on",
+  });
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "  off  " }), {
+    subagentExtensionTools: "off",
+  });
+  assert.deepEqual(
+    workflowSettingsFromEnv({
+      [WORKFLOW_ENV_VARS.subagentExtensionTools]: "pi-vision-handoff, supi-web , pi-vision-handoff",
+    }),
+    { subagentExtensionTools: ["pi-vision-handoff", "supi-web"] },
+    "known source ids are trimmed and deduped",
+  );
+  // Unknown ids are dropped leniently; an all-unknown allowlist yields no
+  // override (the file value still applies).
+  assert.deepEqual(
+    workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "pi-vision-handoff, bogus" }),
+    { subagentExtensionTools: ["pi-vision-handoff"] },
+  );
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "bogus" }), {});
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "" }), {});
+});
+
 test("integer bounds are clamped to the config ceilings", () => {
   const env = {
     [WORKFLOW_ENV_VARS.defaultConcurrency]: "999",

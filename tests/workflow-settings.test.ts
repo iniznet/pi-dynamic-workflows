@@ -177,6 +177,40 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads subagentExtensionTools: on/off literals and the known-source allowlist", async () => {
+    await withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      // The "on"/"off" capture-mode literals round-trip.
+      saveWorkflowSettings({ subagentExtensionTools: "on" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentExtensionTools: "on" });
+      saveWorkflowSettings({ subagentExtensionTools: "off" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentExtensionTools: "off" });
+
+      // A known-source allowlist round-trips (pi-vision-handoff included).
+      saveWorkflowSettings({ subagentExtensionTools: ["pi-vision-handoff", "supi-web"] }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {
+        subagentExtensionTools: ["pi-vision-handoff", "supi-web"],
+      });
+
+      // Unknown/blank entries are dropped while preserving order; an
+      // all-unknown allowlist normalizes away (no setting — the off side).
+      // Written directly (not via saveWorkflowSettings): save merges with the
+      // previous file contents, and a fully-dropped allowlist must leave NO
+      // override — exactly what a raw file with only unknown ids proves.
+      writeFileSync(settingsPath, JSON.stringify({ subagentExtensionTools: ["bogus"] }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+
+      // The empty allowlist is the explicit "none" side.
+      saveWorkflowSettings({ subagentExtensionTools: [] }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentExtensionTools: [] });
+
+      // A wrong-typed value violates the declared schema and fails loudly.
+      writeFileSync(settingsPath, JSON.stringify({ subagentExtensionTools: 42 }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+    });
+  });
+
   it("normalizes default concurrency and agent retries", async () => {
     await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

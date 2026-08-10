@@ -65,6 +65,10 @@ The terminating structured-output tool renders its call and captured payload in 
 
 Agent option not in the contract table: `keepWorktree` — edits are always finalized (`git add -A` + `commit --allow-empty`); with it the branch+path are retained, otherwise discarded. Worktrees live at `<repoRoot>/.pi/worktrees/<id>` (branch `pi/wf/<id>`); leftovers from crashed runs are swept at startup.
 
+## Subagent tool availability
+
+What tools a subagent session gets is settings-gated, not script-declared: MCP tools via `subagentTools` (`all` default), host tools via `subagentHostTools`, vendored chrome via `subagentChromeTools`, and host-captured third-party extension tools via `subagentExtensionTools` — supi-web's `web_fetch_md`/`web_docs_*`, pi-codegraph's `codegraph_*`, and pi-vision-handoff's `describe_image` (captured in-process from the installed package/checkout; the setting defaults to `off`, so no extension defs exist anywhere without explicit opt-in). Per-run exclusion and per-task toolsets (`toolset: "extension-tools"`) apply on top. `/workflows-subagent-tools` lists each tool's truthful status (`allowed` / `available-if-enabled` with the recovery step / `unavailable` with the one-line capture failure).
+
 ## Persistence
 
 Persisted runs keep `checkpoints[]` separate from the operation journal (legacy journal-shaped checkpoints are read back transparently). The journal is capped (50,000 entries / 32 MiB budget; oldest dropped and re-run live on resume), and persisted run JSON is scrubbed of secrets.

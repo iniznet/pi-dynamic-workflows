@@ -29,6 +29,7 @@ Read only what the task needs:
 - Use `log()` for new code; `console` is compatibility-only.
 - Dedupe shared task/scope/objective text with `ctx(text)`: call it once, embed the returned pointer (e.g. `[[ctx:0]]`) in every agent prompt that needs the text, and let the runtime emit the full blob once. `ctx()` stores each distinct blob exactly once per run (the same text always returns the same pointer — the dedupe guarantee) and the blob is part of the resume identity hash, so editing the shared text invalidates cached replays; agents after the first read the blob from the store with `store_get` when their prompt references a pointer. See the [authoring helpers](references/authoring-helpers.md) reference for the full contract.
 - Write plain JavaScript without imports or filesystem modules. Pass nondeterminism through `args`; `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable.
+- Subagent tool availability is settings-gated, never script-declared — including host-captured extension tools (`subagentExtensionTools`; e.g. pi-vision-handoff's `describe_image`), which default to `off` and must be opted into.
 
 ## Running the suite
 

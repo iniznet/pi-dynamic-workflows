@@ -38,11 +38,11 @@
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 29,
-      "bytes": 109473
+      "bytes": 109705
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
-      "medianBytes": 17264.5,
+      "medianBytes": 17496.5,
       "profiles": [
         {
           "name": "write",
@@ -54,7 +54,7 @@
             "skills/workflow-authoring/examples/fan-out-and-synthesize.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 16751
+          "bytes": 16983
         },
         {
           "name": "edit",
@@ -66,7 +66,7 @@
             "skills/workflow-authoring/examples/phased-budgets.js",
             "skills/workflow-authoring/examples/saved-nested-workflows.js"
           ],
-          "bytes": 25469
+          "bytes": 25701
         },
         {
           "name": "review",
@@ -77,7 +77,7 @@
             "skills/workflow-authoring/references/quality-helpers.md",
             "skills/workflow-authoring/examples/adversarial-verification.js"
           ],
-          "bytes": 16168
+          "bytes": 16400
         },
         {
           "name": "debug",
@@ -88,7 +88,7 @@
             "skills/workflow-authoring/references/specialized-helpers.md",
             "skills/workflow-authoring/examples/validated-gate.js"
           ],
-          "bytes": 17778
+          "bytes": 18010
         },
         {
           "name": "loop",
@@ -101,7 +101,7 @@
             "skills/workflow-authoring/examples/loop-until-done.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 26005
+          "bytes": 26237
         },
         {
           "name": "retry",
@@ -113,7 +113,7 @@
             "skills/workflow-authoring/examples/bounded-semantic-retry.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 15881
+          "bytes": 16113
         }
       ]
     }

@@ -230,7 +230,7 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     key: "subagentExtensionTools",
     type: "string[]",
     label: "Subagent extension tools",
-    help: "Host-captured third-party extension tools for subagents: on (opt-in, captures tools from every installed source — supi-web, pi-codegraph), a comma-separated allowlist of exact source ids, or off (default). Empty clears. See /workflows-subagent-tools for the live toolset.",
+    help: "Host-captured third-party extension tools for subagents: on (opt-in, captures tools from every installed source — supi-web, pi-codegraph, pi-vision-handoff), a comma-separated allowlist of exact source ids, or off (default). Empty clears. See /workflows-subagent-tools for the live toolset.",
     group: "Advanced",
     defaultDisplay: "off",
     envVar: WORKFLOW_ENV_VARS.subagentExtensionTools,

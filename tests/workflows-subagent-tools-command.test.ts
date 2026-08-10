@@ -50,12 +50,14 @@ const HOST_INFOS: ToolInfo[] = [
   fakeInfo("todo"),
   fakeInfo("vcc_recall"),
   fakeInfo("mcp"),
-  // Host-registered extension tools (supi-web + pi-codegraph): the listing
+  // Host-registered extension tools (supi-web + pi-codegraph +
+  // pi-vision-handoff): the listing
   // reports their capture state truthfully instead of the metadata-only row.
   fakeInfo("web_fetch_md"),
   fakeInfo("web_docs_search"),
   fakeInfo("codegraph_search"),
   fakeInfo("codegraph_files"),
+  fakeInfo("describe_image"),
 ];
 
 function listing(overrides: Partial<SubagentToolsListingInput> = {}): SubagentToolsListingInput {
@@ -170,12 +172,63 @@ describe("buildSubagentToolRows", () => {
 
   test("extension tools hidden when the setting is off get an actionable note", () => {
     const rows = buildSubagentToolRows(listing());
-    for (const name of ["web_fetch_md", "web_docs_search", "codegraph_search", "codegraph_files"]) {
+    for (const name of ["web_fetch_md", "web_docs_search", "codegraph_search", "codegraph_files", "describe_image"]) {
       const row = rowByName(rows, name);
       assert.equal(row?.status, "available-if-enabled", `${name} must be available-if-enabled`);
       assert.equal(row?.source, "extension");
       assert.match(row?.note ?? "", /subagentExtensionTools is off/);
     }
+  });
+
+  test("a not-installed pi-vision-handoff source reports unavailable with its status", () => {
+    const rows = buildSubagentToolRows(
+      listing({
+        extensionToolsMode: ["pi-codegraph", "pi-vision-handoff"],
+        extensionToolSources: [
+          {
+            sourceId: "supi-web",
+            label: "supi-web",
+            defs: [],
+            status: "not-enabled",
+          } as CapturedSourceResult,
+          {
+            sourceId: "pi-codegraph",
+            label: "pi-codegraph",
+            defs: [],
+            status: "captured",
+          } as CapturedSourceResult,
+          {
+            sourceId: "pi-vision-handoff",
+            label: "pi-vision-handoff",
+            defs: [],
+            status: "not-installed",
+          } as CapturedSourceResult,
+        ],
+      }),
+    );
+    const vision = rowByName(rows, "describe_image");
+    assert.equal(vision?.status, "unavailable");
+    assert.match(vision?.note ?? "", /pi-vision-handoff source: not-installed/);
+  });
+
+  test("a captured pi-vision-handoff source whose tool is assembled is allowed", () => {
+    const rows = buildSubagentToolRows(
+      listing({
+        extensionToolsMode: ["pi-vision-handoff"],
+        extensionToolSources: [
+          {
+            sourceId: "pi-vision-handoff",
+            label: "pi-vision-handoff",
+            defs: [],
+            status: "captured",
+          } as CapturedSourceResult,
+        ],
+        assembledToolNames: ["read", "describe_image"],
+      }),
+    );
+    const vision = rowByName(rows, "describe_image");
+    assert.equal(vision?.status, "allowed");
+    assert.equal(vision?.source, "extension");
   });
 
   test("extension tools of a source allowlisted out report the missing source", () => {

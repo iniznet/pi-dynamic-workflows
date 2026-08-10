@@ -378,9 +378,10 @@ export default function extension(pi: ExtensionAPI) {
   const chromeToolsSupplier =
     settings.subagentChromeTools === "on" ? () => (isChromeAuthorized() ? vendoredChromeTools() : []) : undefined;
   // SUBAGENT EXTENSION TOOLS: host-captured third-party extension tools
-  // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*) captured
-  // in-process from the installed packages and executed in the host via the
-  // gateway (design: tasks/subagent-extension-tools/DESIGN.md). Gated by
+  // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*,
+  // pi-vision-handoff's describe_image) captured in-process from the installed
+  // packages/checkouts and executed in the host via the gateway (design:
+  // tasks/subagent-extension-tools/DESIGN.md). Gated by
   // `subagentExtensionTools` exactly like chrome: off → undefined → no defs
   // anywhere, including the "extension-tools" toolset.
   const extensionToolsMode = settings.subagentExtensionTools ?? "off";

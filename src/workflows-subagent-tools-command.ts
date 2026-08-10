@@ -236,7 +236,8 @@ export function buildSubagentToolRows(input: SubagentToolsListingInput): Subagen
             : "workflow_damage_control defs hidden from this run's toolset (settings.excludeSubagentTools or dedupe)",
       });
     } else if (EXPECTED_EXTENSION_TOOL_NAMES.has(info.name)) {
-      // A host-registered extension tool (supi-web / pi-codegraph) not in the
+      // A host-registered extension tool (supi-web / pi-codegraph /
+      // pi-vision-handoff) not in the
       // assembled set: the setting is off, the source is allowlisted out, or
       // capture failed/not installed — all reported truthfully, no SDK gap.
       const sourceId = extensionSourceIdForTool(info.name);
@@ -338,7 +339,7 @@ export function renderSubagentToolsListing(input: SubagentToolsListingInput): st
     })`,
   );
   lines.push(
-    `- Extension tools: **${renderExtensionToolsMode(input.extensionToolsMode)}** (${input.extensionToolsMode === "off" ? "captured defs hidden — set settings.subagentExtensionTools=on to capture supi-web + pi-codegraph tools" : "captured in-process from installed sources; per-source status below"})`,
+    `- Extension tools: **${renderExtensionToolsMode(input.extensionToolsMode)}** (${input.extensionToolsMode === "off" ? "captured defs hidden — set settings.subagentExtensionTools=on to capture supi-web + pi-codegraph + pi-vision-handoff tools" : "captured in-process from installed sources; per-source status below"})`,
   );
   const damageControlMode = input.damageControlMode ?? "off";
   lines.push(

@@ -11,20 +11,22 @@
  * the existing `hostToolsFromDefinitions` → gateway path. Subagents receive
  * thin proxied defs; the host process executes the real `execute` closures.
  *
- * Entries ship as TypeScript source (verified for both supported sources), so
+ * Entries ship as TypeScript source (verified for all supported sources), so
  * capture transpiles them with jiti — the same mechanism pi's own extension
  * loader uses (jiti is a real dependency of this package). The target
  * packages' runtime imports resolve from their own install locations (the
- * agent npm root), which is why capture only works when the package is
- * actually installed there; a missing package degrades to `not-installed`.
+ * agent npm root, or the `~/.pi/agent/git/github.com` checkout for
+ * git-installed extensions), which is why capture only works when the package
+ * is actually installed there; a missing package degrades to `not-installed`.
  *
  * Scoped to opt-in, allowlisted sources only: supi-web (`web_fetch_md`,
- * `web_docs_search`, `web_docs_fetch`) and pi-codegraph (8 × `codegraph_*`).
- * Extensions whose executors are host-coupled to session state (rpiv-todo's
- * main-session todo store, pi-vcc's session-file search) are intentionally
- * NOT captured — their value is main-session state sharing, which the
- * gateway's per-call context cannot faithfully provide, and native subagent
- * loading is useless (subagents run with in-memory session managers).
+ * `web_docs_search`, `web_docs_fetch`), pi-codegraph (8 × `codegraph_*`), and
+ * pi-vision-handoff (`describe_image`, from the git-installed checkout — see
+ * AgentRoots.git). Extensions whose executors are host-coupled to session
+ * state (rpiv-todo's main-session todo store, pi-vcc's session-file search)
+ * are intentionally NOT captured — their value is main-session state sharing,
+ * which the gateway's per-call context cannot faithfully provide, and native
+ * subagent loading is useless (subagents run with in-memory session managers).
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -36,7 +38,7 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { createJiti } from "jiti/static";
 
 /** Opt-in sources this extension captures. Add a source here + wiring to extend. */
-export type ExtensionToolSourceId = "supi-web" | "pi-codegraph";
+export type ExtensionToolSourceId = "supi-web" | "pi-codegraph" | "pi-vision-handoff";
 
 /** How the `subagentExtensionTools` setting is shaped ("on" | allowlist). */
 export type ExtensionToolsMode = "on" | ExtensionToolSourceId[];
@@ -58,6 +60,8 @@ export interface CapturedSourceResult {
 export interface AgentRoots {
   /** `~/.pi/agent/npm/node_modules` — pi's npm extension install root. */
   npm: string;
+  /** `~/.pi/agent/git/github.com` — pi's git-installed extension checkout root. */
+  git: string;
 }
 
 /** One capturable extension package. */
@@ -75,7 +79,10 @@ export interface ExtensionToolSource {
 /** Default agent install roots, derived from the home directory. Injectable for tests. */
 export function defaultAgentRoots(env: Record<string, string | undefined> = process.env): AgentRoots {
   const home = env.USERPROFILE ?? env.HOME ?? homedir();
-  return { npm: join(home, ".pi", "agent", "npm", "node_modules") };
+  return {
+    npm: join(home, ".pi", "agent", "npm", "node_modules"),
+    git: join(home, ".pi", "agent", "git", "github.com"),
+  };
 }
 
 const requireFromThisModule = createRequire(import.meta.url);
@@ -100,6 +107,34 @@ function resolvePackageEntry(
     // Not in this module's tree — fall through to the agent-root probe.
   }
   const entryPath = join(roots.npm, packageName, entryRelative);
+  if (!existsSync(entryPath)) return undefined;
+  return pathToFileURL(entryPath).href;
+}
+
+/**
+ * Resolve a git-installed extension's entry: first via this module's own
+ * resolution (a checkout that sits in the same tree as the packages), then via
+ * the agent git-root probe (`<git-root>/<owner>/<repo>/<entryRelative>`, the
+ * layout pi's `github.com` git installs use). Mirrors resolvePackageEntry so the
+ * import-specifier/alias handling matches — the returned file URL makes the
+ * entry's own relative imports resolve from its checkout. Returns a file URL or
+ * undefined when the checkout is not installed anywhere we can reach — never
+ * throws.
+ */
+export function resolveGitEntry(
+  roots: AgentRoots,
+  owner: string,
+  repo: string,
+  entryRelative: string,
+  importSpecifier: string,
+): string | undefined {
+  try {
+    const resolved = requireFromThisModule.resolve(importSpecifier);
+    return pathToFileURL(resolved).href;
+  } catch {
+    // Not in this module's tree — fall through to the agent git-root probe.
+  }
+  const entryPath = join(roots.git, owner, repo, entryRelative);
   if (!existsSync(entryPath)) return undefined;
   return pathToFileURL(entryPath).href;
 }
@@ -252,6 +287,14 @@ export const EXTENSION_TOOL_SOURCES: readonly ExtensionToolSource[] = [
     ],
     resolveEntry: (roots) =>
       resolvePackageEntry(roots, "@vndv/pi-codegraph", "extensions/codegraph.ts", "@vndv/pi-codegraph"),
+    loadEntry: async (specifier) => (await jitiImportDefault(specifier)) as (pi: ExtensionAPI) => void,
+  },
+  {
+    id: "pi-vision-handoff",
+    label: "pi-vision-handoff",
+    expectedToolNames: ["describe_image"],
+    resolveEntry: (roots) =>
+      resolveGitEntry(roots, "iniznet", "pi-vision-handoff", "vision-handoff.ts", "pi-vision-handoff"),
     loadEntry: async (specifier) => (await jitiImportDefault(specifier)) as (pi: ExtensionAPI) => void,
   },
 ];
@@ -421,10 +464,11 @@ export function getExtensionToolSourceResults(
  */
 export function createExtensionToolsSupplier(
   mode: ExtensionToolsMode | "off",
+  roots: AgentRoots = defaultAgentRoots(),
 ): (() => Promise<ToolDefinition[]>) | undefined {
   if (mode === "off") return undefined;
   return async () => {
-    const results = await getExtensionToolSourceResults(mode);
+    const results = await getExtensionToolSourceResults(mode, roots);
     return results.flatMap((result) => result.defs);
   };
 }

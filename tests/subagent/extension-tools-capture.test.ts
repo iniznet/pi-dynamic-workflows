@@ -7,10 +7,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -25,6 +26,7 @@ import {
   loadCapturedTools,
   readHostPackageJson,
   resolveEnabledSourceIds,
+  resolveGitEntry,
   resolveHostExportsEntry,
 } from "../../src/subagent/extension-tools-capture.js";
 
@@ -41,9 +43,10 @@ function fakeTool(name: string): ToolDefinition {
   } as ToolDefinition;
 }
 
-/** A roots whose npm dir contains no packages → every source reports not-installed. */
+/** A roots whose npm + git dirs contain no packages/checkouts → every source reports not-installed. */
 function emptyRoots(): AgentRoots {
-  return { npm: mkdtempSync(join(tmpdir(), "ext-tools-capture-")) };
+  const base = mkdtempSync(join(tmpdir(), "ext-tools-capture-"));
+  return { npm: base, git: base };
 }
 
 describe("captureEntryTools", () => {
@@ -111,7 +114,7 @@ describe("captureEntryTools", () => {
 
 describe("resolveEnabledSourceIds", () => {
   test('"on" enables every known source in stable order', () => {
-    assert.deepEqual(resolveEnabledSourceIds("on"), ["supi-web", "pi-codegraph"]);
+    assert.deepEqual(resolveEnabledSourceIds("on"), ["supi-web", "pi-codegraph", "pi-vision-handoff"]);
   });
 
   test("an allowlist keeps only the listed source ids", () => {
@@ -130,6 +133,7 @@ describe("source id helpers", () => {
   test("isKnownExtensionToolSourceId guards the union", () => {
     assert.ok(isKnownExtensionToolSourceId("supi-web"));
     assert.ok(isKnownExtensionToolSourceId("pi-codegraph"));
+    assert.ok(isKnownExtensionToolSourceId("pi-vision-handoff"));
     assert.ok(!isKnownExtensionToolSourceId("rpiv-todo"));
   });
 
@@ -138,6 +142,7 @@ describe("source id helpers", () => {
     assert.equal(extensionSourceIdForTool("web_docs_search"), "supi-web");
     assert.equal(extensionSourceIdForTool("codegraph_search"), "pi-codegraph");
     assert.equal(extensionSourceIdForTool("codegraph_files"), "pi-codegraph");
+    assert.equal(extensionSourceIdForTool("describe_image"), "pi-vision-handoff");
     assert.equal(extensionSourceIdForTool("todo"), undefined);
   });
 });
@@ -205,7 +210,7 @@ describe("getExtensionToolSourceResults", () => {
     const results = await getExtensionToolSourceResults("off", emptyRoots());
     assert.deepEqual(
       results.map((result) => result.status),
-      ["not-enabled", "not-enabled"],
+      ["not-enabled", "not-enabled", "not-enabled"],
     );
   });
 
@@ -213,7 +218,7 @@ describe("getExtensionToolSourceResults", () => {
     const results = await getExtensionToolSourceResults("on", emptyRoots());
     assert.deepEqual(
       results.map((result) => result.status),
-      ["not-installed", "not-installed"],
+      ["not-installed", "not-installed", "not-installed"],
     );
   });
 
@@ -223,6 +228,8 @@ describe("getExtensionToolSourceResults", () => {
     assert.equal(results[0].status, "not-enabled");
     assert.equal(results[1].sourceId, "pi-codegraph");
     assert.equal(results[1].status, "not-installed");
+    assert.equal(results[2].sourceId, "pi-vision-handoff");
+    assert.equal(results[2].status, "not-enabled");
   });
 });
 
@@ -243,5 +250,41 @@ describe("createExtensionToolsSupplier", () => {
     const supplier = createExtensionToolsSupplier(["supi-web"]);
     assert.ok(supplier);
     assert.deepEqual(await supplier(), []);
+  });
+});
+
+describe("resolveGitEntry", () => {
+  /** A temp AgentRoots whose git dir mirrors the `github.com/<owner>/<repo>` layout. */
+  function gitRoots(): { roots: AgentRoots; gitDir: string } {
+    const base = mkdtempSync(join(tmpdir(), "ext-tools-git-"));
+    const gitDir = join(base, "github.com");
+    return { roots: { npm: join(base, "npm"), git: gitDir }, gitDir };
+  }
+
+  test("resolves an existing entry to its file URL via the git-root probe", () => {
+    const { roots, gitDir } = gitRoots();
+    const entry = join(gitDir, "iniznet", "pi-vision-handoff", "vision-handoff.ts");
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "export default function () {}", "utf8");
+    const specifier = resolveGitEntry(roots, "iniznet", "pi-vision-handoff", "vision-handoff.ts", "pi-vision-handoff");
+    assert.ok(specifier, "must resolve an installed checkout");
+    assert.equal(specifier, pathToFileURL(entry).href);
+  });
+
+  test("returns undefined for a checkout that is not installed (never throws)", () => {
+    const { roots } = gitRoots();
+    assert.equal(
+      resolveGitEntry(roots, "iniznet", "pi-vision-handoff", "vision-handoff.ts", "pi-vision-handoff"),
+      undefined,
+    );
+    assert.equal(resolveGitEntry(roots, "someone", "some-repo", "entry.ts", "some-repo"), undefined);
+  });
+
+  test("owner/repo nesting follows the github.com layout", () => {
+    const { roots, gitDir } = gitRoots();
+    const entry = join(gitDir, "acme", "widgets", "src", "extension.ts");
+    mkdirSync(dirname(entry), { recursive: true });
+    writeFileSync(entry, "export default function () {}", "utf8");
+    assert.equal(resolveGitEntry(roots, "acme", "widgets", "src/extension.ts", "widgets"), pathToFileURL(entry).href);
   });
 });
