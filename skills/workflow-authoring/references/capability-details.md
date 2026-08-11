@@ -38,21 +38,78 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `parallel(thunks) => Promise<Array<unknown \| null>>`
+- Signature: `parallel(thunks, options?) => Promise<Array<unknown \| null>>`
+- Option shape: `fan-out-options`
+- `concurrency`: number (optional; default: 16 (MAX_CONCURRENCY); scheduling-only: bounds how many thunks are invoked at once; the run limiter (max 16) still caps real agent parallelism; NEVER part of an agent() call's resume identity — a resumed run replays cached calls identically; finite values are floored; absent/non-finite/below 1 fall back to MAX_CONCURRENCY)
+- `autoApproved`: boolean (optional; default: false; P12: skips the large fan-out approval gate (TUI pause / headless abort) for deliberate headless automations; small fan-outs (at or under the threshold) never pause regardless of this flag)
 - Constraint: requires functions rather than promises
 - Constraint: result order matches input order
 - Constraint: recoverable thunk failures become null; nonrecoverable failures throw
+- Constraint: concurrency bounds how many thunks are invoked at once (scheduling-only; the run limiter still caps real parallelism) and is NEVER part of any agent() call's resume identity
+- Constraint: fan-outs beyond the configured approval threshold pause for human approval (TUI confirm / checkpointGate) or abort headless with WORKFLOW_ABORTED unless autoApproved: true (P12)
 
 <a id="pipeline"></a>
 ## pipeline
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `pipeline(items, ...stages) => Promise<Array<unknown \| null>>`
+- Signature: `pipeline(items, ...stages[, options]) => Promise<Array<unknown \| null>>`
+- Option shape: `fan-out-options`
+- `concurrency`: number (optional; default: 16 (MAX_CONCURRENCY); scheduling-only: bounds how many thunks are invoked at once; the run limiter (max 16) still caps real agent parallelism; NEVER part of an agent() call's resume identity — a resumed run replays cached calls identically; finite values are floored; absent/non-finite/below 1 fall back to MAX_CONCURRENCY)
+- `autoApproved`: boolean (optional; default: false; P12: skips the large fan-out approval gate (TUI pause / headless abort) for deliberate headless automations; small fan-outs (at or under the threshold) never pause regardless of this flag)
 - Constraint: items run concurrently while stages per item run sequentially
 - Constraint: each stage receives previousValue, originalItem, and zero-based index
 - Constraint: a null stage result is passed to the next stage; authors must guard missing coverage explicitly
 - Constraint: recoverable stage failures become null; nonrecoverable failures throw
+- Constraint: a trailing plain object is the options bag ({ concurrency, autoApproved }); concurrency is scheduling-only and never part of any agent() call's resume identity
+- Constraint: fan-outs beyond the configured approval threshold pause for human approval (TUI confirm / checkpointGate) or abort headless with WORKFLOW_ABORTED unless autoApproved: true (P12)
+
+<a id="subagenttools"></a>
+## subagentTools
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `subagentTools.search(query?) / describe(name) / select(capability) / capabilities() => capability discovery over the run's captured subagent tool registry`
+- Constraint: queries the run's captured registry (host bundle + MCP + captured extension + chrome + damage control) — NOT getAllTools(), which is metadata-only on 0.83.0
+- Constraint: select() returns only names the current run's toolset can actually resolve, so agent({ toolNames }) never silently drops a selected tool; non-resolvable registry tools are reported as missing
+- Constraint: results are a deterministic pure function of the captured defs + the run's resolved tool names; suppliers materialize lazily once per run frame
+- Constraint: settings gates still decide what the run CAN resolve: subagentTools / subagentHostTools / subagentExtensionTools (extension-tools, chrome-tools, mcp-tools toolsets apply per-task)
+
+<a id="durablestore"></a>
+## durableStore
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `durableStore.get(key) / has(key) / keys() / put(key, value) / putOnce(id, key, value) / compareAndSwap(key, expected, next) / record(entry) / snapshot() => cross-run project-scoped KV + provenance ledger (async writes; await them)`
+- Constraint: survives run end/restart: persisted under getAgentDir()/durable-store/<projectKey>.json with atomic write + lock (mesh-lite cross-run memory)
+- Constraint: replay-idempotent: put is a no-op on an unchanged value, putOnce dedupes by id, compareAndSwap never re-writes after its original write, record dedupes by id/content — cached-prefix replay leaves the store byte-identical
+- Constraint: deterministic timestamps: ledger timestamps are injected (constant epoch + write seq), never the wall clock
+- Constraint: NEVER part of an agent() call's resume identity: durableStore is excluded from hashAgentCall by contract
+- Constraint: the store is a data plane — script control flow branching on a write result is subject to the same determinism rules as the rest of the script
+
+<a id="supervisedrun"></a>
+## supervisedRun
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `supervisedRun({ task, criterion, maxRounds?, taskLabel?, taskTier?, taskPhase?, supervisorTier?, supervisorTools?, correctionTier? }) => Promise<{ result, supervisor: { rounds, declaredDone, termination, finalVerdict, verdicts, corrections, observations } }>`
+- Option shape: `supervised-run-options`
+- `task`: string (required; required; the work to complete (fed to the task agent and every supervisor prompt))
+- `criterion`: string (required; required; the concrete measurable completion criterion the supervisor verifies against)
+- `maxRounds`: number (optional; default: 5; bounded supervisor turns; finite values are floored and clamped to 1..12)
+- `taskLabel`: string (optional; default: "task")
+- `taskTier`: string (optional; default: run default)
+- `taskPhase`: string (optional; default: current phase)
+- `supervisorTier`: string (optional; default: "small" (economy helper tier))
+- `supervisorTools`: string[] (optional; default: [] (pure-reasoning); an empty array restricts the supervisor vote to the schema/structured_output tool only; read-only tools (read/grep) are opt-in)
+- `correctionTier`: string (optional; default: taskTier, else run default)
+- Constraint: run-scoped supervisor (P02): after the task agent settles, an ECONOMY supervisor agent (pure-reasoning toolNames:[] + structured verdict schema, tier 'small') checks progress against the concrete measurable completion criterion using the run's own settle events (onAgentStart/onAgentEnd with phase/result/error)
+- Constraint: on drift/stall it injects EXACTLY ONE corrective agent per continue-with-correction turn; on a 'done' verdict it declares completion and stops — bounded by maxRounds
+- Constraint: every supervisor turn and corrective agent is a journaled POSITIONAL agent() call; the supervisor prompt is a pure function of (task, criterion, deterministic observations), so cached-prefix resume replays every turn identically (RUN RESUME INVARIANT: no new AgentOptions fields, hashAgentCall untouched)
+- Constraint: supervisor turns count against the run token budget like any agent(); when the budget is spent the loop stops with termination 'budget-exhausted' (budget knob is read-only, never mutated)
+- Constraint: the supervisor prompt embeds only deterministic observation fields (call/label/phase/result/error) — tokens and model labels are recorded but never embedded, so live and replayed settles hash identically
+- Constraint: a supervisor vote failing SCHEMA_NONCOMPLIANCE / AGENT_EXECUTION_ERROR degrades to an empty continue round (logged); budget/limit/abort still fail the run
+- Constraint: v1 is in-run only: durable cross-process residency would need an RpcClient-spawned pi child (feasibility gap on 0.83.0)
 
 <a id="workflow"></a>
 ## workflow
@@ -69,45 +126,88 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[]; maxChars?: number }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>`
+- Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[]; maxChars?: number; tier?: string; distinctModel?: string }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }>; crossCheck?: { model: string; verdict: boolean; agreement: boolean; judged: boolean; judge?: { verdict: boolean; reason?: string } } }>`
 - Option shape: `verify-options`
 - `reviewers`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
 - `threshold`: number (optional; default: 0.5)
 - `lens`: string | string[] (optional)
 - `maxChars`: number (optional; default: 4000; embedded claim payload cap (ellipsis marker + log line when trimmed))
+- `tier`: "small" | "medium" | "big" (optional; default: "small"; standard vocabulary is the closed union 'small' | 'medium' | 'big')
+- `distinctModel`: string (optional; P09: second-logical-model cross-check spec (provider/modelId); a judge pass on disagreement is pinned to this model; the cross-check is a direct ModelRuntime call outside the run's agent accounting; the judge pass is one agent() call on the distinct model (hashAgentCall model/tierModel fields); an unavailable second model degrades gracefully to the primary verdict (logged, never silent); the judge prompt embeds the live cross-check verdict: a resumed run whose re-ask differs re-executes the judge call and everything downstream live (documented first-miss semantics))
 - Constraint: reviewer failures are omitted; successful votes form the denominator in realCount / total
 - Constraint: threshold comparison is inclusive and real is false when no reviewer succeeds
 - Constraint: multiple lenses cycle across reviewers
+- Constraint: distinctModel cross-checks the primary verdict on a SECOND logical model: the cross-check is a direct ModelRuntime call outside the run's agent accounting (no agent slot, no token charge — the economy-tier primary votes are never double-charged), and on disagreement a judge pass (one agent() call pinned to the distinct model) adjudicates — its verdict becomes real and crossCheck.judged is true
+- Constraint: an unavailable second model degrades gracefully to the primary verdict with a logged skip (never silent), and the crossCheck block is absent entirely
+- Constraint: the judge pass carries the distinct model in its resume identity (hashAgentCall model/tierModel fields); its prompt embeds the live cross-check verdict, so a resumed run whose re-ask differs re-executes the judge call and everything downstream live (documented first-miss semantics)
 
 <a id="judgepanel"></a>
 ## judgePanel
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } \| undefined>`
+- Signature: `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string; distinctModel?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }>; crossCheck?: { model: string; verdict: boolean; agreement: boolean; judged: boolean; judge?: { verdict: boolean; reason?: string } } } \| undefined>`
 - Option shape: `judge-panel-options`
 - `judges`: number (optional; default: 3; authors should provide a finite integer; runtime clamps below 1)
 - `rubric`: string (optional; default: "overall quality and correctness")
+- `distinctModel`: string (optional; P09: second-logical-model cross-check of the panel's winning pick (provider/modelId); a top-2 judge pass on disagreement may override the winner; active only when at least two candidates were scored; unavailable second model degrades gracefully to the panel's pick)
 - Constraint: failed judgments are omitted and each candidate score averages successful judgments only
 - Constraint: a candidate with no successful judgments scores 0
 - Constraint: highest mean score wins with stable input index as the tie-break; empty input returns undefined
+- Constraint: distinctModel cross-checks the panel's winning pick on a second logical model (direct ModelRuntime call, outside the run's accounting) and, on disagreement, a top-2 judge pass on the distinct model may override the winner (crossCheck.judged true; judge.verdict false means the alternative won)
+- Constraint: active only when at least two candidates were scored; an unavailable second model degrades gracefully to the panel's pick
+
+<a id="gate"></a>
+## gate
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>`
+- Option shape: `gate-options`
+- `attempts`: number (optional; default: 3; authors must provide a finite integer; runtime clamps values below 1 to 1)
+- Constraint: feedback is undefined on the first thunk call and then receives the previous validator feedback string
+- Constraint: attempt is zero-based for the thunk while the returned attempts count is one-based
+- Constraint: a value is accepted when the validator returns an object with a truthy ok property; a bare boolean is not accepted
+- Constraint: exhaustion returns ok false with the last value and the bounded attempts count
+- Constraint: authors must supply a finite attempts bound when overriding the default
+
+<a id="testgate"></a>
+## testGate
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `testGate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, options: { tests: Array<{ command: string; assert?: { exitCode?: number; outputContains?: string; outputMatches?: string; fileContains?: string } }>; postconditions?: string[]; attempts?: number; tool?: 'bash' \| 'grep' }) => Promise<{ ok: boolean; value: unknown; attempts: number; tests: Array<{ command: string; passed: boolean; detail: string; exitCode: number \| null; output: string }> }>`
+- Option shape: `test-gate-options`
+- `tests`: Array<{ command: string; assert?: { exitCode?: number; outputContains?: string; outputMatches?: string; fileContains?: string } }> (required; required and non-empty: every test runs as one subagent step (bash/grep tool) whose structured capture is machine-validated; assert predicates are machine-checked pure-JS over the captured output, never an LLM verdict; an absent assert defaults to { exitCode: 0 }; fileContains checks the captured output (cat/grep), the vm-safe way to assert file content without host fs access; assert.exitCode requires the bash tool (the grep tool reports matches, not an exit status))
+- `postconditions`: string[] (optional; prose descriptions of the required postconditions, embedded into rework feedback)
+- `attempts`: number (optional; default: 3; bounded rework mirroring gate(): authors must provide a finite integer; runtime clamps values below 1 to 1)
+- `tool`: "bash" | "grep" (optional; default: "bash")
+- Constraint: machine-checked postcondition gate: each test runs as a SUBAGENT STEP (agent({ toolNames: ['bash'] | ['grep'], schema })) whose structured capture is machine-validated by pure-JS predicates — acceptance is evidence-backed machine-validated subagent evidence, never an LLM verdict
+- Constraint: the vm context injects no host fs/exec, so machine postconditions cannot run host-side from a vm global; file content is asserted through the captured command output (cat/grep), the vm-safe mechanism
+- Constraint: feedback is undefined on the first thunk call and then receives the previous attempt's machine failure details plus the postconditions prose; every failure is logged (never silent)
+- Constraint: exhaustion fails CLOSED with ok false and the captured per-test evidence (exitCode/output/detail); an absent assert defaults to { exitCode: 0 }
+- Constraint: tests are required and non-empty; malformed commands/asserts throw a TypeError (loud script bug, never silent)
+- Constraint: resume-safe: every test is a real agent() call under a stable callSeq whose toolNames + schema are hashAgentCall fields, so completed attempts replay from the journal like gate()'s
 
 <a id="loopuntildry"></a>
 ## loopUntilDry
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<{ items: unknown[]; termination: "dry" \| "maxRounds" \| "capacity" \| "failed"; failedRounds: number }>`
+- Signature: `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number; maxRoundCost?: number }) => Promise<{ items: unknown[]; termination: "dry" \| "maxRounds" \| "capacity" \| "failed" \| "costSaturated"; failedRounds: number }>`
 - Option shape: `loop-until-dry-options`
 - `round`: (roundIndex: number) => unknown[] | Promise<unknown[]> (required)
 - `key`: (item: unknown) => string (optional; default: JSON.stringify)
 - `consecutiveEmpty`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
 - `maxRounds`: number (optional; default: 50; authors should provide a finite positive integer)
+- `maxRoundCost`: number (optional; default: no cap; N03: a zero-new-items round whose recorded spend exceeds the cap terminates the loop costSaturated; round spend is the run-wide shared.spent delta across the awaited round (journaled facts, deterministic); a round that produced new items never saturates; non-finite values throw a TypeError)
 - Constraint: roundIndex is zero-based; only a successful round that yields no fresh items counts as dry
 - Constraint: a round returning null/undefined is a FAILED round (termination: "failed", failedRounds incremented), never dry
 - Constraint: token-budget or agent-limit capacity exhaustion returns the accumulated partial items with termination: "capacity"
-- Constraint: the result reports its termination reason (dry | maxRounds | capacity | failed) and the failed-round count
-- Constraint: non-finite maxRounds/consecutiveEmpty throw a TypeError; finite values are floored and clamped to at least 1
+- Constraint: a zero-new-items round whose recorded spend (the run-wide shared.spent delta across the awaited round) exceeds maxRoundCost terminates with "costSaturated" instead of grinding to maxRounds/consecutiveEmpty
+- Constraint: the result reports its termination reason (dry | maxRounds | capacity | failed | costSaturated) and the failed-round count
+- Constraint: non-finite maxRounds/consecutiveEmpty/maxRoundCost throw a TypeError; finite values are floored and clamped to at least 1
+- Constraint: maxRoundCost is loop control only — NEVER part of any agent() call's resume identity (replayed rounds bill zero spend, the same replay-is-free divergence the run budget documents)
 
 <a id="completenesscheck"></a>
 ## completenessCheck
@@ -194,6 +294,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `rounds`: number (optional; default: 2; finite values are floored and clamped to at least 1)
 - `agreeThreshold`: number (optional; default: 0.66; finite values are clamped to [0, 1])
 - `arbitrator`: (context) => unknown | Promise<unknown> (optional)
+- `distinctModel`: string (optional; P09: second-logical-model cross-check of the panel's final side (provider/modelId); a judge pass on disagreement adjudicates the split (agreed becomes true with the judge's ruling); the primary side compared is the agreed verdict, else the arbitrator's boolean ruling, else the last round's majority; no valid votes → no cross-check; unavailable second model degrades gracefully to the panel's outcome (logged))
 - Constraint: each round polls panelists independently with a structured verdict schema; per-vote recoverable nulls are omitted and shrink the denominator (logged)
 - Constraint: the pairwise agreement gate passes when the largest mutually-agreeing group covers at least agreeThreshold of valid votes
 - Constraint: rounds are bounded; after the budget an optional arbitrator (typically one structured agent() call) decides, else the disagreement is returned with agreed false
@@ -212,20 +313,6 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: until is synchronous; returning a Promise is truthy and accepts the first result
 - Constraint: omitting until accepts the first result regardless of attempts
 - Constraint: stops when until(result) is true; exhaustion returns only the last result without attempt metadata
-- Constraint: authors must supply a finite attempts bound when overriding the default
-
-<a id="gate"></a>
-## gate
-
-- Classification: `runtime-global`
-- Support: `supported`
-- Signature: `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>`
-- Option shape: `gate-options`
-- `attempts`: number (optional; default: 3; authors must provide a finite integer; runtime clamps values below 1 to 1)
-- Constraint: feedback is undefined on the first thunk call and then receives the previous validator feedback string
-- Constraint: attempt is zero-based for the thunk while the returned attempts count is one-based
-- Constraint: a value is accepted when the validator returns an object with a truthy ok property; a bare boolean is not accepted
-- Constraint: exhaustion returns ok false with the last value and the bounded attempts count
 - Constraint: authors must supply a finite attempts bound when overriding the default
 
 <a id="checkpoint"></a>
@@ -328,7 +415,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `workflow-tool-input`
 - Support: `supported`
 - Signature: `name?: string`
-- Constraint: resolves a project/user saved workflow first, then one of the 7 built-in patterns
+- Constraint: resolves a project/user saved workflow first, then one of the 10 built-in patterns
 - Constraint: mutually exclusive with resumeFromRunId
 
 <a id="tool-input-args"></a>

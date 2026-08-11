@@ -42,12 +42,15 @@ export interface OptionShape {
     | "verify-options"
     | "judge-panel-options"
     | "loop-until-dry-options"
+    | "fan-out-options"
     | "retry-options"
     | "gate-options"
+    | "test-gate-options"
     | "chunked-options"
     | "route-options"
     | "timeboxed-options"
-    | "consensus-options";
+    | "consensus-options"
+    | "supervised-run-options";
   options: readonly OptionDescriptor[];
 }
 
@@ -131,6 +134,7 @@ export interface WorkflowRuntimeImplementations {
   consensus: unknown;
   retry: unknown;
   gate: unknown;
+  testGate: unknown;
   checkpoint: unknown;
   log: unknown;
   phase: unknown;
@@ -139,6 +143,9 @@ export interface WorkflowRuntimeImplementations {
   process: unknown;
   budget: unknown;
   console: unknown;
+  subagentTools: unknown;
+  durableStore: unknown;
+  supervisedRun: unknown;
 }
 
 /** Exact static projection of one capability for generated references. */
@@ -259,6 +266,15 @@ const VERIFY_OPTIONS: OptionShape = {
     option("maxChars", "number", true, "4000", [
       "embedded claim payload cap (ellipsis marker + log line when trimmed)",
     ]),
+    option("tier", '"small" | "medium" | "big"', true, '"small"', [
+      "standard vocabulary is the closed union 'small' | 'medium' | 'big'",
+    ]),
+    option("distinctModel", "string", true, null, [
+      "P09: second-logical-model cross-check spec (provider/modelId); a judge pass on disagreement is pinned to this model",
+      "the cross-check is a direct ModelRuntime call outside the run's agent accounting; the judge pass is one agent() call on the distinct model (hashAgentCall model/tierModel fields)",
+      "an unavailable second model degrades gracefully to the primary verdict (logged, never silent)",
+      "the judge prompt embeds the live cross-check verdict: a resumed run whose re-ask differs re-executes the judge call and everything downstream live (documented first-miss semantics)",
+    ]),
   ],
 };
 const JUDGE_PANEL_OPTIONS: OptionShape = {
@@ -266,6 +282,10 @@ const JUDGE_PANEL_OPTIONS: OptionShape = {
   options: [
     option("judges", "number", true, "3", ["authors should provide a finite integer; runtime clamps below 1"]),
     option("rubric", "string", true, '"overall quality and correctness"'),
+    option("distinctModel", "string", true, null, [
+      "P09: second-logical-model cross-check of the panel's winning pick (provider/modelId); a top-2 judge pass on disagreement may override the winner",
+      "active only when at least two candidates were scored; unavailable second model degrades gracefully to the panel's pick",
+    ]),
   ],
 };
 const LOOP_UNTIL_DRY_OPTIONS: OptionShape = {
@@ -277,6 +297,26 @@ const LOOP_UNTIL_DRY_OPTIONS: OptionShape = {
       "authors should provide a finite integer; runtime clamps below 1",
     ]),
     option("maxRounds", "number", true, "50", ["authors should provide a finite positive integer"]),
+    option("maxRoundCost", "number", true, "no cap", [
+      "N03: a zero-new-items round whose recorded spend exceeds the cap terminates the loop costSaturated",
+      "round spend is the run-wide shared.spent delta across the awaited round (journaled facts, deterministic)",
+      "a round that produced new items never saturates; non-finite values throw a TypeError",
+    ]),
+  ],
+};
+/** N05/P12: shared option bag for parallel()/pipeline(). */
+const FAN_OUT_OPTIONS: OptionShape = {
+  id: "fan-out-options",
+  options: [
+    option("concurrency", "number", true, "16 (MAX_CONCURRENCY)", [
+      "scheduling-only: bounds how many thunks are invoked at once; the run limiter (max 16) still caps real agent parallelism",
+      "NEVER part of an agent() call's resume identity — a resumed run replays cached calls identically",
+      "finite values are floored; absent/non-finite/below 1 fall back to MAX_CONCURRENCY",
+    ]),
+    option("autoApproved", "boolean", true, "false", [
+      "P12: skips the large fan-out approval gate (TUI pause / headless abort) for deliberate headless automations",
+      "small fan-outs (at or under the threshold) never pause regardless of this flag",
+    ]),
   ],
 };
 const RETRY_OPTIONS: OptionShape = {
@@ -296,6 +336,30 @@ const GATE_OPTIONS: OptionShape = {
     option("attempts", "number", true, "3", [
       "authors must provide a finite integer; runtime clamps values below 1 to 1",
     ]),
+  ],
+};
+const TEST_GATE_OPTIONS: OptionShape = {
+  id: "test-gate-options",
+  options: [
+    option(
+      "tests",
+      "Array<{ command: string; assert?: { exitCode?: number; outputContains?: string; outputMatches?: string; fileContains?: string } }>",
+      false,
+      null,
+      [
+        "required and non-empty: every test runs as one subagent step (bash/grep tool) whose structured capture is machine-validated",
+        "assert predicates are machine-checked pure-JS over the captured output, never an LLM verdict; an absent assert defaults to { exitCode: 0 }",
+        "fileContains checks the captured output (cat/grep), the vm-safe way to assert file content without host fs access",
+        "assert.exitCode requires the bash tool (the grep tool reports matches, not an exit status)",
+      ],
+    ),
+    option("postconditions", "string[]", true, null, [
+      "prose descriptions of the required postconditions, embedded into rework feedback",
+    ]),
+    option("attempts", "number", true, "3", [
+      "bounded rework mirroring gate(): authors must provide a finite integer; runtime clamps values below 1 to 1",
+    ]),
+    option("tool", '"bash" | "grep"', true, '"bash"'),
   ],
 };
 const CHUNKED_OPTIONS: OptionShape = {
@@ -330,6 +394,34 @@ const CONSENSUS_OPTIONS: OptionShape = {
     option("rounds", "number", true, "2", ["finite values are floored and clamped to at least 1"]),
     option("agreeThreshold", "number", true, "0.66", ["finite values are clamped to [0, 1]"]),
     option("arbitrator", "(context) => unknown | Promise<unknown>", true),
+    option("distinctModel", "string", true, null, [
+      "P09: second-logical-model cross-check of the panel's final side (provider/modelId); a judge pass on disagreement adjudicates the split (agreed becomes true with the judge's ruling)",
+      "the primary side compared is the agreed verdict, else the arbitrator's boolean ruling, else the last round's majority; no valid votes → no cross-check",
+      "unavailable second model degrades gracefully to the panel's outcome (logged)",
+    ]),
+  ],
+};
+/** P02: supervisedRun() option bag (run-scoped supervisor). */
+const SUPERVISED_RUN_OPTIONS: OptionShape = {
+  id: "supervised-run-options",
+  options: [
+    option("task", "string", false, null, [
+      "required; the work to complete (fed to the task agent and every supervisor prompt)",
+    ]),
+    option("criterion", "string", false, null, [
+      "required; the concrete measurable completion criterion the supervisor verifies against",
+    ]),
+    option("maxRounds", "number", true, "5", [
+      "bounded supervisor turns; finite values are floored and clamped to 1..12",
+    ]),
+    option("taskLabel", "string", true, '"task"'),
+    option("taskTier", "string", true, "run default"),
+    option("taskPhase", "string", true, "current phase"),
+    option("supervisorTier", "string", true, '"small" (economy helper tier)'),
+    option("supervisorTools", "string[]", true, "[] (pure-reasoning)", [
+      "an empty array restricts the supervisor vote to the schema/structured_output tool only; read-only tools (read/grep) are opt-in",
+    ]),
+    option("correctionTier", "string", true, "taskTier, else run default"),
   ],
 };
 
@@ -404,21 +496,70 @@ const capabilities: readonly CapabilityDescriptor[] = [
     evidence: ["tests/workflow-runtime.test.ts", "tests/agent-registry.test.ts", "tests/structured-output.test.ts"],
   }),
   runtimeGlobal("parallel", {
-    signature: "parallel(thunks) => Promise<Array<unknown | null>>",
+    signature: "parallel(thunks, options?) => Promise<Array<unknown | null>>",
+    optionShape: "fan-out-options",
     constraints: [
       "requires functions rather than promises",
       "result order matches input order",
       "recoverable thunk failures become null; nonrecoverable failures throw",
+      "concurrency bounds how many thunks are invoked at once (scheduling-only; the run limiter still caps real parallelism) and is NEVER part of any agent() call's resume identity",
+      "fan-outs beyond the configured approval threshold pause for human approval (TUI confirm / checkpointGate) or abort headless with WORKFLOW_ABORTED unless autoApproved: true (P12)",
     ],
   }),
   runtimeGlobal("pipeline", {
-    signature: "pipeline(items, ...stages) => Promise<Array<unknown | null>>",
+    signature: "pipeline(items, ...stages[, options]) => Promise<Array<unknown | null>>",
+    optionShape: "fan-out-options",
     constraints: [
       "items run concurrently while stages per item run sequentially",
       "each stage receives previousValue, originalItem, and zero-based index",
       "a null stage result is passed to the next stage; authors must guard missing coverage explicitly",
       "recoverable stage failures become null; nonrecoverable failures throw",
+      "a trailing plain object is the options bag ({ concurrency, autoApproved }); concurrency is scheduling-only and never part of any agent() call's resume identity",
+      "fan-outs beyond the configured approval threshold pause for human approval (TUI confirm / checkpointGate) or abort headless with WORKFLOW_ABORTED unless autoApproved: true (P12)",
     ],
+  }),
+  runtimeGlobal("subagentTools", {
+    signature:
+      "subagentTools.search(query?) / describe(name) / select(capability) / capabilities() => capability discovery over the run's captured subagent tool registry",
+    constraints: [
+      "queries the run's captured registry (host bundle + MCP + captured extension + chrome + damage control) — NOT getAllTools(), which is metadata-only on 0.83.0",
+      "select() returns only names the current run's toolset can actually resolve, so agent({ toolNames }) never silently drops a selected tool; non-resolvable registry tools are reported as missing",
+      "results are a deterministic pure function of the captured defs + the run's resolved tool names; suppliers materialize lazily once per run frame",
+      "settings gates still decide what the run CAN resolve: subagentTools / subagentHostTools / subagentExtensionTools (extension-tools, chrome-tools, mcp-tools toolsets apply per-task)",
+    ],
+    evidence: [
+      "tests/discovery.test.ts",
+      "tests/subagent/subagent-tools-assembler.test.ts",
+      "tests/workflow-runtime.test.ts",
+    ],
+  }),
+  runtimeGlobal("durableStore", {
+    signature:
+      "durableStore.get(key) / has(key) / keys() / put(key, value) / putOnce(id, key, value) / compareAndSwap(key, expected, next) / record(entry) / snapshot() => cross-run project-scoped KV + provenance ledger (async writes; await them)",
+    constraints: [
+      "survives run end/restart: persisted under getAgentDir()/durable-store/<projectKey>.json with atomic write + lock (mesh-lite cross-run memory)",
+      "replay-idempotent: put is a no-op on an unchanged value, putOnce dedupes by id, compareAndSwap never re-writes after its original write, record dedupes by id/content — cached-prefix replay leaves the store byte-identical",
+      "deterministic timestamps: ledger timestamps are injected (constant epoch + write seq), never the wall clock",
+      "NEVER part of an agent() call's resume identity: durableStore is excluded from hashAgentCall by contract",
+      "the store is a data plane — script control flow branching on a write result is subject to the same determinism rules as the rest of the script",
+    ],
+    evidence: ["tests/durable-store.test.ts", "tests/run-report.test.ts"],
+  }),
+  runtimeGlobal("supervisedRun", {
+    signature:
+      "supervisedRun({ task, criterion, maxRounds?, taskLabel?, taskTier?, taskPhase?, supervisorTier?, supervisorTools?, correctionTier? }) => Promise<{ result, supervisor: { rounds, declaredDone, termination, finalVerdict, verdicts, corrections, observations } }>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "supervised-run-options",
+    constraints: [
+      "run-scoped supervisor (P02): after the task agent settles, an ECONOMY supervisor agent (pure-reasoning toolNames:[] + structured verdict schema, tier 'small') checks progress against the concrete measurable completion criterion using the run's own settle events (onAgentStart/onAgentEnd with phase/result/error)",
+      "on drift/stall it injects EXACTLY ONE corrective agent per continue-with-correction turn; on a 'done' verdict it declares completion and stops — bounded by maxRounds",
+      "every supervisor turn and corrective agent is a journaled POSITIONAL agent() call; the supervisor prompt is a pure function of (task, criterion, deterministic observations), so cached-prefix resume replays every turn identically (RUN RESUME INVARIANT: no new AgentOptions fields, hashAgentCall untouched)",
+      "supervisor turns count against the run token budget like any agent(); when the budget is spent the loop stops with termination 'budget-exhausted' (budget knob is read-only, never mutated)",
+      "the supervisor prompt embeds only deterministic observation fields (call/label/phase/result/error) — tokens and model labels are recorded but never embedded, so live and replayed settles hash identically",
+      "a supervisor vote failing SCHEMA_NONCOMPLIANCE / AGENT_EXECUTION_ERROR degrades to an empty continue round (logged); budget/limit/abort still fail the run",
+      "v1 is in-run only: durable cross-process residency would need an RpcClient-spawned pi child (feasibility gap on 0.83.0)",
+    ],
+    evidence: ["tests/supervisor.test.ts"],
   }),
   runtimeGlobal("workflow", {
     signature: "workflow(savedName, childArgs?) => Promise<unknown>",
@@ -431,41 +572,77 @@ const capabilities: readonly CapabilityDescriptor[] = [
   }),
   runtimeGlobal("verify", {
     signature:
-      "verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string | string[]; maxChars?: number }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>",
+      "verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string | string[]; maxChars?: number; tier?: string; distinctModel?: string }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }>; crossCheck?: { model: string; verdict: boolean; agreement: boolean; judged: boolean; judge?: { verdict: boolean; reason?: string } } }>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "verify-options",
     constraints: [
       "reviewer failures are omitted; successful votes form the denominator in realCount / total",
       "threshold comparison is inclusive and real is false when no reviewer succeeds",
       "multiple lenses cycle across reviewers",
+      "distinctModel cross-checks the primary verdict on a SECOND logical model: the cross-check is a direct ModelRuntime call outside the run's agent accounting (no agent slot, no token charge — the economy-tier primary votes are never double-charged), and on disagreement a judge pass (one agent() call pinned to the distinct model) adjudicates — its verdict becomes real and crossCheck.judged is true",
+      "an unavailable second model degrades gracefully to the primary verdict with a logged skip (never silent), and the crossCheck block is absent entirely",
+      "the judge pass carries the distinct model in its resume identity (hashAgentCall model/tierModel fields); its prompt embeds the live cross-check verdict, so a resumed run whose re-ask differs re-executes the judge call and everything downstream live (documented first-miss semantics)",
     ],
-    evidence: ["tests/quality-stdlib.test.ts"],
+    evidence: ["tests/quality-stdlib.test.ts", "tests/slices/helpers/model-crosscheck.test.ts"],
   }),
   runtimeGlobal("judgePanel", {
     signature:
-      "judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } | undefined>",
+      "judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string; distinctModel?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }>; crossCheck?: { model: string; verdict: boolean; agreement: boolean; judged: boolean; judge?: { verdict: boolean; reason?: string } } } | undefined>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "judge-panel-options",
     constraints: [
       "failed judgments are omitted and each candidate score averages successful judgments only",
       "a candidate with no successful judgments scores 0",
       "highest mean score wins with stable input index as the tie-break; empty input returns undefined",
+      "distinctModel cross-checks the panel's winning pick on a second logical model (direct ModelRuntime call, outside the run's accounting) and, on disagreement, a top-2 judge pass on the distinct model may override the winner (crossCheck.judged true; judge.verdict false means the alternative won)",
+      "active only when at least two candidates were scored; an unavailable second model degrades gracefully to the panel's pick",
+    ],
+    evidence: ["tests/quality-stdlib.test.ts", "tests/slices/helpers/model-crosscheck.test.ts"],
+  }),
+  runtimeGlobal("gate", {
+    signature:
+      "gate(thunk: (feedback: string | undefined, attempt: number) => unknown | Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } | Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "gate-options",
+    constraints: [
+      "feedback is undefined on the first thunk call and then receives the previous validator feedback string",
+      "attempt is zero-based for the thunk while the returned attempts count is one-based",
+      "a value is accepted when the validator returns an object with a truthy ok property; a bare boolean is not accepted",
+      "exhaustion returns ok false with the last value and the bounded attempts count",
+      "authors must supply a finite attempts bound when overriding the default",
     ],
     evidence: ["tests/quality-stdlib.test.ts"],
   }),
+  runtimeGlobal("testGate", {
+    signature:
+      "testGate(thunk: (feedback: string | undefined, attempt: number) => unknown | Promise<unknown>, options: { tests: Array<{ command: string; assert?: { exitCode?: number; outputContains?: string; outputMatches?: string; fileContains?: string } }>; postconditions?: string[]; attempts?: number; tool?: 'bash' | 'grep' }) => Promise<{ ok: boolean; value: unknown; attempts: number; tests: Array<{ command: string; passed: boolean; detail: string; exitCode: number | null; output: string }> }>",
+    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
+    optionShape: "test-gate-options",
+    constraints: [
+      "machine-checked postcondition gate: each test runs as a SUBAGENT STEP (agent({ toolNames: ['bash'] | ['grep'], schema })) whose structured capture is machine-validated by pure-JS predicates — acceptance is evidence-backed machine-validated subagent evidence, never an LLM verdict",
+      "the vm context injects no host fs/exec, so machine postconditions cannot run host-side from a vm global; file content is asserted through the captured command output (cat/grep), the vm-safe mechanism",
+      "feedback is undefined on the first thunk call and then receives the previous attempt's machine failure details plus the postconditions prose; every failure is logged (never silent)",
+      "exhaustion fails CLOSED with ok false and the captured per-test evidence (exitCode/output/detail); an absent assert defaults to { exitCode: 0 }",
+      "tests are required and non-empty; malformed commands/asserts throw a TypeError (loud script bug, never silent)",
+      "resume-safe: every test is a real agent() call under a stable callSeq whose toolNames + schema are hashAgentCall fields, so completed attempts replay from the journal like gate()'s",
+    ],
+    evidence: ["tests/slices/helpers/test-gate.test.ts"],
+  }),
   runtimeGlobal("loopUntilDry", {
     signature:
-      'loopUntilDry(options: { round: (roundIndex: number) => unknown[] | Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<{ items: unknown[]; termination: "dry" | "maxRounds" | "capacity" | "failed"; failedRounds: number }>',
+      'loopUntilDry(options: { round: (roundIndex: number) => unknown[] | Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number; maxRoundCost?: number }) => Promise<{ items: unknown[]; termination: "dry" | "maxRounds" | "capacity" | "failed" | "costSaturated"; failedRounds: number }>',
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
     optionShape: "loop-until-dry-options",
     constraints: [
       "roundIndex is zero-based; only a successful round that yields no fresh items counts as dry",
       'a round returning null/undefined is a FAILED round (termination: "failed", failedRounds incremented), never dry',
       'token-budget or agent-limit capacity exhaustion returns the accumulated partial items with termination: "capacity"',
-      "the result reports its termination reason (dry | maxRounds | capacity | failed) and the failed-round count",
-      "non-finite maxRounds/consecutiveEmpty throw a TypeError; finite values are floored and clamped to at least 1",
+      'a zero-new-items round whose recorded spend (the run-wide shared.spent delta across the awaited round) exceeds maxRoundCost terminates with "costSaturated" instead of grinding to maxRounds/consecutiveEmpty',
+      "the result reports its termination reason (dry | maxRounds | capacity | failed | costSaturated) and the failed-round count",
+      "non-finite maxRounds/consecutiveEmpty/maxRoundCost throw a TypeError; finite values are floored and clamped to at least 1",
+      "maxRoundCost is loop control only — NEVER part of any agent() call's resume identity (replayed rounds bill zero spend, the same replay-is-free divergence the run budget documents)",
     ],
-    evidence: ["tests/quality-stdlib.test.ts"],
+    evidence: ["tests/quality-stdlib.test.ts", "tests/slices/runtime/w1-fanout-concurrency-approval.test.ts"],
   }),
   runtimeGlobal("completenessCheck", {
     signature:
@@ -566,20 +743,6 @@ const capabilities: readonly CapabilityDescriptor[] = [
     ],
     evidence: ["tests/quality-stdlib.test.ts"],
   }),
-  runtimeGlobal("gate", {
-    signature:
-      "gate(thunk: (feedback: string | undefined, attempt: number) => unknown | Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } | Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>",
-    discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
-    optionShape: "gate-options",
-    constraints: [
-      "feedback is undefined on the first thunk call and then receives the previous validator feedback string",
-      "attempt is zero-based for the thunk while the returned attempts count is one-based",
-      "a value is accepted when the validator returns an object with a truthy ok property; a bare boolean is not accepted",
-      "exhaustion returns ok false with the last value and the bounded attempts count",
-      "authors must supply a finite attempts bound when overriding the default",
-    ],
-    evidence: ["tests/quality-stdlib.test.ts"],
-  }),
   runtimeGlobal("checkpoint", {
     signature: "checkpoint(prompt, options?) => Promise<unknown>",
     discovery: DiscoveryPlacement.WORKFLOW_AUTHORING_SKILL,
@@ -626,7 +789,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     "mutually exclusive with `script` and `name`",
   ]),
   toolInput("name", "name?: string", [
-    "resolves a project/user saved workflow first, then one of the 7 built-in patterns",
+    "resolves a project/user saved workflow first, then one of the 10 built-in patterns",
     "mutually exclusive with resumeFromRunId",
   ]),
   toolInput("args", "args?: unknown"),
@@ -809,12 +972,15 @@ export const WORKFLOW_CAPABILITY_DEFINITION: WorkflowCapabilityDefinition = {
     VERIFY_OPTIONS,
     JUDGE_PANEL_OPTIONS,
     LOOP_UNTIL_DRY_OPTIONS,
+    FAN_OUT_OPTIONS,
     RETRY_OPTIONS,
     GATE_OPTIONS,
+    TEST_GATE_OPTIONS,
     CHUNKED_OPTIONS,
     ROUTE_OPTIONS,
     TIMEBOXED_OPTIONS,
     CONSENSUS_OPTIONS,
+    SUPERVISED_RUN_OPTIONS,
   ],
   capabilities,
   dynamicReferences: [

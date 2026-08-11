@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import vm from "node:vm";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { createCodingTools } from "@earendil-works/pi-coding-agent";
 import type { Node } from "acorn";
 import { parse } from "acorn";
 import type { TSchema } from "typebox";
@@ -25,9 +27,11 @@ import {
 import {
   DEFAULT_AGENT_TIMEOUT_MS,
   DEFAULT_HELPER_TIER,
+  DEFAULT_MAX_AGENT_RESULT_CHARS,
   DEFAULT_RETRY_BACKOFF_MS,
   DEFAULT_UNTAGGED_TIER,
   DRAIN_ABORT_TIMEOUT_MS,
+  FAN_OUT_APPROVAL_THRESHOLD_DEFAULT,
   MAX_AGENT_RETRIES,
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
@@ -37,9 +41,11 @@ import {
   UNTAGGED_TIER_ECONOMY,
   UNTAGGED_TIER_INHERIT_MAIN,
 } from "./config.js";
+import { createSubagentToolDiscovery, type SubagentToolDiscovery } from "./discovery.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
 import { createWorkflowLogger, pushBoundedLog } from "./logger.js";
+import { createModelCrosschecker, type ModelCrosschecker, parseCrosscheckVerdict } from "./model-crosscheck.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase, tierNameForTask } from "./model-routing.js";
 import { providerFromCanonicalSpec } from "./model-spec.js";
 import {
@@ -55,9 +61,42 @@ import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
 import { classifyRunPlan } from "./plan-size.js";
 import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import { bindRunSupervisor, createSupervisorController, type SupervisorSettleEvent } from "./supervisor.js";
+import {
+  buildTestGateFeedback,
+  buildTestGatePrompt,
+  capTestGateOutput,
+  DEFAULT_TEST_GATE_ATTEMPTS,
+  DEFAULT_TEST_GATE_TOOL,
+  machineValidateTest,
+  TEST_GATE_OUTPUT_SCHEMA,
+  type TestGateStepResult,
+  type TestGateTest,
+  type TestGateTool,
+  validateTestGateTests,
+} from "./test-gate.js";
 import { safeSetTimeout, withTimeout } from "./timing.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
+
+/**
+ * Bind the `subagentTools` runtime global for one run frame (P11): the wired
+ * discovery (extension/assembler) is used as-is, else a fallback is built over
+ * the run's own tools (direct embeds / tests) — mirroring what the agent
+ * actually receives — and the whole thing is wrapped with the run's resolved
+ * tool names so select() never routes a name the current toolset cannot hand
+ * an agent. Pure function of the run options; no wall clock, no RNG.
+ */
+function bindRunSubagentToolsDiscovery(options: WorkflowRunOptions): SubagentToolDiscovery {
+  const base =
+    options.subagentToolDiscovery ??
+    createSubagentToolDiscovery(options.tools ?? createCodingTools(options.cwd ?? process.cwd()), {
+      excludeTools: options.excludeTools,
+    });
+  return base.withResolvable(options.tools?.map((tool) => tool.name));
+}
+
+import { bindRunDurableStore } from "./durable-store.js";
 import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 /**
@@ -80,6 +119,36 @@ import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from 
  * the breaching fan-out's own queue is short-circuited.
  */
 const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
+
+/**
+ * N05/P12: per-call options for parallel()/pipeline(). `concurrency` bounds
+ * how many thunks are INVOKED at once (scheduling-only — the run limiter
+ * still caps how many agents actually execute, see normalizeFanOutConcurrency);
+ * `autoApproved` bypasses the P12 large fan-out approval gate (TUI pause /
+ * headless abort) for scripts that deliberately run big headless fan-outs.
+ */
+export interface FanOutOptions {
+  /** Max thunks invoked concurrently (default: MAX_CONCURRENCY). */
+  concurrency?: number;
+  /** Skip the large fan-out approval gate for this fan-out. */
+  autoApproved?: boolean;
+}
+
+/**
+ * Normalize the N05 fan-out concurrency knob. Scheduling-only by design:
+ * it bounds thunk invocation, so it is NEVER part of any agent() call's
+ * resume identity (hashAgentCall's field set is untouched — like timeboxed's
+ * elapsed values, a resumed run replays cached calls identically regardless
+ * of this knob). Absent/non-finite/zero falls back to the run's global
+ * MAX_CONCURRENCY (16); finite positive values are floored with no upper
+ * clamp — the run-level limiter (concurrency <= MAX_CONCURRENCY) still caps
+ * real agent parallelism, so an author can never oversubscribe the run with
+ * a large knob, only invoke thunks eagerly.
+ */
+function normalizeFanOutConcurrency(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 1) return Math.floor(value);
+  return MAX_CONCURRENCY;
+}
 
 /**
  * T2-07 shared-context (ctx()) constants. `ctx(text)` writes each DISTINCT
@@ -119,6 +188,16 @@ export interface WorkflowMeta {
    * review server is ever started for it.
    */
   gate?: "approve";
+  /**
+   * N01: files/dirs this workflow DECLARES as its intended outputs, relative to
+   * the run's cwd (exact paths, or "/"-suffixed dirs to allow a whole subtree).
+   * The workspace scope enforcer asserts each phase boundary's change set
+   * against these PLUS the workflow system's own artifact dirs (`.pi/`): a
+   * boundary may only touch declared outputs and the system dirs. Purely
+   * host-side — never part of any agent() resume hash; scripts that don't
+   * declare outputs (or don't use phase() gating) are unaffected.
+   */
+  outputs?: string[];
 }
 
 /** One cached agent() result, keyed by its deterministic call index. */
@@ -274,6 +353,16 @@ export interface SharedRuntime {
    */
   nestedCallSeq: number;
   /**
+   * QW4: structured-output recovery warnings observed on the LIVE path (one
+   * entry per distinct agent label). A schema agent() that resolves non-null
+   * while its operation traces contain no structured_output tool call got its
+   * value through repair nudges / prose extraction, not a clean tool call.
+   * Shared (not per-frame) so nested workflow() frames' warnings aggregate to
+   * the top-level run summary. Never part of any resume hash (observation
+   * only; a resumed run re-observes its own live calls).
+   */
+  structuredOutputWarnings: Array<{ label: string; warning: string }>;
+  /**
    * Fires exactly once a run-fatal error is determined: an error that escaped
    * the TOP-level script's own execution completely uncaught (see runWorkflow's
    * catch below) — i.e. nothing anywhere in the call chain, at any nesting
@@ -347,9 +436,12 @@ export type WorkflowRuntimeEvent =
   | {
       type: "quality";
       stage: "start" | "end";
-      helper: "verify" | "judgePanel" | "completenessCheck" | "consensus";
+      helper: "verify" | "judgePanel" | "completenessCheck" | "consensus" | "crosscheck";
     }
-  | { type: "control-attempt"; helper: "retry" | "gate"; attempt: number; accepted: boolean };
+  | { type: "control-attempt"; helper: "retry" | "gate" | "testGate"; attempt: number; accepted: boolean }
+  // P02: one event per supervisor turn (the turn itself is a journaled agent()
+  // call; the event is diagnostics only). Round is deterministic (positional).
+  | { type: "supervisor"; stage: "start" | "end"; round: number };
 
 /** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
 interface WorkflowAgentRunner {
@@ -366,6 +458,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   args?: unknown;
   agent?: WorkflowAgentRunner;
   /**
+   * P11: script-facing capability discovery over the captured subagent tool
+   * registry (host bundle + MCP + extension capture + chrome + damage control).
+   * Wired by the extension (the assembler's createDiscovery()); the run wraps
+   * it with the run's resolved tool names, so select() only returns tools an
+   * agent({ toolNames }) allowlist can actually resolve. Absent (direct
+   * embeds) → a fallback discovery is built from the run's tools so the
+   * `subagentTools` global always exists. Deterministic per run; not part of
+   * any agent() identity hash.
+   */
+  subagentToolDiscovery?: SubagentToolDiscovery;
+  /**
    * Provider pool (design: tasks/provider-load-balance/design.md): per-provider
    * concurrency caps + run-sticky provider routing. Threaded into every agent()
    * call of this run (AgentRunOptions.providerPool + poolStickyKey=deltaKey);
@@ -376,6 +479,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   providerPool?: ProviderPool;
   /** The session's main model (provider/id), shown in /workflows for default agents. */
   mainModel?: string;
+  /**
+   * P09: injectable second-logical-model cross-checker for verify() /
+   * consensus() / judgePanel() `distinctModel` mode. Absent → a real
+   * ModelRuntime-backed crosschecker is created lazily (createModelCrosschecker);
+   * tests inject a fake. The cross-check is a DIRECT ModelRuntime call — it
+   * consumes no agent slot, journals nothing, and never touches the run's
+   * token accounting (the economy-tier primary votes are not double-charged) —
+   * so it never joins any agent() resume hash. Only the judge-pass agent()
+   * call it may trigger carries the distinct model in its identity (the
+   * hashAgentCall `model`/`tierModel` fields).
+   */
+  modelCrosschecker?: ModelCrosschecker;
   /**
    * Injectable source for the model-tiers config used by the resume-replay
    * identity hash (see hashAgentCall's `tierModel` field). Defaults to the
@@ -396,6 +511,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   agentRegistry?: AgentRegistry;
   concurrency?: number;
+  /**
+   * P12: parallel()/pipeline() fan-out size above which a run pauses for
+   * human approval (TUI confirm / checkpointGate) or, headless, throws
+   * WORKFLOW_ABORTED — unless the script passes autoApproved: true. Resolved
+   * by the tool from the fanOutApprovalThreshold settings key (env
+   * PI_WORKFLOW_FAN_OUT_APPROVAL_THRESHOLD). undefined →
+   * FAN_OUT_APPROVAL_THRESHOLD_DEFAULT (8); null → gate disabled; a positive
+   * integer → that threshold. Scheduling/approval only — NEVER part of any
+   * agent() call's resume identity.
+   */
+  fanOutApprovalThreshold?: number | null;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
   /**
@@ -463,6 +589,17 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   compactJournal?: boolean;
   /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
+  /**
+   * P05: run-level default for the per-agent result cap (unstructured text
+   * results only). Applied to every agent() call that doesn't set its own
+   * `maxResultChars`; null explicitly disables the cap for the whole run;
+   * omitted uses DEFAULT_MAX_AGENT_RESULT_CHARS (50_000). Larger results are
+   * tail-preservingly truncated at the workflow layer with the full text
+   * written to an artifact path, and the capped output counts against the run
+   * budget. NEVER part of any agent() call's resume identity (see
+   * AgentOptions.maxResultChars) — the cap transforms results, not inputs.
+   */
+  defaultMaxAgentResultChars?: number | null;
   /**
    * Drain-side backstop deadline in milliseconds: how long the top-level run
    * waits for outstanding (possibly un-awaited) agent() calls to settle after
@@ -655,6 +792,15 @@ export interface WorkflowRunResult<T = unknown> {
    */
   failedAgents?: Array<{ label: string; error: string; errorCode: WorkflowErrorCode; nested?: string }>;
   /**
+   * QW4: structured-output recovery warnings, observed on this run's LIVE
+   * path. One entry per distinct agent label whose schema agent() resolved a
+   * non-null result without ever calling the structured_output tool (the
+   * value was recovered through repair nudges or prose extraction). Undefined
+   * when every schema agent called the tool cleanly (JSON-dropped, so the
+   * persisted shape of a clean run is unchanged).
+   */
+  structuredOutputWarnings?: Array<{ label: string; warning: string }>;
+  /**
    * E3: the first call index that ran live instead of replaying from the
    * journal (Number.POSITIVE_INFINITY → absent). A nested workflow() parent
    * reads this to cut its own cache-hit prefix at the child's fork point when
@@ -722,6 +868,16 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
   toolNames?: string[];
   /** Override timeout for this specific agent. null means no hard timeout. */
   timeoutMs?: number | null;
+  /**
+   * P05: character cap on THIS agent's result (unstructured text only). null
+   * = inherit the run-level default; a positive integer overrides it. Larger
+   * results are tail-preservingly truncated at the workflow layer with the
+   * full text written to an artifact path (see DEFAULT_MAX_AGENT_RESULT_CHARS).
+   * Deliberately NOT part of the resume identity (hashAgentCall): the cap
+   * transforms the RESULT, never the inputs, so a journaled capped result
+   * replays byte-identically whatever this knob says on resume.
+   */
+  maxResultChars?: number | null;
   /** Retry attempts after a recoverable failure for this specific agent. */
   retries?: number;
   /**
@@ -1046,7 +1202,22 @@ export async function runWorkflow<T = unknown>(
     sawTopLevelAgent: false,
   };
 
+  // P02: per-run supervisor observation log — the settle-path tap below feeds
+  // it; the `supervisedRun` runtime global (bound in runtimeImplementations)
+  // reads it. Purely additive: no controller, no tap overhead for runs that
+  // never use supervisedRun (record() no-ops on an empty subscriber set — the
+  // controller is just an in-memory array). Never part of any resume hash: the
+  // observations are rebuilt deterministically from the journaled settle
+  // events (see buildSupervisorPrompt's deterministic-input rule).
+  const runSupervisor = createSupervisorController();
+
   const agentRunner = options.agent ?? new WorkflowAgent(options);
+  // P09: the run's second-logical-model cross-checker. The real runtime-backed
+  // checker is created lazily (the ModelRuntime itself is memoized module-wide
+  // and only materialized on the first ask()); tests inject a fake via
+  // WorkflowRunOptions.modelCrosschecker. Shared across nested workflow()
+  // frames through the options spread.
+  const modelCrosschecker = options.modelCrosschecker ?? createModelCrosschecker();
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
@@ -1077,6 +1248,7 @@ export async function runWorkflow<T = unknown>(
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
     depth: 0,
     nestedCallSeq: 0,
+    structuredOutputWarnings: [],
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     pendingReplayDeltas: [],
@@ -1353,6 +1525,22 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
+  // P02: the supervisor observation tap — fires right after every
+  // onAgentStart/onAgentEnd safeCallback in the settle path so a supervised run
+  // watches the run's own events without restructuring it. Guarded exactly like
+  // safeCallback (M1): a throwing observer can never corrupt the settle path or
+  // double-count tokens. Synchronous append only — the async supervisor turns
+  // are driven by the `supervisedRun` global, never from here.
+  const supervisorTap = (event: SupervisorSettleEvent): void => {
+    try {
+      runSupervisor.record(event);
+    } catch (error) {
+      log(
+        `supervisor observation tap failed (run continues): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
   const phase = (title: string, phaseOptions?: PhaseOptions) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
@@ -1419,6 +1607,52 @@ export async function runWorkflow<T = unknown>(
       WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
       { recoverable: false },
     );
+
+  // P12: the run's fan-out approval threshold — undefined → the default (8),
+  // null → gate disabled, a positive integer → that threshold. Scheduling /
+  // approval policy only: NEVER part of any agent() call's resume identity.
+  const fanOutApprovalThreshold =
+    options.fanOutApprovalThreshold === undefined
+      ? FAN_OUT_APPROVAL_THRESHOLD_DEFAULT
+      : options.fanOutApprovalThreshold;
+
+  /**
+   * P12: large fan-out approval gate for parallel()/pipeline(). Small fan-outs
+   * (count <= threshold) auto-approve and never pause; a big fan-out without
+   * autoApproved pauses for a human via the journaled checkpoint() machinery
+   * (TUI confirm / checkpointGate) — approval replies are journaled and replay
+   * on resume — while a HEADLESS run (no confirm, no gate) aborts with
+   * WORKFLOW_ABORTED instead of silently rubber-stamping a large spend. This
+   * mirrors the existing big-plan rule exactly (checkpoint's headless="abort"
+   * throw path): the fan-out plan is NOT a plan file, so it never goes through
+   * classifyRunPlan, and the meta.gate pre-body path is deliberately not used.
+   * `autoApproved: true` is the documented escape for scripts that
+   * deliberately run big headless fan-outs — it skips the gate entirely, so
+   * existing headless automations that opt in are never broken by the knob.
+   */
+  const assertFanOutApproved = async (count: number, concurrency: number, autoApproved?: boolean): Promise<void> => {
+    if (autoApproved) return;
+    if (fanOutApprovalThreshold == null || count <= fanOutApprovalThreshold) return;
+    const agentsSoFar = shared.agentCount;
+    const spentSoFar = shared.spent;
+    const perItem =
+      agentsSoFar > 0
+        ? `~${Math.max(0, Math.round(spentSoFar / agentsSoFar))} tokens/item`
+        : "unknown (no agents have run yet)";
+    const toolset = options.tools?.length ? `${options.tools.length} tools` : "default toolset";
+    const budgetNote = options.tokenBudget == null ? "no run token budget" : `${budget.remaining()} tokens remaining`;
+    const approved = await checkpoint(
+      `parallel()/pipeline() fan-out of ${count} items exceeds the approval threshold (${fanOutApprovalThreshold}). ` +
+        `It will launch up to ${count} agents (concurrency ${concurrency}; per-item toolset: ${toolset}; ` +
+        `est. budget: ${perItem}; ${budgetNote}). Approve this fan-out?`,
+      { kind: "confirm", default: false, headless: "abort" },
+    );
+    if (!approved) {
+      throw new WorkflowError(`fan-out of ${count} items was not approved`, WorkflowErrorCode.WORKFLOW_ABORTED, {
+        recoverable: false,
+      });
+    }
+  };
 
   // True on an intentional external abort (pause/stop/Esc, via options.signal)
   // OR once this run's fate has been sealed (shared.runFatalController — see
@@ -1649,7 +1883,17 @@ export async function runWorkflow<T = unknown>(
         prompt,
         model: replayModel,
       });
+      supervisorTap({ kind: "start", id: deltaKey, label, phase: assignedPhase, prompt, model: replayModel });
       safeCallback("onAgentEnd", options.onAgentEnd, {
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+        model: replayModel,
+      });
+      supervisorTap({
+        kind: "end",
         id: deltaKey,
         label,
         phase: assignedPhase,
@@ -1704,6 +1948,7 @@ export async function runWorkflow<T = unknown>(
         // fallback until onModelResolved fires.
         model: displayModel,
       });
+      supervisorTap({ kind: "start", id: deltaKey, label, phase: assignedPhase, prompt, model: displayModel });
 
       // Optional per-agent worktree isolation (deterministic name -> stable resume keys).
       // Precedence: explicit call-site isolation > agentDef isolation (resolvedIsolation is
@@ -1980,7 +2225,8 @@ export async function runWorkflow<T = unknown>(
             // "aborted" once agentController fires; the race has already resolved,
             // so swallow that to avoid an unhandled rejection.
             runPromise.catch(() => {});
-            const result = await withTimeout(
+            // P05 note: `result` is rebound to the capped text below.
+            let result = await withTimeout(
               runPromise,
               timeout,
               label,
@@ -2004,7 +2250,68 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
+            // P05: per-agent result cap — unstructured text results only (a
+            // schema result is shape-bound by its contract). Applied AFTER the
+            // empty-output gate (which must judge the ORIGINAL text) and
+            // BEFORE recordTokens, so the capped output counts against the run
+            // budget. capAgentResultText is a pure function of the result
+            // (mirroring capEmbedded's determinism), so a journaled capped
+            // result replays byte-identically on resume; the knob itself is
+            // deliberately NOT part of hashAgentCall — it transforms the
+            // RESULT, never the inputs (same exclusion as timeboxed/elapsedMs).
+            const resolvedResultCap = resolveMaxAgentResultChars(
+              agentOptions.maxResultChars ?? options.defaultMaxAgentResultChars,
+              DEFAULT_MAX_AGENT_RESULT_CHARS,
+            );
+            if (
+              resolvedResultCap !== null &&
+              agentOptions.schema === undefined &&
+              typeof result === "string" &&
+              result.length > resolvedResultCap
+            ) {
+              // Deterministic artifact identity (same namespacing as the
+              // journal's deltaKey): resume re-truncation would target the
+              // same path, and the journal stores the capped text anyway, so
+              // the artifact is only a retrieval channel — best-effort.
+              let artifactPath: string | undefined;
+              try {
+                const artifactDir = join(baseCwd, ".pi", "workflows", "artifacts");
+                artifactPath = join(artifactDir, `${runId}-c${callIndex}.txt`);
+                await mkdir(artifactDir, { recursive: true });
+                await writeFile(artifactPath, result, "utf-8");
+              } catch (error) {
+                log(
+                  `agent "${label}" result artifact write failed (result still capped): ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+                );
+                artifactPath = undefined;
+              }
+              const capped = capAgentResultText(result, resolvedResultCap, artifactPath);
+              log(
+                `agent "${label}" result capped at ${resolvedResultCap} chars (was ${capped.originalChars})` +
+                  (capped.artifactPath ? `; full result at ${capped.artifactPath}` : "; no artifact written"),
+              );
+              result = capped.text;
+            }
             const tokens = recordTokens(result);
+            // QW4: structured-output near-miss — a schema agent() that resolved
+            // a non-null result while its operation traces contain NO
+            // structured_output tool call got its value through repair nudges
+            // or prose extraction, not a clean tool call. Surface it as a
+            // run-summary warning (deduped by label: a fan-out reusing one
+            // role label should not flood the summary). Observation only —
+            // never part of any resume hash; a replay re-observes its own live
+            // calls and the journal stays untouched.
+            if (agentOptions.schema && !(operations ?? []).some((t) => t.op === "structured_output")) {
+              if (!shared.structuredOutputWarnings.some((w) => w.label === label)) {
+                shared.structuredOutputWarnings.push({
+                  label,
+                  warning:
+                    "structured output was recovered without a structured_output tool call (repair nudges or prose extraction); prefer a tool-reliable model",
+                });
+              }
+            }
             // E2: capture the delta together with its store commit ordinal — the
             // delta's position in the run's real completion order — so resume
             // replay can reconstruct the same store the live run ended with
@@ -2049,6 +2356,15 @@ export async function runWorkflow<T = unknown>(
               tokens,
               tokenUsage: usage,
               worktree: runCwd,
+              model: displayModel,
+            });
+            supervisorTap({
+              kind: "end",
+              id: deltaKey,
+              label,
+              phase: assignedPhase,
+              result,
+              tokens,
               model: displayModel,
             });
             return result;
@@ -2189,6 +2505,17 @@ export async function runWorkflow<T = unknown>(
               recoverable: workflowError.recoverable,
               failingOperation,
             });
+            supervisorTap({
+              kind: "end",
+              id: deltaKey,
+              label,
+              phase: assignedPhase,
+              result: null,
+              tokens,
+              model: displayModel,
+              error: workflowError.message,
+              errorCode: workflowError.code,
+            });
 
             if (workflowError.recoverable) {
               log(
@@ -2237,91 +2564,139 @@ export async function runWorkflow<T = unknown>(
     });
   };
 
-  const parallel = async (thunks: Array<() => Promise<unknown>>) => {
+  const parallel = async (thunks: Array<() => Promise<unknown>>, options: FanOutOptions = {}) => {
     throwIfAborted();
     if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
     if (thunks.some((thunk) => typeof thunk !== "function")) {
       throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
     }
+    // N05: scheduling-only concurrency knob — bounds how many thunks are
+    // INVOKED at once; NEVER part of any agent() call's resume identity. The
+    // run-level limiter still caps real agent parallelism, so a resumed run
+    // replays cached calls identically whatever this knob says.
+    const concurrency = normalizeFanOutConcurrency(options?.concurrency);
+    // P12: a big fan-out pauses for human approval (TUI) or aborts headless
+    // unless the script explicitly opts out (see assertFanOutApproved).
+    await assertFanOutApproved(thunks.length, concurrency, options?.autoApproved);
     // Batch-scoped cancellation: agent() calls made (directly or transitively)
     // from these thunks see this store via fanoutScope.getStore(). A breach in
     // THIS fan-out flips `cancelled` so its own still-queued agents bail, without
     // touching a sibling fan-out running concurrently or an enclosing one.
     const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        thunks.map(async (thunk, index) => {
-          try {
-            return await thunk();
-          } catch (error) {
-            if (isAborted()) throw error;
-            // A plain (non-WorkflowError) error is a script bug in this thunk —
-            // propagate it instead of swallowing it into a null (M2): the same
-            // bug in a directly-awaited agent() would fail the run, and a null
-            // would silently corrupt the fan-out's result data. Only WorkflowError
-            // carries the recoverable class that decides null-vs-throw (a
-            // recoverable-exhausted agent() already RESOLVES null on its own, so
-            // a WorkflowError reaching here is always a genuinely fatal class).
-            if (!isWorkflowError(error)) throw error;
-            const workflowError = error;
-            // Non-recoverable failures (token budget / agent limit exhausted) must
-            // halt the whole run, exactly like a directly-awaited agent() — not be
-            // swallowed into a null in the result array.
-            if (!workflowError.recoverable) {
-              // Only a breached agent cap cancels the rest of this batch; the
-              // token budget stays a soft gate by design (in-flight agents may
-              // finish past it), and other non-recoverable errors don't imply
-              // the rest of the batch is doomed.
-              if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-              throw workflowError;
-            }
-            log(`parallel[${index}] failed: ${workflowError.message}`);
-            return null;
+    return fanoutScope.run(batch, async () => {
+      const results: unknown[] = new Array(thunks.length);
+      let next = 0;
+      const runOne = async (index: number): Promise<void> => {
+        try {
+          results[index] = await thunks[index]();
+        } catch (error) {
+          if (isAborted()) throw error;
+          // A plain (non-WorkflowError) error is a script bug in this thunk —
+          // propagate it instead of swallowing it into a null (M2): the same
+          // bug in a directly-awaited agent() would fail the run, and a null
+          // would silently corrupt the fan-out's result data. Only WorkflowError
+          // carries the recoverable class that decides null-vs-throw (a
+          // recoverable-exhausted agent() already RESOLVES null on its own, so
+          // a WorkflowError reaching here is always a genuinely fatal class).
+          if (!isWorkflowError(error)) throw error;
+          const workflowError = error;
+          // Non-recoverable failures (token budget / agent limit exhausted) must
+          // halt the whole run, exactly like a directly-awaited agent() — not be
+          // swallowed into a null in the result array.
+          if (!workflowError.recoverable) {
+            // Only a breached agent cap cancels the rest of this batch; the
+            // token budget stays a soft gate by design (in-flight agents may
+            // finish past it), and other non-recoverable errors don't imply
+            // the rest of the batch is doomed.
+            if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+            throw workflowError;
           }
-        }),
-      ),
-    );
+          log(`parallel[${index}] failed: ${workflowError.message}`);
+          results[index] = null;
+        }
+      };
+      // Worker pool: at most `concurrency` thunks are in flight at once; a
+      // cancelled batch stops pulling new thunks (the breaching worker already
+      // rethrew, so Promise.all rejects regardless of what the survivors
+      // observed). Result order stays input order via the preallocated array.
+      const worker = async (): Promise<void> => {
+        while (!batch.cancelled) {
+          const index = next++;
+          if (index >= thunks.length) return;
+          await runOne(index);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, thunks.length) }, () => worker()));
+      return results;
+    });
   };
 
   const pipeline = async (
     items: unknown[],
-    ...stages: Array<(prev: unknown, original: unknown, index: number) => unknown>
+    ...stagesAndMaybeOptions: Array<((prev: unknown, original: unknown, index: number) => unknown) | FanOutOptions>
   ) => {
     throwIfAborted();
     if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array as the first argument");
+    // N05/P12: an optional trailing plain object is the FanOutOptions bag
+    // (`pipeline(items, stage1, stage2, { concurrency, autoApproved })`). A
+    // stage can never be a plain object (stages are functions), so popping a
+    // trailing non-function object is unambiguous; anything else non-function
+    // still fails the stage validation below exactly as before.
+    const options: FanOutOptions =
+      stagesAndMaybeOptions.length > 0 &&
+      typeof stagesAndMaybeOptions[stagesAndMaybeOptions.length - 1] === "object" &&
+      stagesAndMaybeOptions[stagesAndMaybeOptions.length - 1] !== null &&
+      !Array.isArray(stagesAndMaybeOptions[stagesAndMaybeOptions.length - 1])
+        ? (stagesAndMaybeOptions.pop() as FanOutOptions)
+        : {};
+    const stages = stagesAndMaybeOptions as Array<(prev: unknown, original: unknown, index: number) => unknown>;
     if (stages.some((stage) => typeof stage !== "function")) {
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
+    const concurrency = normalizeFanOutConcurrency(options.concurrency);
+    // P12: see assertFanOutApproved — same gate as parallel().
+    await assertFanOutApproved(items.length, concurrency, options.autoApproved);
     // Batch-scoped cancellation — see parallel() for the rationale.
     const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
-      Promise.all(
-        items.map(async (item, index) => {
-          let value: unknown = item;
-          for (const stage of stages) {
-            try {
-              throwIfAborted();
-              value = await stage(value, item, index);
-              throwIfAborted();
-            } catch (error) {
-              if (isAborted()) throw error;
-              // Plain (non-WorkflowError) errors are script bugs in this stage —
-              // propagate them (M2), same rationale as parallel() above.
-              if (!isWorkflowError(error)) throw error;
-              const workflowError = error;
-              // Non-recoverable failures halt the whole run (see parallel()).
-              if (!workflowError.recoverable) {
-                if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-                throw workflowError;
-              }
-              log(`pipeline[${index}] failed: ${workflowError.message}`);
-              return null;
+    return fanoutScope.run(batch, async () => {
+      const results: unknown[] = new Array(items.length);
+      let next = 0;
+      const runOne = async (index: number): Promise<void> => {
+        const item = items[index];
+        let value: unknown = item;
+        for (const stage of stages) {
+          try {
+            throwIfAborted();
+            value = await stage(value, item, index);
+            throwIfAborted();
+          } catch (error) {
+            if (isAborted()) throw error;
+            // Plain (non-WorkflowError) errors are script bugs in this stage —
+            // propagate them (M2), same rationale as parallel() above.
+            if (!isWorkflowError(error)) throw error;
+            const workflowError = error;
+            // Non-recoverable failures halt the whole run (see parallel()).
+            if (!workflowError.recoverable) {
+              if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
+              throw workflowError;
             }
+            log(`pipeline[${index}] failed: ${workflowError.message}`);
+            results[index] = null;
+            return;
           }
-          return value;
-        }),
-      ),
-    );
+        }
+        results[index] = value;
+      };
+      const worker = async (): Promise<void> => {
+        while (!batch.cancelled) {
+          const index = next++;
+          if (index >= items.length) return;
+          await runOne(index);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+      return results;
+    });
   };
 
   // Nested workflow(): run a saved workflow (or a raw script) inline, sharing this
@@ -2509,6 +2884,163 @@ export async function runWorkflow<T = unknown>(
     properties: { real: { type: "boolean" }, reason: { type: "string" } },
     required: ["real"],
   };
+
+  // ── P09: distinctModel second-logical-model cross-check machinery ──────────
+  // The cross-checker runs OUTSIDE the run's agent machinery (a direct
+  // ModelRuntime call: no agent slot, no journal entry, no shared.spent /
+  // tokenUsage charge — the economy-tier primary votes are never double-
+  // charged). The judge pass is ONE normal agent() call pinned to the distinct
+  // model, so its resume identity carries the distinct model through
+  // hashAgentCall's `model`/`tierModel` fields and a model change invalidates
+  // a cached judge result (a re-asked cross-check verdict that differs simply
+  // makes the judge call miss and everything downstream run live — the
+  // documented first-miss semantics, never a stale replay).
+
+  /** Structured verdict schema for the cross-check judge pass (boolean ruling). */
+  const CROSSCHECK_JUDGE_SCHEMA = {
+    type: "object",
+    properties: { verdict: { type: "boolean" }, reason: { type: "string" } },
+    required: ["verdict"],
+  };
+
+  /** Pick schema for judgePanel's top-2 judge pass (0 = panel's pick stands). */
+  const CROSSCHECK_PICK_SCHEMA = {
+    type: "object",
+    properties: { pick: { type: "number" }, reason: { type: "string" } },
+    required: ["pick"],
+  };
+
+  /**
+   * Machine-reported cross-check block attached to a quality helper's result
+   * when `distinctModel` is set AND the second model was reachable.
+   */
+  interface CrosscheckReport {
+    /** The distinct model spec the cross-check ran on. */
+    model: string;
+    /** The second model's parsed TRUE/FALSE verdict. */
+    verdict: boolean;
+    /** Whether the second model agreed with the primary verdict. */
+    agreement: boolean;
+    /** Whether a judge pass ran (only on disagreement). */
+    judged: boolean;
+    /** The adjudicated judge ruling (present when judged). */
+    judge?: { verdict: boolean; reason?: string };
+  }
+
+  /**
+   * One judge-pass agent() call on the distinct model. Tolerant of the failure
+   * classes a second-model pin can realistically hit: the tolerantVote set
+   * (SCHEMA_NONCOMPLIANCE / AGENT_EXECUTION_ERROR) PLUS MODEL_NOT_FOUND — the
+   * model may be reachable via ModelRuntime yet filtered out of the run's
+   * registry, and that must degrade to an honest flagged-but-unjudged outcome,
+   * never a run crash.
+   */
+  const runCrosscheckAgent = async (
+    prompt: string,
+    label: string,
+    schema: TSchema,
+    modelSpec: string,
+  ): Promise<Record<string, unknown> | null> => {
+    try {
+      const result = await agent(prompt, { label, schema, model: modelSpec, toolNames: [] });
+      if (result === null || typeof result !== "object" || Array.isArray(result)) return null;
+      return result as Record<string, unknown>;
+    } catch (error) {
+      if (
+        isWorkflowError(error) &&
+        (error.code === WorkflowErrorCode.SCHEMA_NONCOMPLIANCE ||
+          error.code === WorkflowErrorCode.AGENT_EXECUTION_ERROR ||
+          error.code === WorkflowErrorCode.MODEL_NOT_FOUND)
+      ) {
+        log(`${label} judge omitted (${error.code}): ${error.message}`);
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  /**
+   * Shared cross-check driver: ask the second model, compare, and on
+   * disagreement run the caller-supplied judge pass. Returns null when the
+   * second model is unavailable — the helper then falls back to its primary
+   * verdict (graceful fallback, never silent: the skip is logged).
+   */
+  const runDistinctModelCrosscheck = async (request: {
+    /** The independent question for the second model (no primary tally leaked). */
+    question: string;
+    /** The distinct model spec (provider/modelId). */
+    modelSpec: string;
+    /** The primary verdict the cross-check verdict is compared against. */
+    primaryVerdict: boolean;
+    /** Judge-pass label suffix (callSeq keeps it unique across invocations). */
+    label: string;
+    /** Judge-pass prompt builder; receives the cross-check verdict. */
+    judgePrompt: (crossVerdict: boolean) => string;
+    /** Judge-pass schema: CROSSCHECK_JUDGE_SCHEMA or CROSSCHECK_PICK_SCHEMA. */
+    judgeSchema: TSchema;
+    /** True when the judge schema reports { pick } instead of { verdict }. */
+    pickJudge: boolean;
+  }): Promise<CrosscheckReport | null> => {
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+      type: "quality",
+      stage: "start",
+      helper: "crosscheck",
+    });
+    try {
+      const reply = await modelCrosschecker.ask(request.question, request.modelSpec);
+      const crossVerdict = parseCrosscheckVerdict(reply);
+      if (crossVerdict === null) {
+        log(
+          `[crosscheck] second model ${request.modelSpec} unavailable (no usable reply); falling back to the primary verdict`,
+        );
+        return null;
+      }
+      if (crossVerdict === request.primaryVerdict) {
+        return { model: request.modelSpec, verdict: crossVerdict, agreement: true, judged: false };
+      }
+      log(
+        `[crosscheck] second model ${request.modelSpec} DISAGREES with the primary verdict ` +
+          `(${crossVerdict} vs ${request.primaryVerdict}); running a judge pass on ${request.modelSpec}`,
+      );
+      const judge = await runCrosscheckAgent(
+        request.judgePrompt(crossVerdict),
+        request.label,
+        request.judgeSchema,
+        request.modelSpec,
+      );
+      if (judge === null) {
+        return { model: request.modelSpec, verdict: crossVerdict, agreement: false, judged: false };
+      }
+      if (request.pickJudge) {
+        const pick = Number(judge.pick);
+        const reason = typeof judge.reason === "string" ? judge.reason : undefined;
+        if (!Number.isFinite(pick)) return null;
+        // pick 0 keeps the panel's winner (verdict true); pick 1 overrides it.
+        return {
+          model: request.modelSpec,
+          verdict: crossVerdict,
+          agreement: false,
+          judged: true,
+          judge: { verdict: Math.round(pick) !== 1, reason },
+        };
+      }
+      if (typeof judge.verdict !== "boolean") return null;
+      return {
+        model: request.modelSpec,
+        verdict: crossVerdict,
+        agreement: false,
+        judged: true,
+        judge: { verdict: judge.verdict, reason: typeof judge.reason === "string" ? judge.reason : undefined },
+      };
+    } finally {
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "quality",
+        stage: "end",
+        helper: "crosscheck",
+      });
+    }
+  };
+
   const verify = async (
     item: unknown,
     opts: {
@@ -2518,6 +3050,13 @@ export async function runWorkflow<T = unknown>(
       maxChars?: number;
       /** T2-04: model tier for the reviewer votes (default "small"). */
       tier?: string;
+      /**
+       * P09: run an independent second-model cross-check over the primary
+       * panel verdict and, on disagreement, a judge pass on this model
+       * (provider/modelId). Unavailable second model → graceful fallback to
+       * the primary verdict. Never part of the primary votes' economy tier.
+       */
+      distinctModel?: string;
     } = {},
   ) => {
     const callSeq = ++qualityCallSeq;
@@ -2557,12 +3096,37 @@ export async function runWorkflow<T = unknown>(
       )
     ).filter(Boolean) as Array<{ real?: boolean; reason?: string }>;
     const realCount = votes.filter((v) => v?.real).length;
-    const verdict = {
-      real: votes.length > 0 && realCount / votes.length >= threshold,
-      realCount,
-      total: votes.length,
-      votes,
-    };
+    const primaryReal = votes.length > 0 && realCount / votes.length >= threshold;
+    const verdict: {
+      real: boolean;
+      realCount: number;
+      total: number;
+      votes: Array<{ real?: boolean; reason?: string }>;
+      crossCheck?: CrosscheckReport;
+    } = { real: primaryReal, realCount, total: votes.length, votes };
+    if (opts.distinctModel) {
+      const distinctModel = opts.distinctModel;
+      const cross = await runDistinctModelCrosscheck({
+        question:
+          "Independently review whether the following is REAL/correct. Try to refute it; " +
+          "default to FALSE if unsure. Reply with exactly one word: TRUE or FALSE, then a colon " +
+          `and your reasoning.\n\nClaim:\n${claim}`,
+        modelSpec: distinctModel,
+        primaryVerdict: primaryReal,
+        label: `crosscheck ${callSeq}`,
+        judgePrompt: (crossVerdict) =>
+          `The primary review panel voted ${realCount}/${votes.length} that the claim below is REAL. ` +
+          `A second model (${distinctModel}) says ${crossVerdict ? "it is REAL" : "it is NOT real"}. ` +
+          `Adjudicate: is the claim REAL? Reply with { verdict: boolean, reason: string }.\n\nClaim:\n${claim}`,
+        judgeSchema: CROSSCHECK_JUDGE_SCHEMA,
+        pickJudge: false,
+      });
+      if (cross !== null) {
+        verdict.crossCheck = cross;
+        // The judge pass adjudicates: its ruling is the final verdict.
+        if (cross.judged && cross.judge) verdict.real = cross.judge.verdict;
+      }
+    }
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
       stage: "end",
@@ -2583,6 +3147,15 @@ export async function runWorkflow<T = unknown>(
       rubric?: string;
       /** T2-04: model tier for the judge votes (default "small"). */
       tier?: string;
+      /**
+       * P09: run an independent second-model cross-check over the panel's
+       * winning selection and, on disagreement, a top-2 judge pass on this
+       * model (provider/modelId) that may override the winner. Unavailable
+       * second model → graceful fallback to the panel's pick. Active only
+       * when at least two candidates were scored (a one-candidate panel has
+       * no alternative for the judge to pick).
+       */
+      distinctModel?: string;
     } = {},
   ) => {
     const callSeq = ++qualityCallSeq;
@@ -2631,6 +3204,51 @@ export async function runWorkflow<T = unknown>(
     if (best !== undefined) {
       for (const s of scored) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
     }
+    // P09: distinctModel cross-check of the panel's pick. Active when at least
+    // two candidates were scored so the top-2 judge pass has an alternative.
+    if (opts.distinctModel && best !== undefined && scored.length >= 2) {
+      const distinctModel = opts.distinctModel;
+      // Stable runner-up: highest score among the non-winners (index tie-break
+      // mirrors the winner rule so the selection is deterministic).
+      let runnerUp: { index: number; attempt: unknown; score: number; judgments: unknown[] } | undefined;
+      for (const s of scored) {
+        if (s === best) continue;
+        if (
+          runnerUp === undefined ||
+          s.score > runnerUp.score ||
+          (s.score === runnerUp.score && s.index < runnerUp.index)
+        ) {
+          runnerUp = s;
+        }
+      }
+      const winnerText = capEmbedded(best.attempt);
+      const runnerUpText = runnerUp ? capEmbedded(runnerUp.attempt) : undefined;
+      const cross = await runDistinctModelCrosscheck({
+        question:
+          `A scoring panel ranked candidates on: ${rubric}. Independently judge whether the winning ` +
+          `candidate below is genuinely the best. Reply with exactly one word: TRUE (it is the best) or ` +
+          `FALSE (it is not), then a colon and your reasoning.\n\nCandidate:\n${winnerText}`,
+        modelSpec: distinctModel,
+        primaryVerdict: true,
+        label: `crosscheck ${callSeq}`,
+        judgePrompt: (crossVerdict) =>
+          `The panel's winning candidate is shown below. A second model (${distinctModel}) says ` +
+          `${crossVerdict ? "the panel is right" : "the panel picked the WRONG candidate"}. ` +
+          `If the alternative candidate shown second is better, pick 1; if the panel's pick stands, pick 0. ` +
+          `Reply with { pick: number, reason: string }.\n\nPanel pick:\n${winnerText}` +
+          (runnerUpText ? `\n\nAlternative:\n${runnerUpText}` : ""),
+        judgeSchema: CROSSCHECK_PICK_SCHEMA,
+        pickJudge: true,
+      });
+      if (cross !== null) {
+        // judge.verdict === false means the judge picked the alternative
+        // (pick 1) — the runner-up replaces the panel's winner.
+        if (cross.judged && cross.judge && cross.judge.verdict === false && runnerUp !== undefined) {
+          best = { ...runnerUp };
+        }
+        (best as { crossCheck?: CrosscheckReport }).crossCheck = cross;
+      }
+    }
     safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
       type: "quality",
       stage: "end",
@@ -2649,8 +3267,9 @@ export async function runWorkflow<T = unknown>(
     items: unknown[];
     /** "dry": K consecutive successful empty rounds; "maxRounds": cap hit;
      * "capacity": budget/agent-limit exhaustion broke the loop; "failed": a
-     * round returned null/undefined. */
-    termination: "dry" | "maxRounds" | "capacity" | "failed";
+     * round returned null/undefined; "costSaturated": a round spent more than
+     * maxRoundCost while yielding zero NEW items (N03). */
+    termination: "dry" | "maxRounds" | "capacity" | "failed" | "costSaturated";
     /** How many rounds failed (returned null) before the loop stopped. */
     failedRounds: number;
   }
@@ -2660,18 +3279,41 @@ export async function runWorkflow<T = unknown>(
     key?: (item: unknown) => string;
     consecutiveEmpty?: number;
     maxRounds?: number;
+    /**
+     * N03: token ceiling for ONE round. When a round's recorded spend (the
+     * run's cumulative shared.spent delta across the awaited round — journaled
+     * facts, so deterministic) exceeds this cap AND the round produced zero NEW
+     * items (per the key dedup), the loop terminates with "costSaturated"
+     * instead of grinding to maxRounds/consecutiveEmpty. A round that produced
+     * new items never saturates; undefined disables the cap. Loop control
+     * only — NEVER part of any agent() call's resume identity (a resumed run
+     * replays cached calls at zero spend, the same "replay is free" class of
+     * divergence the run budget already documents).
+     */
+    maxRoundCost?: number;
   }): Promise<LoopUntilDryResult> => {
     if (!opts || typeof opts.round !== "function")
       throw new TypeError("loopUntilDry requires { round: (i) => items[] }");
     const key = opts.key ?? ((x: unknown) => JSON.stringify(x));
     const consecutiveEmpty = normalizeBoundedCount(opts.consecutiveEmpty, 2, Number.MAX_SAFE_INTEGER);
     const maxRounds = normalizeBoundedCount(opts.maxRounds, 50, Number.MAX_SAFE_INTEGER);
+    const maxRoundCost =
+      opts.maxRoundCost === undefined
+        ? undefined
+        : normalizeBoundedCount(opts.maxRoundCost, 1, Number.MAX_SAFE_INTEGER, "maxRoundCost");
     const seen = new Set<string>();
     const all: unknown[] = [];
     let dry = 0;
     let failedRounds = 0;
     let termination: LoopUntilDryResult["termination"] = "maxRounds";
     for (let r = 0; r < maxRounds; r++) {
+      // N03: the round's recorded spend is the run-wide shared.spent delta
+      // across the awaited round. In the common sequential-round shape the
+      // delta is exactly the round's tokens (journaled, deterministic); a
+      // round that also fires unrelated concurrent agent() calls would have
+      // their spend attributed here too — the honest reading of "the run
+      // spent this much while this round was in flight".
+      const spentBeforeRound = shared.spent;
       let items: unknown[] | null;
       try {
         items = (await opts.round(r)) ?? null;
@@ -2695,6 +3337,14 @@ export async function runWorkflow<T = unknown>(
       }
       const fresh = items.filter((x) => x != null && !seen.has(key(x)));
       if (!fresh.length) {
+        // N03: a zero-new-items round that overspent its per-round ceiling is
+        // saturation, not "dry" — grinding on would only burn more tokens for
+        // the same nothing. Checked before the dry counter so the termination
+        // reason is unambiguous.
+        if (maxRoundCost !== undefined && shared.spent - spentBeforeRound > maxRoundCost) {
+          termination = "costSaturated";
+          break;
+        }
         dry++;
         if (dry >= consecutiveEmpty) {
           termination = "dry";
@@ -3027,6 +3677,14 @@ export async function runWorkflow<T = unknown>(
       agreeThreshold?: number;
       /** T2-04: model tier for the panel votes (default "small"). */
       tier?: string;
+      /**
+       * P09: run an independent second-model cross-check over the panel's
+       * final side and, on disagreement, a judge pass on this model
+       * (provider/modelId) that adjudicates the split. Unavailable second
+       * model → graceful fallback to the panel's outcome. Never part of the
+       * panel votes' economy tier.
+       */
+      distinctModel?: string;
       arbitrator?: (context: {
         question: string;
         votes: Array<ConsensusVote | null>;
@@ -3042,6 +3700,7 @@ export async function runWorkflow<T = unknown>(
     rounds: number;
     omitted: number;
     arbitration?: unknown;
+    crossCheck?: CrosscheckReport;
   }> => {
     const callSeq = ++qualityCallSeq;
     if (typeof question !== "string" || !question.trim())
@@ -3072,6 +3731,10 @@ export async function runWorkflow<T = unknown>(
       // T2-04: panel votes are bounded true/false outputs — economy tier
       // unless the author overrides (arbitrator stays author-supplied).
       const voteTier = opts.tier ?? DEFAULT_HELPER_TIER;
+      let finalAgreed = false;
+      let finalVerdict: boolean | null = null;
+      let finalCount = 0;
+      let finalTotal = 0;
       for (let round = 1; round <= rounds; round++) {
         executedRounds = round;
         const votes = (await parallel(
@@ -3106,10 +3769,96 @@ export async function runWorkflow<T = unknown>(
           const no = valid.length - yes;
           const [value, count] = yes >= no ? [true, yes] : [false, no];
           if (count / valid.length >= threshold) {
-            return { agreed: true, verdict: value, count, total: valid.length, votes, rounds: executedRounds, omitted };
+            finalAgreed = true;
+            finalVerdict = value;
+            finalCount = count;
+            finalTotal = valid.length;
+            break;
           }
         }
       }
+      // Arbitration: runs only when the panel never reached the gate.
+      let arbitration: unknown;
+      if (!finalAgreed && opts.arbitrator !== undefined) {
+        arbitration = await opts.arbitrator({ question, votes: lastRound, rounds: executedRounds });
+      }
+      // The result shape mirrors the pre-P09 contract exactly (the agreement
+      // path returns that round's valid count; the disagreement path reports
+      // the last round's valid count and the panel's side is null unless the
+      // arbitrator supplied a boolean).
+      const validLast = lastRound.filter(
+        (vote): vote is ConsensusVote => vote !== null && typeof vote.verdict === "boolean",
+      );
+      const result: {
+        agreed: boolean;
+        verdict: boolean | null;
+        count: number;
+        total: number;
+        votes: Array<ConsensusVote | null>;
+        rounds: number;
+        omitted: number;
+        arbitration?: unknown;
+        crossCheck?: CrosscheckReport;
+      } = finalAgreed
+        ? {
+            agreed: true,
+            verdict: finalVerdict,
+            count: finalCount,
+            total: finalTotal,
+            votes: lastRound,
+            rounds: executedRounds,
+            omitted,
+          }
+        : {
+            agreed: false,
+            verdict: null,
+            count: 0,
+            total: validLast.length,
+            votes: lastRound,
+            rounds: executedRounds,
+            omitted,
+            ...(arbitration !== undefined ? { arbitration } : {}),
+          };
+      // P09: distinctModel cross-check. The primary side is the panel's verdict
+      // (or the arbitrator's boolean ruling, or the last round's majority).
+      if (opts.distinctModel) {
+        const distinctModel = opts.distinctModel;
+        let primaryVerdict: boolean | null = null;
+        if (finalAgreed && finalVerdict !== null) {
+          primaryVerdict = finalVerdict;
+        } else if (typeof arbitration === "boolean") {
+          primaryVerdict = arbitration;
+        } else if (validLast.length > 0) {
+          const yes = validLast.filter((vote) => vote.verdict).length;
+          primaryVerdict = yes >= validLast.length - yes;
+        }
+        if (primaryVerdict !== null) {
+          const cross = await runDistinctModelCrosscheck({
+            question:
+              `Independently decide whether you AGREE with the statement below. Reply with exactly one ` +
+              `word: TRUE (agree) or FALSE (disagree), then a colon and your reasoning.\n\nStatement:\n${statement}`,
+            modelSpec: distinctModel,
+            primaryVerdict,
+            label: `crosscheck ${callSeq}`,
+            judgePrompt: (crossVerdict) =>
+              `The statement below is under review. A panel concluded ${primaryVerdict ? "AGREE" : "DISAGREE"}; ` +
+              `a second model (${distinctModel}) says ${crossVerdict ? "AGREE" : "DISAGREE"}. ` +
+              `Adjudicate the split. Reply with { verdict: boolean, reason: string }.\n\nStatement:\n${statement}`,
+            judgeSchema: CROSSCHECK_JUDGE_SCHEMA,
+            pickJudge: false,
+          });
+          if (cross !== null) {
+            result.crossCheck = cross;
+            // A judged split is adjudicated: the judge's ruling is final.
+            if (cross.judged && cross.judge) {
+              result.agreed = true;
+              result.verdict = cross.judge.verdict;
+              result.count = 0;
+            }
+          }
+        }
+      }
+      return result;
     } finally {
       safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
         type: "quality",
@@ -3117,21 +3866,6 @@ export async function runWorkflow<T = unknown>(
         helper: "consensus",
       });
     }
-    const total = lastRound.filter((vote) => vote !== null && typeof vote.verdict === "boolean").length;
-    if (opts.arbitrator !== undefined) {
-      const arbitration = await opts.arbitrator({ question, votes: lastRound, rounds: executedRounds });
-      return {
-        agreed: false,
-        verdict: null,
-        count: 0,
-        total,
-        votes: lastRound,
-        rounds: executedRounds,
-        omitted,
-        arbitration,
-      };
-    }
-    return { agreed: false, verdict: null, count: 0, total, votes: lastRound, rounds: executedRounds, omitted };
   };
 
   // Thin bounded-retry / validation-gate combinators. Sugar over the for-loop +
@@ -3182,6 +3916,102 @@ export async function runWorkflow<T = unknown>(
       feedback = verdict?.feedback; // fed into the next attempt
     }
     return { ok: false, value: last, attempts };
+  };
+
+  // P01: machine-checked postcondition gate on top of gate()'s bounded-rework
+  // shape. The vm context injects NO host fs/exec, so machine postconditions
+  // CANNOT run host-side from a new vm global — each test runs as a SUBAGENT
+  // STEP (agent({ toolNames: ['bash'] | ['grep'], schema })) whose structured
+  // output is machine-validated (schema capture + exit-code capture) by pure
+  // JS predicates (never an LLM verdict). Acceptance is evidence-backed
+  // machine-validated subagent evidence; every failure is logged AND fed back
+  // into the next thunk attempt (bounded rework, mirroring gate()); exhaustion
+  // fails CLOSED with the captured per-test evidence. Resume-safe: each test
+  // is a real agent() call under a stable callSeq whose toolNames + schema are
+  // already hashAgentCall fields, so completed attempts replay from the journal
+  // exactly like gate()'s attempts.
+  const testGate = async (
+    thunk: (feedback: string | undefined, attempt: number) => Promise<unknown> | unknown,
+    opts: {
+      /**
+       * Machine-checked postcondition tests, each run as one subagent step.
+       * Required and non-empty (a testGate with no tests provides no evidence).
+       */
+      tests: TestGateTest[];
+      /** Optional prose descriptions of the required postconditions, fed into rework feedback. */
+      postconditions?: string[];
+      /** Bounded rework attempts (default DEFAULT_TEST_GATE_ATTEMPTS = 3). */
+      attempts?: number;
+      /** Tool the test subagent may use: "bash" (default) or "grep". */
+      tool?: TestGateTool;
+    },
+  ): Promise<{
+    ok: boolean;
+    value: unknown;
+    attempts: number;
+    tests: TestGateStepResult[];
+  }> => {
+    const callSeq = ++qualityCallSeq;
+    const attempts = normalizeBoundedCount(
+      opts.attempts,
+      DEFAULT_TEST_GATE_ATTEMPTS,
+      Number.MAX_SAFE_INTEGER,
+      "attempts",
+    );
+    const tool: TestGateTool = opts.tool ?? DEFAULT_TEST_GATE_TOOL;
+    const tests = validateTestGateTests(opts.tests, tool);
+    let feedback: string | undefined;
+    let last: unknown;
+    let lastResults: TestGateStepResult[] = [];
+    for (let i = 0; i < attempts; i++) {
+      last = await thunk(feedback, i);
+      const results: TestGateStepResult[] = [];
+      for (let t = 0; t < tests.length; t++) {
+        const test = tests[t];
+        const step = await tolerantVote(
+          buildTestGatePrompt(test, tool),
+          // testgate <attempt>.<test>.<callSeq> keeps the prefix stable across
+          // invocations while the trailing counter makes labels unique (L14).
+          `testgate ${i + 1}.${t + 1}.${callSeq}`,
+          TEST_GATE_OUTPUT_SCHEMA,
+          // T1-08: a machine test needs only its tool (bash/grep) + the schema tool.
+          { toolNames: [tool], tier: DEFAULT_HELPER_TIER },
+        );
+        const outcome = machineValidateTest(step, test.assert);
+        const exitCode =
+          step !== null && typeof step === "object" && typeof (step as { exitCode?: unknown }).exitCode === "number"
+            ? (step as { exitCode: number }).exitCode
+            : null;
+        const output =
+          step !== null && typeof step === "object" && typeof (step as { output?: unknown }).output === "string"
+            ? (step as { output: string }).output
+            : "";
+        const result: TestGateStepResult = {
+          command: test.command,
+          passed: outcome.passed,
+          detail: outcome.detail,
+          exitCode,
+          output: capTestGateOutput(output),
+        };
+        results.push(result);
+        if (!result.passed) {
+          // Never silent: every machine failure is logged with its evidence.
+          log(`testGate attempt ${i + 1} test ${t + 1} FAILED: ${outcome.detail} (command: ${test.command})`);
+        }
+      }
+      const accepted = results.length > 0 && results.every((result) => result.passed);
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, {
+        type: "control-attempt",
+        helper: "testGate",
+        attempt: i + 1,
+        accepted,
+      });
+      lastResults = results;
+      if (accepted) return { ok: true, value: last, attempts: i + 1, tests: results };
+      feedback = buildTestGateFeedback(results, opts.postconditions, i + 1);
+    }
+    // Fail closed: bounded rework exhausted, the evidence stays visible.
+    return { ok: false, value: last, attempts, tests: lastResults };
   };
 
   // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
@@ -3344,10 +4174,35 @@ export async function runWorkflow<T = unknown>(
     consensus,
     retry,
     gate,
+    // P01: machine-checked postcondition gate (subagent-step mechanism).
+    testGate,
     checkpoint,
     log,
     phase,
     ctx,
+    // P11: script-facing capability discovery over the captured subagent tool
+    // registry (see bindRunSubagentToolsDiscovery). Deterministic per run.
+    subagentTools: bindRunSubagentToolsDiscovery(options),
+    // P06: cross-run durable store (mesh-lite) — project-scoped, versioned KV
+    // persisted under getAgentDir() with atomic write + lock, injected like the
+    // other runtime globals so scripts get cross-run memory, a CAS task board,
+    // and the provenance ledger. The bind also registers the store as this
+    // run's provenance sink (host-side settle/finalize hooks resolve it by
+    // runId). Deterministic clock, idempotent writes — NEVER part of any
+    // agent() call's resume identity (MUST NOT join hashAgentCall).
+    durableStore: bindRunDurableStore(options),
+    // P02: run-scoped supervisor — after each work-agent settle an economy
+    // supervisor agent checks progress against a concrete measurable completion
+    // criterion; on drift/stall it injects ONE corrective agent; on verified
+    // completion it declares done. Every turn is a journaled positional agent()
+    // call (resume-safe), counting against the run budget like any agent.
+    supervisedRun: bindRunSupervisor({
+      controller: runSupervisor,
+      agent,
+      budget,
+      log,
+      onRuntimeEvent: (event) => safeCallback("onRuntimeEvent", options.onRuntimeEvent, event),
+    }),
     args: options.args,
     cwd: options.cwd ?? process.cwd(),
     process: Object.freeze({ cwd: () => options.cwd ?? process.cwd() }),
@@ -3433,6 +4288,10 @@ export async function runWorkflow<T = unknown>(
       // text both read this; absent when every agent succeeded (undefined keys
       // are JSON-dropped, keeping lenient runs' persisted shape unchanged).
       failedAgents: state.failedAgents.length > 0 ? state.failedAgents : undefined,
+      // QW4: structured-output recovery warnings observed on this run's live
+      // path (undefined when every schema agent called the tool cleanly).
+      structuredOutputWarnings:
+        shared.structuredOutputWarnings.length > 0 ? shared.structuredOutputWarnings : undefined,
       // E3: only surfaced when the prefix actually broke (finite), so an intact
       // run's result shape stays unchanged; a nested workflow() parent uses it
       // to cut its own prefix at the child's fork point (see workflowFn).
@@ -3738,6 +4597,12 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   // time instead of silently running ungated.
   if (value.gate !== undefined && value.gate !== "approve") {
     throw new Error('meta.gate must be "approve" when set');
+  }
+  if (value.outputs !== undefined) {
+    if (!Array.isArray(value.outputs)) throw new Error("meta.outputs must be an array of path strings");
+    if (value.outputs.some((p) => typeof p !== "string" || !p.trim())) {
+      throw new Error("meta.outputs must be an array of non-empty path strings");
+    }
   }
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
@@ -4200,6 +5065,77 @@ export function estimateTokensDetailed(value: unknown): { chars: number; segment
 export function estimateTokens(value: unknown): number {
   const { chars, segment } = estimateTokensDetailed(value);
   return Math.ceil(chars / TOKEN_ESTIMATE_SEGMENT_DIVISORS[segment]);
+}
+
+// ── P05: per-agent result cap (pure, replay-stable) ──────────────────────────
+
+/**
+ * Deterministic middle truncation for an oversized agent result (P05): keeps
+ * BOTH the head (context) and the tail (the conclusion — "tail-preserving")
+ * with a fixed omission marker, exactly like pi-fabric's truncateMiddle and
+ * mirroring capEmbedded's pure-function determinism (workflow.ts). Pure: the
+ * same input always yields the same output, so a journaled capped result
+ * replays byte-identically on resume.
+ */
+export function truncateAgentResultMiddle(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const marker = `\n\n… ${value.length - maxChars} characters omitted (agent result capped at ${maxChars}) …\n\n`;
+  const available = Math.max(0, maxChars - marker.length);
+  const head = Math.ceil(available / 2);
+  const tail = Math.floor(available / 2);
+  return `${value.slice(0, head)}${marker}${value.slice(value.length - tail)}`;
+}
+
+/** Result of capping one agent() output (P05). */
+export interface CappedAgentResult {
+  /** The bounded text (truncation marker + artifact suffix included), <= maxChars. */
+  text: string;
+  /** True when the original exceeded the budget and was truncated. */
+  truncated: boolean;
+  /** Length of the original full result. */
+  originalChars: number;
+  /** Characters omitted from the visible text (full length - body budget). */
+  omittedChars: number;
+  /** Artifact path appended to the text (present only when one was written). */
+  artifactPath?: string;
+}
+
+/**
+ * Cap an agent result string to `maxChars` (P05). When the artifact path is
+ * supplied the suffix note is counted inside the budget (body budget shrinks
+ * by the suffix length), so the final text never exceeds maxChars. Pure
+ * function of its inputs — deterministic, replay-stable.
+ */
+export function capAgentResultText(text: string, maxChars: number, artifactPath?: string): CappedAgentResult {
+  if (text.length <= maxChars) {
+    return { text, truncated: false, originalChars: text.length, omittedChars: 0 };
+  }
+  const suffix = artifactPath ? `\n\n[Full result (${text.length} chars) saved to: ${artifactPath}]` : "";
+  const bodyBudget = Math.max(1, maxChars - suffix.length);
+  const withSuffix = `${truncateAgentResultMiddle(text, bodyBudget)}${suffix}`;
+  return {
+    text: withSuffix.length <= maxChars ? withSuffix : truncateAgentResultMiddle(withSuffix, maxChars),
+    truncated: true,
+    originalChars: text.length,
+    omittedChars: Math.max(0, text.length - bodyBudget),
+    ...(artifactPath ? { artifactPath } : {}),
+  };
+}
+
+/**
+ * Resolve the effective result cap for one agent() call (P05): an explicit
+ * per-call/run-level null means "no cap", a positive finite number is the
+ * cap, and Infinity also means "no cap"; anything else falls back to the
+ * default (DEFAULT_MAX_AGENT_RESULT_CHARS). Pure — never part of any resume
+ * hash.
+ */
+export function resolveMaxAgentResultChars(value: number | null | undefined, fallback: number): number | null {
+  if (value === null) return null;
+  if (typeof value === "number") {
+    if (value === Infinity) return null;
+    if (Number.isFinite(value)) return value >= 1 ? Math.floor(value) : fallback;
+  }
+  return fallback;
 }
 
 function normalizeConcurrency(value: unknown): number {

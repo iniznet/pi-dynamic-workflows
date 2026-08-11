@@ -90,6 +90,9 @@ if (effectiveReviewers < reviewers) {
 }
 
 phase('Refute')
+// P12: the refute fan-out deliberately runs big headless batches (findings x
+// reviewers can reach 250) — autoApproved preserves the builtin's unattended
+// behavior under the fan-out approval gate.
 const judged = await parallel(findings.map((f, i) => () =>
   parallel(Array.from({ length: effectiveReviewers }, (_, r) => () =>
     agent(
@@ -98,7 +101,7 @@ const judged = await parallel(findings.map((f, i) => () =>
       'TASK: ' + task + '\\nFINDING: ' + f,
       { label: 'refute ' + (i + 1) + '.' + (r + 1), schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } }
     )
-  )).then((votes) => {
+  ), { autoApproved: true }).then((votes) => {
     // H6: a null vote (recoverable agent failure) is a FAILED vote, not a
     // missing one — it still occupies a reviewer slot, never counts as real,
     // and shrinks the survival ratio. Logged so silent reviewer loss is visible.
@@ -113,8 +116,7 @@ const judged = await parallel(findings.map((f, i) => () =>
     const ratio = votes.length ? realCount / votes.length : 0
     return { finding: f, realVotes: realCount, totalVotes: votes.length, survives: ratio >= threshold }
   })
-))
-
+), { autoApproved: true })
 const survivors = judged.filter((j) => j && j.survives)
 
 phase('Consensus')
@@ -160,9 +162,11 @@ export function generateMultiPerspectiveWorkflow(topic: string, perspectives: st
 
 phase('Perspective Analysis');
 const topic = ${JSON.stringify(topic)};
+// P12: caller-supplied perspectives can exceed the approval threshold headless —
+// autoApproved keeps the builtin's unattended behavior under the fan-out gate.
 const analyses = await parallel([
 ${perspectiveAgents}
-]);
+], { autoApproved: true });
 
 phase('Synthesis');
 const synthesis = await agent(

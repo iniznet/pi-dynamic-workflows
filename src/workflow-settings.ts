@@ -53,6 +53,14 @@ export interface WorkflowSettings {
   defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * P12: parallel()/pipeline() fan-out size above which a run pauses for
+   * human approval (TUI confirm) or, headless, aborts with WORKFLOW_ABORTED
+   * unless the script passes `autoApproved: true`. null disables the gate
+   * (a project override can wipe a global threshold); omitted → the default
+   * (FAN_OUT_APPROVAL_THRESHOLD_DEFAULT = 8).
+   */
+  fanOutApprovalThreshold?: number | null;
   /** Bottom task-panel display mode: "compact" (default, one line per run) | "detailed". */
   progressPanelMode?: "compact" | "detailed";
   /** Max agents shown per phase in detailed progress mode (default 8). */
@@ -70,6 +78,16 @@ export interface WorkflowSettings {
    * `summary`/`synthesis` fields are never truncated.
    */
   deliveredResultMaxChars?: number;
+  /**
+   * P05: default character cap on a single agent() result (unstructured text
+   * results only; DEFAULT_MAX_AGENT_RESULT_CHARS = 50_000 when unset). Results
+   * larger than this are tail-preservingly truncated at the workflow layer
+   * with the full text written to an artifact path; the capped output counts
+   * against the run budget. null explicitly disables the default cap (a
+   * project override can cancel a global cap). Per-call agent({ maxResultChars })
+   * and run-level overrides take precedence over this setting.
+   */
+  maxAgentResultChars?: number | null;
   /**
    * Extra tool names to deny in workflow subagent sessions, on top of the
    * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
@@ -179,8 +197,14 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   defaultAgentRetries: ["number"],
   progressPanelMode: ["string"],
   progressPanelMaxAgents: ["number"],
+  // P12: null disables the fan-out approval gate (tombstone, same style as
+  // defaultAgentTimeoutMs/defaultTokenBudget); a positive integer is a
+  // threshold.
+  fanOutApprovalThreshold: ["number", "null"],
   persistAgentSessions: ["boolean"],
   deliveredResultMaxChars: ["number"],
+  // P05: positive integer cap, or null to disable the default cap.
+  maxAgentResultChars: ["number", "null"],
   // null is a tombstone for "cleared": loading it normalizes to an empty list
   // (see normalizeSettings) so a project override can wipe a global exclusion
   // list instead of being schema-rejected.
@@ -384,6 +408,22 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
+  // P05: null tombstone cancels the default cap (project override); a positive
+  // integer sets the default per-agent result cap.
+  if (raw.maxAgentResultChars === null) {
+    settings.maxAgentResultChars = null;
+  } else {
+    const maxAgentResultChars = normalizeInteger(raw.maxAgentResultChars, 1, Number.MAX_SAFE_INTEGER);
+    if (maxAgentResultChars !== undefined) settings.maxAgentResultChars = maxAgentResultChars;
+  }
+  if (raw.fanOutApprovalThreshold === null) {
+    // Tombstone: an explicit null disables the fan-out approval gate (a
+    // project override can wipe a global threshold).
+    settings.fanOutApprovalThreshold = null;
+  } else {
+    const fanOutApprovalThreshold = normalizeInteger(raw.fanOutApprovalThreshold, 1, Number.MAX_SAFE_INTEGER);
+    if (fanOutApprovalThreshold !== undefined) settings.fanOutApprovalThreshold = fanOutApprovalThreshold;
+  }
   if (raw.excludeSubagentTools === null) {
     // Tombstone: a project override writes null to clear a global exclusion
     // list. Emitted as an explicit empty list so the spread-merge in

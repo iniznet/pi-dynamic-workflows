@@ -17,6 +17,7 @@
 import { type ChildProcess, execFile } from "node:child_process";
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { recordProvenance } from "./durable-store.js";
 
 export interface Worktree {
   /** True when a real worktree was created; false means "ran in the shared tree". */
@@ -36,6 +37,15 @@ export interface GitExecOptions {
   timeoutMs?: number;
   /** When aborted, the in-flight git child is SIGKILLed and the call rejects. */
   signal?: AbortSignal;
+  /**
+   * P06 provenance: the stable run identity whose durable-store ledger the
+   * worktree-finalize claim should be recorded into (resolved from the
+   * durable-store module registry; no-op when unset or no store is bound).
+   * The workflow runner's own finalize call site does not pass it (the
+   * manager records the same claim from onAgentEnd instead); direct callers
+   * and tests can wire it here.
+   */
+  provenanceRunId?: string;
 }
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -285,6 +295,22 @@ export async function finalizeWorktree(wt: Worktree, opts: GitExecOptions = {}):
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       return { ok: false, reason: `git ${step} failed: ${detail}` };
+    }
+  }
+  // P06 provenance at worktree finalize: a successful finalize IS the claim
+  // that this worktree's agent edits were committed (so teardown could never
+  // silently destroy them). Recorded into the run's durable-store ledger when
+  // a run identity is wired (see GitExecOptions.provenanceRunId). Best-effort
+  // — a durable-store failure must never fail the finalize.
+  if (opts.provenanceRunId) {
+    try {
+      await recordProvenance(opts.provenanceRunId, {
+        source: "worktree",
+        file: wt.cwd,
+        agent: wt.branch,
+      });
+    } catch {
+      // provenance is observability, not execution
     }
   }
   return { ok: true };

@@ -36,9 +36,10 @@ test("deep-research script enforces minSupport deterministically and routes to C
   assert.match(body, /const conflicts = \[/);
   assert.match(body, /underSupported\.map/);
   assert.match(body, /discarded\.map/);
-  // The report agent receives the Conflicts JSON, and the result returns it.
+  // The report agent receives the Conflicts JSON, and the result returns it
+  // (plus the N02 verification artifact).
   assert.match(body, /CONFLICTS JSON/);
-  assert.match(body, /return \{ question, queries, supported, conflicts, report \}/);
+  assert.match(body, /return \{ question, queries, supported, conflicts, report, verification \}/);
 });
 
 test("deep-research script caps the embedded source list before JSON.stringify (T1-03)", () => {

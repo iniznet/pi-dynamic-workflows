@@ -65,7 +65,7 @@ function expectError(key: keyof WorkflowSettings, raw: string): string {
 describe("FIELD_REGISTRY completeness", () => {
   it("has exactly one entry per WorkflowSettings key, mirroring WORKFLOW_ENV_VARS", () => {
     const registryKeys = FIELD_REGISTRY.map((field) => field.key);
-    assert.equal(registryKeys.length, 18, "registry must hold one row per settings key");
+    assert.equal(registryKeys.length, 20, "registry must hold one row per settings key");
     assert.deepEqual(
       new Set(registryKeys),
       new Set(Object.keys(WORKFLOW_ENV_VARS)),
@@ -135,6 +135,9 @@ describe("registry table conformance (design.md §3)", () => {
     assert.equal(fieldOf("persistAgentSessions").defaultDisplay, "false");
     assert.equal(fieldOf("deliveredResultMaxChars").defaultDisplay, "400");
     assert.equal(fieldOf("excludeSubagentTools").defaultDisplay, "[] (none)");
+    // P04 default flip: subagentExtensionTools defaults to on (fresh installs
+    // get the captured codegraph_*/web/vision research tools).
+    assert.equal(fieldOf("subagentExtensionTools").defaultDisplay, "on");
   });
 
   it("declares the four groups in order", () => {

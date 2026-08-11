@@ -263,4 +263,50 @@ describe("SubagentToolsAssembler", () => {
     assert.ok(tools.some((tool) => tool.name === "web_fetch_md"));
     assert.ok(!tools.some((tool) => tool.name === "web_docs_search"));
   });
+
+  test("createDiscovery composes the named-toolset surfaces into one queryable registry (P11)", async () => {
+    const assembler = makeAssembler(
+      makeManager(await mcpServerTools()),
+      "all",
+      [],
+      () => [fakeTool("chrome_snapshot")],
+      () => [fakeTool("web_fetch_md"), fakeTool("codegraph_search")],
+    );
+    const discovery = assembler.createDiscovery();
+    const all = await discovery.search();
+    const names = all.map((tool) => tool.name);
+    assert.ok(names.includes("read"), "host bundle is discoverable");
+    assert.ok(names.includes("mcp_svelte_get-docs"), "MCP defs are discoverable");
+    assert.ok(names.includes("web_fetch_md") && names.includes("codegraph_search"), "captured extension defs");
+    assert.ok(names.includes("chrome_snapshot"), "chrome defs are discoverable (per-task source)");
+    assert.ok(!names.includes("workflow") && !names.includes("workflow_control"), "denied names never surface");
+    // select() routes the research surface (host web_search + captured defs).
+    const research = await discovery.select("research");
+    assert.deepEqual(research.toolNames, ["web_search", "web_fetch_md", "codegraph_search"]);
+    assert.equal(research.toolset, undefined, "research spans host + extension — no single named toolset");
+  });
+
+  test("createDiscovery applies the MCP mode allowlist and excludeTools like the named toolsets", async () => {
+    const assembler = makeAssembler(
+      makeManager(await mcpServerTools()),
+      ["mcp_svelte_read-resource"],
+      ["web_fetch_md"],
+      undefined,
+      () => [fakeTool("web_fetch_md")],
+    );
+    const all = await assembler.createDiscovery().search();
+    const names = all.map((tool) => tool.name);
+    assert.ok(names.includes("mcp_svelte_read-resource"));
+    assert.ok(!names.includes("mcp_svelte_get-docs"), "MCP allowlist applies to discovery");
+    assert.ok(!names.includes("web_fetch_md"), "excludeTools applies to discovery");
+  });
+
+  test("createDiscovery with no suppliers reports host defs only and never throws", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), []);
+    const all = await assembler.createDiscovery().search();
+    assert.deepEqual(
+      all.map((tool) => tool.name),
+      HOST_TOOLS.map((tool) => tool.name),
+    );
+  });
 });

@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   applyEnvSettingsOverride,
+  DEFAULT_SUBAGENT_EXTENSION_TOOLS,
   MAX_AGENT_RETRIES,
   MAX_CONCURRENCY,
   normalizeKeywordTriggerWord,
@@ -111,6 +112,14 @@ test("subagentTools env accepts the all literal or a comma-separated allowlist",
   for (const garbage of ["", "  "]) {
     assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentTools]: garbage }), {});
   }
+});
+
+test("subagentExtensionTools default is on (P04 default-flip knob)", () => {
+  // The single knob shared by the runtime gate (extensions/workflow.ts
+  // `?? DEFAULT_SUBAGENT_EXTENSION_TOOLS`) and the settings UI default display
+  // (workflow-settings-fields.ts). Fresh installs get the captured research
+  // tools (codegraph_*/web/vision) unless the user opts out with off.
+  assert.equal(DEFAULT_SUBAGENT_EXTENSION_TOOLS, "on");
 });
 
 test("subagentExtensionTools env accepts on|off or a comma-separated known-source allowlist", () => {
@@ -216,6 +225,8 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "progressPanelMaxAgents",
     "persistAgentSessions",
     "deliveredResultMaxChars",
+    "maxAgentResultChars",
+    "fanOutApprovalThreshold",
     "excludeSubagentTools",
     "subagentHostTools",
     "subagentTools",

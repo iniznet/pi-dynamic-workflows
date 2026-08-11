@@ -12,7 +12,9 @@
 import {
   DEFAULT_AGENT_TIMEOUT_MS,
   DEFAULT_KEYWORD_TRIGGER_WORD,
+  DEFAULT_SUBAGENT_EXTENSION_TOOLS,
   DEFAULT_TOKEN_BUDGET,
+  FAN_OUT_APPROVAL_THRESHOLD_DEFAULT,
   MAX_AGENT_RETRIES,
   MAX_CONCURRENCY,
   normalizeKeywordTriggerWord,
@@ -66,7 +68,7 @@ export interface WorkflowSettingsField {
 }
 
 /**
- * The 17 settings rows, in UI render order. Bounds/options/defaults are the
+ * The settings rows, in UI render order. Bounds/options/defaults are the
  * verified load-path semantics: normalizeSettings (ws:233-298), the cfg env
  * clamps (cfg:130-166), and the documented runtime fallbacks.
  */
@@ -189,6 +191,25 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     envVar: WORKFLOW_ENV_VARS.deliveredResultMaxChars,
   },
   {
+    // P05: per-agent result cap — the runtime default for agent() results
+    // (unstructured text only). Bounds what a single agent can deliver to the
+    // script and into synthesis context; the full text is written to an
+    // artifact path under .pi/workflows/artifacts when truncated, and the
+    // capped output counts against the run budget. null/empty = no default
+    // cap (a project override can cancel a global cap). Mirrors
+    // normalizeSettings (workflow-settings.ts) + the env clamp (config.ts).
+    key: "maxAgentResultChars",
+    type: "number",
+    label: "Max agent result chars",
+    help: "Char cap on a single agent() result (unstructured text only), clamped to [1, 2^53-1]. Larger results are tail-preservingly truncated and the full text is written to an artifact path; capped output counts against the run budget. null/empty disables the default cap (50000). Per-call agent({ maxResultChars }) wins.",
+    min: 1,
+    max: Number.MAX_SAFE_INTEGER,
+    group: "Advanced",
+    defaultDisplay: "50000",
+    envVar: WORKFLOW_ENV_VARS.maxAgentResultChars,
+    nullable: true,
+  },
+  {
     key: "excludeSubagentTools",
     type: "string[]",
     label: "Exclude subagent tools",
@@ -196,6 +217,23 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     group: "Advanced",
     defaultDisplay: "[] (none)",
     envVar: WORKFLOW_ENV_VARS.excludeSubagentTools,
+  },
+  {
+    // P12: fan-out approval gate knob. null disables the gate entirely (a
+    // project override can wipe a global threshold); a positive integer is
+    // the fan-out size above which parallel()/pipeline() pause for human
+    // approval (TUI) or abort WORKFLOW_ABORTED headless unless the script
+    // passes autoApproved: true. Mirrors the plan-approval step limit so the
+    // two "big plan" rules read consistently.
+    key: "fanOutApprovalThreshold",
+    type: "number",
+    label: "Fan-out approval threshold",
+    help: "parallel()/pipeline() fan-outs beyond this many items require human approval: TUI runs pause via a checkpoint confirm; headless runs throw WORKFLOW_ABORTED unless the script passes autoApproved: true. null disables the gate.",
+    min: 1,
+    group: "Advanced",
+    defaultDisplay: FAN_OUT_APPROVAL_THRESHOLD_DEFAULT.toString(),
+    envVar: WORKFLOW_ENV_VARS.fanOutApprovalThreshold,
+    nullable: true,
   },
   {
     key: "subagentHostTools",
@@ -230,9 +268,12 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     key: "subagentExtensionTools",
     type: "string[]",
     label: "Subagent extension tools",
-    help: "Host-captured third-party extension tools for subagents: on (opt-in, captures tools from every installed source — supi-web, pi-codegraph, pi-vision-handoff), a comma-separated allowlist of exact source ids, or off (default). Empty clears. See /workflows-subagent-tools for the live toolset.",
+    help: `Host-captured third-party extension tools for subagents: on (default, captures tools from every installed source — supi-web, pi-codegraph, pi-vision-handoff), a comma-separated allowlist of exact source ids, or off. Empty clears. See /workflows-subagent-tools for the live toolset.`,
     group: "Advanced",
-    defaultDisplay: "off",
+    // P04 default flip: fresh installs get codegraph_*/web/vision in subagents
+    // (untagged default merge + every pattern's task-fit toolset + the
+    // "code-dev" superset). Off restores the pre-flip behavior (no defs).
+    defaultDisplay: DEFAULT_SUBAGENT_EXTENSION_TOOLS,
     envVar: WORKFLOW_ENV_VARS.subagentExtensionTools,
   },
   {

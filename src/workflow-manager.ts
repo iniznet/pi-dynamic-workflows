@@ -7,12 +7,25 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type AgentUsage, usageComponentsTotal, type WorkflowAgent } from "./agent.js";
+import type { SubagentToolDiscovery } from "./discovery.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
+import { closeRunDurableStore, recordProvenance, runDurableStore } from "./durable-store.js";
 import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { resolvePersistenceFs, unlinkIfExistsSafe } from "./fs-persistence.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
 import { compactJournal, verifyJournalCompaction } from "./journal-compaction.js";
 import { DEFAULT_MAX_LOG_ENTRIES, pushBoundedLog } from "./logger.js";
 import { createMemoizedLoadModelTierConfig } from "./model-tier-config.js";
+import type {
+  PhaseStage,
+  ScopeViolationRecord,
+  WorkspaceFingerprint,
+  WorkspaceScopeCheck,
+} from "./phases/state-machine.js";
+
+export type { WorkspaceFingerprint } from "./phases/state-machine.js";
+
+import { DEFAULT_MAX_AGENT_RESULT_CHARS } from "./config.js";
 import {
   buildResumeJournal,
   capJournalBudget,
@@ -31,6 +44,7 @@ import {
   type RunStatus,
   renewRunLease,
 } from "./run-persistence.js";
+import { runReportPath, writeRunReport } from "./run-report.js";
 import {
   type AgentKillChannel,
   type CheckpointGate,
@@ -44,6 +58,7 @@ import {
 } from "./workflow.js";
 import type { KillAgentResult } from "./workflow-damage-control.js";
 import { reconcileAgentAfterKill } from "./workflow-damage-control.js";
+import { workflowProjectPaths } from "./workflow-paths.js";
 import { gitExec, pruneWorktrees } from "./worktree.js";
 
 interface ManagedRunBase {
@@ -333,6 +348,13 @@ export interface ExecOptions {
   /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
   agentTimeoutMs?: number | null;
   /**
+   * P05: per-run default for the agent() result cap (unstructured text only;
+   * see WorkflowManagerOptions.defaultMaxAgentResultChars). null disables the
+   * cap for this run; omitted falls back to the manager default. Frozen at run
+   * start like agentTimeoutMs.
+   */
+  maxAgentResultChars?: number | null;
+  /**
    * Drain-side grace period in milliseconds (H1): how long this run's
    * completion may wait for outstanding (possibly un-awaited) agent() calls to
    * settle before aborting them via the run-fatal controller and completing
@@ -373,6 +395,14 @@ export interface ExecOptions {
   /** Resolve a checkpoint() question with a human reply (only for UI-bearing runs). */
   confirm?: (promptText: string, options: unknown) => Promise<unknown>;
   /**
+   * P12: parallel()/pipeline() fan-out size above which a run pauses for
+   * human approval (TUI confirm / checkpointGate) or, headless, throws
+   * WORKFLOW_ABORTED unless the script passes autoApproved: true. Resolved by
+   * the tool from the fanOutApprovalThreshold settings key; threaded into
+   * runWorkflow. undefined → the run's default; null → gate disabled.
+   */
+  fanOutApprovalThreshold?: number | null;
+  /**
    * Optional visual approve/deny gate for checkpoint() (e.g. the plannotator
    * SSE bridge). Threaded into runWorkflow; absent → checkpoint() keeps its
    * default headless/confirm behavior. Additive: no existing caller regresses.
@@ -391,6 +421,12 @@ export interface ExecOptions {
    */
   phaseState?: PhaseStateIntegration;
   /**
+   * N01: per-run workspace-scope enforcement mode override (wins over the
+   * manager option and the PI_WORKFLOW_WORKSPACE_SCOPE_ENFORCE env var). See
+   * WorkflowManagerOptions.workspaceScopeEnforce for the mode semantics.
+   */
+  workspaceScopeEnforce?: WorkspaceScopeEnforceMode;
+  /**
    * Whether this run is eligible for auto-resume when it pauses on a provider
    * usage limit. Default-on: omit or pass true to stay eligible, pass false to
    * opt out. Persisted on the run so a cold-start UsageLimitScheduler respects
@@ -408,6 +444,12 @@ export interface ExecOptions {
    * to today's shape. See journal-compaction.ts.
    */
   compactJournal?: boolean;
+  /**
+   * P11: script-facing capability discovery for THIS execution (wins over the
+   * manager-level discovery). The run resolves it against the run's own tools;
+   * absent → the manager's discovery, else runWorkflow's run-tools fallback.
+   */
+  subagentToolDiscovery?: SubagentToolDiscovery;
   /**
    * Seed for the execution's cumulative token counters — passed through to
    * runWorkflow's WorkflowRunOptions.initialTokenUsage. Only resume() sets
@@ -460,6 +502,16 @@ export interface WorkflowManagerOptions {
   sessionId?: string;
   /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
+  /**
+   * P05: default character cap on a single agent() result (unstructured text
+   * only), applied to runs that don't pass their own maxAgentResultChars.
+   * null explicitly disables the default cap; omitted uses
+   * DEFAULT_MAX_AGENT_RESULT_CHARS (50_000). Larger results are
+   * tail-preservingly truncated at the workflow layer with the full text
+   * written to an artifact path; the capped output counts against the run
+   * budget. Never part of any agent() resume hash.
+   */
+  defaultMaxAgentResultChars?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
@@ -494,6 +546,13 @@ export interface WorkflowManagerOptions {
    * other recursive-orchestration tools (#107).
    */
   excludeSubagentTools?: string[];
+  /**
+   * P11: script-facing capability discovery over the captured subagent tool
+   * registry (the extension wires the assembler's createDiscovery()). Passed
+   * into every run; the execution wraps it with the run's resolved tool names.
+   * Absent → runWorkflow builds a fallback from the run's own tools.
+   */
+  subagentToolDiscovery?: SubagentToolDiscovery;
   /**
    * Persist each subagent transcript as a real pi session file under the
    * standard sessions directory. Default false (in-memory, discarded).
@@ -534,6 +593,16 @@ export interface WorkflowManagerOptions {
    * waiting out the full TTL (F01).
    */
   leaseRenewIntervalMs?: number;
+  /**
+   * N01: workspace-scope enforcement mode for phase-gated runs. Default
+   * "flag" (diagnostic-only: violations are recorded with the phase state and
+   * surfaced on the run log, never failing the run). "reject" fails closed
+   * (headless automation), "confirm" routes violations through the run's
+   * `confirm` handler (TUI), "off" disables the assertion entirely. Falls
+   * back to the PI_WORKFLOW_WORKSPACE_SCOPE_ENFORCE env var, then "flag".
+   * See WorkspaceScopeEnforceMode for the full documented policy.
+   */
+  workspaceScopeEnforce?: WorkspaceScopeEnforceMode;
 }
 
 /** Options that a fresh extension generation may safely refresh on a live
@@ -544,12 +613,14 @@ export type WorkflowManagerReloadOptions = Pick<
   | "concurrency"
   | "loadSavedWorkflow"
   | "defaultAgentTimeoutMs"
+  | "defaultMaxAgentResultChars"
   | "defaultAgentRetries"
   | "defaultTokenBudget"
   | "defaultTokenBudgetCountsCacheRead"
   | "toolsets"
   | "defaultTools"
   | "excludeSubagentTools"
+  | "subagentToolDiscovery"
   | "persistAgentSessions"
 >;
 
@@ -636,6 +707,208 @@ function journalSideKey(entry: JournalEntry): string {
  */
 function isProviderSaturated(error: unknown): error is WorkflowError {
   return error instanceof WorkflowError && error.code === WorkflowErrorCode.PROVIDER_SATURATED;
+}
+
+// ── N01: workspace change-scope fingerprint (host side, where fs/git exist) ──
+
+/**
+ * Parse one `git status --porcelain` line into its status code and path.
+ * Handles rename/copy entries (`R  old -> new` keeps the ORIGIN path — the
+ * file that was removed), unquotes quoted paths, and normalizes separators so
+ * the machine diff is stable across platforms. Pure.
+ */
+export function parseGitStatusLine(line: string): { xy: string; path: string } {
+  const xy = line.slice(0, 2);
+  const rest = line.slice(3);
+  const arrow = rest.indexOf(" -> ");
+  const path = arrow >= 0 ? rest.slice(0, arrow) : rest;
+  return { xy, path: path.replace(/"/g, "").replace(/\\/g, "/") };
+}
+
+/**
+ * N01: capture a workspace fingerprint at a phase boundary. READ-ONLY git
+ * (rev-parse + status --porcelain) — never stages/commits/resets, so it cannot
+ * interfere with worktree isolation or mutate the tree it is measuring.
+ * Outside a git repo (or on any git failure) it degrades to a null tree hash
+ * and an empty status list rather than throwing, so non-git workspaces still
+ * get a forward-only snapshot log.
+ */
+export async function captureWorkspaceFingerprint(cwd: string, phase: PhaseStage): Promise<WorkspaceFingerprint> {
+  let treeHash: string | null = null;
+  try {
+    treeHash = (await gitExec(["-C", cwd, "rev-parse", "HEAD^{tree}"])).trim() || null;
+  } catch {
+    treeHash = null;
+  }
+  let gitStatus: string[] = [];
+  try {
+    // -uall: list untracked files INDIVIDUALLY. Plain `status --porcelain`
+    // collapses an untracked directory into one `?? dir/` line, which would
+    // make the scope diff blind to which file inside it changed — a declared
+    // output at docs/out.md would show up as a violation "added: docs/" (and
+    // a sneaky sibling would hide inside the same line). With -uall each path
+    // is exact, so workspaceScopeViolations' exact/prefix matching is precise.
+    const out = await gitExec(["-C", cwd, "status", "--porcelain", "-uall"]);
+    gitStatus = out.split(/\r?\n/).filter((line) => line.length > 0);
+  } catch {
+    gitStatus = [];
+  }
+  return { phase, treeHash, gitStatus };
+}
+
+/** Machine diff between two phase-boundary fingerprints (N01). */
+export interface WorkspaceScopeDiff {
+  /** Paths present in `after` but absent from `before`. */
+  added: string[];
+  /** Paths present in `before` but absent from `after` (incl. rename origins). */
+  removed: string[];
+  /** Paths present in both whose status code changed (untracked → modified, etc.). */
+  modified: string[];
+  /** Whether the committed tree baseline itself changed (a commit landed). */
+  treeHashChanged: boolean;
+}
+
+/**
+ * Diff two phase-boundary fingerprints into a machine-readable change set
+ * (N01): added/removed/modified paths plus a tree-baseline-change flag. Pure —
+ * the scope assertion (`workspaceScopeViolations`) and host gates consume it.
+ */
+export function diffWorkspaceFingerprints(
+  before: WorkspaceFingerprint,
+  after: WorkspaceFingerprint,
+): WorkspaceScopeDiff {
+  const beforeMap = new Map(
+    before.gitStatus.map((line) => {
+      const parsed = parseGitStatusLine(line);
+      return [parsed.path, parsed.xy] as const;
+    }),
+  );
+  const afterMap = new Map(
+    after.gitStatus.map((line) => {
+      const parsed = parseGitStatusLine(line);
+      return [parsed.path, parsed.xy] as const;
+    }),
+  );
+  const added: string[] = [];
+  const modified: string[] = [];
+  for (const [path, xy] of afterMap) {
+    if (!beforeMap.has(path)) added.push(path);
+    else if (beforeMap.get(path) !== xy) modified.push(path);
+  }
+  const removed: string[] = [];
+  for (const path of beforeMap.keys()) {
+    if (!afterMap.has(path)) removed.push(path);
+  }
+  return {
+    added: added.sort(),
+    removed: removed.sort(),
+    modified: modified.sort(),
+    treeHashChanged: before.treeHash !== null && after.treeHash !== null && before.treeHash !== after.treeHash,
+  };
+}
+
+/**
+ * N01 scope assertion: every path that changed between two phase-boundary
+ * fingerprints must be within the intended set. Returns the violating change
+ * descriptions (empty = "only intended files changed"). `allowed` is the set
+ * of paths the phase was permitted to touch; untracked artifacts the pipeline
+ * itself writes should be listed there by the caller. Paths ending with "/"
+ * are SUBTREE prefixes (they allow everything under that directory — e.g.
+ * ".pi/" covers the phase machine's own active-state.json, plans, artifacts,
+ * and runs dirs without enumerating them); all other entries are exact-path
+ * allows. Paths are matched as reported by `git status --porcelain` (relative
+ * to the run's cwd, "/"-separated).
+ */
+export function workspaceScopeViolations(
+  diff: WorkspaceScopeDiff,
+  allowed: ReadonlySet<string> | readonly string[],
+): string[] {
+  const rawSet = allowed instanceof Set ? allowed : new Set(allowed);
+  const prefixes: string[] = [];
+  const exact = new Set<string>();
+  for (const entry of rawSet) {
+    if (entry.endsWith("/")) prefixes.push(entry.slice(0, -1));
+    else exact.add(entry);
+  }
+  const isAllowed = (path: string) =>
+    exact.has(path) || prefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+  const violations: string[] = [];
+  for (const path of diff.added) if (!isAllowed(path)) violations.push(`added: ${path}`);
+  for (const path of diff.removed) if (!isAllowed(path)) violations.push(`removed: ${path}`);
+  for (const path of diff.modified) if (!isAllowed(path)) violations.push(`modified: ${path}`);
+  return violations;
+}
+
+// ── N01: workspace-scope ENFORCEMENT policy (flag / reject / ui.confirm) ──
+
+/**
+ * Env var for the workspace-scope enforcement mode (headless/CI channel).
+ * Values: "flag" (default), "reject", "confirm", "off". Kept local to the
+ * manager — the extension wires the same knob via WorkflowManagerOptions /
+ * ExecOptions — so a documented headless opt-in needs no new public export.
+ */
+const WORKFLOW_SCOPE_ENFORCE_ENV = "PI_WORKFLOW_WORKSPACE_SCOPE_ENFORCE";
+
+/**
+ * N01 enforcement modes (documented policy — see the enforcer below):
+ *
+ *  - `"flag"`  (DEFAULT): violations are computed at every phase boundary,
+ *    recorded into the phase state (`scopeViolations` sidecar, forward-only)
+ *    and surfaced on the run's live log. NEVER fails the run — matches the
+ *    original N01 design promise ("capture is diagnostic, best-effort") and
+ *    keeps every existing phase-gated run byte-identical in behavior while
+ *    making the capture+diff machinery actually observable.
+ *  - `"reject"` (fail-closed, for headless automation): the violating
+ *    boundary transition throws WORKSPACE_SCOPE_VIOLATION and the run settles
+ *    failed. Deterministic: the violation is persisted, so a resume re-rejects
+ *    at the same boundary until the script's declared outputs (or the
+ *    offending files) change.
+ *  - `"confirm"` (ui.confirm, for UI-bearing runs): each violation batch is
+ *    surfaced via the run's `confirm` handler; approval proceeds (recorded as
+ *    approved), denial rejects exactly like `"reject"`.
+ *  - `"off"`     : no assertion at all — capture persists as before, but the
+ *    diff is never computed (full opt-out).
+ *
+ * Opt-out / opt-in surfaces: `WorkflowManagerOptions.workspaceScopeEnforce`,
+ * per-run `ExecOptions.workspaceScopeEnforce`, and the env var above
+ * (precedence: exec override > manager option > env > "flag").
+ */
+export type WorkspaceScopeEnforceMode = "flag" | "reject" | "confirm" | "off";
+
+/**
+ * Resolve an arbitrary value into a WorkspaceScopeEnforceMode with the same
+ * drop-on-violation leniency as the env settings layer: unknown/garbage values
+ * fall back to the default ("flag") so a misconfigured CI env can never crash
+ * the manager — it just runs diagnostic-only. Pure; exported for tests.
+ */
+export function resolveWorkspaceScopeEnforceMode(value: unknown): WorkspaceScopeEnforceMode {
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "reject" || normalized === "confirm" || normalized === "off" || normalized === "flag") {
+      return normalized;
+    }
+  }
+  return "flag";
+}
+
+/**
+ * Build the intended-path set a phase boundary is asserted against: the
+ * workflow system's own runtime dirs (`.pi/` — active-state.json, plans,
+ * artifacts, runs, saved — always allowed) plus the script's DECLARED outputs
+ * (`meta.outputs`, exact paths or "/"-suffixed dirs). Paths are normalized to
+ * git-porcelain form: leading "./" stripped, separators unified to "/",
+ * empties dropped. Pure; exported for tests. Never part of any agent() resume
+ * hash — the enforcer is host-side only.
+ */
+export function workspaceScopeAllowedPaths(declared: readonly string[] | undefined): string[] {
+  const normalize = (raw: string): string | undefined => {
+    let path = raw.trim().replace(/\\/g, "/");
+    while (path.startsWith("./")) path = path.slice(2);
+    if (path.startsWith("/") || path === "" || path === ".") return undefined;
+    return path;
+  };
+  const outputs = (declared ?? []).map(normalize).filter((p): p is string => p !== undefined);
+  return [".pi/", ...outputs];
 }
 
 /**
@@ -811,6 +1084,7 @@ export class WorkflowManager extends EventEmitter {
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
+  private defaultMaxAgentResultChars: number | null;
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
   /** T1-01 budget-gate knob default (see WorkflowManagerOptions). */
@@ -818,7 +1092,10 @@ export class WorkflowManager extends EventEmitter {
   private toolsets?: Record<string, () => ToolDefinition[] | Promise<ToolDefinition[]>>;
   private defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
   private excludeSubagentTools?: string[];
+  private subagentToolDiscovery?: SubagentToolDiscovery;
   private persistAgentSessions: boolean;
+  /** N01 workspace-scope enforcement mode (see WorkflowManagerOptions). */
+  private workspaceScopeEnforce: WorkspaceScopeEnforceMode;
 
   constructor(options: WorkflowManagerOptions = {}) {
     super();
@@ -830,6 +1107,7 @@ export class WorkflowManager extends EventEmitter {
     this.modelRegistry = options.modelRegistry;
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultMaxAgentResultChars = options.defaultMaxAgentResultChars ?? DEFAULT_MAX_AGENT_RESULT_CHARS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
@@ -837,6 +1115,10 @@ export class WorkflowManager extends EventEmitter {
     this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    // N01: manager option wins; else the headless/CI env channel; else the
+    // diagnostic-only default ("flag") — see WorkspaceScopeEnforceMode.
+    this.workspaceScopeEnforce =
+      options.workspaceScopeEnforce ?? resolveWorkspaceScopeEnforceMode(process.env[WORKFLOW_SCOPE_ENFORCE_ENV]);
     this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
     this.maxPausedRunsInMemory = options.maxPausedRunsInMemory ?? DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY;
     this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
@@ -909,12 +1191,14 @@ export class WorkflowManager extends EventEmitter {
     this.concurrency = options.concurrency ?? 8;
     this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultMaxAgentResultChars = options.defaultMaxAgentResultChars ?? DEFAULT_MAX_AGENT_RESULT_CHARS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
     this.toolsets = options.toolsets;
     this.defaultTools = options.defaultTools;
     this.excludeSubagentTools = options.excludeSubagentTools;
+    this.subagentToolDiscovery = options.subagentToolDiscovery;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
   }
 
@@ -1171,6 +1455,7 @@ export class WorkflowManager extends EventEmitter {
       resumeJournal,
       maxAgents,
       agentTimeoutMs,
+      maxAgentResultChars,
       drainTimeoutMs,
       externalSignal,
       onProgress,
@@ -1181,6 +1466,7 @@ export class WorkflowManager extends EventEmitter {
       retryOnlyIfSpendUnder,
       confirm,
       checkpointGate,
+      fanOutApprovalThreshold,
       pipeline,
       phaseState,
       tools,
@@ -1203,6 +1489,13 @@ export class WorkflowManager extends EventEmitter {
         : agentTimeoutMs !== undefined
           ? agentTimeoutMs
           : this.defaultAgentTimeoutMs;
+    // P05: the per-execution agent-result cap (explicit exec value wins, else
+    // the manager default). Deliberately NOT frozen on the managed run (see
+    // ExecOptions.maxAgentResultChars — a pure behavior knob, like
+    // retryBackoffMs): the cap is baked into every journaled result, so resume
+    // replays capped bytes whatever this execution resolves.
+    const resolvedMaxAgentResultChars =
+      maxAgentResultChars !== undefined ? maxAgentResultChars : this.defaultMaxAgentResultChars;
     const resolvedConcurrency =
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
@@ -1265,6 +1558,20 @@ export class WorkflowManager extends EventEmitter {
     // the execution settles (success or failure); a pause()/stop() that already
     // released the lease makes later ticks no-op via the status/isCurrent gates.
     this.armLeaseHeartbeat(managed);
+    // N01: workspace change-scope fingerprint — attach the host-side capture
+    // (read-only tree hash + git status) to the run's persisted phase state
+    // machine so every phase boundary records a forward-only snapshot
+    // alongside active-state.json. The machine holds ONE provider (idempotent
+    // overwrite), shared across runs on this manager; the capture degrades
+    // gracefully outside a git repo. The scope ENFORCER rides the same hook:
+    // after each boundary's snapshot lands, the manager asserts the change
+    // set against the run's declared outputs + artifact dirs and applies the
+    // documented flag/reject/confirm policy (see enforceWorkspaceScope). Both
+    // stay host-side — never part of any agent() resume hash.
+    if (phaseState?.stateManager) {
+      phaseState.stateManager.setFingerprintCapture((phase) => captureWorkspaceFingerprint(this.cwd, phase));
+      phaseState.stateManager.setScopeEnforcer((check) => this.enforceWorkspaceScope(managed, script, exec, check));
+    }
     try {
       const result = await runWorkflow(script, {
         cwd: this.cwd,
@@ -1300,12 +1607,19 @@ export class WorkflowManager extends EventEmitter {
         retryOnlyIfSpendUnder,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
+        // P05: per-run agent-result cap default (see resolvedMaxAgentResultChars).
+        defaultMaxAgentResultChars: resolvedMaxAgentResultChars,
         drainTimeoutMs: resolvedDrainTimeoutMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
+        // P11: per-execution discovery (exec override wins) else the manager's;
+        // runWorkflow wraps it with the run's resolved tool names for honest
+        // select() routing against this run's actual toolset.
+        subagentToolDiscovery: exec.subagentToolDiscovery ?? this.subagentToolDiscovery,
         excludeTools: this.excludeSubagentTools,
         confirm,
         checkpointGate,
+        fanOutApprovalThreshold,
         pipeline,
         phaseState,
         loadSavedWorkflow: this.loadSavedWorkflow,
@@ -1549,6 +1863,21 @@ export class WorkflowManager extends EventEmitter {
           // double-count" semantics of journal replay.
           this.accumulateTokenUsage(managed, event.tokens ?? 0, event.tokenUsage);
           this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
+          // P06 provenance: a LIVE worktree-isolated agent's finalize claim.
+          // The runner's own finalizeWorktree call site passes no run identity,
+          // so the manager records the same {source:"worktree", file, agent,
+          // phase} claim here from the settle event — the durable store dedupes
+          // by content identity, and REPLAYED (cache-hit) agents carry no
+          // worktree, so replay never re-records provenance. Best-effort
+          // (recordProvenance swallows failures): observability, not execution.
+          if (event.worktree) {
+            void recordProvenance(managed.runId, {
+              source: "worktree",
+              file: event.worktree,
+              agent: event.label,
+              phase: event.phase,
+            });
+          }
           progress();
         },
         onAgentHistory: (event) => {
@@ -1575,6 +1904,38 @@ export class WorkflowManager extends EventEmitter {
         },
       });
 
+      // N01 terminal scope assertion: the LAST phase's work happens AFTER the
+      // final boundary's snapshot (the 2→3 transition fires at approval, before
+      // the execute-phase agents run), so the boundary machinery alone would
+      // never assert the execute phase. After the run settles, capture a fresh
+      // terminal snapshot and assert it against the most recent boundary
+      // baseline with the same flag/reject/confirm policy. The boundary
+      // baseline is forward-only/persisted (stable across resume); the
+      // terminal snapshot is re-captured per execution, so a resume after the
+      // user fixed an offending file re-asserts clean and a resume with the
+      // violation intact re-rejects — deterministic either way. A reject here
+      // throws into the catch below and settles the run FAILED (never
+      // "completed"), with the violation recorded in the phase state.
+      if (phaseState?.stateManager) {
+        const settleState = await phaseState.stateManager.getState();
+        const snapshots = settleState.fingerprints ?? {};
+        let boundary: WorkspaceFingerprint | undefined;
+        let highest = -1;
+        for (const [key, entry] of Object.entries(snapshots)) {
+          const stage = Number(key);
+          if (Number.isInteger(stage) && stage >= 0 && stage <= settleState.activePhase && entry && stage > highest) {
+            highest = stage;
+            boundary = entry;
+          }
+        }
+        const terminal = await captureWorkspaceFingerprint(this.cwd, settleState.activePhase);
+        await this.enforceWorkspaceScope(managed, script, exec, {
+          stage: settleState.activePhase,
+          previous: boundary,
+          next: terminal,
+        });
+      }
+
       managed.result = result;
       // Settle the run to idle (completed): flip status + release the lease
       // (isCurrent-gated — see settleExecuting). The flip happens before the
@@ -1595,6 +1956,9 @@ export class WorkflowManager extends EventEmitter {
 
       // Persist final state.
       this.persistRun(managed);
+      // N04: emit the machine-readable run report (additive — resume() never
+      // reads it, so it cannot affect resume-replay hashes).
+      this.emitRunReport(managed);
       if (this.isCurrent(managed)) {
         // Now (and only now — after the run's data is safely on disk and its
         // lease released) does this run become eviction-eligible; see the
@@ -1710,6 +2074,9 @@ export class WorkflowManager extends EventEmitter {
       // Persist final state (see the success-path comment above for the
       // isCurrent() rationale — same guard, same reason).
       this.persistRun(managed);
+      // N04: emit the machine-readable run report for the settled (failed /
+      // paused / aborted) run, mirroring the success path.
+      this.emitRunReport(managed);
       if (this.isCurrent(managed)) {
         // "paused" (manual pause() or a usage-limit checkpoint) is
         // deliberately NOT eviction-eligible — only a genuinely settled
@@ -1732,6 +2099,12 @@ export class WorkflowManager extends EventEmitter {
       }
       // The execution settled — stop renewing its lease (see armLeaseHeartbeat).
       this.disarmLeaseHeartbeat(managed);
+      // P06: the run's durable store is run-scoped — unregister it (and any
+      // nested-frame stores) now that the execution has fully settled, so a
+      // long-lived process never accumulates per-run sinks. The terminal-settle
+      // paths already snapshotted the store into the run report; a still-
+      // running store object is simply no longer reachable by runId.
+      closeRunDurableStore(managed.runId);
       // The execution has FULLY settled — a paused run (manual pause() or a
       // usage-limit/provider-outage checkpoint) can now be retired from the
       // in-memory registry when the paused-run cap is exceeded
@@ -1789,6 +2162,124 @@ export class WorkflowManager extends EventEmitter {
         );
       }
     }
+  }
+
+  /**
+   * N01: workspace-scope enforcement at a phase boundary (host side). The
+   * state machine hands us the boundary's captured fingerprint plus the most
+   * recent snapshot below it; we compute the machine diff, assert it against
+   * the run's intended-path set (declared `meta.outputs` + the system's own
+   * `.pi/` dirs), record the outcome forward-only with the phase state, and
+   * apply the documented policy:
+   *
+   *  - flag    → record + live-log, never fail (DEFAULT).
+   *  - reject  → throw WORKSPACE_SCOPE_VIOLATION (fail-closed; headless).
+   *  - confirm → surface via the run's `confirm` handler; denial throws the
+   *              same code, approval proceeds and is recorded as approved.
+   *  - off     → nothing (the capture still persists, as before N01 wiring).
+   *
+   * Determinism: the diff inputs are the persisted forward-only snapshots, so
+   * the same boundary re-asserted on resume sees the same inputs; a rejection
+   * re-rejects deterministically (the run settles failed, resumable after the
+   * script's declared outputs or the offending files change). This is a
+   * host-side gate — never part of any agent() resume hash.
+   */
+  private async enforceWorkspaceScope(
+    managed: ManagedRun,
+    script: string,
+    exec: ExecOptions,
+    check: WorkspaceScopeCheck,
+  ): Promise<void> {
+    const mode = exec.workspaceScopeEnforce ?? this.workspaceScopeEnforce;
+    if (mode === "off") return;
+    // No baseline snapshot → the run's first boundary: nothing to diff yet.
+    if (!check.previous) return;
+    const diff = diffWorkspaceFingerprints(check.previous, check.next);
+    // The declared outputs are parsed once per execution and memoized — a
+    // second parse of the (already validated) script is cheap and keeps the
+    // allowed set off the hot path. parseWorkflowScript throws on an invalid
+    // script; executeRun only reaches here with a validated one, but degrade
+    // to no declarations rather than crash a boundary on a defensive edge.
+    const declared = this.declaredScopeOutputs.get(script) ?? this.parseDeclaredScopeOutputs(script);
+    const allowed = workspaceScopeAllowedPaths(declared);
+    const violations = workspaceScopeViolations(diff, allowed);
+    if (violations.length === 0) return;
+
+    const record: ScopeViolationRecord = { violations, allowed };
+    const stateManager = exec.phaseState?.stateManager;
+    const logSurface = (approved: boolean | undefined) => {
+      const detail = violations.join("; ");
+      this.emitLive(managed, "log", {
+        runId: managed.runId,
+        message: `[scope] phase ${check.stage} boundary changed files outside the intended set (${
+          approved === true ? "human-approved" : approved === false ? "denied" : "flagged"
+        }): ${detail}`,
+      });
+    };
+
+    if (mode === "flag") {
+      if (stateManager) {
+        // Await the record — the persisted flag is part of the assertion, so a
+        // caller that reads the phase state right after the run settles must
+        // see it (never fire-and-forget). A storage failure degrades to the
+        // live log (observability, not a gate).
+        await stateManager.recordScopeViolations(check.stage, record).catch(() => undefined);
+      }
+      logSurface(undefined);
+      return;
+    }
+    if (mode === "confirm" && exec.confirm) {
+      const approved = await exec.confirm(
+        `Phase ${check.stage} boundary changed files outside the run's declared outputs: ${violations.join(
+          "; ",
+        )}\nProceed? (approving records the exception on the run's phase state)`,
+        { kind: "workspace-scope", violations, allowed, phase: check.stage },
+      );
+      const accepted = approved === true;
+      if (stateManager) {
+        await stateManager.recordScopeViolations(check.stage, { ...record, approved: accepted }).catch(() => undefined);
+      }
+      logSurface(accepted);
+      if (!accepted) throw this.scopeViolationError(check.stage, violations);
+      return;
+    }
+    // "reject" (fail-closed) — and "confirm" without a confirm handler
+    // (headless): the boundary rejects and the run settles failed.
+    if (stateManager) {
+      await stateManager.recordScopeViolations(check.stage, record).catch(() => undefined);
+    }
+    logSurface(undefined);
+    throw this.scopeViolationError(check.stage, violations);
+  }
+
+  /** Parse the script's declared outputs once per script text (memoized). */
+  private readonly declaredScopeOutputs = new Map<string, string[]>();
+  private parseDeclaredScopeOutputs(script: string): string[] {
+    try {
+      const outputs = parseWorkflowScript(script).meta.outputs ?? [];
+      this.declaredScopeOutputs.set(script, outputs);
+      return outputs;
+    } catch {
+      // Defensive: never let an unparseable script take down a boundary gate.
+      return [];
+    }
+  }
+
+  private scopeViolationError(stage: PhaseStage, violations: string[]): WorkflowError {
+    return new WorkflowError(
+      `Workspace scope violation at phase ${stage} boundary: ${violations.join("; ")} ` +
+        "(declare intended outputs in the workflow's meta.outputs, add them to the allowed set, or set " +
+        "PI_WORKFLOW_WORKSPACE_SCOPE_ENFORCE=flag|off to soften enforcement)",
+      WorkflowErrorCode.WORKSPACE_SCOPE_VIOLATION,
+      {
+        recoverable: false,
+        details: {
+          code: WorkflowErrorCode.WORKSPACE_SCOPE_VIOLATION,
+          phase: stage,
+          violations,
+        },
+      },
+    );
   }
 
   /**
@@ -2142,6 +2633,29 @@ export class WorkflowManager extends EventEmitter {
     // F19: lifecycle-settle writes (start, pause/resume/stop, complete, error,
     // force-release) are the compaction boundaries — see writeRunToDisk.
     this.writeRunToDisk(managed, true);
+  }
+
+  /**
+   * N04: emit the machine-readable run report alongside the persisted run
+   * record. Hooked at completion (executeRun's success + failure paths) and on
+   * resume — the report is derived from the freshly-persisted state and the
+   * run's durable-store view (entries + provenance ledger), and written to
+   * `<runsDir>/<runId>.report.json`. Strictly best-effort: a report write must
+   * never fail the run, and the file is never read by resume(), so it can
+   * never affect resume-replay hashes.
+   */
+  private emitRunReport(managed: ManagedRun): void {
+    try {
+      const persisted = this.persistence.load(managed.runId);
+      if (!persisted) return;
+      writeRunReport(persisted, {
+        runsDir: workflowProjectPaths(this.cwd).runsDir,
+        durable: runDurableStore(managed.runId)?.snapshot() ?? null,
+        mainModel: this.mainModel,
+      });
+    } catch (error) {
+      console.warn(`[workflow-manager] run report failed for ${managed.runId}: ${String(error)}`);
+    }
   }
 
   /**
@@ -2798,6 +3312,11 @@ export class WorkflowManager extends EventEmitter {
     // Persist before notifying renderers: listRuns() is their source of truth for
     // lifecycle status, while getRun() supplies the live in-memory snapshot.
     this.persistRun(managed);
+    // N04: emit the machine-readable run report on RESUME (a snapshot of the
+    // run state as the resumed execution starts — replayed agents, seeded
+    // spend, prior checkpoints). Additive: the report file is never read by
+    // the resume path, so it cannot affect resume-replay hashes.
+    this.emitRunReport(managed);
 
     // Namespace by (runId, index) exactly like the live onAgentJournal dedup
     // and like SharedStore's deltaKey — see JournalEntry.runId and
@@ -3135,6 +3654,17 @@ export class WorkflowManager extends EventEmitter {
     if (timer) {
       clearTimeout(timer);
       this.persistTimers.delete(runId);
+    }
+    // N04: the run's report artifact is additive and lives under the reports
+    // subdir — sweep it (and its .bak sidecar) with the run record so deleting
+    // a run also deletes its report. Best-effort (the persistence delete below
+    // is the authoritative result).
+    try {
+      const reportPath = runReportPath(workflowProjectPaths(this.cwd).runsDir, runId);
+      unlinkIfExistsSafe(resolvePersistenceFs(), reportPath);
+      unlinkIfExistsSafe(resolvePersistenceFs(), `${reportPath}.bak`);
+    } catch {
+      // report cleanup is best-effort
     }
     return this.persistence.delete(runId);
   }

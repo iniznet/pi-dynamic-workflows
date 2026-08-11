@@ -13,7 +13,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
+import type { BuiltinWorkflowInvocation, ExtensionToolsSupplier } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
 import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
@@ -83,16 +83,18 @@ function requireBuiltin(name: string) {
  * invalid-args error (e.g. a whitespace-only string that passes the handler's
  * cheap `!value` check but fails the registry's real validation) as the same
  * kind of warning notify the handlers already use for their own validation,
- * rather than an uncaught rejection.
+ * rather than an uncaught rejection. Async since P04 (patterns append the
+ * captured extension defs).
  */
-function resolveBuiltinOrNotify(
+async function resolveBuiltinOrNotify(
   name: string,
   cwd: string,
   args: unknown,
   ctx: ExtensionCommandContext,
-): BuiltinWorkflowInvocation | undefined {
+  extensionTools?: ExtensionToolsSupplier,
+): Promise<BuiltinWorkflowInvocation | undefined> {
   try {
-    return requireBuiltin(name).resolve(cwd, args);
+    return await requireBuiltin(name).resolve(cwd, args, { extensionTools });
   } catch (error) {
     ctx.ui.notify(`/${name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
     return undefined;
@@ -101,9 +103,15 @@ function resolveBuiltinOrNotify(
 
 export function registerBuiltinWorkflows(
   pi: ExtensionAPI,
-  opts: { cwd: string; manager: WorkflowManager; storage?: WorkflowStorage },
+  opts: {
+    cwd: string;
+    manager: WorkflowManager;
+    storage?: WorkflowStorage;
+    /** P04: captured extension defs appended to every pattern's task-fit toolset. */
+    extensionTools?: ExtensionToolsSupplier;
+  },
 ): void {
-  const { cwd, manager } = opts;
+  const { cwd, manager, extensionTools } = opts;
   const storage = opts.storage ?? createWorkflowStorage(cwd);
 
   /**
@@ -141,7 +149,7 @@ export function registerBuiltinWorkflows(
         // Resolve through the shared builtin registry (builtin-workflows.ts) so
         // this command and the workflow tool's `name` input always run the exact
         // same generated script and exec context (tools/toolset) for this pattern.
-        const resolved = resolveBuiltinOrNotify("deep-research", cwd, { question }, ctx);
+        const resolved = await resolveBuiltinOrNotify("deep-research", cwd, { question }, ctx, extensionTools);
         if (!resolved) return;
         startBackground(
           manager,
@@ -168,7 +176,7 @@ export function registerBuiltinWorkflows(
         if (runSavedShadowIfPresent("adversarial-review", args, ctx)) return;
         const task = args.trim();
         if (!task) return ctx.ui.notify("Usage: /adversarial-review <task or question>", "warning");
-        const resolved = resolveBuiltinOrNotify("adversarial-review", cwd, { task }, ctx);
+        const resolved = await resolveBuiltinOrNotify("adversarial-review", cwd, { task }, ctx, extensionTools);
         if (!resolved) return;
         startBackground(manager, ctx, "adversarial-review", resolved.script, { task });
       },
@@ -268,7 +276,7 @@ export function registerBuiltinWorkflows(
         // diff already truncated here would report itself as not truncated, and the
         // original length is needed for accurate "characters omitted" accounting.
         const reviewArgs = { diff, diffSource, diffTruncated, diffLength: originalLength };
-        const resolved = resolveBuiltinOrNotify("code-review", cwd, reviewArgs, ctx);
+        const resolved = await resolveBuiltinOrNotify("code-review", cwd, reviewArgs, ctx, extensionTools);
         if (!resolved) return;
         startBackground(manager, ctx, "code-review", resolved.script, reviewArgs);
       },
@@ -289,7 +297,13 @@ export function registerBuiltinWorkflows(
         }
         // resolve() falls back to a broadly-useful default set when fewer than
         // two perspectives are given (see builtin-workflows.ts).
-        const resolved = resolveBuiltinOrNotify("multi-perspective", cwd, { topic, perspectives: rest }, ctx);
+        const resolved = await resolveBuiltinOrNotify(
+          "multi-perspective",
+          cwd,
+          { topic, perspectives: rest },
+          ctx,
+          extensionTools,
+        );
         if (!resolved) return;
         startBackground(manager, ctx, "multi-perspective", resolved.script);
       },
@@ -308,7 +322,7 @@ export function registerBuiltinWorkflows(
         if (!scope || checks.length === 0) {
           return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
         }
-        const resolved = resolveBuiltinOrNotify("codebase-audit", cwd, { scope, checks }, ctx);
+        const resolved = await resolveBuiltinOrNotify("codebase-audit", cwd, { scope, checks }, ctx, extensionTools);
         if (!resolved) return;
         startBackground(manager, ctx, "codebase-audit", resolved.script);
       },

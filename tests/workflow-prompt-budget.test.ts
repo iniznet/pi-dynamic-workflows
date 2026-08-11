@@ -81,7 +81,15 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // exhausted instead). The new numeric parameter and its description increase
 // the measured definition from 5,608 to 5,959 bytes (+351), and the accepted
 // ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 5_959;
+//
+// P11: added a one-line capability-discovery pointer (the `subagentTools`
+// script global — search/describe/select/capabilities over the run's captured
+// tool registry, so an author can hand agents tools not known at write time).
+// Deliberately terse: full signatures live in the generated capability table
+// (README + docs/workflow-authoring.md), not the always-on tool description.
+// The clause increases the measured definition from 5,959 to 6,159 bytes
+// (+200), and the accepted ceiling moves with it.
+const TOOL_DEFINITION_BUDGET_BYTES = 6_159;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

@@ -29,6 +29,7 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAssemblerSubagentToolDiscovery, type SubagentToolDiscovery } from "../discovery.js";
 import { isExcludedHostTool } from "../gateway/subagent-host-tools.js";
 import type { McpToolsManager } from "./mcp-tools.js";
 
@@ -203,5 +204,30 @@ export class SubagentToolsAssembler {
   async damageControlToolsOnly(): Promise<ToolDefinition[]> {
     const damageControl = (await this.damageControlTools?.()) ?? [];
     return filterDamageControlTools(damageControl, this.excludeTools);
+  }
+
+  /**
+   * P11: capability discovery + runtime routing over the assembler's registries.
+   * EXTENDS the named-toolset mechanism — the same suppliers the
+   * mcpToolsOnly()/chromeToolsOnly()/extensionToolsOnly()/damageControlToolsOnly()
+   * surfaces resolve become ONE queryable registry: scripts search/describe/
+   * select tools by capability at runtime (e.g. a newly added MCP server, a
+   * newly installed research extension) and hand agents tools not known at
+   * author time via `agent({ toolNames })`. Lazy: nothing resolves until a
+   * discovery method is called; MCP mode/exclude filtering matches the named
+   * toolsets exactly, so what select() reports as resolvable is what the
+   * assembler can actually merge. Never throws (per-source degradation yields
+   * [] like the other suppliers).
+   */
+  createDiscovery(): SubagentToolDiscovery {
+    return createAssemblerSubagentToolDiscovery({
+      hostTools: () => this.hostTools(),
+      mcpTools: () => this.mcpTools.listSubagentTools(),
+      mcpMode: this.mode,
+      ...(this.extensionTools ? { extensionTools: () => this.extensionTools?.() ?? [] } : {}),
+      ...(this.chromeTools ? { chromeTools: () => this.chromeTools?.() ?? [] } : {}),
+      ...(this.damageControlTools ? { damageControlTools: () => this.damageControlTools?.() ?? [] } : {}),
+      excludeTools: this.excludeTools,
+    });
   }
 }

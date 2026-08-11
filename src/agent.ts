@@ -20,6 +20,7 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { DEFAULT_UNTAGGED_TIER, UNTAGGED_TIER_ECONOMY, UNTAGGED_TIER_INHERIT_MAIN } from "./config.js";
+import { recordProvenance } from "./durable-store.js";
 import {
   classifyContextOverflow,
   classifyProviderLimit,
@@ -519,6 +520,15 @@ export interface WorkflowAgentOptions {
    * `sessionHandoff: true`.
    */
   onHandoffSession?: (sessionId: string) => void;
+  /**
+   * P06 provenance: the stable run identity whose durable-store ledger this
+   * instance's settle records should be routed into (resolved from the
+   * durable-store module registry). The workflow runner passes its full run
+   * options (which carry `runId`) even though this declared type is narrower;
+   * the constructor reads `runId` from the runtime object when this field is
+   * absent, so real runs emit automatically.
+   */
+  provenanceRunId?: string;
 }
 
 // pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
@@ -932,6 +942,21 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * id, which is UNCHANGED across the swap (the same session continues).
    */
   onSwap?: (info: HandoffSwapInfo) => void;
+  /**
+   * P06 provenance: the stable run identity whose durable-store ledger this
+   * agent's settle should be recorded into (resolved from the durable-store
+   * module registry; no-op when unset or the run bound no store). The workflow
+   * runner threads the run's runId at construction (WorkflowAgent receives the
+   * full run options), so agent() calls in real runs emit automatically.
+   */
+  provenanceRunId?: string;
+  /**
+   * P06 provenance: the workflow phase this call was attributed to, recorded
+   * on the settle entry. Optional — the workflow layer owns phase routing and
+   * does not pass it per call, so real-run settle entries carry no phase (the
+   * run report recovers per-agent phases from the persisted roster instead).
+   */
+  provenancePhase?: string;
 }
 
 /**
@@ -1115,6 +1140,13 @@ export class WorkflowAgent {
   private handoffUnsubscribe?: () => void;
   /** Observer hook: session id of every handoff run (see WorkflowAgentOptions). */
   private readonly onHandoffSession?: (sessionId: string) => void;
+  /**
+   * P06 provenance: the run identity this instance belongs to, captured at
+   * construction from the run options the workflow layer passes (the runtime
+   * object carries `runId`; a direct embed without one leaves it undefined and
+   * the settle hook no-ops). See AgentRunOptions.provenanceRunId.
+   */
+  private readonly provenanceRunId?: string;
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -1122,6 +1154,12 @@ export class WorkflowAgent {
     this.excludeTools = options.excludeTools ?? [];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
+    // P06: the workflow runner constructs us with its full WorkflowRunOptions
+    // (runId present on the manager path) even though our declared type is the
+    // narrower WorkflowAgentOptions — read the run's stable identity so the
+    // settle hook can route provenance to the run's durable store (registered
+    // by the runtime injection). Explicit per-call overrides win.
+    this.provenanceRunId = options.provenanceRunId ?? (options as { runId?: string }).runId;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.defaultUntaggedTier = options.defaultUntaggedTier;
@@ -1817,6 +1855,24 @@ export class WorkflowAgent {
       secondChanceTimer = undefined;
       if (runOwnsSession) {
         disposeRunSession();
+      }
+      // P06 provenance at agent settle: record this run's settle in the run's
+      // durable-store ledger (resolved by runId from the module registry — a
+      // no-op when the run bound no store or the identity is absent). Fires on
+      // BOTH success and error paths, exactly once per run() call; the ledger
+      // dedupes repeats (same source+agent) so a retried attempt collapses.
+      // Best-effort by design: a durable-store write must never mask the run
+      // result or delay teardown.
+      if (this.provenanceRunId) {
+        try {
+          await recordProvenance(this.provenanceRunId, {
+            source: "agent",
+            agent: options.label,
+            phase: options.provenancePhase,
+          });
+        } catch {
+          // provenance is observability, not execution
+        }
       }
       removeToolListener();
     }

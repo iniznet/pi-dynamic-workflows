@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
+import type { ExtensionToolsSupplier } from "./builtin-workflows.js";
 import { BUILTIN_WORKFLOW_NAMES, prepareBuiltinWorkflowArgs, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import {
@@ -79,6 +80,7 @@ const workflowToolSchema = Type?.Object({
         "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
         "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
         "Core API: phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), log(message), args, cwd, process.cwd(), and budget. The workflow must call agent() at least once.",
+        "Capability discovery: subagentTools.search/describe/select/capabilities query the run's captured tool registry at runtime — select('web') returns toolNames to pass to agent(prompt, { toolNames }).",
         "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
         "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
         "On failure or pause, resume with resumeFromRunId instead of starting a new run.",
@@ -99,7 +101,7 @@ const workflowToolSchema = Type?.Object({
     Type.String({
       description:
         "Run a saved or built-in workflow by name; args go in `args`. " +
-        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see workflow-patterns skill for their args. ` +
+        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")}. ` +
         "A same-named saved workflow wins. Not with resumeFromRunId.",
     }),
   ),
@@ -231,6 +233,14 @@ export interface WorkflowToolOptions {
   manager?: WorkflowManager;
   /** Shared saved-workflow storage. */
   storage?: WorkflowStorage;
+  /**
+   * Lazy supplier of host-captured extension tool defs (P04) appended to a
+   * built-in pattern's task-fit toolset (codegraph_* / web_fetch_md / web_docs_*
+   * / describe_image) — same supplier the extension hands the assembler, so a
+   * `name` run's FIRST execution matches what a resumed run re-resolves via
+   * the manager's toolsets map.
+   */
+  extensionTools?: ExtensionToolsSupplier;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
   /** Default max concurrent agents when no tool-level concurrency is passed. */
@@ -243,6 +253,14 @@ export interface WorkflowToolOptions {
    * behavior (declared default or inline confirm).
    */
   checkpointGate?: CheckpointGate;
+  /**
+   * P12: parallel()/pipeline() fan-out size above which a run pauses for
+   * human approval (TUI confirm) or, headless, throws WORKFLOW_ABORTED unless
+   * the script passes autoApproved: true. Resolved from the
+   * fanOutApprovalThreshold settings key (env PI_WORKFLOW_FAN_OUT_APPROVAL_THRESHOLD);
+   * null disables the gate. Per-run override of the settings value.
+   */
+  fanOutApprovalThreshold?: number | null;
   /**
    * Opt-in Phase 0/1 pipeline wiring (wayfinder -> prewalk) threaded into every
    * run this tool starts. Absent → the run behaves exactly as before (no
@@ -292,7 +310,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       // `name` resolves through the same registry the built-in slash commands
       // and saved-workflow commands use (see builtin-workflows.ts /
       // workflow-saved.ts): a project/user saved workflow of that name wins on
-      // a collision, else one of the 7 curated built-in patterns. This lets the
+      // a collision, else one of the 10 curated built-in patterns. This lets the
       // model reach a curated pattern by name instead of having to author an
       // equivalent script from scratch (and, for patterns that need it, the
       // right exec context — e.g. deep-research's web tools — travels with it).
@@ -337,7 +355,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               onUpdate?.({ content: [{ type: "text", text: message }], details: { phase: "preparing" } });
             })) as Record<string, unknown> | undefined);
         runArgs = invocationArgs;
-        const resolved = resolveWorkflowInvocation(params.name, invocationArgs, { storage, cwd });
+        const resolved = await resolveWorkflowInvocation(params.name, invocationArgs, {
+          storage,
+          cwd,
+          extensionTools: options.extensionTools,
+        });
         if (!resolved) {
           throw new Error(
             `workflow: no saved or built-in workflow named "${params.name}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`,
@@ -396,6 +418,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
           checkpointGate: options.checkpointGate,
+          fanOutApprovalThreshold: defaults.fanOutApprovalThreshold,
           pipeline: options.pipeline,
           phaseState: options.phaseState,
         });
@@ -435,6 +458,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           tools: invocationTools,
           toolset: invocationToolset,
           checkpointGate: options.checkpointGate,
+          fanOutApprovalThreshold: defaults.fanOutApprovalThreshold,
           pipeline: options.pipeline,
           phaseState: options.phaseState,
         });
@@ -469,6 +493,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           toolset: invocationToolset,
           confirm,
           checkpointGate: options.checkpointGate,
+          fanOutApprovalThreshold: defaults.fanOutApprovalThreshold,
           pipeline: options.pipeline,
           phaseState: options.phaseState,
           externalSignal: signal,
@@ -614,6 +639,16 @@ export function formatCompletedResultText(
       "\n\nThese agents did not produce results. Do NOT treat this output as complete: edit the workflow (e.g. raise agentRetries, shorten the failing agent's prompt, or use a larger-context model) and re-run, or pass failOnExhaustedAgent to have the run fail resumable instead of completing silently."
     : "";
 
+  // QW4: structured-output recovery warnings (one per distinct agent label).
+  // A schema agent that resolved without ever calling the structured_output
+  // tool got its value through repair nudges or prose extraction — the value
+  // is real, but a tool-reliable model is more trustworthy for schema work.
+  const structuredOutputWarnings = result.structuredOutputWarnings?.length
+    ? `\n\n## ⚠ Structured-output recovery warnings\n` +
+      result.structuredOutputWarnings.map((w) => `- **${w.label}**: ${w.warning}`).join("\n") +
+      "\n\nThese schema results were recovered without a clean structured_output call. Consider a tool-reliable model for schema agents."
+    : "";
+
   const formattedResult =
     result.result !== undefined ? `\n\`\`\`json\n${formatResultDump(result.result, result.runId)}\n\`\`\`` : "";
 
@@ -621,7 +656,7 @@ export function formatCompletedResultText(
   const lead = snapshot ? "" : `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).`;
   // Notes already carry their own leading blank lines for the legacy layout;
   // trim them when composing so the status block is followed by one blank line.
-  const notes = [tokenInfo.trim(), failures.trim()].filter(Boolean).join("\n\n");
+  const notes = [tokenInfo.trim(), failures.trim(), structuredOutputWarnings.trim()].filter(Boolean).join("\n\n");
   const body = notes ? `${notes}\n\n` : "";
   return `${statusBlock}${lead}${body}## Result${formattedResult}`;
 }
@@ -651,7 +686,12 @@ function dryRunResult(meta: WorkflowMeta): {
 function resolveWorkflowToolDefaults(
   options: WorkflowToolOptions,
   cwd: string,
-): { agentTimeoutMs: number | null; concurrency?: number; agentRetries: number } {
+): {
+  agentTimeoutMs: number | null;
+  concurrency?: number;
+  agentRetries: number;
+  fanOutApprovalThreshold: number | null | undefined;
+} {
   const settings = loadWorkflowSettings({ cwd });
   return {
     agentTimeoutMs:
@@ -660,6 +700,12 @@ function resolveWorkflowToolDefaults(
         : (settings.defaultAgentTimeoutMs ?? null),
     concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
     agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
+    // P12: an explicit tool-level value wins; else the settings key (a null
+    // tombstone disables the gate; absent → the run's default threshold).
+    fanOutApprovalThreshold:
+      options.fanOutApprovalThreshold !== undefined
+        ? options.fanOutApprovalThreshold
+        : settings.fanOutApprovalThreshold,
   };
 }
 

@@ -672,10 +672,13 @@ const validArgsByBuiltinName: Record<string, unknown> = {
   "codebase-audit": { scope: "src/", checks: ["security"] },
   "plan-then-execute": { objective: "do the thing" },
   "spec-generation": { topic: "a topic" },
+  "debug-loop": { bug: "the parser crashes on empty input" },
+  "spec-conformance": { spec: { goal: "g", requirements: [{ id: "R1", statement: "s" }] } },
+  "supervised-run": { task: "implement the widget", criterion: "all tests pass" },
 };
 
 test(
-  "workflow tool: `name` resolves each of the 7 built-in patterns and starts a run",
+  "workflow tool: `name` resolves each of the 10 built-in patterns and starts a run",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     manager.on("error", () => {});

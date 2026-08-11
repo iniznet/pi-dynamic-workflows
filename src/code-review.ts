@@ -274,8 +274,10 @@ const base = 'Use the read/grep tools to pull in any additional file context you
 // correctness/security/altitude on medium) — baked at generation time so the
 // script text (and thus resume hashes) is deterministic per generator version.
 const VERIFY_TIER = ${verifyTierJs}
-
 phase('Find')
+// P12: finder fan-out is exactly the 8-angle product and verifyBatches can
+// exceed the approval threshold headless — autoApproved keeps the builtin's
+// unattended behavior under the fan-out approval gate.
 const finders = await parallel([
   () => agent(
     'You are a line-by-line correctness scanner. Hunt ONLY for: inverted conditions, off-by-one errors, ' +
@@ -326,7 +328,7 @@ const finders = await parallel([
     'failure scenario. Return ONLY issues you can justify with a line in the diff slice shown below.' + base + shardBlock('H'),
     { label: 'H-security', tier: 'medium', schema: candidateSchema }
   ),
-])
+], { autoApproved: true })
 
 // Collect and deduplicate candidates across all finders
 const allRaw = finders.flatMap((r, fi) => {
@@ -408,7 +410,7 @@ const batchResults = verifyBatches.length > 0
           },
         }
       )
-    ))
+    ), { autoApproved: true })
   : []
 // Flatten batch verdicts back into pool order, preserving per-candidate slots:
 // every batch carries the exact pool index of each candidate it judged, so a

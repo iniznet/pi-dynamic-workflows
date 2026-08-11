@@ -8,7 +8,8 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { builtinToolsetTools } from "../src/builtin-workflows.js";
+import { builtinToolsetTools, CODE_DEV_TOOLSET } from "../src/builtin-workflows.js";
+import { DEFAULT_SUBAGENT_EXTENSION_TOOLS } from "../src/config.js";
 import { DEFAULT_IDLE_AGENT_MS, formatElapsed, tokenFigures, type WorkflowAgentSnapshot } from "../src/display.js";
 import {
   claimWorkflowRuntime,
@@ -266,6 +267,19 @@ export default function extension(pi: ExtensionAPI) {
   // task panel, and keyword arming.
   const loadSettings = () => applyEnvSettingsOverride(loadWorkflowSettings({ cwd }));
   const settings = loadSettings();
+  // SUBAGENT EXTENSION TOOLS (P04): host-captured third-party extension tools
+  // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*,
+  // pi-vision-handoff's describe_image) captured in-process from the installed
+  // packages/checkouts and executed in the host via the gateway (design:
+  // tasks/subagent-extension-tools/DESIGN.md). Gated by `subagentExtensionTools`
+  // exactly like chrome: off → undefined → no defs anywhere, including the
+  // "extension-tools"/"code-dev" toolsets. The supplier is created BEFORE the
+  // manager options because the pattern toolsets map (below) appends its defs
+  // to a pattern's task-fit toolset — the corrected P04 mechanism (naming the
+  // captured tools in BUILTIN_TOOLSET_TOOLS alone silently no-ops, since
+  // builtinToolsetTools only materializes coding/read-only tools).
+  const extensionToolsMode = settings.subagentExtensionTools ?? DEFAULT_SUBAGENT_EXTENSION_TOOLS;
+  const extensionToolsSupplier = createExtensionToolsSupplier(extensionToolsMode);
   const managerOptions = {
     loadSavedWorkflow: (name: string) => storage.load(name)?.script,
     // Named toolsets survive on the persisted run (the tag, not the functions),
@@ -273,15 +287,26 @@ export default function extension(pi: ExtensionAPI) {
     // /deep-research keeps web access instead of degrading to coding tools.
     // The builtin-pattern tags (T2-06) resolve the same task-fit subsets the
     // registry hands the first execution, so a resumed run keeps the exact
-    // toolset (not the full default bundle).
+    // toolset (not the full default bundle). P04: each pattern's subset ALSO
+    // appends the captured extension research defs (codegraph_*/web/vision)
+    // via the same supplier, so first execution (registry resolve) and resume
+    // (this map) resolve byte-identically.
     toolsets: {
-      "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
-      "code-review": () => builtinToolsetTools(cwd, "code-review"),
-      "spec-generation": () => builtinToolsetTools(cwd, "spec-generation"),
-      "adversarial-review": () => builtinToolsetTools(cwd, "adversarial-review"),
-      "codebase-audit": () => builtinToolsetTools(cwd, "codebase-audit"),
-      "plan-then-execute": () => builtinToolsetTools(cwd, "plan-then-execute"),
-      "multi-perspective": () => builtinToolsetTools(cwd, "multi-perspective"),
+      "web-research": async () => [
+        ...createCodingTools(cwd),
+        ...createWebTools(),
+        ...((await extensionToolsSupplier?.()) ?? []),
+      ],
+      "code-review": () => builtinToolsetTools(cwd, "code-review", extensionToolsSupplier),
+      "spec-generation": () => builtinToolsetTools(cwd, "spec-generation", extensionToolsSupplier),
+      "adversarial-review": () => builtinToolsetTools(cwd, "adversarial-review", extensionToolsSupplier),
+      "codebase-audit": () => builtinToolsetTools(cwd, "codebase-audit", extensionToolsSupplier),
+      "plan-then-execute": () => builtinToolsetTools(cwd, "plan-then-execute", extensionToolsSupplier),
+      "multi-perspective": () => builtinToolsetTools(cwd, "multi-perspective", extensionToolsSupplier),
+      // P04: the named SUPERSET toolset = every pattern's task-fit subset ∪ the
+      // captured extension research defs. Gated by the same single default as
+      // everything else (subagentExtensionTools): off → no captured defs.
+      [CODE_DEV_TOOLSET]: () => builtinToolsetTools(cwd, CODE_DEV_TOOLSET, extensionToolsSupplier),
     },
     // On top of the always-on workflow/workflow_control denial in subagents
     // (#107), let users block additional recursive-orchestration tools.
@@ -377,15 +402,6 @@ export default function extension(pi: ExtensionAPI) {
     });
   const chromeToolsSupplier =
     settings.subagentChromeTools === "on" ? () => (isChromeAuthorized() ? vendoredChromeTools() : []) : undefined;
-  // SUBAGENT EXTENSION TOOLS: host-captured third-party extension tools
-  // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*,
-  // pi-vision-handoff's describe_image) captured in-process from the installed
-  // packages/checkouts and executed in the host via the gateway (design:
-  // tasks/subagent-extension-tools/DESIGN.md). Gated by
-  // `subagentExtensionTools` exactly like chrome: off → undefined → no defs
-  // anywhere, including the "extension-tools" toolset.
-  const extensionToolsMode = settings.subagentExtensionTools ?? "off";
-  const extensionToolsSupplier = createExtensionToolsSupplier(extensionToolsMode);
   // SUBAGENT DAMAGE-CONTROL TOOLS: the workflow_damage_control toolset
   // (design: tasks/damage-control-recovery/DESIGN.md §6). Gated by
   // `subagentDamageControlTools` exactly like chrome/extension: "off" →
@@ -461,6 +477,12 @@ export default function extension(pi: ExtensionAPI) {
       // supplier is undefined → [] (script intent recorded, no tools).
       "damage-control-tools": () => subagentToolsAssembler.damageControlToolsOnly(),
     },
+    // P11: script-facing capability discovery over the assembler's registries
+    // (host + MCP + extension capture + chrome + damage control) — wired into
+    // every run as the `subagentTools` global; each execution wraps it with
+    // the run's resolved tool names so select() only routes what the run can
+    // hand its agents. Lazy: nothing resolves until a script calls it.
+    subagentToolDiscovery: subagentToolsAssembler.createDiscovery(),
   };
   // The gateway is created per extension generation; a /reload hands the old
   // bridge no continuation, so stop it on shutdown to release the socket.
@@ -658,6 +680,10 @@ export default function extension(pi: ExtensionAPI) {
         cwd,
         manager,
         storage,
+        // P04: patterns resolved by `name` append the captured extension
+        // research defs on their FIRST execution — the same supplier the
+        // toolsets map uses for resume, so both paths stay identical.
+        extensionTools: extensionToolsSupplier,
         checkpointGate,
         // Phase 0/1 wiring (audit actions 1+3): the per-cwd persisted state
         // machine becomes the pipeline's persistence root, so wayfinder →
@@ -810,9 +836,10 @@ export default function extension(pi: ExtensionAPI) {
     assembleDefaultTools: () => subagentToolsAssembler.assemble(),
     listMcpServers: () => mcpToolsManager.serverNames(),
     getChromeGranted: () => isChromeAuthorized(),
-    getExtensionToolSources: () => getExtensionToolSourceResults(settings.subagentExtensionTools ?? "off"),
+    getExtensionToolSources: () =>
+      getExtensionToolSourceResults(settings.subagentExtensionTools ?? DEFAULT_SUBAGENT_EXTENSION_TOOLS),
   });
-  registerBuiltinWorkflows(pi, { cwd, manager, storage });
+  registerBuiltinWorkflows(pi, { cwd, manager, storage, extensionTools: extensionToolsSupplier });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
   // "Workflows mode": type `workflow(s)` to arm a forced workflow at submit

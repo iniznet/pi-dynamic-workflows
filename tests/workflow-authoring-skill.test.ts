@@ -283,6 +283,8 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["threshold", "0.5"],
       ["lens", null],
       ["maxChars", "4000"],
+      ["tier", '"small"'],
+      ["distinctModel", null],
     ],
   );
   assert.match(verify?.constraints.join(" ") ?? "", /successful votes.*denominator/i);
@@ -293,11 +295,12 @@ test("generated helper facts expose exact callback, option, result, and failure 
     [
       ["judges", "3"],
       ["rubric", '"overall quality and correctness"'],
+      ["distinctModel", null],
     ],
   );
   assert.match(judgePanel?.constraints.join(" ") ?? "", /stable.*input index.*tie/i);
 
-  assert.match(loopUntilDry?.signature ?? "", /round.*roundIndex.*key.*consecutiveEmpty.*maxRounds/i);
+  assert.match(loopUntilDry?.signature ?? "", /round.*roundIndex.*key.*consecutiveEmpty.*maxRounds.*maxRoundCost/i);
   assert.deepEqual(
     loopUntilDry?.options?.options.map(({ name, default: value }) => [name, value]),
     [
@@ -305,10 +308,14 @@ test("generated helper facts expose exact callback, option, result, and failure 
       ["key", "JSON.stringify"],
       ["consecutiveEmpty", "2"],
       ["maxRounds", "50"],
+      ["maxRoundCost", "no cap"],
     ],
   );
   assert.match(loopUntilDry?.constraints.join(" ") ?? "", /capacity exhaustion.*partial (array|items)/i);
-  assert.match(loopUntilDry?.constraints.join(" ") ?? "", /termination.*dry.*maxRounds.*capacity.*failed/i);
+  assert.match(
+    loopUntilDry?.constraints.join(" ") ?? "",
+    /termination.*dry.*maxRounds.*capacity.*failed.*costSaturated/i,
+  );
 
   assert.match(completenessCheck?.signature ?? "", /complete: boolean.*missing\?: string\[\].*null/i);
   assert.match(completenessCheck?.constraints.join(" ") ?? "", /4,000.*serialized result/i);

@@ -31,6 +31,17 @@ export {
   renderWorkflowLines,
   renderWorkflowText,
 } from "./display.js";
+export type { ProvenanceEntry } from "./durable-store.js";
+export {
+  bindRunDurableStore,
+  closeRunDurableStore,
+  createRunDurableStore,
+  DURABLE_STORE_SCHEMA_VERSION,
+  DurableStore,
+  deterministicRunClock,
+  recordProvenance,
+  runDurableStore,
+} from "./durable-store.js";
 export {
   createEffortState,
   type EffortLevel,
@@ -109,6 +120,12 @@ export type { PlannotatorBridge, PlannotatorConfig, ReviewPlan } from "./integra
 export { createPlannotatorBridge, getPlanStatus, submitPlan, waitForApproval } from "./integrations/plannotator.js";
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
 export { createWorkflowLogger } from "./logger.js";
+export type {
+  CrosscheckVerdict,
+  ModelCrosschecker,
+  ModelCrosscheckerOptions,
+} from "./model-crosscheck.js";
+export { createModelCrosschecker, parseCrosscheckVerdict, resolveModelForCrosscheck } from "./model-crosscheck.js";
 export type { ModelRoute, ModelRoutingConfig } from "./model-routing.js";
 export {
   classifyTask,
@@ -234,6 +251,14 @@ export {
   resumeRun,
   saveCheckpoint,
 } from "./run-persistence.js";
+export type { RunReport, RunReportAgent, RunReportPhase } from "./run-report.js";
+export {
+  buildRunReport,
+  deriveTruncationReports,
+  RUN_REPORT_SCHEMA_VERSION,
+  terminationReason,
+  writeRunReport,
+} from "./run-report.js";
 export {
   parseCommandArgs,
   registerAllSavedWorkflows,
@@ -249,7 +274,43 @@ export {
 } from "./spec-generation.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
+export type {
+  RunSupervisorContext,
+  SupervisedRunConfig,
+  SupervisedRunOptions,
+  SupervisedRunOutcome,
+  SupervisorBudget,
+  SupervisorController,
+  SupervisorObservation,
+  SupervisorSettleEvent,
+  SupervisorVerdict,
+} from "./supervisor.js";
+export {
+  bindRunSupervisor,
+  buildCorrectionPrompt,
+  buildSupervisorPrompt,
+  createSupervisorController,
+  generateSupervisedRunWorkflow,
+  parseSupervisorVerdict,
+  SUPERVISED_RUN_NUMERIC_ARGS,
+  SUPERVISOR_DEFAULT_MAX_ROUNDS,
+  SUPERVISOR_VERDICT_SCHEMA,
+} from "./supervisor.js";
 export type { TaskPanelOptions } from "./task-panel.js";
+export type {
+  TestGateAssert,
+  TestGateStepResult,
+  TestGateTest,
+  TestGateTool,
+} from "./test-gate.js";
+export {
+  buildTestGateFeedback,
+  buildTestGatePrompt,
+  capTestGateOutput,
+  machineValidateTest,
+  TEST_GATE_OUTPUT_SCHEMA,
+  validateTestGateTests,
+} from "./test-gate.js";
 export type {
   AutoResumeDelayParams,
   SchedulableWorkflowManager,
@@ -260,6 +321,7 @@ export { computeAutoResumeDelayMs, parseResetHintMs, UsageLimitScheduler } from 
 export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";
 export type {
   AgentOptions,
+  CappedAgentResult,
   CheckpointGate,
   JournalEntry,
   PhaseOptions,
@@ -270,7 +332,14 @@ export type {
   WorkflowRunOptions,
   WorkflowRunResult,
 } from "./workflow.js";
-export { parseWorkflowScript, runWorkflow } from "./workflow.js";
+export {
+  capAgentResultText,
+  estimateTokens,
+  parseWorkflowScript,
+  resolveMaxAgentResultChars,
+  runWorkflow,
+  truncateAgentResultMiddle,
+} from "./workflow.js";
 export type {
   AlignmentEvidence,
   CapabilityDescriptor,
@@ -301,7 +370,6 @@ export type {
   WorkflowControlRunDetails,
   WorkflowControlToolOptions,
 } from "./workflow-control-tool.js";
-
 export { createWorkflowControlTool } from "./workflow-control-tool.js";
 export type {
   AgentSummary,
@@ -341,8 +409,19 @@ export {
   registerWorkflowTriggerCommand,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
-export { WorkflowManager } from "./workflow-manager.js";
+export type {
+  ManagedRun,
+  WorkflowManagerOptions,
+  WorkspaceFingerprint,
+  WorkspaceScopeDiff,
+} from "./workflow-manager.js";
+export {
+  captureWorkspaceFingerprint,
+  diffWorkspaceFingerprints,
+  parseGitStatusLine,
+  WorkflowManager,
+  workspaceScopeViolations,
+} from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
   WORKFLOW_HOME_RELATIVE_DIR,

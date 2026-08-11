@@ -48,7 +48,7 @@ test("limiter cap holds under sustained queue churn (L1 semaphore handoff)", asy
   };
 
   const script = `export const meta = { name: 'limiter_cap', description: 'cap under churn' }
-const xs = await parallel(Array.from({ length: ${AGENTS} }, (_, i) => () => agent(String(i), { label: String(i) })))
+const xs = await parallel(Array.from({ length: ${AGENTS} }, (_, i) => () => agent(String(i), { label: String(i) })), { autoApproved: true })
 return xs`;
 
   const run = runWorkflow(script, { agent: runner, concurrency: CONCURRENCY, persistLogs: false });

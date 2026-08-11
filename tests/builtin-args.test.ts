@@ -133,36 +133,38 @@ test("numericArgCoercionSource throws for invalid values exactly like coerceNumb
 
 // ─── Resolver wiring (builtin-workflows.ts) ────────────────────────────────────
 
-test("builtin resolvers reject invalid numeric args loudly before a run starts", () => {
+test("builtin resolvers reject invalid numeric args loudly before a run starts", async () => {
   const deepResearch = findBuiltinWorkflow("deep-research");
   const adversarialReview = findBuiltinWorkflow("adversarial-review");
   const codeReview = findBuiltinWorkflow("code-review");
   assert.ok(deepResearch && adversarialReview && codeReview);
 
-  assert.throws(() => deepResearch.resolve("/tmp", { question: "q", angles: 0 }), /angles/);
-  assert.throws(() => deepResearch.resolve("/tmp", { question: "q", angles: 9 }), /angles/);
-  assert.throws(() => deepResearch.resolve("/tmp", { question: "q", minSupport: 2.5 }), /minSupport/);
+  await assert.rejects(() => deepResearch.resolve("/tmp", { question: "q", angles: 0 }), /angles/);
+  await assert.rejects(() => deepResearch.resolve("/tmp", { question: "q", angles: 9 }), /angles/);
+  await assert.rejects(() => deepResearch.resolve("/tmp", { question: "q", minSupport: 2.5 }), /minSupport/);
 
-  assert.throws(() => adversarialReview.resolve("/tmp", { task: "t", reviewers: 0 }), /reviewers/);
-  assert.throws(() => adversarialReview.resolve("/tmp", { task: "t", reviewers: 2.5 }), /reviewers/);
-  assert.throws(() => adversarialReview.resolve("/tmp", { task: "t", threshold: 2 }), /threshold/);
-  assert.throws(() => adversarialReview.resolve("/tmp", { task: "t", maxFindings: 10_000 }), /maxFindings/);
+  await assert.rejects(() => adversarialReview.resolve("/tmp", { task: "t", reviewers: 0 }), /reviewers/);
+  await assert.rejects(() => adversarialReview.resolve("/tmp", { task: "t", reviewers: 2.5 }), /reviewers/);
+  await assert.rejects(() => adversarialReview.resolve("/tmp", { task: "t", threshold: 2 }), /threshold/);
+  await assert.rejects(() => adversarialReview.resolve("/tmp", { task: "t", maxFindings: 10_000 }), /maxFindings/);
 
-  assert.throws(() => codeReview.resolve("/tmp", { diff: "d", maxCandidates: 0 }), /maxCandidates/);
-  assert.throws(() => codeReview.resolve("/tmp", { diff: "d", maxCandidates: 300 }), /maxCandidates/);
-  assert.throws(() => codeReview.resolve("/tmp", { diff: "d", verifyBatchSize: 25 }), /verifyBatchSize/);
+  await assert.rejects(() => codeReview.resolve("/tmp", { diff: "d", maxCandidates: 0 }), /maxCandidates/);
+  await assert.rejects(() => codeReview.resolve("/tmp", { diff: "d", maxCandidates: 300 }), /maxCandidates/);
+  await assert.rejects(() => codeReview.resolve("/tmp", { diff: "d", verifyBatchSize: 25 }), /verifyBatchSize/);
 });
 
-test("builtin resolvers accept valid numeric args (including a present 0 for threshold)", () => {
+test("builtin resolvers accept valid numeric args (including a present 0 for threshold)", async () => {
   const deepResearch = findBuiltinWorkflow("deep-research");
   const adversarialReview = findBuiltinWorkflow("adversarial-review");
   const codeReview = findBuiltinWorkflow("code-review");
   assert.ok(deepResearch && adversarialReview && codeReview);
 
-  assert.ok(deepResearch.resolve("/tmp", { question: "q", angles: 8, minSupport: 5 }).script);
-  assert.ok(deepResearch.resolve("/tmp", { question: "q" }).script); // missing → runtime default
-  assert.ok(adversarialReview.resolve("/tmp", { task: "t", reviewers: 2, threshold: 0, maxFindings: 25 }).script);
-  assert.ok(codeReview.resolve("/tmp", { diff: "d", maxCandidates: 30, verifyBatchSize: 5 }).script);
+  assert.ok((await deepResearch.resolve("/tmp", { question: "q", angles: 8, minSupport: 5 })).script);
+  assert.ok((await deepResearch.resolve("/tmp", { question: "q" })).script); // missing → runtime default
+  assert.ok(
+    (await adversarialReview.resolve("/tmp", { task: "t", reviewers: 2, threshold: 0, maxFindings: 25 })).script,
+  );
+  assert.ok((await codeReview.resolve("/tmp", { diff: "d", maxCandidates: 30, verifyBatchSize: 5 })).script);
 });
 
 // ─── Runtime: scripts enforce the same rules (f2–f5/i1) ────────────────────────

@@ -16,6 +16,17 @@ import type { WorkflowSettings } from "./workflow-settings.js";
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
 
+/**
+ * Default for the `subagentExtensionTools` setting (P04): "on" captures the
+ * installed research-extension sources (supi-web, pi-codegraph,
+ * pi-vision-handoff) into every subagent toolset — the single gate that
+ * decides whether codegraph_* / web / vision defs exist at all. One knob shared by
+ * the consumption site (extensions/workflow.ts `?? DEFAULT_...`) and the UI
+ * default display (workflow-settings-fields.ts), so the flip is testable and
+ * can never drift between the runtime and the settings surface.
+ */
+export const DEFAULT_SUBAGENT_EXTENSION_TOOLS = "on" as const;
+
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
 
@@ -32,6 +43,17 @@ export const DRAIN_ABORT_TIMEOUT_MS = 60_000;
 
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;
+
+/**
+ * P12: default parallel()/pipeline() fan-out size above which a human
+ * approval is required (TUI pause via ui.confirm; headless runs throw
+ * WORKFLOW_ABORTED unless the script passes autoApproved: true). Mirrors the
+ * existing plan-approval step limit (plan-size.ts PLAN_APPROVAL_STEP_LIMIT_DEFAULT)
+ * so the two "beyond this many parallel units" rules read consistently.
+ * Overridable per user via the fanOutApprovalThreshold settings key (null
+ * disables the gate) and per run via runWorkflow's fanOutApprovalThreshold.
+ */
+export const FAN_OUT_APPROVAL_THRESHOLD_DEFAULT = 8;
 
 /**
  * Hard ceiling on live nested workflow() frames, enforced at the vm wrapper —
@@ -61,6 +83,17 @@ export const MAX_RETRY_BACKOFF_MS = 60_000;
 
 /** Default token budget if none specified. */
 export const DEFAULT_TOKEN_BUDGET = null;
+
+/**
+ * P05: default character cap on a single agent() result (unstructured text
+ * results only). Matches pi's tool-result ceiling so a fan-out's synthesis
+ * context stays bounded; results larger than this are tail-preservingly
+ * truncated at the workflow layer (see capAgentResultText in workflow.ts) with
+ * the full text written to an artifact path for retrieval, and the capped
+ * output counts against the run budget. Explicitly excluded from hashAgentCall
+ * (it transforms the RESULT, never the inputs — resume replay stays stable).
+ */
+export const DEFAULT_MAX_AGENT_RESULT_CHARS = 50_000;
 
 /** Legacy project-relative directory for persisted workflow run state. New writes use workflowProjectPaths(). */
 export const WORKFLOW_RUNS_DIR = ".pi/workflows/runs";
@@ -117,6 +150,25 @@ export const ROUTING_POLICY_VERSION = 2;
  */
 export const DEFAULT_HELPER_TIER = "small";
 
+// ─── W2 P01/P09: testGate + multi-model cross-check defaults ────────────────
+
+/**
+ * Default bounded rework attempts for testGate() (P01) — mirrors gate()'s
+ * default so the machine-checked postcondition gate and the validator gate
+ * share the same bounded-rework shape (never silent, never unbounded).
+ */
+export const DEFAULT_TEST_GATE_ATTEMPTS = 3;
+
+/** Default tool the testGate() test subagent may use to run its command. */
+export const DEFAULT_TEST_GATE_TOOL = "bash" as const;
+
+/**
+ * Cap (milliseconds) on ONE ModelRuntime cross-check call (P09). A hung
+ * second-model request must not stall the whole run; withTimeout fails the
+ * call closed and the quality helper falls back to the same-model verdict.
+ */
+export const DEFAULT_CROSSCHECK_TIMEOUT_MS = 30_000;
+
 // NOTE (cross-slice, B2-owned): surfacing `defaultUntaggedTier` in
 // settings.json (workflow-settings.ts schema + workflow-settings-fields.ts UI)
 // and wiring it through extensions/workflow.ts is deliberately NOT done here —
@@ -147,8 +199,11 @@ export const WORKFLOW_ENV_VARS = {
   defaultAgentRetries: "PI_WORKFLOW_DEFAULT_AGENT_RETRIES",
   progressPanelMode: "PI_WORKFLOW_PROGRESS_PANEL_MODE",
   progressPanelMaxAgents: "PI_WORKFLOW_PROGRESS_PANEL_MAX_AGENTS",
+  fanOutApprovalThreshold: "PI_WORKFLOW_FAN_OUT_APPROVAL_THRESHOLD",
   persistAgentSessions: "PI_WORKFLOW_PERSIST_AGENT_SESSIONS",
   deliveredResultMaxChars: "PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS",
+  // P05: char cap on a single agent() result (see DEFAULT_MAX_AGENT_RESULT_CHARS).
+  maxAgentResultChars: "PI_WORKFLOW_MAX_AGENT_RESULT_CHARS",
   excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
   subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
@@ -225,10 +280,25 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   }
   const progressPanelMaxAgents = envInteger(env[WORKFLOW_ENV_VARS.progressPanelMaxAgents], 1, 1000);
   if (progressPanelMaxAgents !== undefined) settings.progressPanelMaxAgents = progressPanelMaxAgents;
+  // P12: fan-out approval threshold — null ("" or the literal "null") disables
+  // the gate; a positive integer sets the fan-out size that requires approval.
+  const fanOutApprovalThreshold = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.fanOutApprovalThreshold],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (fanOutApprovalThreshold !== undefined) settings.fanOutApprovalThreshold = fanOutApprovalThreshold;
   const persistAgentSessions = envBoolean(env[WORKFLOW_ENV_VARS.persistAgentSessions]);
   if (persistAgentSessions !== undefined) settings.persistAgentSessions = persistAgentSessions;
   const deliveredResultMaxChars = envInteger(env[WORKFLOW_ENV_VARS.deliveredResultMaxChars], 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
+  // P05: per-agent result cap default (positive integer; "" / "null" = no default cap).
+  const maxAgentResultChars = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.maxAgentResultChars],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (maxAgentResultChars !== undefined) settings.maxAgentResultChars = maxAgentResultChars;
   const excludeSubagentTools = env[WORKFLOW_ENV_VARS.excludeSubagentTools]
     ?.split(",")
     .map((name) => name.trim())

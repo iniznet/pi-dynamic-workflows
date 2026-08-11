@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { createSubagentToolDiscovery } from "../src/discovery.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -1208,7 +1209,11 @@ test("a fan-out past maxAgents cancels queued agents instead of draining the res
     },
   };
   const script = `export const meta = { name: 'c4', description: 'fanout cancel' }
-const xs = await parallel(Array.from({ length: ${fanout} }, (_, i) => () => agent('x' + i, { label: 'a' + i })))
+// P12: this fan-out deliberately runs a big headless batch (100 > the 8-item
+// approval threshold) to exercise limiter breach + cancellation — the
+// autoApproved escape keeps the automation headless-safe; concurrency 100
+// restores the eager all-at-once invocation the test measures.
+const xs = await parallel(Array.from({ length: ${fanout} }, (_, i) => () => agent('x' + i, { label: 'a' + i })), { concurrency: 100, autoApproved: true })
 return xs`;
   const run = runWorkflow(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
   // The run now drains every in-flight agent() call (including these
@@ -1247,7 +1252,7 @@ test("sibling parallel() batches are isolated: one breaching maxAgents does not 
   const script = `export const meta = { name: 'sib', description: 'sibling isolation' }
 const batchA = parallel(Array.from({ length: 3 }, (_, i) => () => agent('a' + i, { label: 'a' + i })))
   .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
-const batchB = parallel(Array.from({ length: 40 }, (_, i) => () => agent('b' + i, { label: 'b' + i })))
+const batchB = parallel(Array.from({ length: 40 }, (_, i) => () => agent('b' + i, { label: 'b' + i })), { autoApproved: true })
   .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
 const [a, b] = await Promise.all([batchA, batchB])
 return { a, b }`;
@@ -2107,4 +2112,83 @@ return { a }`;
     resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
   });
   assert.equal(edited.state.calls, 1, "a toolNames change must invalidate the cached call (not replay stale)");
+});
+
+// ─── P11: subagentTools discovery global ───────────────────────────────────────
+
+test("runWorkflow exposes subagentTools for capability discovery over the run's tools", async () => {
+  const discoveryScript = `export const meta = { name: 'discovery_probe', description: 'probe subagentTools' }
+const web = (await subagentTools.search('web')).map((t) => t.name).sort()
+const desc = await subagentTools.describe('codegraph_search')
+const selection = await subagentTools.select('web')
+return { web, desc, selection }`;
+  const tools = [
+    {
+      name: "web_fetch_md",
+      label: "web_fetch_md",
+      description: "Fetch a URL as Markdown",
+      parameters: { type: "object", properties: {} },
+    },
+    {
+      name: "codegraph_search",
+      label: "codegraph_search",
+      description: "Search the code graph",
+      parameters: { type: "object", properties: {} },
+    },
+  ] as never[];
+  const result = await runWorkflow(discoveryScript, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    tools: tools as never,
+  });
+  const body = result.result as {
+    web: string[];
+    desc: { name: string; source: string; capability: string; resolvable: boolean } | null;
+    selection: { toolNames: string[]; missing: string[] };
+  };
+  assert.deepEqual(body.web, ["web_fetch_md"], "search classifies the captured web surface");
+  assert.ok(body.desc);
+  assert.equal(body.desc.name, "codegraph_search");
+  assert.equal(body.desc.capability, "codebase");
+  assert.equal(body.desc.resolvable, true);
+  assert.deepEqual(body.selection.toolNames, ["web_fetch_md"], "select routes only run-resolvable names");
+  assert.deepEqual(body.selection.missing, [], "every registry tool of this run is resolvable");
+});
+
+test("subagentTools.select() reports run tools the discovery registry knows but the run cannot resolve", async () => {
+  const discoveryScript = `export const meta = { name: 'discovery_scoped', description: 'scoped probe' }
+const selection = await subagentTools.select('web')
+return { selection }`;
+  // The WIRED discovery knows web_fetch_md + web_docs_search; the run's tools
+  // (what agents can actually be handed) only carry web_fetch_md.
+  const wired = createSubagentToolDiscovery([
+    {
+      name: "web_fetch_md",
+      label: "web_fetch_md",
+      description: "Fetch a URL as Markdown",
+      parameters: { type: "object", properties: {} },
+    },
+    {
+      name: "web_docs_search",
+      label: "web_docs_search",
+      description: "Search docs",
+      parameters: { type: "object", properties: {} },
+    },
+  ] as never[]);
+  const result = await runWorkflow(discoveryScript, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    tools: [
+      {
+        name: "web_fetch_md",
+        label: "web_fetch_md",
+        description: "Fetch a URL as Markdown",
+        parameters: { type: "object", properties: {} },
+      },
+    ] as never[],
+    subagentToolDiscovery: wired,
+  });
+  const { selection } = result.result as { selection: { toolNames: string[]; missing: string[] } };
+  assert.deepEqual(selection.toolNames, ["web_fetch_md"], "only the run-resolvable tool routes");
+  assert.deepEqual(selection.missing, ["web_docs_search"], "the non-resolvable registry tool is reported");
 });

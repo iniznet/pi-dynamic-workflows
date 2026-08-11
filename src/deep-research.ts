@@ -4,6 +4,7 @@
  */
 
 import { DEEP_RESEARCH_NUMERIC_ARGS, numericArgCoercionSource } from "./builtin-args.js";
+import { claimVerifySource } from "./claim-verify.js";
 
 export interface DeepResearchConfig {
   /** Number of distinct search angles/queries to explore. */
@@ -82,6 +83,8 @@ if (planned.length > angles) {
 }
 
 phase('Gather')
+// P12: the gather fan-out is the angles product (up to 8) — autoApproved
+// keeps the builtin's unattended behavior under the fan-out approval gate.
 const gathered = await parallel(queries.map((q, i) => () =>
   agent(
     'Research this query using the web_search and web_fetch tools.\\nQuery: ' + q +
@@ -90,7 +93,7 @@ const gathered = await parallel(queries.map((q, i) => () =>
     'Do NOT invent sources or claims — report only what the fetched pages actually say.',
     { label: 'research ' + (i + 1), tier: ${tierGather}, schema: { type: 'object', properties: { sources: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, claims: { type: 'array', items: { type: 'string' } } }, required: ['url', 'claims'] } } }, required: ['sources'] } }
   )
-))
+), { autoApproved: true })
 const allSources = gathered.filter(Boolean).flatMap((g) => (g && g.sources) || [])
 
 phase('Verify')
@@ -170,6 +173,10 @@ const conflicts = [
   ...underSupported.map((c) => ({ claim: c.claim, reason: 'fewer than ' + minSupport + ' distinct source URLs' })),
   ...discarded.map((d) => ({ claim: d, reason: 'discarded by cross-check' })),
 ]
+// N02: per-claim evidence verification runs AFTER minSupport enforcement — it
+// verifies the claims that SURVIVED support checking (never before it), and it
+// never alters the deterministic enforcement above.
+${claimVerifySource({ tier: tierCrossCheck })}
 
 phase('Report')
 const report = await agent(
@@ -177,11 +184,13 @@ const report = await agent(
   'Cite source URLs inline next to each claim. If the evidence is thin, say so explicitly. Include a short Conflicts ' +
   'section listing the entries below and why each was excluded — never present them as fact.\\n\\n' +
   'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify(supported) +
-  '\\n\\nCONFLICTS JSON:\\n' + JSON.stringify(conflicts),
+  '\\n\\nCONFLICTS JSON:\\n' + JSON.stringify(conflicts) +
+  '\\n\\nVERIFICATION JSON:\\n' + JSON.stringify(verification) +
+  '\\n\\nEach entry in VERIFICATION JSON carries verified: true/false — entries marked verified: false could not be confirmed against their cited pages; disclose them as unverified in the report, never as fact.',
   { label: 'write report', tier: ${tierReport} }
 )
 
-return { question, queries, supported, conflicts, report }`;
+return { question, queries, supported, conflicts, report, verification }`;
 }
 
 /**
@@ -221,9 +230,11 @@ export function generateCodebaseAuditWorkflow(scope: string, checks: string[]): 
 
 phase('Individual Checks');
 const scope = ${JSON.stringify(scope)};
+// P12: caller-supplied checks can exceed the approval threshold headless —
+// autoApproved keeps the builtin's unattended behavior under the fan-out gate.
 const findings = await parallel([
 ${checkAgents}
-]);
+], { autoApproved: true });
 
 phase('Cross-Validation');
 const validated = await agent(

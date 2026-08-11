@@ -59,6 +59,78 @@ const MAX_SET_STATE_ATTEMPTS = 8;
 /** Deterministic workflow stage in the persisted phase state machine (0–3). */
 export type PhaseStage = 0 | 1 | 2 | 3;
 
+/**
+ * N01: workspace change-scope fingerprint captured at a phase boundary (host
+ * side, where fs/git are available). Pure data: a read-only git tree hash of
+ * the committed baseline plus the full `git status --porcelain` snapshot, so
+ * a later machine diff can answer "only intended files changed". Snapshots
+ * persist WITH the phase state (inside active-state.json) and are forward-only
+ * (a phase's snapshot is recorded once, never regressed). Never part of any
+ * agent() resume hash.
+ */
+export interface WorkspaceFingerprint {
+  /** The phase boundary this snapshot was captured at (0–3). */
+  phase: PhaseStage;
+  /** `git rev-parse HEAD^{tree}` — the committed tree baseline (null outside a repo). */
+  treeHash: string | null;
+  /** Every non-empty `git status --porcelain` line ([] outside a repo). */
+  gitStatus: string[];
+}
+
+/**
+ * N01: host-injected provider that captures a WorkspaceFingerprint at a phase
+ * boundary. The workflow layer stays fs/git-free; the host (WorkflowManager)
+ * injects the real capture (tree hash + porcelain status) and the machine
+ * persists the result alongside active-state.json.
+ */
+export type WorkspaceFingerprintProvider = (phase: PhaseStage) => WorkspaceFingerprint | Promise<WorkspaceFingerprint>;
+
+/**
+ * N01: the inputs a scope enforcer sees after a forward phase transition — the
+ * fingerprint captured AT the boundary just crossed plus the most recent
+ * fingerprint captured at a LOWER boundary (the diff baseline). `previous` is
+ * undefined for the run's first boundary (no baseline yet → nothing to diff).
+ * Because the snapshots are forward-only (never rewritten), a resume replay
+ * sees the SAME persisted inputs, so the enforcer fires at most once per
+ * boundary across the run's whole lifetime — deterministically.
+ */
+export interface WorkspaceScopeCheck {
+  /** The phase boundary just crossed (the NEW stage). */
+  stage: PhaseStage;
+  /** Most recent fingerprint captured below `stage` (undefined = no baseline). */
+  previous: WorkspaceFingerprint | undefined;
+  /** The fingerprint captured at THIS boundary. */
+  next: WorkspaceFingerprint;
+}
+
+/**
+ * N01: host-injected scope enforcer, invoked AFTER the boundary fingerprint is
+ * persisted — deliberately OUTSIDE the capture's best-effort try/catch, so a
+ * throwing enforcer genuinely rejects the transition. The host computes the
+ * machine diff + violation assertion (diffWorkspaceFingerprints /
+ * workspaceScopeViolations live host-side in workflow-manager.ts) and applies
+ * its documented policy (flag / reject / ui.confirm). The machine itself stays
+ * fs/git-free and holds no policy.
+ */
+export type WorkspaceScopeEnforcer = (check: WorkspaceScopeCheck) => void | Promise<void>;
+
+/**
+ * N01: persisted result of a scope assertion at one phase boundary. Written by
+ * the host's enforcer through `recordScopeViolations`; forward-only like
+ * fingerprints (a boundary's record is written once, never regressed), so
+ * resume replays see a stable audit trail.
+ */
+export interface ScopeViolationRecord {
+  /** Human-readable change descriptions outside the intended set ("added: x"). */
+  violations: string[];
+  /** The intended-path set the boundary was asserted against (exact paths +
+   *  "/"-suffixed subtree prefixes, relative to the run's cwd). */
+  allowed: string[];
+  /** ui.confirm mode: true when a human explicitly approved the out-of-scope
+   *  change (the transition proceeded); absent in flag/reject modes. */
+  approved?: boolean;
+}
+
 /** Persisted workflow phase state. */
 export interface PhaseState {
   /** Currently active workflow phase (0–3). */
@@ -80,6 +152,22 @@ export interface PhaseState {
    * and its rename and retry without losing either update.
    */
   version: number;
+  /**
+   * N01: workspace fingerprints captured at each phase boundary, keyed by the
+   * phase they were captured for (0–3). Absent until the first capture (and
+   * absent on legacy state files) — JSON drops the undefined key, so
+   * pre-N01 active-state.json stays byte-identical. Forward-only: an entry is
+   * written once per phase and never regressed.
+   */
+  fingerprints?: Partial<Record<PhaseStage, WorkspaceFingerprint>>;
+  /**
+   * N01: scope-assertion outcomes recorded at phase boundaries by the host's
+   * enforcer (flag / reject / ui.confirm), keyed by phase. Absent when no
+   * violation was ever asserted (and on legacy files) — JSON drops the key.
+   * Forward-only, same rule as fingerprints. Never part of any agent() resume
+   * hash.
+   */
+  scopeViolations?: Partial<Record<PhaseStage, ScopeViolationRecord>>;
 }
 
 /** Factory for a fresh default state (new timestamp on every call). */
@@ -128,6 +216,9 @@ function normalizePhaseState(parsed: unknown): PhaseState {
       ? raw.version
       : defaults.version;
 
+  const fingerprints = normalizeFingerprints(raw.fingerprints);
+  const scopeViolations = normalizeScopeViolations(raw.scopeViolations);
+
   return {
     activePhase,
     humanApproved: asBoolean("humanApproved"),
@@ -136,7 +227,61 @@ function normalizePhaseState(parsed: unknown): PhaseState {
     plannotatorSubmitted: asBoolean("plannotatorSubmitted"),
     updatedAt,
     version,
+    ...(fingerprints ? { fingerprints } : {}),
+    ...(scopeViolations ? { scopeViolations } : {}),
   };
+}
+
+/**
+ * Validate the persisted fingerprints side of active-state.json (N01): keep
+ * only well-formed entries whose numeric key matches the embedded phase and
+ * whose gitStatus is a string array; drop everything else (hand-edits degrade
+ * leniently, exactly like the other fields). Returns undefined when nothing
+ * valid remains (legacy files normalize to the pre-N01 shape).
+ */
+function normalizeFingerprints(value: unknown): Partial<Record<PhaseStage, WorkspaceFingerprint>> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const out: Partial<Record<PhaseStage, WorkspaceFingerprint>> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const phase = Number(key);
+    if (!Number.isInteger(phase) || phase < 0 || phase > 3) continue;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    if (entry.phase !== phase) continue;
+    const treeHash = typeof entry.treeHash === "string" ? entry.treeHash : null;
+    if (!Array.isArray(entry.gitStatus)) continue;
+    if (entry.gitStatus.some((line) => typeof line !== "string")) continue;
+    out[phase as PhaseStage] = { phase: phase as PhaseStage, treeHash, gitStatus: entry.gitStatus as string[] };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Validate the persisted scope-violation sidecar of active-state.json (N01):
+ * keep only well-formed entries whose numeric key matches the phase, whose
+ * violations/allowed are string arrays, and whose optional approved is a
+ * boolean; drop everything else (hand-edits degrade leniently, exactly like
+ * the fingerprints side). Returns undefined when nothing valid remains (legacy
+ * files normalize to the pre-enforcement shape).
+ */
+function normalizeScopeViolations(value: unknown): Partial<Record<PhaseStage, ScopeViolationRecord>> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const out: Partial<Record<PhaseStage, ScopeViolationRecord>> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    const phase = Number(key);
+    if (!Number.isInteger(phase) || phase < 0 || phase > 3) continue;
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    if (!Array.isArray(entry.violations) || entry.violations.some((v) => typeof v !== "string")) continue;
+    if (!Array.isArray(entry.allowed) || entry.allowed.some((v) => typeof v !== "string")) continue;
+    const approved = typeof entry.approved === "boolean" ? entry.approved : undefined;
+    out[phase as PhaseStage] = {
+      violations: entry.violations as string[],
+      allowed: entry.allowed as string[],
+      ...(approved !== undefined ? { approved } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +310,21 @@ export class WorkflowStateManager {
   private readonly statePath: string;
   private readonly enforcePrerequisites: boolean;
   private cachedState: PhaseState | null = null;
+  /**
+   * N01: host-injected workspace fingerprint provider (see
+   * setFingerprintCapture). When set, every successful forward transition
+   * captures a snapshot at the phase boundary and persists it with the phase
+   * state. Never set by the machine itself — the host (WorkflowManager)
+   * injects the fs/git-backed capture.
+   */
+  private fingerprintCapture: WorkspaceFingerprintProvider | undefined;
+  /**
+   * N01: host-injected workspace scope enforcer (see setScopeEnforcer). When
+   * set, every successful forward transition runs it AFTER the boundary
+   * fingerprint is persisted. Unlike the capture (best-effort), a throwing
+   * enforcer REJECTS the transition — the fail-closed enforcement path.
+   */
+  private scopeEnforcer: WorkspaceScopeEnforcer | undefined;
   /**
    * Serialize writes originating from this manager instance. Concurrent
    * `setState`/`transitionTo`/`approvePlan` calls on the same state machine
@@ -292,6 +452,79 @@ export class WorkflowStateManager {
     );
   }
 
+  /**
+   * N01: inject (or replace) the host-side workspace fingerprint provider. The
+   * machine calls it after each successful forward transition and persists the
+   * captured snapshot with the phase state (see recordFingerprint). Idempotent:
+   * the provider is shared per machine across runs; re-injection just replaces
+   * it.
+   */
+  setFingerprintCapture(provider: WorkspaceFingerprintProvider): void {
+    this.fingerprintCapture = provider;
+  }
+
+  /**
+   * N01: inject (or replace) the host-side workspace scope enforcer. The
+   * machine calls it after each successful forward transition's fingerprint is
+   * persisted and passes the boundary check (stage + previous/next snapshots);
+   * the host decides flag/reject/confirm. Idempotent like the capture
+   * provider: shared per machine across runs; re-injection just replaces it.
+   */
+  setScopeEnforcer(enforcer: WorkspaceScopeEnforcer): void {
+    this.scopeEnforcer = enforcer;
+  }
+
+  /**
+   * N01: persist one scope-assertion outcome with the phase state. Forward-only
+   * exactly like recordFingerprint: a phase's record is written once and never
+   * overwritten (a resumed run that re-crosses the same boundary re-asserts
+   * against the SAME persisted diff — the enforcer's reject/approve decision is
+   * deterministic on replay). Merged inside the write chain (serialized with
+   * setState/transitionTo/recordFingerprint on this instance).
+   */
+  async recordScopeViolations(phase: PhaseStage, record: ScopeViolationRecord): Promise<void> {
+    const run = this.writeChain.then(async () => {
+      const current = await this.readStateFromDisk();
+      const existing = current.scopeViolations ?? {};
+      if (existing[phase] !== undefined) return;
+      await this.applyStateUpdate({ scopeViolations: { ...existing, [phase]: record } });
+    });
+    // Detach the chain from this run's outcome (same policy as setState).
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    await run;
+  }
+
+  /**
+   * N01: persist one workspace fingerprint with the phase state. Forward-only:
+   * an entry for a phase is written exactly once (a repeat capture of the same
+   * phase is a no-op), and a phase below the highest already recorded is
+   * refused — so pause/resume cycles can add NEW boundary snapshots but never
+   * regress or rewrite history. Merged inside the write chain (serialized with
+   * setState/transitionTo on this instance) so concurrent transitions on a
+   * shared machine can't drop each other's snapshots; the CAS loop still
+   * guards cross-process writers.
+   */
+  async recordFingerprint(fingerprint: WorkspaceFingerprint): Promise<void> {
+    const run = this.writeChain.then(async () => {
+      const current = await this.readStateFromDisk();
+      const existing = current.fingerprints ?? {};
+      const highest = Math.max(0, ...Object.keys(existing).map(Number));
+      // Forward-only: never record a phase below the newest snapshot, and
+      // never overwrite a phase already captured.
+      if (fingerprint.phase < highest || existing[fingerprint.phase] !== undefined) return;
+      await this.applyStateUpdate({ fingerprints: { ...existing, [fingerprint.phase]: fingerprint } });
+    });
+    // Detach the chain from this run's outcome (same policy as setState).
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    await run;
+  }
+
   // -----------------------------------------------------------------------
   // Phase transitions
   // -----------------------------------------------------------------------
@@ -347,6 +580,42 @@ export class WorkflowStateManager {
     }
 
     await this.setState({ activePhase: phase });
+    // N01: workspace fingerprint at the phase boundary (host-injected capture).
+    // Best-effort: a failing capture must never fail a transition the machine
+    // already committed — the snapshot is diagnostic evidence, not a gate.
+    let fingerprint: WorkspaceFingerprint | undefined;
+    if (this.fingerprintCapture) {
+      try {
+        const captured = await this.fingerprintCapture(phase);
+        if (captured) {
+          await this.recordFingerprint(captured);
+          fingerprint = captured;
+        }
+      } catch {
+        // capture is diagnostic only
+      }
+    }
+    // N01: scope enforcement at the phase boundary (host-injected enforcer).
+    // Deliberately OUTSIDE the capture's best-effort try/catch: the enforcer's
+    // diff + violation assertion is the gate itself, so a throwing enforcer
+    // (fail-closed reject, or a ui.confirm denial) genuinely rejects this
+    // transition and surfaces at the run's flush point. The diff baseline is
+    // the most recent persisted snapshot BELOW this stage — forward-only, so
+    // the same boundary re-asserted on resume sees the same inputs.
+    if (this.scopeEnforcer && fingerprint) {
+      const state = await this.getState();
+      const snapshots = state.fingerprints ?? {};
+      let previous: WorkspaceFingerprint | undefined;
+      let highest = -1;
+      for (const [key, entry] of Object.entries(snapshots)) {
+        const stage = Number(key);
+        if (Number.isInteger(stage) && stage >= 0 && stage < phase && entry && stage > highest) {
+          highest = stage;
+          previous = entry;
+        }
+      }
+      await this.scopeEnforcer({ stage: phase, previous, next: fingerprint });
+    }
   }
 
   /**

@@ -40,8 +40,8 @@ test("findBuiltinWorkflow resolves both new names", () => {
 
 // ─── Per-pattern resolve(): defaults + parseability ───────────────────────────
 
-test("plan-then-execute resolve() works with only the required objective and carries its task-fit toolset", () => {
-  const invocation = requireBuiltin("plan-then-execute").resolve("/tmp", { objective: "build a thing" });
+test("plan-then-execute resolve() works with only the required objective and carries its task-fit toolset", async () => {
+  const invocation = await requireBuiltin("plan-then-execute").resolve("/tmp", { objective: "build a thing" });
   assert.equal(invocation.script, generatePlanThenExecuteWorkflow());
   // T2-06: read/write/bash subset + persistable tag instead of the full default toolset.
   assert.deepEqual(
@@ -53,8 +53,8 @@ test("plan-then-execute resolve() works with only the required objective and car
   assert.equal(meta.name, "plan_then_execute");
 });
 
-test("plan-then-execute resolve() accepts the optional context/maxSteps/execute args", () => {
-  const invocation = requireBuiltin("plan-then-execute").resolve("/tmp", {
+test("plan-then-execute resolve() accepts the optional context/maxSteps/execute args", async () => {
+  const invocation = await requireBuiltin("plan-then-execute").resolve("/tmp", {
     objective: "o",
     context: "c",
     maxSteps: 5,
@@ -63,19 +63,19 @@ test("plan-then-execute resolve() accepts the optional context/maxSteps/execute 
   assert.equal(invocation.script, generatePlanThenExecuteWorkflow());
 });
 
-test("plan-then-execute resolve() rejects missing objective and invalid optional args", () => {
+test("plan-then-execute resolve() rejects missing objective and invalid optional args", async () => {
   const resolve = requireBuiltin("plan-then-execute").resolve;
-  assert.throws(() => resolve("/tmp", {}), /objective/);
-  assert.throws(() => resolve("/tmp", { objective: "   " }), /objective/);
-  assert.throws(() => resolve("/tmp", { objective: "o", maxSteps: 0 }), /maxSteps/);
-  assert.throws(() => resolve("/tmp", { objective: "o", maxSteps: 100 }), /maxSteps/);
-  assert.throws(() => resolve("/tmp", { objective: "o", maxSteps: 2.5 }), /maxSteps/);
-  assert.throws(() => resolve("/tmp", { objective: "o", execute: "yes" }), /execute/);
-  assert.throws(() => resolve("/tmp", { objective: "o", context: 42 }), /context/);
+  await assert.rejects(() => resolve("/tmp", {}), /objective/);
+  await assert.rejects(() => resolve("/tmp", { objective: "   " }), /objective/);
+  await assert.rejects(() => resolve("/tmp", { objective: "o", maxSteps: 0 }), /maxSteps/);
+  await assert.rejects(() => resolve("/tmp", { objective: "o", maxSteps: 100 }), /maxSteps/);
+  await assert.rejects(() => resolve("/tmp", { objective: "o", maxSteps: 2.5 }), /maxSteps/);
+  await assert.rejects(() => resolve("/tmp", { objective: "o", execute: "yes" }), /execute/);
+  await assert.rejects(() => resolve("/tmp", { objective: "o", context: 42 }), /context/);
 });
 
-test("spec-generation resolve() works with only the required topic and carries its task-fit toolset", () => {
-  const invocation = requireBuiltin("spec-generation").resolve("/tmp", { topic: "an app" });
+test("spec-generation resolve() works with only the required topic and carries its task-fit toolset", async () => {
+  const invocation = await requireBuiltin("spec-generation").resolve("/tmp", { topic: "an app" });
   assert.equal(invocation.script, generateSpecGenerationWorkflow());
   // T2-06: read/bash/write subset + persistable tag instead of the full default toolset.
   assert.deepEqual(
@@ -87,8 +87,8 @@ test("spec-generation resolve() works with only the required topic and carries i
   assert.equal(meta.name, "spec_generation");
 });
 
-test("spec-generation resolve() accepts the optional audience/format args", () => {
-  const invocation = requireBuiltin("spec-generation").resolve("/tmp", {
+test("spec-generation resolve() accepts the optional audience/format args", async () => {
+  const invocation = await requireBuiltin("spec-generation").resolve("/tmp", {
     topic: "t",
     audience: "devs",
     format: "json",
@@ -96,11 +96,11 @@ test("spec-generation resolve() accepts the optional audience/format args", () =
   assert.equal(invocation.script, generateSpecGenerationWorkflow());
 });
 
-test("spec-generation resolve() rejects missing topic, non-string audience, and unknown formats", () => {
+test("spec-generation resolve() rejects missing topic, non-string audience, and unknown formats", async () => {
   const resolve = requireBuiltin("spec-generation").resolve;
-  assert.throws(() => resolve("/tmp", {}), /topic/);
-  assert.throws(() => resolve("/tmp", { topic: "  " }), /topic/);
-  assert.throws(() => resolve("/tmp", { topic: "t", audience: 42 }), /audience/);
-  assert.throws(() => resolve("/tmp", { topic: "t", format: "pdf" }), /format/);
-  assert.throws(() => resolve("/tmp", { topic: "t", format: 5 }), /format/);
+  await assert.rejects(() => resolve("/tmp", {}), /topic/);
+  await assert.rejects(() => resolve("/tmp", { topic: "  " }), /topic/);
+  await assert.rejects(() => resolve("/tmp", { topic: "t", audience: 42 }), /audience/);
+  await assert.rejects(() => resolve("/tmp", { topic: "t", format: "pdf" }), /format/);
+  await assert.rejects(() => resolve("/tmp", { topic: "t", format: 5 }), /format/);
 });

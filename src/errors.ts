@@ -127,6 +127,17 @@ export enum WorkflowErrorCode {
    * numeric alias `APPROVAL_REQUIRED`).
    */
   APPROVAL_REQUIRED = -31003,
+  /**
+   * N01 workspace-scope enforcement: a phase boundary's fingerprint diff
+   * showed files changed outside the run's intended set (declared outputs +
+   * known artifact dirs) while the run was configured to fail closed
+   * (workspaceScopeEnforce: "reject") or a ui.confirm denied the change.
+   * Non-recoverable: the violation is persisted with the phase state, so a
+   * resume re-rejects at the same boundary until the script's declared
+   * outputs (or the offending files) are fixed. Never part of any agent()
+   * resume hash.
+   */
+  WORKSPACE_SCOPE_VIOLATION = "WORKSPACE_SCOPE_VIOLATION",
 }
 
 /**

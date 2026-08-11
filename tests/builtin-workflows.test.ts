@@ -320,7 +320,7 @@ test("code-review prepareArgs resolves diffSource:'git diff HEAD' into a non-emp
     // produce the real code_review script — the model-visible end result.
     const builtin = findBuiltinWorkflow("code-review");
     assert.ok(builtin);
-    const invocation = builtin.resolve(repo, prepared);
+    const invocation = await builtin.resolve(repo, prepared);
     assert.equal(parseWorkflowScript(invocation.script).meta.name, "code_review");
   } finally {
     await rmForce(repo);
@@ -382,7 +382,7 @@ test("code-review prepareArgs leaves a whitespace-only diffSource untouched (res
     assert.equal(prepared, args);
     const builtin = findBuiltinWorkflow("code-review");
     assert.ok(builtin);
-    assert.throws(() => builtin.resolve(repo, args), /requires args\.diff/);
+    await assert.rejects(() => builtin.resolve(repo, args), /requires args\.diff/);
   } finally {
     await rmForce(repo);
   }

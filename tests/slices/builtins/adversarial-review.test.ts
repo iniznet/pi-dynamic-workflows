@@ -28,7 +28,7 @@ test("adversarial-review requires reviewers >= 2 and defaults threshold to 0.66 
 test("adversarial-review resolver rejects reviewers: 1 and the script enforces it at runtime", async () => {
   const pattern = findBuiltinWorkflow("adversarial-review");
   assert.ok(pattern);
-  assert.throws(() => pattern.resolve("/tmp", { task: "t", reviewers: 1 }), /reviewers/);
+  await assert.rejects(() => pattern.resolve("/tmp", { task: "t", reviewers: 1 }), /reviewers/);
 
   const runner = {
     async run(_prompt: string) {
