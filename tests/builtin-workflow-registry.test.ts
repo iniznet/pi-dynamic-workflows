@@ -64,15 +64,17 @@ function withTempCwd(fn: (cwd: string) => void | Promise<void>) {
 
 // ─── Registry shape ─────────────────────────────────────────────────────────────
 
-test("BUILTIN_WORKFLOW_NAMES lists exactly the 10 curated patterns", () => {
+test("BUILTIN_WORKFLOW_NAMES lists exactly the 12 curated patterns", () => {
   assert.deepEqual([...BUILTIN_WORKFLOW_NAMES].sort(), [
     "adversarial-review",
     "code-review",
     "codebase-audit",
     "debug-loop",
     "deep-research",
+    "multi-model",
     "multi-perspective",
     "plan-then-execute",
+    "review-remediate",
     "spec-conformance",
     "spec-generation",
     "supervised-run",
@@ -110,15 +112,23 @@ test("deep-research resolve() rejects a missing/blank question", async () => {
   await assert.rejects(() => resolve("/tmp", { question: "   " }), /question/);
 });
 
-test("adversarial-review resolve() produces the real generator script with its task-fit toolset", async () => {
+test("adversarial-review resolve() produces the impact-scoped generator script with its task-fit toolset", async () => {
   const invocation = await requireBuiltin("adversarial-review").resolve("/tmp", { task: "investigate this" });
-  assert.equal(invocation.script, generateAdversarialReviewWorkflow());
+  // V2-QW4: the resolved script is the generator output WITH the impact-analysis
+  // phase injected (Impact Analysis first, every refute reviewer embeds the
+  // partition) — never the bare generator output.
+  assert.notEqual(invocation.script, generateAdversarialReviewWorkflow());
+  assert.ok(invocation.script.includes("{ title: 'Impact Analysis' }"));
+  assert.ok(invocation.script.includes("label: 'impact analysis'"));
+  assert.ok(invocation.script.includes("'TASK: ' + task + '\\nFINDING: ' + f + impactScopeBlock(),"));
+  assert.ok(invocation.script.includes("report, impactPartition }"));
   // T2-06: the pattern no longer inherits the FULL default toolset — it gets
-  // the read/grep subset and the persistable "adversarial-review" tag. With no
-  // extension supplier (this test) no captured defs append.
+  // the read/grep/find subset (find traces the impact radius — V2-QW4) and the
+  // persistable "adversarial-review" tag. With no extension supplier (this
+  // test) no captured defs append.
   assert.deepEqual(
     (invocation.tools ?? []).map((t) => t.name),
-    ["read", "grep"],
+    ["read", "grep", "find"],
   );
   assert.equal(invocation.toolset, "adversarial-review");
 });
@@ -143,12 +153,17 @@ test("code-review resolve() produces the impact-scoped generator script and requ
   await assert.rejects(() => requireBuiltin("code-review").resolve("/tmp", { diff: "" }), /diff/);
 });
 
-test("multi-perspective resolve() bakes the given topic/perspectives into the same generator output", async () => {
+test("multi-perspective resolve() bakes the given topic/perspectives into the impact-scoped generator output", async () => {
   const invocation = await requireBuiltin("multi-perspective").resolve("/tmp", {
     topic: "climate policy",
     perspectives: ["economic", "environmental"],
   });
-  assert.equal(invocation.script, generateMultiPerspectiveWorkflow("climate policy", ["economic", "environmental"]));
+  // V2-QW4: the resolved script wraps the generator output with the
+  // impact-analysis phase (every analyst embeds the partition).
+  assert.notEqual(invocation.script, generateMultiPerspectiveWorkflow("climate policy", ["economic", "environmental"]));
+  assert.ok(invocation.script.includes("{ title: 'Impact Analysis' }"));
+  assert.ok(invocation.script.includes('+ topic + impactScopeBlock(), { label: "economic" }'));
+  assert.ok(invocation.script.includes("return { analyses, synthesis, impactPartition };"));
 });
 
 test("multi-perspective resolve() falls back to the default perspective set below 2 items", async () => {
@@ -158,8 +173,11 @@ test("multi-perspective resolve() falls back to the default perspective set belo
     perspectives: ["only-one"],
   });
   const expected = generateMultiPerspectiveWorkflow("topic", [...DEFAULT_MULTI_PERSPECTIVES]);
-  assert.equal(noPerspectives.script, expected);
-  assert.equal(onePerspective.script, expected);
+  assert.notEqual(noPerspectives.script, expected);
+  assert.notEqual(onePerspective.script, expected);
+  // Both degrade to the same default perspective set (impact-scoped, so the
+  // scripts are identical to each other).
+  assert.equal(noPerspectives.script, onePerspective.script);
 });
 
 test("multi-perspective resolve() rejects a missing topic", async () => {
@@ -173,16 +191,21 @@ test("multi-perspective resolve() rejects a missing topic", async () => {
 
 test("every pattern's resolve() carries its task-fit toolset tag and exact tool subset", async () => {
   // The plan's assignment (plan.md §3 T2-06); deep-research keeps web-research.
+  // V2-QW4: adversarial-review + multi-perspective gain find for the
+  // impact-analysis phase; V2-P05/V2-P06 add the multi-model + review-remediate
+  // patterns with the full work surface.
   const expectedTags: Record<string, { toolset: string; tools: string[] }> = {
-    "adversarial-review": { toolset: "adversarial-review", tools: ["read", "grep"] },
+    "adversarial-review": { toolset: "adversarial-review", tools: ["read", "grep", "find"] },
     "code-review": { toolset: "code-review", tools: ["read", "grep", "find"] },
     "codebase-audit": { toolset: "codebase-audit", tools: ["read", "grep", "find"] },
     "debug-loop": { toolset: "debug-loop", tools: ["read", "grep", "find", "bash", "write"] },
     "spec-conformance": { toolset: "spec-conformance", tools: ["read", "grep", "find", "bash"] },
     "plan-then-execute": { toolset: "plan-then-execute", tools: ["read", "write", "bash"] },
     "spec-generation": { toolset: "spec-generation", tools: ["read", "bash", "write"] },
-    "multi-perspective": { toolset: "multi-perspective", tools: ["read", "grep"] },
+    "multi-perspective": { toolset: "multi-perspective", tools: ["read", "grep", "find"] },
     "supervised-run": { toolset: "supervised-run", tools: ["read", "grep", "find", "bash", "write"] },
+    "review-remediate": { toolset: "review-remediate", tools: ["read", "grep", "find", "bash", "write"] },
+    "multi-model": { toolset: "multi-model", tools: ["read", "grep", "find", "bash", "write"] },
   };
   const validArgs: Record<string, Record<string, unknown>> = {
     "adversarial-review": { task: "t" },
@@ -194,6 +217,8 @@ test("every pattern's resolve() carries its task-fit toolset tag and exact tool 
     "spec-generation": { topic: "t" },
     "multi-perspective": { topic: "t" },
     "supervised-run": { task: "t", criterion: "c" },
+    "review-remediate": { diff: "d" },
+    "multi-model": { task: "t", models: ["a/b", "c/d"] },
   };
   for (const name of Object.keys(expectedTags)) {
     const { toolset, tools } = expectedTags[name];
@@ -214,15 +239,17 @@ test("every pattern's resolve() carries its task-fit toolset tag and exact tool 
   }
 });
 
-test("BUILTIN_TOOLSET_TOOLS covers the 9 toolset-tagged patterns plus the code-dev superset (P04)", async () => {
+test("BUILTIN_TOOLSET_TOOLS covers the 11 toolset-tagged patterns plus the code-dev superset (P04)", async () => {
   assert.deepEqual([...Object.keys(BUILTIN_TOOLSET_TOOLS)].sort(), [
     "adversarial-review",
     "code-dev",
     "code-review",
     "codebase-audit",
     "debug-loop",
+    "multi-model",
     "multi-perspective",
     "plan-then-execute",
+    "review-remediate",
     "spec-conformance",
     "spec-generation",
     "supervised-run",
@@ -304,7 +331,12 @@ test("debug-loop resolve() carries its task-fit toolset and rejects invalid args
 test("spec-conformance resolve() carries its task-fit toolset and rejects invalid args", async () => {
   const spec = { goal: "g", requirements: [{ id: "R1", statement: "s" }] };
   const invocation = await requireBuiltin("spec-conformance").resolve("/tmp", { spec });
-  assert.equal(invocation.script, generateSpecConformanceWorkflow());
+  // V2-QW4: the resolved script wraps the generator output with the
+  // impact-analysis phase (every evidence agent embeds the partition).
+  assert.notEqual(invocation.script, generateSpecConformanceWorkflow());
+  assert.ok(invocation.script.includes("{ title: 'Impact Analysis' }"));
+  assert.ok(invocation.script.includes("label: 'impact analysis'"));
+  assert.ok(invocation.script.includes("report, trend, impactPartition }"));
   assert.equal(invocation.toolset, "spec-conformance");
   assert.deepEqual(
     (invocation.tools ?? []).map((t) => t.name),
@@ -382,6 +414,8 @@ test("every built-in pattern's resolve() output is a parseable workflow script",
     "debug-loop": { bug: "b" },
     "spec-conformance": { spec: { goal: "g", requirements: [{ id: "R1", statement: "s" }] } },
     "supervised-run": { task: "t", criterion: "c" },
+    "review-remediate": { diff: "d" },
+    "multi-model": { task: "t", models: ["a/b", "c/d"] },
   };
   for (const descriptor of BUILTIN_WORKFLOWS) {
     const { script } = await descriptor.resolve("/tmp", validArgsByName[descriptor.name]);

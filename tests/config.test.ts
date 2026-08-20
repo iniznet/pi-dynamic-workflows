@@ -146,6 +146,17 @@ test("subagentExtensionTools env accepts on|off or a comma-separated known-sourc
   assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentExtensionTools]: "" }), {});
 });
 
+test("hostActors env is a strict on|off gate (V2-P12 default off)", () => {
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.hostActors]: "on" }), { hostActors: "on" });
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.hostActors]: "  off  " }), { hostActors: "off" });
+  // Anything else (or nothing) drops to the default-off side — no observer
+  // registration, no actor manager.
+  for (const garbage of ["", "  ", "auto", "true", "1"]) {
+    assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.hostActors]: garbage }), {});
+  }
+  assert.deepEqual(workflowSettingsFromEnv({}), {});
+});
+
 test("integer bounds are clamped to the config ceilings", () => {
   const env = {
     [WORKFLOW_ENV_VARS.defaultConcurrency]: "999",
@@ -226,6 +237,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "persistAgentSessions",
     "deliveredResultMaxChars",
     "maxAgentResultChars",
+    "maxTotalOutputChars",
     "fanOutApprovalThreshold",
     "excludeSubagentTools",
     "subagentHostTools",
@@ -233,6 +245,7 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "subagentChromeTools",
     "subagentExtensionTools",
     "subagentDamageControlTools",
+    "hostActors",
     "providerPool",
   ];
   for (const key of settingsKeys) {

@@ -428,6 +428,46 @@ export function loadPersistedJournal(state: {
   return state.journal ?? [];
 }
 
+/**
+ * V2-P10: the deterministic source a recorded-replay fixture is built from — a
+ * persisted run's identity (runId/name/script/phases/args) plus its journal of
+ * agent() call→result pairs. Read-only: replay never mutates the source run.
+ */
+export interface RunJournalForReplay {
+  runId: string;
+  workflowName: string;
+  script: string;
+  phases: string[];
+  args?: unknown;
+  journal: JournalEntry[];
+}
+
+/**
+ * V2-P10: read a persisted run's journal (compacted or plain) for fixture
+ * generation. Returns null when no run with this id is persisted (or the
+ * persisted state is unreadable). The journal is the exact call→result record
+ * the live run wrote — `loadPersistedJournal` reconstructs a compacted journal
+ * back to the original entries, so a fixture built from either shape replays
+ * identically.
+ */
+export function readRunJournalForReplay(runId: string, cwd?: string): RunJournalForReplay | null {
+  try {
+    const persistence = createRunPersistence(cwd || process.cwd());
+    const state = persistence.load(runId);
+    if (!state) return null;
+    return {
+      runId: state.runId,
+      workflowName: state.workflowName,
+      script: state.script,
+      phases: state.phases ?? [],
+      args: state.args,
+      journal: loadPersistedJournal(state),
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface LockFile {
   runId: string;
   runPath: string;

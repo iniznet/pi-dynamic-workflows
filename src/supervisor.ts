@@ -29,8 +29,16 @@
  */
 
 import { type NumericArgSpec, numericArgCoercionSource } from "./builtin-args.js";
-import { DEFAULT_HELPER_TIER } from "./config.js";
+import { DEFAULT_HELPER_TIER, DEFAULT_TEST_GATE_TOOL } from "./config.js";
 import { isWorkflowError, WorkflowErrorCode } from "./errors.js";
+import {
+  buildTestGatePrompt,
+  machineValidateTest,
+  TEST_GATE_OUTPUT_SCHEMA,
+  type TestGateAssert,
+  type TestGateTool,
+  validateTestGateTests,
+} from "./test-gate.js";
 import type { AgentOptions, WorkflowRuntimeEvent } from "./workflow.js";
 
 /** Bounds for the supervised-run fix→check rework loop (supervisor turns). */
@@ -191,12 +199,155 @@ export function parseSupervisorVerdict(result: unknown): SupervisorVerdict {
   return { status: "continue", reason: `(unknown supervisor status: ${String(status)})`, correction: null };
 }
 
+/**
+ * V2-N1 machine completion criteria. The verdict a script-side criterion
+ * function may return: a boolean predicate (`true` = done, `false` =
+ * continue) or a structured verdict mirroring the LLM verdict shape.
+ * `correction` is a DETERMINISTIC corrective instruction supplied by the
+ * script author — never an LLM verdict.
+ */
+export interface MachineCriterionVerdict {
+  status: "done" | "continue";
+  reason?: string;
+  correction?: string | null;
+}
+
+/**
+ * Script-side pure predicate: a function of the (journal-rebuilt, deterministic)
+ * observation log that returns the continue/done predicate. Must be a PURE
+ * function of its input — replay determinism requires it (the same observations
+ * must always produce the same verdict).
+ */
+export type MachineCriterionFunction = (
+  observations: readonly SupervisorObservation[],
+) => boolean | MachineCriterionVerdict;
+
+/**
+ * V2-N1 testGate-style machine criterion spec: ONE machine-checked
+ * postcondition run as a subagent step (the P01 mechanism — bash/grep tool +
+ * capture schema) whose acceptance is decided by the PURE machineValidateTest
+ * predicate, never an LLM verdict. `args` is the command (bash tool) or
+ * pattern (grep tool); `assert` follows the shared TestGateAssert contract
+ * (absent defaults to `{ exitCode: 0 }`).
+ */
+export interface MachineCriterionSpec {
+  tool?: TestGateTool;
+  args: string;
+  assert?: TestGateAssert;
+}
+
+/**
+ * The widened criterion union (V2-N1). A string is the original LLM mode — the
+ * supervisor agent checks it with a structured verdict and generates
+ * corrections. A machine criterion (function or spec) REPLACES the LLM
+ * supervisor turn with a deterministic continue/done predicate: verifiable
+ * criteria spend no supervisor-agent tokens and replay identically.
+ */
+export type SupervisedRunCriterion = string | MachineCriterionFunction | MachineCriterionSpec;
+
+/** How the completion criterion is evaluated (LLM verdict vs machine predicate). */
+export type SupervisedRunCriterionMode = "llm" | "machine-function" | "machine-test";
+
+/**
+ * Classify + validate the script-supplied criterion into its supervision mode
+ * (V2-N1). Throws a TypeError on garbage or a malformed machine-test spec
+ * (loud script bug — never silently falls back to the LLM path). The machine
+ * modes return the raw criterion value; the string mode returns the trimmed
+ * non-empty text.
+ */
+export function resolveSupervisedRunCriterion(criterion: unknown): {
+  mode: SupervisedRunCriterionMode;
+  value: SupervisedRunCriterion;
+} {
+  if (typeof criterion === "string") {
+    if (!criterion.trim()) throw new TypeError("supervisedRun requires a non-empty string criterion");
+    return { mode: "llm", value: criterion };
+  }
+  if (typeof criterion === "function") {
+    return { mode: "machine-function", value: criterion as MachineCriterionFunction };
+  }
+  if (criterion !== null && typeof criterion === "object") {
+    const spec = criterion as Record<string, unknown>;
+    const tool: unknown = spec.tool ?? DEFAULT_TEST_GATE_TOOL;
+    if (tool !== "bash" && tool !== "grep") {
+      throw new TypeError(`supervisedRun machine-test criterion tool must be "bash" or "grep", got ${String(tool)}`);
+    }
+    if (typeof spec.args !== "string" || !spec.args.trim()) {
+      throw new TypeError("supervisedRun machine-test criterion requires a non-empty string args");
+    }
+    // The shared testGate contract validates the assert shape — loud on a
+    // malformed spec so a broken criterion cannot silently accept/reject.
+    const assert = spec.assert as TestGateAssert | undefined;
+    validateTestGateTests([{ command: spec.args, assert }], tool);
+    const validated: MachineCriterionSpec = { tool, args: spec.args, ...(assert !== undefined ? { assert } : {}) };
+    return { mode: "machine-test", value: validated };
+  }
+  throw new TypeError(
+    "supervisedRun criterion must be a non-empty string, a pure function of observations, or a { tool, args, assert } machine-test spec",
+  );
+}
+
+/**
+ * Deterministic, bounded renderer of the criterion for agent prompts. A
+ * string embeds as-is (capped); a machine criterion renders as a fixed label
+ * plus the spec's command/assert — NEVER the function body (embedding script
+ * source would make the task-prompt hash depend on code text, not behavior).
+ */
+export function describeCriterion(criterion: SupervisedRunCriterion): string {
+  if (typeof criterion === "string") return capEmbedded(criterion, 2000);
+  if (typeof criterion === "function") {
+    return "(machine completion criterion: a script-side pure predicate over the observed run events)";
+  }
+  const tool = criterion.tool ?? DEFAULT_TEST_GATE_TOOL;
+  const assert = criterion.assert === undefined ? "{ exitCode: 0 }" : JSON.stringify(criterion.assert);
+  return `(machine completion criterion: run ${tool} command \`${capEmbedded(criterion.args, 400)}\` and require ${assert})`;
+}
+
+/**
+ * Normalize a machine criterion function's return value into a
+ * SupervisorVerdict. TOTAL and pure — every input maps to a well-defined
+ * verdict, so the machine continue/done control flow is deterministic over
+ * the journal-rebuilt observations (exactly like parseSupervisorVerdict for
+ * LLM mode). A `correction` string from the script is the deterministic
+ * corrective channel; absent/null means an empty continue round.
+ */
+export function normalizeMachineFunctionVerdict(raw: unknown): SupervisorVerdict {
+  if (typeof raw === "boolean") {
+    return raw
+      ? { status: "done", reason: "machine completion criterion satisfied", correction: null }
+      : { status: "continue", reason: "machine completion criterion not yet satisfied", correction: null };
+  }
+  if (raw !== null && typeof raw === "object" && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    if (record.status === "done") {
+      return { status: "done", reason: typeof record.reason === "string" ? record.reason : "", correction: null };
+    }
+    if (record.status === "continue") {
+      const correction = typeof record.correction === "string" ? record.correction : null;
+      return {
+        status: "continue",
+        reason: typeof record.reason === "string" ? record.reason : "",
+        correction: correction?.trim() ? correction : null,
+      };
+    }
+  }
+  return { status: "continue", reason: "(machine criterion returned no usable verdict)", correction: null };
+}
+
 /** Options for one `supervisedRun` invocation (script-facing runtime global). */
 export interface SupervisedRunOptions {
   /** The work to complete (fed to the task agent and every supervisor prompt). */
   task: string;
-  /** The concrete measurable completion criterion the supervisor verifies against. */
-  criterion: string;
+  /**
+   * The completion criterion. LLM mode (string): the supervisor agent checks
+   * it with a structured verdict and generates corrections. V2-N1 machine
+   * modes: a script-side PURE function of observations or a testGate-style
+   * { tool, args, assert } spec — the deterministic continue/done predicate
+   * then REPLACES the LLM supervisor turn (no supervisor-agent spend; a
+   * machine-mode failure injects a corrective agent carrying the deterministic
+   * machine detail).
+   */
+  criterion: SupervisedRunCriterion;
   /** Bounded supervisor turns (default SUPERVISOR_DEFAULT_MAX_ROUNDS). */
   maxRounds?: number;
   /** Task agent label (default "task"). */
@@ -220,6 +371,8 @@ export interface SupervisedRunOutcome {
   supervisor: {
     /** Supervisor turns executed. */
     rounds: number;
+    /** V2-N1: how the completion criterion was evaluated this run. */
+    mode: SupervisedRunCriterionMode;
     /** Whether the supervisor verified the completion criterion met. */
     declaredDone: boolean;
     /** How the loop ended. */
@@ -278,13 +431,13 @@ const promptSafeObservation = (entry: SupervisorObservation): string => {
 };
 
 /** Build the delegated work agent's prompt (deterministic inputs only). */
-export function buildTaskPrompt(task: string, criterion: string): string {
+export function buildTaskPrompt(task: string, criterion: SupervisedRunCriterion): string {
   return (
     "You are the delegated work agent in a supervised run. Complete the task below. " +
     "A supervisor will verify your work against the completion criterion after you settle — " +
     "make the result verifiable against it.\n\n" +
     `TASK:\n${task}\n\n` +
-    `COMPLETION CRITERION (the supervisor will check this):\n${capEmbedded(criterion, 2000)}`
+    `COMPLETION CRITERION (the supervisor will check this):\n${describeCriterion(criterion)}`
   );
 }
 
@@ -313,7 +466,7 @@ export function buildSupervisorPrompt(
 /** Build the corrective agent's work prompt (deterministic inputs only). */
 export function buildCorrectionPrompt(
   task: string,
-  criterion: string,
+  criterion: SupervisedRunCriterion,
   verdict: SupervisorVerdict,
   observations: readonly SupervisorObservation[],
 ): string {
@@ -325,7 +478,7 @@ export function buildCorrectionPrompt(
     "You are the corrective work agent in a supervised run. The previous attempt drifted from or stalled against the " +
     "completion criterion; implement exactly the correction below, then keep the task's other requirements intact.\n\n" +
     `TASK:\n${capEmbedded(task, 4000)}\n\n` +
-    `COMPLETION CRITERION:\n${capEmbedded(criterion, 2000)}\n\n` +
+    `COMPLETION CRITERION:\n${describeCriterion(criterion)}\n\n` +
     `SUPERVISOR CORRECTION (do this):\n${capEmbedded(verdict.correction, 2000)}\n\n` +
     `SUPERVISOR REASON:\n${capEmbedded(verdict.reason, 1000)}\n\n` +
     `RECENT RUN EVENTS:\n${tail.length > 0 ? tail : "(none)"}`
@@ -361,10 +514,15 @@ export function bindRunSupervisor(
 ): (options: SupervisedRunOptions) => Promise<SupervisedRunOutcome> {
   return async (options: SupervisedRunOptions): Promise<SupervisedRunOutcome> => {
     const task = typeof options.task === "string" ? options.task : "";
-    const criterion = typeof options.criterion === "string" ? options.criterion : "";
-    if (!task.trim() || !criterion.trim()) {
-      throw new Error("supervisedRun requires non-empty string options.task and options.criterion");
+    if (!task.trim()) {
+      throw new Error("supervisedRun requires non-empty string options.task and a non-empty criterion");
     }
+    // V2-N1: resolve the criterion mode UP FRONT (before any agent() call) so a
+    // malformed machine spec fails loud before a task-agent turn is spent, and
+    // the mode — a pure function of the script input — stays deterministic on
+    // resume (the same script always picks the same mode and the same number of
+    // positional agent() calls).
+    const { mode: criterionMode, value: criterion } = resolveSupervisedRunCriterion(options.criterion);
     const maxRounds = Math.max(
       1,
       Math.min(SUPERVISOR_DEFAULT_MAX_ROUNDS, Math.floor(options.maxRounds ?? SUPERVISOR_DEFAULT_MAX_ROUNDS)),
@@ -385,27 +543,63 @@ export function bindRunSupervisor(
       ...(options.taskPhase !== undefined ? { phase: options.taskPhase } : {}),
     });
 
-    const verdicts: SupervisorVerdict[] = [];
-    let finalVerdict: SupervisorVerdict | null = null;
-    let declaredDone = false;
-    let termination: SupervisedRunOutcome["supervisor"]["termination"] = "max-rounds";
-    let corrections = 0;
-    let lastWorkResult: unknown = taskResult;
-
-    for (let round = 1; round <= maxRounds; round += 1) {
-      // Run-budget interplay: supervisor turns count against the run budget
-      // like every agent(); when the budget is spent, stop supervising instead
-      // of letting the next agent() throw TOKEN_BUDGET_EXHAUSTED.
-      if (ctx.budget.total !== null && ctx.budget.remaining() <= 0) {
-        ctx.log(`supervisedRun: run token budget exhausted after ${round - 1} supervisor turn(s) — stopping`);
-        termination = "budget-exhausted";
-        break;
+    // V2-N1 machine-test mode: run ONE testGate-style postcondition as a
+    // subagent step (the P01 mechanism — bash/grep tool + capture schema) and
+    // machine-validate the capture. The step is a journaled positional agent()
+    // call whose prompt/toolNames/schema are deterministic (already hashAgentCall
+    // fields — the field set is untouched), so it replays from the journal
+    // exactly like testGate's own steps. A failed test injects a corrective
+    // agent carrying the DETERMINISTIC machine failure detail (never an LLM
+    // correction).
+    const evaluateMachineTestRound = async (round: number, spec: MachineCriterionSpec): Promise<SupervisorVerdict> => {
+      const tool: TestGateTool = spec.tool ?? DEFAULT_TEST_GATE_TOOL;
+      const tests = validateTestGateTests([{ command: spec.args, assert: spec.assert }], tool);
+      const test = tests[0];
+      let step: unknown = null;
+      try {
+        step = await ctx.agent(buildTestGatePrompt(test, tool), {
+          label: `${SUPERVISOR_LABEL_PREFIX} test ${round}`,
+          tier: options.supervisorTier ?? DEFAULT_HELPER_TIER,
+          schema: TEST_GATE_OUTPUT_SCHEMA,
+          toolNames: [tool],
+        });
+      } catch (error) {
+        // A test step hitting the schema wall / execution failure must not abort
+        // the run: it degrades to a failed test (empty continue round). Run-wide
+        // conditions (budget/limit/abort) still throw.
+        if (
+          !isWorkflowError(error) ||
+          (error.code !== WorkflowErrorCode.SCHEMA_NONCOMPLIANCE &&
+            error.code !== WorkflowErrorCode.AGENT_EXECUTION_ERROR)
+        ) {
+          throw error;
+        }
+        ctx.log(`supervisedRun: machine test round ${round} omitted (${error.code})`);
+        step = null;
       }
-      const observations = observe();
-      ctx.onRuntimeEvent?.({ type: "supervisor", stage: "start", round });
+      const outcome = machineValidateTest(step, test.assert);
+      if (outcome.passed) {
+        return { status: "done", reason: `machine postcondition verified: ${test.command}`, correction: null };
+      }
+      return {
+        status: "continue",
+        reason: `machine postcondition not met: ${outcome.detail}`,
+        correction:
+          `The machine postcondition is not met: ${outcome.detail}\n` +
+          `Rework the result so \`${test.command}\` passes ${JSON.stringify(test.assert)}.`,
+      };
+    };
+
+    // LLM mode: the unchanged supervisor agent() turn. Kept byte-identical so
+    // existing LLM-mode runs and their journals replay exactly as before.
+    const evaluateLlmRound = async (
+      round: number,
+      observations: readonly SupervisorObservation[],
+      criterionText: string,
+    ): Promise<SupervisorVerdict> => {
       let raw: unknown;
       try {
-        raw = await ctx.agent(buildSupervisorPrompt(task, criterion, observations, round), {
+        raw = await ctx.agent(buildSupervisorPrompt(task, criterionText, observations, round), {
           label: `${SUPERVISOR_LABEL_PREFIX} ${round}`,
           tier: options.supervisorTier ?? DEFAULT_HELPER_TIER,
           schema: SUPERVISOR_VERDICT_SCHEMA,
@@ -425,8 +619,44 @@ export function bindRunSupervisor(
         ctx.log(`supervisedRun: supervisor turn ${round} omitted (${error.code})`);
         raw = null;
       }
+      return parseSupervisorVerdict(raw);
+    };
+
+    const verdicts: SupervisorVerdict[] = [];
+    let finalVerdict: SupervisorVerdict | null = null;
+    let declaredDone = false;
+    let termination: SupervisedRunOutcome["supervisor"]["termination"] = "max-rounds";
+    let corrections = 0;
+    let lastWorkResult: unknown = taskResult;
+
+    for (let round = 1; round <= maxRounds; round += 1) {
+      // Run-budget interplay: supervisor turns count against the run budget
+      // like every agent(); when the budget is spent, stop supervising instead
+      // of letting the next agent() throw TOKEN_BUDGET_EXHAUSTED.
+      if (ctx.budget.total !== null && ctx.budget.remaining() <= 0) {
+        ctx.log(`supervisedRun: run token budget exhausted after ${round - 1} supervisor turn(s) — stopping`);
+        termination = "budget-exhausted";
+        break;
+      }
+      const observations = observe();
+      ctx.onRuntimeEvent?.({ type: "supervisor", stage: "start", round });
+      // V2-N1: the verdict path branches on the criterion. Machine modes replace
+      // the LLM supervisor turn with a deterministic predicate — a script-side
+      // pure function of the (journal-rebuilt) observations, or a machine-test
+      // subagent step — so verifiable criteria never spend a supervisor turn.
+      // Skipping the supervisor agent() call keeps call indices deterministic:
+      // the same script always skips the same calls (the mode is a pure function
+      // of the script input, and machine verdicts are pure functions of the
+      // journaled observations).
+      let verdict: SupervisorVerdict;
+      if (typeof criterion === "function") {
+        verdict = normalizeMachineFunctionVerdict(criterion(observations));
+      } else if (typeof criterion === "object") {
+        verdict = await evaluateMachineTestRound(round, criterion);
+      } else {
+        verdict = await evaluateLlmRound(round, observations, criterion);
+      }
       ctx.onRuntimeEvent?.({ type: "supervisor", stage: "end", round });
-      const verdict = parseSupervisorVerdict(raw);
       verdicts.push(verdict);
       finalVerdict = verdict;
       if (verdict.status === "done") {
@@ -458,6 +688,7 @@ export function bindRunSupervisor(
       result: lastWorkResult,
       supervisor: {
         rounds: verdicts.length,
+        mode: criterionMode,
         declaredDone,
         termination,
         finalVerdict,

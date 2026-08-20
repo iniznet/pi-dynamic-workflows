@@ -15,7 +15,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { findBuiltinWorkflow } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { generateSupervisedRunWorkflow, parseSupervisorVerdict } from "../src/supervisor.js";
+import {
+  buildTaskPrompt,
+  describeCriterion,
+  generateSupervisedRunWorkflow,
+  normalizeMachineFunctionVerdict,
+  parseSupervisorVerdict,
+  resolveSupervisedRunCriterion,
+} from "../src/supervisor.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
 const supervisedScript = `export const meta = { name: 'supervised_demo', description: 'supervised' }
@@ -400,4 +407,353 @@ test("supervised-run builtin: generated script guards missing args", async () =>
   const out = result.result as { error: string; outcome: null };
   assert.match(out.error, /task and criterion are required/);
   assert.equal(out.outcome, null);
+});
+
+// ─── V2-N1 machine completion criteria ─────────────────────────────────────────
+
+const machineFunctionDoneScript = `export const meta = { name: 'sup_machine_done', description: 'x' }
+const outcome = await supervisedRun({
+  task: 'Implement the widget',
+  criterion: (observations) => observations.some((o) => o.kind === 'end' && o.label === 'task' && o.result === 'complete'),
+  maxRounds: 3,
+})
+return outcome`;
+
+const machineCorrectionScript = `export const meta = { name: 'sup_machine_corr', description: 'x' }
+const outcome = await supervisedRun({
+  task: 'Implement the widget',
+  criterion: (observations) => {
+    const wired = observations.some((o) => o.kind === 'end' && o.label === 'corrective 1' && String(o.result).includes('wired'))
+    return wired ? { status: 'done', reason: 'wired into the entry' } : { status: 'continue', correction: 'Wire the widget into the entry' }
+  },
+  maxRounds: 3,
+})
+return outcome`;
+
+const machineTestScript = `export const meta = { name: 'sup_machine_test', description: 'x' }
+const outcome = await supervisedRun({
+  task: 'Implement the widget',
+  criterion: { tool: 'bash', args: 'npx tsc --noEmit', assert: { exitCode: 0 } },
+  maxRounds: 3,
+})
+return outcome`;
+
+/** Fake runner scripting machine-test mode: fail once, then pass after the correction. */
+function machineTestFake() {
+  const state = { calls: 0, labels: [] as string[], testCalls: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string, options?: { label?: string }) {
+        state.calls++;
+        if (options?.label) state.labels.push(options.label);
+        if (prompt.includes("You are the delegated work agent")) return "partial";
+        if (prompt.includes("Run the following command")) {
+          state.testCalls++;
+          return state.testCalls === 1 ? { exitCode: 1, output: "ERROR: type mismatch" } : { exitCode: 0, output: "" };
+        }
+        if (prompt.includes("corrective work agent")) return "wired into the entry";
+        return "unexpected";
+      },
+    },
+  };
+}
+
+test("supervisedRun machine-function criterion: a pure predicate replaces the LLM supervisor turn (done on first check)", async () => {
+  const state = { calls: 0, supervisorPrompts: 0 };
+  const runner = {
+    async run(prompt: string) {
+      state.calls++;
+      if (prompt.includes("You are the supervisor")) state.supervisorPrompts++;
+      return "complete";
+    },
+  };
+  const result = await runWorkflow(machineFunctionDoneScript, { agent: runner, persistLogs: false });
+  const outcome = result.result as {
+    supervisor: {
+      rounds: number;
+      mode: string;
+      declaredDone: boolean;
+      termination: string;
+      corrections: number;
+    };
+  };
+  assert.equal(state.calls, 1, "only the task agent runs — the supervisor agent() call is skipped");
+  assert.equal(state.supervisorPrompts, 0, "no LLM supervisor turn ever runs");
+  assert.equal(outcome.supervisor.rounds, 1);
+  assert.equal(outcome.supervisor.mode, "machine-function");
+  assert.equal(outcome.supervisor.declaredDone, true);
+  assert.equal(outcome.supervisor.termination, "declared-done");
+  assert.equal(outcome.supervisor.corrections, 0);
+});
+
+test("supervisedRun machine-function criterion: a verdict correction injects exactly one corrective agent (deterministic)", async () => {
+  const state = { calls: 0, correctivePrompts: 0 };
+  const runner = {
+    async run(prompt: string) {
+      state.calls++;
+      if (prompt.includes("You are the delegated work agent")) return "partial";
+      if (prompt.includes("corrective work agent")) {
+        state.correctivePrompts++;
+        return "wired into the entry";
+      }
+      return "unexpected";
+    },
+  };
+  const result = await runWorkflow(machineCorrectionScript, { agent: runner, persistLogs: false });
+  const outcome = result.result as {
+    result: string;
+    supervisor: {
+      rounds: number;
+      mode: string;
+      declaredDone: boolean;
+      corrections: number;
+      termination: string;
+    };
+  };
+  assert.equal(state.calls, 2, "task + one corrective agent — no LLM supervisor turn");
+  assert.equal(state.correctivePrompts, 1, "the script's deterministic correction is honored");
+  assert.equal(outcome.supervisor.rounds, 2);
+  assert.equal(outcome.supervisor.mode, "machine-function");
+  assert.equal(outcome.supervisor.declaredDone, true);
+  assert.equal(outcome.supervisor.corrections, 1);
+  assert.equal(outcome.result, "wired into the entry");
+});
+
+test("supervisedRun machine-function criterion: an unsatisfied predicate is a bounded empty-round loop (max-rounds)", async () => {
+  const state = { calls: 0 };
+  const runner = {
+    async run(_prompt: string) {
+      state.calls++;
+      return "partial";
+    },
+  };
+  const script = `export const meta = { name: 'sup_machine_stall', description: 'x' }
+const outcome = await supervisedRun({
+  task: 'Implement the widget',
+  criterion: () => false,
+  maxRounds: 3,
+})
+return outcome`;
+  const result = await runWorkflow(script, { agent: runner, persistLogs: false });
+  const outcome = result.result as {
+    supervisor: { rounds: number; mode: string; declaredDone: boolean; termination: string; corrections: number };
+  };
+  assert.equal(state.calls, 1, "only the task agent — machine rounds spend no agent calls");
+  assert.equal(outcome.supervisor.rounds, 3, "all bounded rounds evaluated the machine predicate");
+  assert.equal(outcome.supervisor.mode, "machine-function");
+  assert.equal(outcome.supervisor.declaredDone, false);
+  assert.equal(outcome.supervisor.termination, "max-rounds");
+  assert.equal(outcome.supervisor.corrections, 0);
+});
+
+test("supervisedRun machine-test criterion: a passing postcondition declares done without any LLM turn", async () => {
+  const state = { calls: 0, supervisorPrompts: 0 };
+  const runner = {
+    async run(prompt: string) {
+      state.calls++;
+      if (prompt.includes("You are the supervisor")) state.supervisorPrompts++;
+      if (prompt.includes("Run the following command")) return { exitCode: 0, output: "" };
+      return "done";
+    },
+  };
+  const result = await runWorkflow(machineTestScript, { agent: runner, persistLogs: false });
+  const outcome = result.result as {
+    supervisor: { rounds: number; mode: string; declaredDone: boolean; termination: string; corrections: number };
+  };
+  assert.equal(state.calls, 2, "task + one machine-test subagent step");
+  assert.equal(state.supervisorPrompts, 0, "the machine test replaced the LLM supervisor turn");
+  assert.equal(outcome.supervisor.rounds, 1);
+  assert.equal(outcome.supervisor.mode, "machine-test");
+  assert.equal(outcome.supervisor.declaredDone, true);
+  assert.equal(outcome.supervisor.termination, "declared-done");
+});
+
+test("supervisedRun machine-test criterion: a failed postcondition injects one corrective agent, then re-checks", async () => {
+  const fake = machineTestFake();
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow(machineTestScript, {
+    agent: fake.runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  const outcome = result.result as {
+    result: string;
+    supervisor: {
+      rounds: number;
+      mode: string;
+      declaredDone: boolean;
+      corrections: number;
+      finalVerdict: { status: string; correction: string | null };
+      verdicts: Array<{ status: string; correction: string | null }>;
+    };
+  };
+  assert.equal(fake.state.calls, 4, "task + test(fail) + corrective + test(pass)");
+  assert.deepEqual(fake.state.labels, ["task", "supervisor test 1", "corrective 1", "supervisor test 2"]);
+  assert.equal(outcome.supervisor.rounds, 2);
+  assert.equal(outcome.supervisor.mode, "machine-test");
+  assert.equal(outcome.supervisor.declaredDone, true);
+  assert.equal(outcome.supervisor.corrections, 1);
+  assert.equal(outcome.result, "wired into the entry");
+  assert.ok(
+    outcome.supervisor.verdicts[0].correction?.includes("exit code 1"),
+    "the corrective instruction carries the deterministic machine failure detail",
+  );
+  assert.deepEqual(
+    journal.map((entry) => entry.index),
+    [0, 1, 2, 3],
+    "every machine-test step and corrective agent is a journaled positional call",
+  );
+});
+
+test("supervisedRun machine criteria: resume replays identically (full cache hit = zero live calls)", async () => {
+  // Function mode: the journal holds only the task call — the skipped
+  // supervisor call keeps call indices deterministic across resume.
+  const fnJournal: JournalEntry[] = [];
+  const firstFn = {
+    async run() {
+      return "complete";
+    },
+  };
+  const r1 = await runWorkflow(machineFunctionDoneScript, {
+    agent: firstFn,
+    persistLogs: false,
+    runId: "sup-machine-fn-resume",
+    onAgentJournal: (entry) => fnJournal.push(entry),
+  });
+  assert.deepEqual(
+    fnJournal.map((entry) => entry.index),
+    [0],
+    "machine-function mode journals only the task call",
+  );
+  const secondFn = {
+    async run() {
+      throw new Error("live call on a full cache hit");
+    },
+  };
+  const r2 = await runWorkflow(machineFunctionDoneScript, {
+    agent: secondFn,
+    persistLogs: false,
+    runId: "sup-machine-fn-resume",
+    resumeJournal: new Map(fnJournal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+  });
+  assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
+
+  // Test mode: the machine-test steps are journaled agent() calls too.
+  const testJournal: JournalEntry[] = [];
+  const first = machineTestFake();
+  const firstTestResult = await runWorkflow(machineTestScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "sup-machine-test-resume",
+    onAgentJournal: (entry) => testJournal.push(entry),
+  });
+  assert.equal(first.state.calls, 4);
+  const replayed = machineTestFake();
+  const r3 = await runWorkflow(machineTestScript, {
+    agent: replayed.runner,
+    persistLogs: false,
+    runId: "sup-machine-test-resume",
+    resumeJournal: new Map(testJournal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+  });
+  assert.equal(replayed.state.calls, 0, "a full cache hit replays task + test steps + corrective — zero live calls");
+  assert.equal(JSON.stringify(r3.result), JSON.stringify(firstTestResult.result));
+});
+
+test("supervisedRun machine criteria: editing the test args invalidates the cached machine-test step", async () => {
+  const journal: JournalEntry[] = [];
+  const first = machineTestFake();
+  await runWorkflow(machineTestScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "sup-machine-test-edit",
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(first.state.calls, 4);
+
+  const edited = machineTestScript.replace("npx tsc --noEmit", "npm test -- --filter widget");
+  const replayed = machineTestFake();
+  await runWorkflow(edited, {
+    agent: replayed.runner,
+    persistLogs: false,
+    runId: "sup-machine-test-edit",
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+  });
+  assert.equal(replayed.state.calls, 4, "an edited args re-runs the machine-test loop live");
+});
+
+test("resolveSupervisedRunCriterion classifies + validates the criterion union", () => {
+  assert.equal(resolveSupervisedRunCriterion("all tests pass").mode, "llm");
+  assert.equal(resolveSupervisedRunCriterion(() => true).mode, "machine-function");
+  assert.equal(
+    resolveSupervisedRunCriterion({ args: "npx tsc --noEmit", assert: { exitCode: 0 } }).mode,
+    "machine-test",
+  );
+  assert.equal(
+    resolveSupervisedRunCriterion({ args: "pattern" }).mode,
+    "machine-test",
+    "assert defaults to exitCode 0",
+  );
+  for (const garbage of [
+    "",
+    "   ",
+    null,
+    42,
+    {},
+    { args: "" },
+    { args: "x", tool: "fish" },
+    { args: "x", assert: {} },
+  ]) {
+    assert.throws(
+      () => resolveSupervisedRunCriterion(garbage),
+      TypeError,
+      `garbage criterion rejected: ${String(garbage)}`,
+    );
+  }
+});
+
+test("normalizeMachineFunctionVerdict is total and deterministic over any raw result", () => {
+  assert.deepEqual(normalizeMachineFunctionVerdict(true), {
+    status: "done",
+    reason: "machine completion criterion satisfied",
+    correction: null,
+  });
+  assert.deepEqual(normalizeMachineFunctionVerdict(false), {
+    status: "continue",
+    reason: "machine completion criterion not yet satisfied",
+    correction: null,
+  });
+  assert.deepEqual(normalizeMachineFunctionVerdict({ status: "done", reason: "r" }), {
+    status: "done",
+    reason: "r",
+    correction: null,
+  });
+  assert.deepEqual(normalizeMachineFunctionVerdict({ status: "continue", correction: "fix it" }), {
+    status: "continue",
+    reason: "",
+    correction: "fix it",
+  });
+  assert.deepEqual(normalizeMachineFunctionVerdict({ status: "continue", correction: "   " }), {
+    status: "continue",
+    reason: "",
+    correction: null,
+  });
+  for (const garbage of [null, undefined, "string", 42, [], {}, { status: "nope" }]) {
+    assert.equal(normalizeMachineFunctionVerdict(garbage).status, "continue");
+  }
+});
+
+test("describeCriterion renders machine criteria deterministically (never the function body)", () => {
+  const text = describeCriterion("all tests pass");
+  assert.ok(text.includes("all tests pass"));
+  const fn = describeCriterion(() => true);
+  assert.ok(fn.includes("script-side pure predicate"), "function criteria render a fixed label, not source");
+  assert.ok(!fn.includes("=>"), "the function body never leaks into a prompt hash");
+  const spec = describeCriterion({ tool: "bash", args: "npx tsc --noEmit", assert: { exitCode: 0 } });
+  assert.ok(spec.includes("npx tsc --noEmit"));
+  assert.ok(spec.includes('"exitCode":0'));
+  // The task prompt embeds the deterministic description for machine modes.
+  const taskPrompt = buildTaskPrompt("Implement the widget", () => false);
+  assert.ok(taskPrompt.includes("script-side pure predicate"));
+  assert.ok(taskPrompt.includes("Implement the widget"));
 });

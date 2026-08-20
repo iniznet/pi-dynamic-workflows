@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import {
+  type BeforeAgentStartEvent,
+  type ContextEvent,
   createCodingTools,
   defineTool,
   type ExtensionAPI,
   type ExtensionContext,
+  getAgentDir,
+  type SessionCompactEvent,
+  type SessionStartEvent,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -26,17 +31,23 @@ import type { CheckpointGate, ProviderPool } from "../src/index.js";
 import {
   applyEnvSettingsOverride,
   createEffortState,
+  createHostActorManager,
   createPlannotatorBridge,
   createProviderPoolFromConfig,
   createWebTools,
   createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
+  type EstimateFanOutRow,
+  type EstimatePhaseRow,
+  estimateWorkflowForecast,
   HostToolGateway,
   installResultDelivery,
   installTaskPanel,
   installWorkflowKeywordArming,
+  listRunReports,
   loadWorkflowSettings,
+  readRunReport,
   registerAllSavedWorkflows,
   registerBuiltinWorkflows,
   registerEffortCommand,
@@ -45,10 +56,12 @@ import {
   registerWorkflowModelsCommand,
   registerWorkflowSettingsCommand,
   registerWorkflowSubagentToolsCommand,
+  renderWorkflowEstimate,
   saveWorkflowSettingsForCwd,
   UsageLimitScheduler,
   WorkflowManager,
   WorkflowStateManager,
+  workflowProjectPaths,
 } from "../src/index.js";
 import { DEFAULT_APPROVAL_TIMEOUT_MS, waitForStatus } from "../src/integrations/plannotator.js";
 import { classifyRunPlan, ensurePendingRunPlan } from "../src/plan-size.js";
@@ -100,6 +113,35 @@ export interface WorkflowRunningAgentDetail {
   lastActiveAtMs?: number;
   idleMs?: number;
   tokens?: number;
+}
+
+/**
+ * Structured details for the workflow_estimate tool result (V2-N4). The
+ * success branch fills every forecast field; the error branch carries only
+ * `estimate` + `error`, so the union stays single-typed for the SDK's
+ * AgentToolResult<TDetails> inference.
+ */
+export interface WorkflowEstimateToolDetails {
+  estimate: boolean;
+  name?: string;
+  agentCount?: number;
+  worstCaseAgentCount?: number;
+  promptTokens?: number;
+  replyTokens?: number;
+  totalTokens?: number;
+  worstCaseTotalTokens?: number;
+  costWeightedTokens?: number;
+  durationMs?: number;
+  worstCaseDurationMs?: number;
+  checkpoints?: number;
+  checkpointTokens?: number;
+  fanOuts?: EstimateFanOutRow[];
+  phases?: EstimatePhaseRow[];
+  warnings?: string[];
+  budget?: number | null;
+  exceedsBudget?: boolean;
+  nearBudget?: boolean;
+  error?: string;
 }
 
 /**
@@ -267,6 +309,25 @@ export default function extension(pi: ExtensionAPI) {
   // task panel, and keyword arming.
   const loadSettings = () => applyEnvSettingsOverride(loadWorkflowSettings({ cwd }));
   const settings = loadSettings();
+  // V2-P12: session-scoped host-event actors (cross-run watchdog/advisor/spec).
+  // Settings-gated, DEFAULT OFF: no manager, no observers, zero cost. When
+  // `hostActors: "on"`, the manager below owns the before_agent_start / context
+  // / session_compact observer registration and loads its actor defs + persisted
+  // state (ledgers, journals) from `getAgentDir()/workflows/actors/` — so a new
+  // extension generation reloads the same session-scoped actors. Deliveries for
+  // non-before_agent_start events (session_compact reminders, supervisor
+  // re-steers) ride the host's sendMessage channel with the actor's delivery
+  // policy (triggerTurn supervisor-only, enforced by the manager).
+  const hostActorsEnabled = settings.hostActors === "on";
+  const hostActorManager = hostActorsEnabled
+    ? createHostActorManager({
+        // The manager is only constructed when the setting is on, so the master
+        // enable gate is explicit here (mirrors the manager's default-off).
+        enabled: true,
+        dir: join(getAgentDir(), "workflows", "actors"),
+        deliver: (message, options) => pi.sendMessage(message, options),
+      })
+    : undefined;
   // SUBAGENT EXTENSION TOOLS (P04): host-captured third-party extension tools
   // (supi-web's web_fetch_md/web_docs_*, pi-codegraph's codegraph_*,
   // pi-vision-handoff's describe_image) captured in-process from the installed
@@ -769,6 +830,134 @@ export default function extension(pi: ExtensionAPI) {
       }),
     "get_workflow_status tool",
   );
+  // V2-QW5: get_run_report — a thin report-artifact reader over the same
+  // derived artifacts the manager's emitRunReport writes (<runsDir>/reports/
+  // <runId>.json). Query-only like get_workflow_status (no lifecycle verbs, no
+  // mutation): by runId it returns the full machine-readable report (roster,
+  // phases, budget/output-budget, approvals, truncations, durable view), and
+  // with no runId it lists recent reports newest-first. This is the surface
+  // that also enables /workflows status report links: every row carries the
+  // canonical runId the status surfaces already use.
+  registerToolSafely(
+    () =>
+      defineTool({
+        name: "get_run_report",
+        label: "Get Run Report",
+        description:
+          "Read a prior workflow run's machine-readable report (agent roster, phase budgets, token/output budget, approvals, truncations, durable view) by canonical run ID, or list recent reports. Query-only — reports are derived artifacts written at run completion/resume.",
+        promptSnippet: "Read a prior workflow run's report or list recent reports.",
+        parameters: Type.Object({
+          runId: Type.Optional(
+            Type.String({ description: "Canonical workflow run ID. Omit to list recent reports newest-first." }),
+          ),
+          limit: Type.Optional(Type.Number({ description: "Max listing rows (default 25)." })),
+        }),
+        async execute(_toolCallId, params) {
+          const runsDir = workflowProjectPaths(cwd).runsDir;
+          const details = { runId: params.runId ?? "", found: false, count: 0 };
+          if (params.runId) {
+            const report = await readRunReport(runsDir, params.runId);
+            if (report === null) {
+              return {
+                content: [{ type: "text", text: `get_run_report: report not found: ${params.runId}` }],
+                details,
+              };
+            }
+            details.found = true;
+            details.count = 1;
+            const text = JSON.stringify(report, null, 2);
+            return {
+              content: [{ type: "text", text: text.slice(0, 100_000) }],
+              details,
+            };
+          }
+          const rows = await listRunReports(runsDir, params.limit ?? 25);
+          details.found = rows.length > 0;
+          details.count = rows.length;
+          details.runId = rows[0]?.runId ?? "";
+          const lines = rows.map(
+            (row) => `${row.runId} name=${row.workflowName} status=${row.status} started=${row.startedAt}`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: lines.length ? lines.join("\n") : "get_run_report: no reports found",
+              },
+            ],
+            details,
+          };
+        },
+      }),
+    "get_run_report tool",
+  );
+  // V2-N4: workflow_estimate — the pre-flight cost & duration forecast
+  // (`workflow --estimate` CLI surface). A READ-ONLY AST scan of the script's
+  // agent()/parallel()/pipeline()/chunked()/loopUntilDry()/recursive()/
+  // checkpoint()/phase() call graph + the shipped estimateTokens estimator →
+  // agent count, token range, duration range, worst-case fan-out, and a
+  // budget-exceeds warning. The script is never executed and nothing is
+  // written — it is the dryRun-style pre-flight the roadmap's V2-N4 calls for
+  // (workflow-tool.ts owns the runtime dryRun surface; this parallel query
+  // surface lives in the extension entry so the runtime tool stays untouched).
+  registerToolSafely(
+    () =>
+      defineTool({
+        name: "workflow_estimate",
+        label: "Estimate Workflow Cost",
+        description:
+          "Forecast a workflow script's agent count, token spend, duration, and worst-case fan-out BEFORE running it. Read-only: the script is parsed and statically scanned (agent()/parallel()/pipeline()/chunked()/loopUntilDry()/recursive()/checkpoint()/phase()), never executed, and nothing is written. Use to sanity-check cost before launching an unattended run, to compare two script shapes, or to warn when a forecast exceeds a token budget.",
+        promptSnippet: "Estimate the cost, duration, and agent count of a workflow script before running it.",
+        parameters: Type.Object({
+          script: Type.String({
+            description: "The workflow script to estimate (parsed and statically scanned only — nothing runs).",
+          }),
+          tokenBudget: Type.Optional(
+            Type.Number({
+              minimum: 1,
+              description:
+                "Optional token budget the forecast is compared against (exceedsBudget / nearBudget flags + warnings).",
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params) {
+          const details: WorkflowEstimateToolDetails = { estimate: true };
+          try {
+            const estimate = estimateWorkflowForecast(params.script, { tokenBudget: params.tokenBudget });
+            details.name = estimate.name;
+            details.agentCount = estimate.agentCount;
+            details.worstCaseAgentCount = estimate.worstCaseAgentCount;
+            details.promptTokens = estimate.promptTokens;
+            details.replyTokens = estimate.replyTokens;
+            details.totalTokens = estimate.totalTokens;
+            details.worstCaseTotalTokens = estimate.worstCaseTotalTokens;
+            details.costWeightedTokens = estimate.costWeightedTokens;
+            details.durationMs = estimate.durationMs;
+            details.worstCaseDurationMs = estimate.worstCaseDurationMs;
+            details.checkpoints = estimate.checkpoints;
+            details.checkpointTokens = estimate.checkpointTokens;
+            details.fanOuts = estimate.fanOuts;
+            details.phases = estimate.phases;
+            details.warnings = estimate.warnings;
+            details.budget = estimate.budget;
+            details.exceedsBudget = estimate.exceedsBudget;
+            details.nearBudget = estimate.nearBudget;
+            return {
+              content: [{ type: "text", text: renderWorkflowEstimate(estimate) }],
+              details,
+            };
+          } catch (error) {
+            details.error = error instanceof Error ? error.message : String(error);
+            return {
+              content: [{ type: "text", text: `workflow_estimate: ${details.error}` }],
+              isError: true,
+              details,
+            };
+          }
+        },
+      }),
+    "workflow_estimate tool",
+  );
   // Audit: workflow_damage_control — the damage-control + recovery toolset
   // (design: tasks/damage-control-recovery/DESIGN.md): list/status/agents/
   // pause/resume/stop/kill-agent/recover/clean with session-scoped mutating
@@ -809,6 +998,27 @@ export default function extension(pi: ExtensionAPI) {
   // re-arms any run that was already paused-on-usage_limit before this process
   // started (cold start), so restarting pi doesn't strand a paused run.
   const usageLimitScheduler = new UsageLimitScheduler(manager);
+  // V2-P12 observers: registered ONLY when hostActors is "on" (default off —
+  // the existing mock-pi tests and any host with the setting unset register no
+  // actor observers). SIDE-INPUT CONTRACT (V2 note): every handler returns a
+  // session-side contribution (BeforeAgentStartEventResult message/systemPrompt)
+  // or records state; none of them touches a workflow run's resume identity —
+  // actors are side effects, not steps (host-actors.ts module contract).
+  if (hostActorManager) {
+    pi.on("before_agent_start", (event: BeforeAgentStartEvent) =>
+      hostActorManager.onBeforeAgentStart({ prompt: event.prompt, systemPrompt: event.systemPrompt }),
+    );
+    // Observational only: the manager reads a bounded, defensive text view and
+    // never rewrites the LLM context (host-actors.ts contract).
+    pi.on("context", (event: ContextEvent) => hostActorManager.onContext({ messages: event.messages }));
+    pi.on("session_compact", (event: SessionCompactEvent) =>
+      hostActorManager.onSessionCompact({
+        reason: event.reason,
+        fromExtension: event.fromExtension,
+        willRetry: event.willRetry,
+      }),
+    );
+  }
   pi.on("session_shutdown", (event?: { reason?: string }) => {
     // Resources owned by this generation are disposed inside the runtime's
     // dispose hook: handoff/discard run it deterministically (at most once)
@@ -850,7 +1060,15 @@ export default function extension(pi: ExtensionAPI) {
   // per extension activation (session_start can re-fire on session switch).
   let providerPoolNoticeShown = false;
 
-  pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
+  pi.on("session_start", (event: SessionStartEvent, ctx: ExtensionContext) => {
+    // V2-P12: session-boundary dispatch for actor ledgers (session-scoped
+    // actors survive across workflow runs; the boundary marks a new session).
+    // Defensive: the payload reason is optional so a minimal/mock event object
+    // (e.g. `{}` in tests) never throws.
+    hostActorManager?.onSessionStart({
+      reason: typeof event?.reason === "string" ? event.reason : undefined,
+      previousSessionFile: event?.previousSessionFile,
+    });
     if (pausedForVersionChange > 0) {
       ctx.ui.notify(
         `Workflow extension updated during /reload; paused ${pausedForVersionChange} active workflow(s) for safe resume.`,

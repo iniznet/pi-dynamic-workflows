@@ -10,6 +10,7 @@ import { type AgentUsage, usageComponentsTotal, type WorkflowAgent } from "./age
 import type { SubagentToolDiscovery } from "./discovery.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { closeRunDurableStore, recordProvenance, runDurableStore } from "./durable-store.js";
+import { pruneEditTransactionSnapshots } from "./edit-transaction.js";
 import { isProviderOverloaded, isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { resolvePersistenceFs, unlinkIfExistsSafe } from "./fs-persistence.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
@@ -45,6 +46,7 @@ import {
   renewRunLease,
 } from "./run-persistence.js";
 import { runReportPath, writeRunReport } from "./run-report.js";
+import { distillAndPersistRunKnowledge } from "./task-knowledge.js";
 import {
   type AgentKillChannel,
   type CheckpointGate,
@@ -2105,6 +2107,15 @@ export class WorkflowManager extends EventEmitter {
       // paths already snapshotted the store into the run report; a still-
       // running store object is simply no longer reachable by runId.
       closeRunDurableStore(managed.runId);
+      // V2-P03: edit-transaction snapshots are run-scoped scratch state — sweep
+      // them with the run's other per-run state. Only TERMINAL settles prune
+      // (completed/failed/aborted): a checkpoint-paused run is expected to
+      // resume, and a resume re-drives the host-side transaction from a fresh
+      // begin(). Best-effort — snapshot cleanup is hygiene, never a reason to
+      // fail the settle.
+      if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) {
+        void pruneEditTransactionSnapshots(managed.runId);
+      }
       // The execution has FULLY settled — a paused run (manual pause() or a
       // usage-limit/provider-outage checkpoint) can now be retired from the
       // in-memory registry when the paused-run cap is exceeded
@@ -2648,14 +2659,44 @@ export class WorkflowManager extends EventEmitter {
     try {
       const persisted = this.persistence.load(managed.runId);
       if (!persisted) return;
+      // Capture the durable snapshot at report time — executeRun()'s finally
+      // closes the run's store right after this method returns, so the async
+      // KB distill below must carry its own copy.
+      const durable = runDurableStore(managed.runId)?.snapshot() ?? null;
       writeRunReport(persisted, {
         runsDir: workflowProjectPaths(this.cwd).runsDir,
-        durable: runDurableStore(managed.runId)?.snapshot() ?? null,
+        durable,
         mainModel: this.mainModel,
       });
+      // V2-P02: cross-run task knowledge distillation at run completion. Only
+      // TERMINAL settles distill (a resume-path report is a mid-flight
+      // snapshot, not completion knowledge); the async persist runs detached
+      // from the settle path — emitRunReport stays synchronous/best-effort,
+      // and a KB write failure is logged, never allowed to fail the run.
+      this.distillCompletedRunKnowledge(managed, persisted, durable);
     } catch (error) {
       console.warn(`[workflow-manager] run report failed for ${managed.runId}: ${String(error)}`);
     }
+  }
+
+  /**
+   * V2-P02: fire-and-forget KB distillation for a TERMINAL run (completed /
+   * failed). The distilled entries are content-identified and merged into the
+   * project KB idempotently (a resumed-then-recompleted run re-distills to a
+   * no-op). Runs detached: never blocks run settlement, and failures only
+   * warn — knowledge distillation is observability, not execution.
+   */
+  private distillCompletedRunKnowledge(
+    managed: ManagedRun,
+    persisted: PersistedRunState,
+    durable: { entries: Record<string, unknown>; ledger: unknown[] } | null,
+  ): void {
+    if (persisted.status !== "completed" && persisted.status !== "failed") return;
+    void distillAndPersistRunKnowledge(this.cwd, persisted, durable).catch((error: unknown) => {
+      console.warn(
+        `[workflow-manager] task-knowledge distill failed for ${managed.runId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   }
 
   /**
@@ -3666,6 +3707,9 @@ export class WorkflowManager extends EventEmitter {
     } catch {
       // report cleanup is best-effort
     }
+    // V2-P03: deleting a run also sweeps its edit-transaction snapshots
+    // (best-effort — the persistence delete below is authoritative).
+    void pruneEditTransactionSnapshots(runId);
     return this.persistence.delete(runId);
   }
 

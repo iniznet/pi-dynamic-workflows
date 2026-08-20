@@ -105,17 +105,41 @@ export function deterministicRunClock(_runId?: string): (seq: number) => string 
  * absent). `timestamp` is stamped by the store's injected clock when omitted
  * (deterministic — see {@link deterministicRunClock}).
  */
+export type ProvenanceSourceKind =
+  | "agent"
+  | "worktree"
+  | "script"
+  | "testGate"
+  | "spec-conformance"
+  | "claim-verify"
+  | (string & {});
+
+/**
+ * One provenance ledger entry: a change/claim record with
+ * `{source | file, agent, phase, timestamp}` (the P06 contract shape) plus an
+ * optional stable `id` used for replay dedupe (auto-derived from content when
+ * absent). `timestamp` is stamped by the store's injected clock when omitted
+ * (deterministic — see {@link deterministicRunClock}). Machine-gate kinds
+ * (V2-N5) attach their verdict/score/hash payload via the optional `detail`
+ * field (JSON-serializable by contract).
+ */
 export interface ProvenanceEntry {
   /** Stable dedupe identity; auto-derived from content when omitted. */
   id?: string;
   /** Who/what recorded the change (e.g. "agent", "worktree", a script label). */
-  source?: string;
+  source?: ProvenanceSourceKind;
   /** The file path the change/claim is about (worktree path, target file...). */
   file?: string;
   /** The agent (or branch) that made the change. */
   agent?: string;
   /** The workflow phase the change happened in, when known. */
   phase?: string;
+  /**
+   * Machine-gate evidence payload (V2-N5): testGate verdict, spec-conformance
+   * per-requirement score, claim-verify hash envelope. JSON-serializable;
+   * absent on plain host/script records.
+   */
+  detail?: unknown;
   /** Deterministic injected timestamp (store-stamped when omitted). */
   timestamp?: string;
 }
@@ -159,17 +183,71 @@ export function isDeepEqual(a: unknown, b: unknown): boolean {
 }
 
 function stableStringify(value: unknown): string {
+  return canonicalJsonStringify(value);
+}
+
+/**
+ * Canonical JSON serialization (sorted keys, stable primitive encoding) — the
+ * content-identity substrate shared by {@link isDeepEqual}, ledger auto-ids,
+ * and {@link provenanceContentId}. Deliberately loop-based with NO nested
+ * function declarations: the embedded copy (see {@link provenanceContentIdSource})
+ * is serialized via Function.prototype.toString(), and a nested arrow would
+ * carry the transpiler's `__name` keep-names helper into the vm realm where it
+ * is undefined.
+ */
+function canonicalJsonStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(",")}]`;
+  if (Array.isArray(value)) {
+    const parts: string[] = [];
+    for (const item of value) parts.push(canonicalJsonStringify(item));
+    return `[${parts.join(",")}]`;
+  }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`).join(",")}}`;
+  const parts: string[] = [];
+  for (const key of keys) parts.push(`${JSON.stringify(key)}:${canonicalJsonStringify(record[key])}`);
+  return `{${parts.join(",")}}`;
 }
 
 function contentIdentity(entry: ProvenanceEntry): string {
   return createHash("sha256")
     .update(stableStringify({ source: entry.source, file: entry.file, agent: entry.agent, phase: entry.phase }))
     .digest("hex");
+}
+
+/**
+ * Deterministic 32-bit FNV-1a over a canonical-JSON payload (V2-N5). The
+ * content-derived identity behind machine-gate ledger ids: the SAME evidence
+ * always yields the SAME id, so a replayed (deduped) record never re-appends
+ * and a changed verdict produces a DISTINCT entry. Pure ES (no crypto), so
+ * the exact function is embeddable into generated workflow scripts via
+ * {@link provenanceContentIdSource} — host and vm settle sites agree on one
+ * algorithm (the claim-verify evidence hash uses the same FNV-1a family).
+ *
+ * Not a security boundary — an evidence fingerprint / provenance identity.
+ */
+export function provenanceContentId(payload: Record<string, unknown>): string {
+  const json = canonicalJsonStringify(payload);
+  let hash = 2166136261;
+  for (let i = 0; i < json.length; i++) {
+    hash ^= json.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * The vm-embeddable source of {@link provenanceContentId} (self-contained —
+ * no module-scope closure, no nested functions), baked into generated
+ * machine-gate scripts so their ledger ids use the identical content-derived
+ * algorithm. Serialized via Function.prototype.toString() like the other
+ * embedded deterministic cores (claim-verify, spec-generation normalizers);
+ * the tsx/tsc runtime strips type annotations, so the emitted source is plain
+ * JS.
+ */
+export function provenanceContentIdSource(): string {
+  return `${canonicalJsonStringify.toString()}
+${provenanceContentId.toString()}`;
 }
 
 interface StoreLockFile {
@@ -419,6 +497,32 @@ export class DurableStore {
   }
 
   /**
+   * Write several keys in ONE atomic commit (single lock acquisition, single
+   * file read, single atomic file write). Each key dedupes exactly like a
+   * standalone `put` (a deep-equal unchanged value is a per-key no-op; when
+   * NO key changed the whole batch skips the file write), so the batch is
+   * replay-idempotent and resume-correct like every other write path here.
+   * Used by runWorkflow's settle path to coalesce its end-of-run
+   * observability writes (phase budgets, output budget, steer revisions,
+   * spend ledger) into ONE commit instead of up to N+3 sequential atomic
+   * writes (~8ms each under load) — the extra sequential writes made the
+   * pre-existing wall-clock settle-path tests load-flaky under cap-2.
+   */
+  async putMany(entries: Array<[string, unknown]>): Promise<void> {
+    if (entries.length === 0) return;
+    return this.commit((fresh) => {
+      let changed = false;
+      for (const [key, value] of entries) {
+        if (isDeepEqual(fresh.entries[key], value)) continue;
+        fresh.entries[key] = value;
+        fresh.seq += 1;
+        changed = true;
+      }
+      return { changed, merge: () => {} };
+    }).then(() => {});
+  }
+
+  /**
    * Write at most once per caller-chosen `id` (persisted trail). The replay-
    * safe way to express a write that MUST happen exactly once per identity
    * (e.g. a cross-run counter keyed by a per-run id from `args`).
@@ -464,8 +568,11 @@ export class DurableStore {
   /**
    * Append a provenance record to the ledger (at most once per `entry.id`, or
    * per content identity `{source,file,agent,phase}` when no id is given —
-   * replay re-execution is a no-op). The timestamp is stamped by the store's
-   * injected deterministic clock when `entry.timestamp` is omitted.
+   * replay re-execution is a no-op). Machine-gate kinds (V2-N5) pass explicit
+   * content-derived ids (see {@link provenanceContentId}) so each distinct
+   * verdict/score/hash gets its own stable entry while an identical replayed
+   * record still dedupes. The timestamp is stamped by the store's injected
+   * deterministic clock when `entry.timestamp` is omitted.
    */
   async record(entry: ProvenanceEntry): Promise<boolean> {
     const id = entry.id ?? contentIdentity(entry);
@@ -494,6 +601,42 @@ export class DurableStore {
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── cross-run read surface (V2-P04 lineage queries) ────────────────────────
+
+/**
+ * Read a persisted durable-store file from disk (missing/corrupt/newer-schema
+ * → null, never throws). The host-side read surface for cross-run lineage
+ * queries: the in-memory registry only holds RUNS LIVE IN THIS PROCESS, while
+ * lineage wants the full cross-run ledger + entries that earlier runs and
+ * other processes persisted. Malformed/legacy tolerance mirrors
+ * readJsonWithBackupRecovery's lenient read + the report reader's
+ * missing-file-safe contract.
+ */
+export function readDurableStoreFile(path: string, fs?: Partial<PersistenceFsLayer>): DurableStoreFile | null {
+  try {
+    const raw = readJsonWithBackupRecovery<DurableStoreFile>(resolvePersistenceFs(fs), path);
+    if (!raw || typeof raw.version !== "number" || raw.version !== DURABLE_STORE_SCHEMA_VERSION) return null;
+    if (typeof raw.entries !== "object" || raw.entries === null) return null;
+    return {
+      version: raw.version,
+      seq: Number.isFinite(raw.seq) && raw.seq >= 0 ? raw.seq : 0,
+      entries: raw.entries,
+      ledger: Array.isArray(raw.ledger) ? raw.ledger : [],
+      writeIds: Array.isArray(raw.writeIds) ? raw.writeIds : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The project's persisted durable-store file path (`getAgentDir()/durable-store/
+ * <projectKey>.json` — the same path {@link DurableStore} writes).
+ */
+export function projectDurableStorePath(projectKey: string, baseDir?: string): string {
+  return join(baseDir ?? join(getAgentDir(), DURABLE_STORE_SUBDIR), `${projectKey}.json`);
 }
 
 // ── run-scoped registry (the provenance sink) ─────────────────────────────

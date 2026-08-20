@@ -25,9 +25,24 @@ import {
   resolveAgentType,
 } from "./agent-registry.js";
 import {
+  type ApprovalClassifier,
+  type ApprovalDecision,
+  ApprovalGrantStore,
+  type ApprovalPolicyConfig,
+  approvalGrantKey,
+  buildGateCostLine,
+  createApprovalClassifier,
+  type RiskClass,
+  resolveRiskPolicy,
+} from "./approval-policy.js";
+import {
+  APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS,
   DEFAULT_AGENT_TIMEOUT_MS,
   DEFAULT_HELPER_TIER,
   DEFAULT_MAX_AGENT_RESULT_CHARS,
+  DEFAULT_RECURSIVE_DEPTH,
+  DEFAULT_RECURSIVE_MAX_ROOTS,
+  DEFAULT_REPLAN_THRESHOLD,
   DEFAULT_RETRY_BACKOFF_MS,
   DEFAULT_UNTAGGED_TIER,
   DRAIN_ABORT_TIMEOUT_MS,
@@ -36,8 +51,10 @@ import {
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
   MAX_NESTED_WORKFLOW_DEPTH,
+  MAX_RECURSIVE_DEPTH,
   MAX_RETRY_BACKOFF_MS,
   ROUTING_POLICY_VERSION,
+  resolveMaxTotalOutputChars,
   UNTAGGED_TIER_ECONOMY,
   UNTAGGED_TIER_INHERIT_MAIN,
 } from "./config.js";
@@ -61,6 +78,13 @@ import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
 import { classifyRunPlan } from "./plan-size.js";
 import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import {
+  bindSpendAnalytics,
+  buildSpendLedgerEntry,
+  type SpendLedgerEntry,
+  type SpendLedgerReplan,
+  spendLedgerKey,
+} from "./spend-ledger.js";
 import { bindRunSupervisor, createSupervisorController, type SupervisorSettleEvent } from "./supervisor.js";
 import {
   buildTestGateFeedback,
@@ -73,9 +97,11 @@ import {
   type TestGateStepResult,
   type TestGateTest,
   type TestGateTool,
+  testGateVerdictEntries,
   validateTestGateTests,
 } from "./test-gate.js";
 import { safeSetTimeout, withTimeout } from "./timing.js";
+import { createTrustedScriptsStore, scriptBodyHash, type TrustedScriptsStore } from "./trusted-scripts.js";
 import { typecheckWorkflowScript } from "./typecheck.js";
 import { WORKFLOW_CAPABILITY_CONTRACT, type WorkflowRuntimeImplementations } from "./workflow-capability-contract.js";
 
@@ -96,7 +122,180 @@ function bindRunSubagentToolsDiscovery(options: WorkflowRunOptions): SubagentToo
   return base.withResolvable(options.tools?.map((tool) => tool.name));
 }
 
-import { bindRunDurableStore } from "./durable-store.js";
+import { buildClaimVerifyPrompt, type ClaimEvidencePage, DEFAULT_FETCHED_PAGE_MAX_CHARS } from "./claim-verify.js";
+import { listRunReports, readRunReport } from "./run-report.js";
+import {
+  buildRecallResult,
+  type LineageQueryOptions,
+  type LineageResult,
+  queryLineage,
+  type RecallOptions,
+  type RecallResult,
+} from "./task-knowledge.js";
+import { workflowProjectKey, workflowProjectPaths } from "./workflow-paths.js";
+
+/**
+ * V2-P02: script-facing cross-run knowledge recall. `recall({ query?,
+ * keywords?, phase?, pattern?, limit? })` ranks prior task knowledge (KB
+ * entries distilled at run completion + run-report artifacts) into a
+ * privacy-safe context block a future run can embed or seed from. Read-only
+ * by construction; results are a pure function of the persisted KB/reports
+ * (never wall-clock), and the global is deliberately NEVER part of any
+ * agent() call's resume identity (a cache-hit replay never re-reads the KB).
+ */
+export type Recall = (options?: RecallOptions) => Promise<RecallResult>;
+
+/**
+ * V2-P04: script-facing cross-run lineage query. `lineage({ runId?,
+ * source?, file?, phase?, agent?, pattern?, limit?, verify?, ttlMs? })`
+ * filters the project's provenance ledger with a deterministic decay verdict
+ * (fresh/stale vs the newest entry); `verify: true` re-verifies stale
+ * claim-verify evidence through journaled agent steps (N02 mechanics).
+ * Read-only except for the verify path's journaled re-fetch agents.
+ */
+export type Lineage = (options?: LineageQueryOptions) => Promise<LineageResult>;
+
+/**
+ * V2-P02: bind the read-only `recall` runtime global for one run frame.
+ * Queries the project KB + report artifacts under the run's cwd. Read-only
+ * by construction and deliberately NEVER part of any agent() call's resume
+ * identity — a cache-hit replay never re-reads the KB (the opt-in seeded
+ * context flows through the ctx() blob mechanism instead, whose text IS part
+ * of the shared-context fingerprint).
+ */
+function bindRunRecall(options: WorkflowRunOptions): Recall {
+  const cwd = options.cwd ?? process.cwd();
+  return (recallOptions) => buildRecallResult(cwd, recallOptions);
+}
+
+/**
+ * V2-P04: bind the read-only `lineage` runtime global for one run frame.
+ * `verify` re-verifies stale claim-verify evidence through the injected N02
+ * re-fetch mechanism (journaled agent steps, resume-replayable).
+ */
+function bindRunLineage(
+  options: WorkflowRunOptions,
+  fetchClaimPages?: (claim: string, sources: readonly string[]) => Promise<readonly ClaimEvidencePage[]>,
+): Lineage {
+  const cwd = options.cwd ?? process.cwd();
+  return (lineageOptions) => queryLineage(cwd, lineageOptions, fetchClaimPages ? { fetchClaimPages } : undefined);
+}
+
+/**
+ * V2-P04: the run's N02 claim re-fetch mechanism — ONE journaled agent()
+ * step re-fetches the claim's cited URLs (web_fetch via the verifier prompt)
+ * and returns the fetched page texts as data. Deterministic call identity
+ * (claim + sorted sources); a failure degrades to zero pages (the entry
+ * stays stale — fail-closed, never a false freshness).
+ */
+async function lineageFetchClaimPages(
+  claim: string,
+  sources: readonly string[],
+  agent: (prompt: string, options?: AgentOptions) => Promise<unknown>,
+  log: (message: string) => void,
+): Promise<readonly ClaimEvidencePage[]> {
+  try {
+    const prompt = buildClaimVerifyPrompt(claim, sources, DEFAULT_FETCHED_PAGE_MAX_CHARS);
+    const result = await agent(prompt, {
+      label: "verify evidence freshness",
+      tier: "small",
+      schema: {
+        type: "object",
+        properties: {
+          pages: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: { url: { type: "string" }, content: { type: "string" } },
+              required: ["url", "content"],
+            },
+          },
+        },
+        required: ["pages"],
+      },
+    });
+    const pages = (result as { pages?: unknown } | null)?.pages;
+    if (!Array.isArray(pages)) return [];
+    return pages.filter(
+      (page): page is ClaimEvidencePage =>
+        typeof page === "object" &&
+        page !== null &&
+        typeof (page as ClaimEvidencePage).url === "string" &&
+        typeof (page as ClaimEvidencePage).content === "string",
+    );
+  } catch (error) {
+    log(
+      `task-knowledge: lineage re-verification fetch failed (${error instanceof Error ? error.message : String(error)}); entry stays stale`,
+    );
+    return [];
+  }
+}
+
+/**
+ * V2-P02: OPT-IN future-run knowledge seeding (default OFF). At run start the
+ * run recalls the project's prior knowledge and registers the context as a
+ * shared ctx() blob (index 0) so agent instructions carry it. The blob text
+ * folds into the shared-context fingerprint — the seeded context is FRESH per
+ * run (a KB change invalidates stale cached replays instead of replaying
+ * identity). Missing/empty matches log a note and seed nothing.
+ */
+async function seedRunKnowledge(options: {
+  cwd: string;
+  seed: boolean | RecallOptions;
+  recall: Recall;
+  ctx: (text: unknown) => string;
+  log: (message: string) => void;
+}): Promise<void> {
+  const recallOptions = typeof options.seed === "object" ? options.seed : {};
+  const result = await options.recall(recallOptions);
+  if (result.hits.length === 0 || result.context.length === 0) {
+    options.log("task-knowledge: seedKnowledge enabled but no prior knowledge matched — no seed context added");
+    return;
+  }
+  const pointer = options.ctx(result.context);
+  options.log(
+    `task-knowledge: seeded ${result.hits.length} prior-knowledge hit(s) into shared run context (${pointer})`,
+  );
+}
+
+/**
+ * V2-QW5: bind the read-only `getRunReport` runtime global for one run frame.
+ * Reads a prior run's report artifact (`<runsDir>/reports/<runId>.json`) or
+ * lists recent reports (newest-first) so a script can seed context from prior
+ * runs today — the stepping stone for cross-run knowledge recall. Read-only
+ * by construction: it never mutates the run, the journal, or the durable
+ * store, and is deliberately NEVER part of any agent() call's resume identity
+ * (a cache-hit replay never re-reads a report). Missing-file safe: an unknown
+ * runId resolves to null and a listing never throws on a malformed artifact.
+ */
+function bindRunGetReport(options: WorkflowRunOptions): GetRunReport {
+  const runsDir = workflowProjectPaths(options.cwd ?? process.cwd()).runsDir;
+  const getRunReport: GetRunReport = (runIdOrOptions?: string | { limit?: number }) => {
+    if (typeof runIdOrOptions === "string") {
+      return readRunReport(runsDir, runIdOrOptions);
+    }
+    return listRunReports(runsDir, runIdOrOptions?.limit ?? 25);
+  };
+  return getRunReport;
+}
+
+/**
+ * V2-QW5: script-facing prior-run report query. `getRunReport(runId)` returns
+ * the full report artifact (or null for an unknown/malformed run);
+ * `getRunReport()` (optionally `{ limit }`) lists recent reports newest-first.
+ * Read-only; never part of any resume identity.
+ */
+export type GetRunReport = (
+  runIdOrOptions?: string | { limit?: number },
+) => Promise<import("./run-report.js").RunReport | null | Array<import("./run-report.js").RunReportSummary>>;
+
+import {
+  bindRunDurableStore,
+  isDeepEqual,
+  provenanceContentId,
+  recordProvenance,
+  runDurableStore,
+} from "./durable-store.js";
 import { createWorktree, finalizeWorktree, removeWorktree, type Worktree } from "./worktree.js";
 
 /**
@@ -310,6 +509,16 @@ export interface SharedRuntime {
   agentCount: number;
   spent: number;
   /**
+   * V2-QW3: the run's accumulated agent-output chars (the FINAL result chars,
+   * post-P05-cap, counted via countOutputChars). Shared across nested
+   * workflow() frames like spent, so the run-level total-output ceiling holds
+   * across the whole run tree. Seeded from the resume journal on resume so the
+   * ceiling holds cumulatively across pause/resume (mirrors initialTokenUsage,
+   * but derived here — see runWorkflow's journal seed). Never part of any
+   * resume hash (it measures results, not inputs).
+   */
+  totalOutputChars: number;
+  /**
    * T1-01 fresh-spend counter: input+output only (cacheRead and cacheWrite
    * excluded). Always tracked, but only read by the budget gate when the
    * `tokenBudgetCountsCacheRead: false` knob is set (opt-in fresh-counting;
@@ -427,6 +636,45 @@ export interface SharedRuntime {
    * per agent. Never part of any resume hash (instructions are not identity).
    */
   sharedContextEmitted: boolean;
+  /**
+   * V2-P01: per-run in-memory approval grant store (serialized grants, never
+   * widening). Shared across nested workflow() frames so a session grant is
+   * honored run-wide. Grants are action-exact + run-scoped host-side policy —
+   * NEVER part of any agent()/checkpoint() resume identity.
+   */
+  approvalGrants: ApprovalGrantStore;
+  /**
+   * V2-P07: live nested-recursive() frame count (recursive() has its own
+   * depth counter — it never routes through workflow() nesting, so the
+   * MAX_NESTED_WORKFLOW_DEPTH ceiling is untouched). Enforced against
+   * MAX_RECURSIVE_DEPTH as a runaway guard for a solve() that itself calls
+   * recursive() in an unbounded chain. Never part of any resume hash (control
+   * flow, like the workflow() depth counter).
+   */
+  recursiveDepth: number;
+  /**
+   * V2-P11: edge flag — set the first time the re-plan forecast crosses the
+   * threshold on the live path (the replan runtime event fires once per run).
+   * Observation only: `replanSignal()` derives `triggered` fresh from
+   * journal-derived state, so a resumed run sees a consistent value without
+   * replaying the flag. Never part of any resume hash.
+   */
+  rePlanEmitted: boolean;
+  /**
+   * V2-P09: run-wide per-phase token attribution (M25-style, but aggregated
+   * across the WHOLE run tree — nested workflow() frames attribute into their
+   * own per-frame state, so the ledger needs a shared accumulator). Updated in
+   * recordTokens alongside the frame's phaseSpend. Observability data only,
+   * never part of any agent() resume hash.
+   */
+  runPhaseSpend: Map<string, number>;
+  /**
+   * V2-P09: run-wide per-provider token attribution, derived from each settled
+   * call's final resolved model (providerFromCanonicalSpec). The substrate of
+   * the cross-run spend ledger's per-provider analytics. Never part of any
+   * agent() resume hash (observability).
+   */
+  providerSpend: Map<string, number>;
 }
 
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
@@ -441,10 +689,146 @@ export type WorkflowRuntimeEvent =
   | { type: "control-attempt"; helper: "retry" | "gate" | "testGate"; attempt: number; accepted: boolean }
   // P02: one event per supervisor turn (the turn itself is a journaled agent()
   // call; the event is diagnostics only). Round is deterministic (positional).
-  | { type: "supervisor"; stage: "start" | "end"; round: number };
+  | { type: "supervisor"; stage: "start" | "end"; round: number }
+  // V2-P01: one event per recorded approval decision (policy/grant/classifier/
+  // human/trusted-script). Diagnostics + report evidence only — NEVER a resume
+  // identity input (the decision is derived live from the same inputs each
+  // run, so replay re-derives it; it is not a step to replay).
+  | { type: "approval"; decision: ApprovalDecision }
+  // V2-P11: the budget-adaptive re-plan signal — emitted ONCE per run, the
+  // first time the forecast burn (spent + remaining phase budgets) crosses
+  // `tokenBudget * rePlanThreshold` BEFORE the hard caps trip. Read-only
+  // observation: the runtime never mutates the VM; the script re-scopes via
+  // its own phase()/agent() calls. Never part of any agent() resume identity.
+  | { type: "replan"; forecast: RePlanForecast }
+  // V2-P08: one steer-plan channel event — emitted when a steerPlan.submit()
+  // revision is applied on the LIVE path (stage "submit") or re-applied from
+  // the resume journal on replay (stage "replay"). Diagnostics only — the
+  // revision is a journaled delta (callIndex-keyed, like checkpoint replies),
+  // never a resume-identity input (hashAgentCall's field set is untouched).
+  | { type: "steer"; stage: "submit" | "replay"; revision: SteerPlanRevision; callIndex: number };
 
-/** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
-interface WorkflowAgentRunner {
+/**
+ * V2-P11: deterministic forecast of the run's projected token burn, derived
+ * from journal-derived state only (seeded/live spend + declared phase
+ * budgets + phase-attributed spend). See evaluateRePlan.
+ */
+export interface RePlanForecast {
+  /** Tokens spent so far (honors the tokenBudgetCountsCacheRead knob). */
+  spent: number;
+  /** Sum of unspent declared phase budgets (the remaining plan). */
+  plannedRemaining: number;
+  /** spent + plannedRemaining — the projected end-of-run burn. */
+  projectedTotal: number;
+  /** The run's frozen token budget (null = unlimited → never triggered). */
+  budget: number | null;
+  /** The frozen re-plan threshold fraction (0..1). */
+  threshold: number;
+  /** True when projectedTotal already exceeds the budget. */
+  overBudget: boolean;
+}
+
+// ── V2-P08: live steering — steer-plan channel (PRIMARY half) ───────────────
+//
+// Journaled plan-rescope surface: the runtime exposes a script-visible
+// `steerPlan` global whose verbs are (a) read() — the current plan/phase state
+// snapshot — and (b) submit(revision) — a journaled revised plan. A revision
+// is a plain object describing the rescope: re-declared phase ceilings
+// (`phases`), a steering target phase (`currentPhase`), and free-form
+// `note`/`reason` prose. submit() is a deterministic, journaled, replayable
+// record exactly like checkpoint(): it takes a callIndex, hashes the revision
+// (fixed-field canonical JSON), and replays the SAME applied revision from the
+// resume journal on a cache hit — so a paused/resumed (or edited-script
+// resumed) run rescopes identically. The applied revisions are persisted as
+// `steerRevisions:<runId>` in the run's durable store (replay-idempotent,
+// resume-correct) and surfaced in the run report. The revision rescope mirrors
+// phase() re-declaration semantics (positive finite budgets re-base the phase
+// ceiling, which the phase gate honors immediately); read() derives its
+// forecast from the same shared checkpoint-rescope machinery as
+// replanSignal(). Determinism: steer revisions are journaled deltas — NEVER
+// part of any agent()/checkpoint() resume identity (hashAgentCall's field set
+// is untouched).
+//
+// The IN-FLIGHT INTERRUPT half of live steering is EXPLICITLY DEFERRED: agent
+// sessions expose ONLY an AbortSignal channel (no interrupt-check hook), so
+// no bounded instruction can be injected into a running agent mid-tool-call —
+// steer-plan rescoping happens at the next script call boundary, and mid-flight
+// VM mutation never happens.
+
+/** One phase entry of a revised plan — re-declares that phase's soft ceiling. */
+export interface SteerPlanPhaseRevision {
+  /** The phase title (must match a declared phase, or pre-declare a new one). */
+  title: string;
+  /** New positive soft sub-budget for the phase; the phase gate honors it immediately. */
+  budget?: number;
+}
+
+/**
+ * One journaled plan-rescope revision. The revision is hashed as-is (fixed
+ * field order, absent-vs-null normalized) so a deterministically-resubmitted
+ * revision replays byte-identically; a changed revision is a journal miss and
+ * re-submits live (checkpoint semantics). `note`/`reason` participate in the
+ * hash — they are the steering instruction itself, not display-only details.
+ */
+export interface SteerPlanRevision {
+  /** Re-declared phase ceilings (the plan-rescope); omitted = no budget change. */
+  phases?: SteerPlanPhaseRevision[];
+  /** Steering target phase (sets the runtime's current phase). */
+  currentPhase?: string;
+  /** Human/script-readable note (e.g. the steering instruction). */
+  note?: string;
+  /** Why the plan was rescoped (e.g. "drift", "budget", "human steer"). */
+  reason?: string;
+}
+
+/** One phase row of the read() snapshot. */
+export interface SteerPlanPhaseState {
+  title: string;
+  /** The phase's current soft sub-budget (declared or last rescoped), null when none. */
+  budget: number | null;
+  /** Phase-attributed token spend (M25). */
+  spend: number;
+}
+
+/** The deterministic plan/phase state snapshot returned by steerPlan.read(). */
+export interface SteerPlanSnapshot {
+  runId: string;
+  currentPhase: string | null;
+  phases: SteerPlanPhaseState[];
+  /** Agent() calls made so far (including replayed prefix on resume). */
+  agentCount: number;
+  /** The frame's call index (journal position — the next call's index). */
+  callSeq: number;
+  /** Run budget accounting (honors the tokenBudgetCountsCacheRead knob). */
+  budget: { limit: number | null; spent: number; remaining: number };
+  /** The shared re-plan forecast (same machinery as replanSignal()). */
+  forecast: RePlanForecast;
+  /** Applied revisions in submission order. */
+  revisions: readonly SteerPlanRevision[];
+}
+
+/**
+ * The documented steer-plan verbs: read() (current plan/phase state) and
+ * submit(revision) (journaled plan-rescope, replayed deterministically on
+ * resume). Deterministic — never wall-clock, never RNG; revisions are
+ * journaled deltas, never hashAgentCall inputs.
+ */
+export interface SteerPlanApi {
+  read(): SteerPlanSnapshot;
+  submit(revision: SteerPlanRevision): SteerPlanRevision;
+}
+
+/**
+ * Minimal injected agent surface used by the workflow runtime and deterministic tests.
+ *
+ * Public (V2-P10): `WorkflowRunOptions.agent` accepts any object matching this
+ * interface, so the replay harness and test suites can substitute a mock agent
+ * executor (a recorder, a per-prompt stub, or a replay double that throws on a
+ * fixture miss) without constructing a real subagent session. The runner is
+ * NEVER part of any agent()/checkpoint() resume identity — it only executes the
+ * call; the identity is the hashAgentCall field set.
+ */
+export interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
   /**
    * Optional teardown the workflow layer calls when the top-level run frame
@@ -491,6 +875,32 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * hashAgentCall `model`/`tierModel` fields).
    */
   modelCrosschecker?: ModelCrosschecker;
+  /**
+   * V2-P01: per-risk-class approval policy (read/write/execute/network/agent
+   * × allow/ask/auto/deny) layered on the journaled checkpoint() gate and the
+   * P12 fan-out gate. Absent → DEFAULT_APPROVAL_POLICY (read=allow, the rest
+   * ask; `auto` routes one exact action to the LLM classifier, `deny` refuses
+   * outright). Policy + grant recording is host-side approval state — NEVER
+   * part of any agent()/checkpoint() resume identity.
+   */
+  approvalPolicy?: ApprovalPolicyConfig;
+  /**
+   * V2-P01: injectable LLM auto-approval classifier for `auto`-policy gates.
+   * Absent → a real ModelRuntime-backed classifier is created lazily (via the
+   * public completeSimple channel, like the crosschecker); tests inject a
+   * fake. The classifier is a DIRECT ModelRuntime call — it consumes no agent
+   * slot and journals nothing, but its estimated spend IS metered against the
+   * run budget. Never part of any resume identity.
+   */
+  approvalClassifier?: ApprovalClassifier;
+  /**
+   * V2-N6: injectable trusted-script allowlist (script-hash → previously
+   * human-approved). Absent → the default store under getAgentDir(). A
+   * trusted script body hash skips the fan-out / meta.gate / confirm-checkpoint
+   * gates on re-run; any edit invalidates. Gate-skip is host-side policy,
+   * excluded from hashAgentCall like autoApproved today.
+   */
+  trustedScripts?: TrustedScriptsStore;
   /**
    * Injectable source for the model-tiers config used by the resume-replay
    * identity hash (see hashAgentCall's `tierModel` field). Defaults to the
@@ -551,6 +961,40 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   failOnExhaustedAgent?: boolean;
   tokenBudget?: number | null;
+  /**
+   * V2-P11: budget-adaptive re-planning knob — the forecast-burn fraction of
+   * the run's token budget at which the runtime emits the re-plan signal
+   * (spent + remaining phase budgets crossing `tokenBudget * rePlanThreshold`)
+   * BEFORE the hard caps trip, so the script can re-scope remaining phases
+   * (see `replanSignal`). A finite number in [0, 1]; anything else falls back
+   * to DEFAULT_REPLAN_THRESHOLD (0.9). Read-only observation — the signal
+   * never mutates the VM, and the knob is deliberately NOT part of any agent()
+   * resume hash (observation, like the concurrency/autoApproved exclusions).
+   */
+  rePlanThreshold?: number;
+  /**
+   * V2-QW3: run-level total-output ceiling (chars) — the sum of FINAL agent()
+   * result chars (post-P05-cap) across the whole run tree. Once the run's
+   * accumulator crosses the ceiling, the next agent() call throws
+   * OUTPUT_BUDGET_EXCEEDED (non-recoverable like TOKEN_BUDGET_EXHAUSTED;
+   * scripts can try/catch to proceed with less work). null explicitly
+   * disables the ceiling; omitted falls back to the
+   * PI_WORKFLOW_MAX_TOTAL_OUTPUT_CHARS env var, else no ceiling. Frozen at
+   * run start (like tokenBudget); nested workflow() frames inherit it.
+   * Deliberately NOT part of any agent() resume hash — it budgets the RESULT,
+   * never the inputs (same exclusion as maxResultChars).
+   */
+  maxTotalOutputChars?: number | null;
+  /**
+   * V2-P02: OPT-IN future-run knowledge seeding (default OFF). When enabled
+   * (a boolean, or a recall-options bag), the run recalls the project's
+   * prior task knowledge at start and registers the privacy-safe context as
+   * a shared ctx() blob — agent instructions carry it under FRESH resume
+   * hashes (the blob text folds into the shared-context fingerprint, so a KB
+   * change invalidates stale cached replays instead of replaying identity).
+   * Default off by design: cross-run knowledge is opt-in, never implicit.
+   */
+  seedKnowledge?: boolean | RecallOptions;
   signal?: AbortSignal;
   /** Maximum number of agents allowed in this run. Default: 1000 */
   maxAgents?: number;
@@ -801,6 +1245,15 @@ export interface WorkflowRunResult<T = unknown> {
    */
   structuredOutputWarnings?: Array<{ label: string; warning: string }>;
   /**
+   * V2-P01: approval decisions recorded on this run's live path (policy
+   * allows/denies, human verdicts, classifier verdicts, serialized grants,
+   * trusted-script skips). Undefined when no risk-classed approval gate
+   * fired (JSON-dropped, so a policy-less run's result shape is unchanged).
+   * The classifier decision lives here + in the run log — never in any
+   * agent() resume identity (hashAgentCall's field set is untouched).
+   */
+  approvalDecisions?: ApprovalDecision[];
+  /**
    * E3: the first call index that ran live instead of replaying from the
    * journal (Number.POSITIVE_INFINITY → absent). A nested workflow() parent
    * reads this to cut its own cache-hit prefix at the child's fork point when
@@ -816,6 +1269,13 @@ export interface WorkflowRunResult<T = unknown> {
     cacheRead?: number;
     cacheWrite?: number;
   };
+  /**
+   * V2-QW3: the run's accumulated agent-output chars (post-P05-cap), surfaced
+   * only when a `maxTotalOutputChars` ceiling was configured (undefined
+   * otherwise — JSON-dropped, so a ceiling-less run's result shape is
+   * unchanged). The same figure the report's `outputBudget.spent` carries.
+   */
+  totalOutputChars?: number;
 }
 
 export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema | undefined> {
@@ -896,7 +1356,7 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
 }
 
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
-interface CheckpointOptions {
+export interface CheckpointOptions {
   /** Reply used when no UI is available (headless/background) and headless != "abort". */
   default?: unknown;
   /** Headless behavior: "default" (take `default`/true) or "abort" (throw). Default "default". */
@@ -907,6 +1367,40 @@ interface CheckpointOptions {
   choices?: string[];
   /** Per-checkpoint timeout in ms for the interactive prompt. */
   timeoutMs?: number;
+  /**
+   * V2-P01: risk class of the action this checkpoint gates. When set, the
+   * run's per-risk-class approval policy decides what happens: `allow` takes
+   * the declared default, `deny` refuses (false), `ask` prompts the human,
+   * and `auto` routes the exact action to the LLM classifier (allow →
+   * default, anything else → human, headless fails closed). Included in the
+   * checkpoint hash (a re-classified checkpoint must not replay a stale
+   * decision) — omitted entirely when absent so legacy journals replay
+   * byte-identically.
+   */
+  riskClass?: RiskClass;
+  /**
+   * V2-P01: canonical action identity for grant dedupe (default: the prompt
+   * text). Part of the hash (optional key, omitted when absent) because a
+   * changed action identity changes the grant scope.
+   */
+  action?: string;
+  /**
+   * V2-P01: grant kind recorded after a HUMAN approval of this checkpoint
+   * (default "session" — the exact action is pre-approved for the rest of
+   * the run; "once" pre-approves exactly one future occurrence). Grants are
+   * per-run in-memory, action-exact, never widening. Deliberately NOT part of
+   * the checkpoint hash: grant recording is host-side policy that never
+   * changes the reply value (replay short-circuits before grants, and grants
+   * are empty on a fresh resume run).
+   */
+  grantMode?: "once" | "session";
+  /**
+   * V2-N3: display-only enrichment (e.g. a gate-time cost preview) appended
+   * to the UI prompt. NEVER hashed — the checkpoint identity covers a fixed
+   * field subset, and a run-state-derived forecast must stay out of it (a
+   * cache-hit replay must not re-block on a changed forecast line).
+   */
+  details?: string;
 }
 
 /**
@@ -1021,6 +1515,14 @@ export interface PhaseStateIntegration {
 interface RuntimeState {
   currentPhase?: string;
   /**
+   * V2-P01: approval decisions recorded on this run's live path (policy
+   * allows/denies, human verdicts, classifier verdicts, serialized grants,
+   * trusted-script skips). Observability + report evidence — NEVER part of
+   * any agent()/checkpoint() resume identity (decisions are re-derived live
+   * from the same inputs on replay, never replayed as steps).
+   */
+  approvalDecisions: ApprovalDecision[];
+  /**
    * Per-phase soft sub-budgets carved from the run total: phase title -> the
    * ceiling. Spend is attributed via phaseSpend (M25): every token an agent
    * spends is charged to the phase it was ASSIGNED at call time (assignedPhase),
@@ -1050,6 +1552,13 @@ interface RuntimeState {
    * callIndex < firstMiss; once a call misses, it AND everything after run live.
    */
   firstMiss: number;
+  /**
+   * V2-P08: applied steer-plan revisions in submission order (the revision +
+   * its callIndex). Rebuilt deterministically on resume: each replay cache hit
+   * re-applies the journaled revision, so the applied list is identical to the
+   * original run's. Journaled deltas — never part of any resume identity.
+   */
+  steerRevisions: Array<{ revision: SteerPlanRevision; callIndex: number }>;
   /**
    * Phase of the last TOP-LEVEL agent() call (undefined before the first). Used
    * by the session-handoff chaining rule: a top-level call whose phase differs
@@ -1137,6 +1646,19 @@ export async function runWorkflow<T = unknown>(
     typeof options.maxNestedWorkflowDepth === "number" && Number.isFinite(options.maxNestedWorkflowDepth)
       ? Math.max(1, Math.min(MAX_NESTED_WORKFLOW_DEPTH, Math.floor(options.maxNestedWorkflowDepth)))
       : 1;
+  // V2-P11: the run's frozen re-plan threshold — a finite number in [0, 1]
+  // (the fraction of the token budget whose forecast burn triggers the re-plan
+  // signal); anything else falls back to DEFAULT_REPLAN_THRESHOLD. Frozen at
+  // run start (like tokenBudget) and inherited by nested workflow() frames via
+  // the options spread. Observation-only — NEVER part of any agent() resume
+  // identity (the same exclusion as concurrency/autoApproved).
+  const rePlanThreshold =
+    typeof options.rePlanThreshold === "number" &&
+    Number.isFinite(options.rePlanThreshold) &&
+    options.rePlanThreshold >= 0 &&
+    options.rePlanThreshold <= 1
+      ? options.rePlanThreshold
+      : DEFAULT_REPLAN_THRESHOLD;
   // Positive finite numbers only; anything else (undefined, NaN, <= 0) falls
   // back to the documented constant so the drain always has a deadline.
   const drainTimeoutMs =
@@ -1145,6 +1667,14 @@ export async function runWorkflow<T = unknown>(
       : DRAIN_ABORT_TIMEOUT_MS;
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
+  // V2-QW3: the run's frozen total-output ceiling. An explicit option wins;
+  // undefined falls back to the PI_WORKFLOW_MAX_TOTAL_OUTPUT_CHARS env var,
+  // then null (no ceiling). Frozen at run start (like tokenBudget) so the
+  // pre-call gate cannot drift mid-run, and inherited by nested workflow()
+  // frames via the options spread. Deliberately NOT part of any agent()
+  // resume hash — it budgets the RESULT, never the inputs (same exclusion as
+  // maxAgentResultChars).
+  const maxTotalOutputChars = resolveMaxTotalOutputChars(options.maxTotalOutputChars);
   // Snapshot the agentType registry ONCE per run so two agent() calls can't
   // observe a mid-run edit (determinism); a later resume re-reads it.
   const agentRegistry = options.agentRegistry ?? loadAgentRegistry(baseCwd);
@@ -1189,6 +1719,7 @@ export async function runWorkflow<T = unknown>(
   const state: RuntimeState = {
     logs: [],
     failedAgents: [],
+    approvalDecisions: [],
     // When the script declares meta.phases, default the current phase to the
     // first one so agents created before any explicit phase() call still group
     // under a declared phase instead of an orphan "(no phase)" bucket. An
@@ -1200,6 +1731,7 @@ export async function runWorkflow<T = unknown>(
     callSeq: 0,
     firstMiss: Number.POSITIVE_INFINITY,
     sawTopLevelAgent: false,
+    steerRevisions: [],
   };
 
   // P02: per-run supervisor observation log — the settle-path tap below feeds
@@ -1218,6 +1750,29 @@ export async function runWorkflow<T = unknown>(
   // WorkflowRunOptions.modelCrosschecker. Shared across nested workflow()
   // frames through the options spread.
   const modelCrosschecker = options.modelCrosschecker ?? createModelCrosschecker();
+  // V2-P01: the run's risk-class approval policy table (absent → defaults;
+  // approval is host-side policy, never part of any resume identity). Nested
+  // workflow() frames inherit it via the options spread.
+  const approvalPolicy = options.approvalPolicy;
+  // V2-P01: the run's LLM auto-approval classifier over the public
+  // ModelRuntime completeSimple channel (created lazily like the crosschecker;
+  // tests inject a fake). Runs on the session's main model by default — the
+  // most capable model decides. Its spend is metered against the run budget by
+  // the gate paths (classifier decisions never join any resume identity).
+  const approvalClassifier = options.approvalClassifier ?? createApprovalClassifier({ modelSpec: options.mainModel });
+  // V2-N6: the run's trusted-script allowlist. Injected stores (tests, a host
+  // wiring) win; otherwise the default store persists under getAgentDir(),
+  // PROJECT-SCOPED (the durable-store pattern): a script approved in one
+  // project is never auto-trusted in another — approval never widens across
+  // projects, and throwaway cwds (tests) never pollute a real project's
+  // allowlist. Reads are lenient (a missing file is an empty allowlist). The
+  // trust check is SNAPSHOTTED at run start: the skip applies to gates on
+  // RE-RUNS of an already-approved script — an approval recorded mid-run never
+  // re-gates this same execution, keeping the run deterministic.
+  const trustedScripts =
+    options.trustedScripts ?? createTrustedScriptsStore({ projectKey: workflowProjectKey(baseCwd) });
+  const scriptHash = scriptBodyHash(script);
+  const isTrustedScript = trustedScripts.isTrusted(scriptHash);
   const concurrency = normalizeConcurrency(
     options.concurrency ?? Math.max(1, (globalThis.navigator?.hardwareConcurrency ?? 8) - 2),
   );
@@ -1238,11 +1793,29 @@ export async function runWorkflow<T = unknown>(
   // needs seeding precisely because its cache-hit branch deliberately does NOT
   // re-run recordTokens() (to avoid double-counting already-spent tokens) —
   // there is no replay-based reconstruction for it the way there is for count.
+  // V2-QW3: seed the run's output accumulator from the resume journal so the
+  // run-level total-output ceiling holds CUMULATIVELY across pause/resume
+  // (mirrors how resume() seeds initialTokenUsage — derived here because the
+  // journal IS the persisted truth and the manager's resume plumbing is out
+  // of this slice's file scope). Replayed cache-hit results never reach the
+  // live settle path's accumulator, so without this seed a resumed run would
+  // restart the counter at zero and silently overshoot the ceiling. Journal
+  // entries also include checkpoint replies; their trivial length is counted
+  // too (safe direction — the ceiling trips marginally early, never late).
+  // Applied only on the fresh-SharedRuntime branch below; a nested workflow()
+  // frame inherits the parent's already-live accumulator instead.
+  let initialTotalOutputChars = 0;
+  if (options.resumeJournal) {
+    for (const entry of options.resumeJournal.values()) {
+      initialTotalOutputChars += countOutputChars(entry.result);
+    }
+  }
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
     spent: options.initialTokenUsage?.total ?? 0,
     freshSpent: options.initialFreshSpend ?? 0,
+    totalOutputChars: initialTotalOutputChars,
     tokenUsage: options.initialTokenUsage
       ? { ...options.initialTokenUsage }
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
@@ -1259,6 +1832,19 @@ export async function runWorkflow<T = unknown>(
     // Seed the elapsedMs() global from the true top-level start; a nested
     // workflow() frame inherits this exact value via options.sharedRuntime.
     runStartedAtMs: Date.now(),
+    // V2-P01: per-run approval grant store — shared across nested workflow()
+    // frames so a session grant is honored run-wide (action-exact, run-scoped,
+    // never widening; never part of any resume identity).
+    approvalGrants: new ApprovalGrantStore(),
+    // V2-P07: live nested-recursive() counter starts at zero per top-level run.
+    recursiveDepth: 0,
+    // V2-P11: the re-plan edge flag starts unset; the live settle/phase paths
+    // set it once when the forecast first crosses the threshold.
+    rePlanEmitted: false,
+    // V2-P09: run-wide phase/provider spend accumulators start empty; the
+    // settle path fills them exactly like the frame-local phaseSpend.
+    runPhaseSpend: new Map(),
+    providerSpend: new Map(),
   };
   const limiter = shared.limiter;
   // This frame created `shared` fresh (rather than inheriting a parent
@@ -1541,6 +2127,109 @@ export async function runWorkflow<T = unknown>(
     }
   };
 
+  // V2-QW2: per-phase budget persistence into the run's durable store. The
+  // carve below is live-only (in-memory); persisting it lets the run report
+  // (and a paused/resumed run's report) read the declared ceilings. Per-phase
+  // keys — never one shared map, whose sequential full-map writes from
+  // consecutive phase() declarations could clobber each other — and written
+  // idempotently: a replayed declaration re-writes the same value into the
+  // same key, which dedupes to a byte-identical no-op. Only runs bound to a
+  // durable sink (registered by runId) persist; direct embeds without a runId
+  // skip this entirely. Never part of any resume identity (durable-store
+  // contents are excluded from hashAgentCall by contract).
+  const phaseBudgetKey = (budgetRunId: string, title: string): string => `phaseBudgets:${budgetRunId}:${title}`;
+  /**
+   * V2-QW2/QW3/P08: this frame's end-of-run observability entries (phase
+   * budgets + output budget + steer revisions), built as a batch so the settle
+   * path lands them in ONE atomic store commit (a single lock acquisition +
+   * single file write replaces the previous up-to-N+2 sequential atomic
+   * writes, ~8ms each under load). Pure value building — the write is the
+   * caller's putMany. Same idempotency contract as the old per-key helpers: a
+   * replayed/resumed re-flush is a per-key deep-equal no-op. Only frames bound
+   * to a durable sink (registered by runId) build entries; direct embeds
+   * without a runId skip this entirely. Never part of any resume identity
+   * (durable-store contents are excluded from hashAgentCall by contract).
+   */
+  const buildObservabilityBatch = (): Array<[string, unknown]> => {
+    if (!runDurableStore(runId)) return [];
+    const batch: Array<[string, unknown]> = [];
+    for (const [title, pb] of state.phaseBudgets) {
+      batch.push([phaseBudgetKey(runId, title), pb.budget]);
+    }
+    // V2-QW3: the run's total-output accounting (only when a ceiling was
+    // configured — opt-in observability; a ceiling-less run's report shape is
+    // unchanged).
+    if (maxTotalOutputChars !== null) {
+      batch.push([`outputBudget:${runId}`, { limit: maxTotalOutputChars, spent: shared.totalOutputChars }]);
+    }
+    // V2-P08: the applied steer-plan revisions (absent for unsteered runs).
+    if (state.steerRevisions.length > 0) {
+      batch.push([
+        steerRevisionsKey(runId),
+        state.steerRevisions.map(({ revision, callIndex }) => ({ revision, callIndex })),
+      ]);
+    }
+    return batch;
+  };
+
+  /**
+   * V2-QW2/QW3/P08: coalesced end-of-run persistence of THIS frame's
+   * observability entries — one commit (single lock + single atomic file
+   * write) instead of the previous sequential per-key atomic writes. Runs per
+   * frame: a nested workflow() flushes its own batch to its own store, and the
+   * TOP-LEVEL frame appends the spend-ledger entry (see
+   * persistRunEndObservability) so the whole run's settle lands in exactly one
+   * commit. REPLAY-IDEMPOTENT (putMany dedupes each key like a standalone put)
+   * and RESUME-CORRECT. Best-effort by design — observability, never a reason
+   * to fail the run.
+   */
+  const persistFrameObservability = async (): Promise<void> => {
+    const store = runDurableStore(runId);
+    if (!store) return;
+    await store.putMany(buildObservabilityBatch());
+  };
+
+  /**
+   * V2-P09: the TOP-LEVEL settle's coalesced run-end flush — the frame
+   * observability batch PLUS the run's cross-run token-spend ledger entry
+   * (`spendLedger:<runId>`, see src/spend-ledger.ts) in ONE store commit.
+   * Written at TOP-LEVEL run end (after the drain so in-flight stragglers'
+   * spend is captured) from the run's journaled/aggregated token accounting,
+   * and before the store goes away so the manager's emitRunReport snapshot
+   * (which reads spendLedger:<runId>, run-report.ts) always sees the entry.
+   * REPLAY-IDEMPOTENT (putMany's per-key deep-equal no-op for a re-executed
+   * write) and RESUME-CORRECT (a resumed run writes its cumulative total under
+   * the SAME runId, replacing the stale pre-pause entry). Only runs bound to a
+   * durable sink (registered by runId) persist; direct embeds without a runId
+   * skip this entirely. Never part of any resume identity (durable-store
+   * contents are excluded from hashAgentCall by contract). Best-effort by
+   * design — observability, never a reason to fail the run.
+   */
+  const persistRunEndObservability = async (status: "completed" | "failed"): Promise<void> => {
+    const store = runDurableStore(runId);
+    if (!store) return;
+    const batch = buildObservabilityBatch();
+    const replan: SpendLedgerReplan | undefined =
+      options.tokenBudget != null
+        ? { triggered: shared.rePlanEmitted, threshold: rePlanThreshold, events: shared.rePlanEmitted ? 1 : 0 }
+        : undefined;
+    const entry: SpendLedgerEntry = buildSpendLedgerEntry({
+      runId,
+      workflowName: meta.name ?? "untitled",
+      status,
+      agents: shared.agentCount,
+      tokenUsage: { ...shared.tokenUsage, freshSpend: shared.freshSpent },
+      budgetLimit: options.tokenBudget ?? null,
+      totalOutputChars: maxTotalOutputChars !== null ? shared.totalOutputChars : null,
+      phases: shared.runPhaseSpend,
+      phaseBudgets: state.phaseBudgets,
+      providers: shared.providerSpend,
+      replan,
+    });
+    batch.push([spendLedgerKey(runId), entry]);
+    await store.putMany(batch);
+  };
+
   const phase = (title: string, phaseOptions?: PhaseOptions) => {
     state.currentPhase = title;
     if (!state.phases.includes(title)) state.phases.push(title);
@@ -1556,6 +2245,19 @@ export async function runWorkflow<T = unknown>(
       // phase-attributed spend") — only the FIRST declaration seeds 0, so a
       // re-declare / pause-resume never silently reopens a soft sub-budget.
       if (!state.phaseSpend.has(title)) state.phaseSpend.set(title, 0);
+      // V2-QW2: persist the carved ceiling into the run's durable store so the
+      // report (and a paused/resumed run) can read it. Fire-and-forget —
+      // phase() stays synchronous; the awaited end-of-run flush below is the
+      // completion guarantee. Best-effort by design: budget persistence is
+      // observability, never a reason to fail the phase() call.
+      const store = runDurableStore(runId);
+      if (store) {
+        void store.put(phaseBudgetKey(runId, title), phaseOptions.budget).catch(() => {});
+      }
+      // V2-P11: a phase budget declaration changes the forecast — re-evaluate
+      // the re-plan signal so a script gets the warning the moment the plan
+      // itself becomes unsustainable, not only after the first settle.
+      evaluateRePlan("phase");
     }
     // Deterministic stage for the persisted phase state machine (opt-in, see
     // PhaseStateIntegration). Queued — phase() stays synchronous — and flushed
@@ -1601,6 +2303,305 @@ export async function runWorkflow<T = unknown>(
         : (budgetCountsCacheRead ? shared.spent : shared.freshSpent) + tokens > options.tokenBudget,
   });
 
+  // ── V2-P11: budget-adaptive re-planning (forecast burn → signal before caps) ──
+
+  /**
+   * The per-level budget share recursive() hands to a branch (V2-P07): the
+   * run's token budget shrunk geometrically with depth (full budget at the
+   * root, half at depth 1, ...). DATA, not control flow: the recursion tree is
+   * a pure function of (items, maxDepth, split), so on resume the same branch
+   * receives the same share without any budget-dependent branch decisions
+   * desyncing positional agent() call indices. Infinity when no budget is
+   * configured (an unbounded run has no shrinking constraint).
+   */
+  const budgetInheritance = (depth: number): number =>
+    options.tokenBudget == null ? Number.POSITIVE_INFINITY : options.tokenBudget / 2 ** depth;
+
+  /**
+   * Deterministic forecast of the run's projected token burn — a pure function
+   * of journal-derived state (seeded/live spend + declared phase budgets +
+   * phase-attributed spend), so a resumed run computes the same values at the
+   * same logical points. `plannedRemaining` is the sum of each declared phase
+   * budget's unspent capacity (the remaining plan); `projectedTotal` is
+   * spent + plannedRemaining. Best-effort by design (phases declared AFTER a
+   * fan-out can't be forecast), never blocks resume.
+   */
+  const computeRePlanForecast = (): RePlanForecast => {
+    const spent = budgetCountsCacheRead ? shared.spent : shared.freshSpent;
+    let plannedRemaining = 0;
+    for (const [title, pb] of state.phaseBudgets) {
+      plannedRemaining += Math.max(0, pb.budget - (state.phaseSpend.get(title) ?? 0));
+    }
+    const projectedTotal = spent + plannedRemaining;
+    const budgetLimit = options.tokenBudget ?? null;
+    return {
+      spent,
+      plannedRemaining,
+      projectedTotal,
+      budget: budgetLimit,
+      threshold: rePlanThreshold,
+      overBudget: budgetLimit !== null && projectedTotal > budgetLimit,
+    };
+  };
+
+  /**
+   * Re-plan signal evaluation: recompute the forecast and, on the live path,
+   * emit the `replan` runtime event + a log line ONCE when the forecast burn
+   * first crosses `tokenBudget * rePlanThreshold` (the edge flag lives on the
+   * SharedRuntime so nested frames share it). Read-only observation — never a
+   * VM mutation: the script re-scopes remaining phases via its own phase()
+   * declarations. Evaluated after each live agent settle (recordTokens) and at
+   * each phase() declaration. `replanSignal()` derives `triggered` fresh, so
+   * the signal value stays deterministic on resume even though the event edge
+   * is live-path-only.
+   */
+  const evaluateRePlan = (origin: "spend" | "phase"): void => {
+    const budgetLimit = options.tokenBudget;
+    if (budgetLimit == null) return;
+    const forecast = computeRePlanForecast();
+    if (forecast.projectedTotal >= budgetLimit * rePlanThreshold) {
+      if (shared.rePlanEmitted) return;
+      shared.rePlanEmitted = true;
+      log(
+        `[replan] forecast burn crosses the re-plan threshold (projected ${Math.round(forecast.projectedTotal)} / ` +
+          `${budgetLimit} tokens at threshold ${rePlanThreshold}, origin ${origin}); scripts can re-scope ` +
+          "remaining phases via replanSignal()",
+      );
+      safeCallback("onRuntimeEvent", options.onRuntimeEvent, { type: "replan", forecast });
+    }
+  };
+
+  /**
+   * V2-P11: script-visible re-plan signal — a synchronous, deterministic read
+   * returning the current forecast plus whether the threshold has been crossed.
+   * A pure function of journal-derived state (spent + phase budgets), so a
+   * resumed run sees a consistent value; scripts call it at their own
+   * deterministic points (e.g. after phase() declarations or between fan-outs)
+   * and re-scope remaining phases by re-declaring budgets. NEVER part of any
+   * agent() resume identity (read-only observation, like elapsedMs).
+   */
+  const replanSignal = (): {
+    triggered: boolean;
+    events: number;
+    forecast: RePlanForecast;
+  } => {
+    const forecast = computeRePlanForecast();
+    return {
+      triggered:
+        shared.rePlanEmitted ||
+        forecast.projectedTotal >= (forecast.budget ?? Number.POSITIVE_INFINITY) * rePlanThreshold,
+      events: shared.rePlanEmitted ? 1 : 0,
+      forecast,
+    };
+  };
+
+  // ── V2-P08: live steering — the steer-plan channel ────────────────────────
+  // A journaled plan-rescope surface (see the SteerPlanApi doc comment):
+  // read() is a deterministic snapshot of the current plan/phase state;
+  // submit(revision) is a deterministic, journaled, replayable rescope record
+  // modeled on checkpoint() (callIndex + fixed-field hash + resume-journal
+  // replay) and persisted into the run's durable store so the run report
+  // carries the applied revisions. Steer revisions are journaled deltas —
+  // NEVER part of any agent()/checkpoint() resume identity. The in-flight
+  // cooperative interrupt half is EXPLICITLY DEFERRED (see the types' doc
+  // comment): agent sessions expose only AbortSignal, no interrupt hook.
+
+  /** Durable-store key for the run's applied steer revisions. */
+  const steerRevisionsKey = (steerRunId: string): string => `steerRevisions:${steerRunId}`;
+
+  /**
+   * Persist the applied revisions into the run's durable store
+   * (`steerRevisions:<runId>`, the same observability pattern as phase
+   * budgets/output budget). REPLAY-IDEMPOTENT (put is a deep-equal no-op for
+   * a re-executed write) and RESUME-CORRECT (a resumed run re-applies the
+   * replayed prefix and writes the CUMULATIVE list under the same runId,
+   * replacing the stale pre-pause entry). Only runs bound to a durable sink
+   * (registered by runId) persist; direct embeds without a runId skip this
+   * entirely. Never part of any resume identity (durable-store contents are
+   * excluded from hashAgentCall by contract). Best-effort by design —
+   * observability, never a reason to fail the run.
+   */
+  const persistSteerRevisions = async (): Promise<void> => {
+    const store = runDurableStore(runId);
+    if (!store || state.steerRevisions.length === 0) return;
+    await store.put(
+      steerRevisionsKey(runId),
+      state.steerRevisions.map(({ revision, callIndex }) => ({ revision, callIndex })),
+    );
+  };
+
+  /**
+   * Validate + normalize a revision, apply the plan-rescope to the runtime's
+   * declared plan (mirrors phase() re-declaration: a positive finite budget
+   * re-bases the phase ceiling, which the phase gate honors immediately), and
+   * record it in state.steerRevisions. Returns the normalized revision — the
+   * exact object the journal stores and replay re-applies. Deterministic:
+   * a pure function of (revision, current runtime state) — no wall clock, no
+   * RNG. Never touches hashAgentCall identity.
+   */
+  const applySteerRevision = (
+    revision: SteerPlanRevision,
+    callIndex: number,
+    stage: "submit" | "replay",
+  ): SteerPlanRevision => {
+    const normalized = normalizeSteerRevision(revision);
+    // Apply the rescope: re-base each revised phase's ceiling (idempotent
+    // re-declaration — a replay applies the same values), pre-declare new
+    // phase titles so read()/the gate see them, and set the steering phase.
+    for (const entry of normalized.phases ?? []) {
+      state.phaseBudgets.set(entry.title, { budget: entry.budget as number, warned: false });
+      if (!state.phases.includes(entry.title)) state.phases.push(entry.title);
+      if (!state.phaseSpend.has(entry.title)) state.phaseSpend.set(entry.title, 0);
+    }
+    if (normalized.currentPhase !== undefined) state.currentPhase = normalized.currentPhase;
+    state.steerRevisions.push({ revision: normalized, callIndex });
+    const revisionNumber = state.steerRevisions.length;
+    log(
+      `[steer] ${stage} plan revision #${revisionNumber} (call ${callIndex})` +
+        `${normalized.note !== undefined ? ` — ${normalized.note}` : ""}` +
+        `${normalized.reason !== undefined ? ` (${normalized.reason})` : ""}`,
+    );
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, { type: "steer", stage, revision: normalized, callIndex });
+    // Fire-and-forget persistence — the awaited end-of-run flush below is the
+    // completion guarantee; the next live agent()/checkpoint() settle would
+    // catch it anyway on a run that aborts mid-flight.
+    const store = runDurableStore(runId);
+    if (store) void persistSteerRevisions().catch(() => {});
+    return normalized;
+  };
+
+  /**
+   * V2-P08: steerPlan.submit — journaled plan-rescope. The revision is
+   * validated + normalized BEFORE a callIndex is consumed (a malformed
+   * revision never advances the call slot — checkpoint() parity), then hashed
+   * (fixed-field canonical JSON) as the resume-replay key. A resume-journal
+   * cache hit replays the SAME applied revision (stage "replay" steer event)
+   * and a miss applies the revision live + journals it (stage "submit") —
+   * exactly the checkpoint() replay contract, so a paused/resumed run rescopes
+   * identically. Synchronous like phase(); the applied revision is returned.
+   */
+  const steerPlanSubmit = (revision: SteerPlanRevision): SteerPlanRevision => {
+    if (typeof revision !== "object" || revision === null || Array.isArray(revision)) {
+      throw new TypeError("steerPlan.submit(revision) needs a revision object");
+    }
+    const normalized = normalizeSteerRevision(revision);
+    const callIndex = state.callSeq++;
+    const callHash = hashSteerPlanRevision(normalized);
+    const journalKey = journalEntryKey(runId, callIndex);
+    const cached = options.resumeJournal?.get(journalKey);
+    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+      // Replay: re-apply the journaled revision without re-journaling (the
+      // original run's entry already persists) — the same rule as checkpoint.
+      return applySteerRevision(cached.result as SteerPlanRevision, callIndex, "replay");
+    }
+    if (cached == null || cached.hash !== callHash) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      // A steer-plan miss is a live boundary too: the calls that follow it run
+      // live against the store, so apply the buffered replay deltas now.
+      flushReplayDeltas();
+    }
+    const applied = applySteerRevision(normalized, callIndex, "submit");
+    safeCallback("onAgentJournal", options.onAgentJournal, {
+      index: callIndex,
+      runId,
+      hash: callHash,
+      result: applied,
+    });
+    return applied;
+  };
+
+  /**
+   * V2-P08: steerPlan.read — the deterministic current plan/phase state
+   * snapshot. A pure function of journal-derived state (declared phases +
+   * budgets + phase spend, cumulative spend, the shared re-plan forecast), so
+   * a resumed run sees consistent values at the same logical points. Read-only
+   * — never part of any agent() resume identity.
+   */
+  const steerPlanRead = (): SteerPlanSnapshot => ({
+    runId,
+    currentPhase: state.currentPhase ?? null,
+    phases: state.phases.map((title) => ({
+      title,
+      budget: state.phaseBudgets.get(title)?.budget ?? null,
+      spend: state.phaseSpend.get(title) ?? 0,
+    })),
+    agentCount: shared.agentCount,
+    callSeq: state.callSeq,
+    budget: {
+      limit: options.tokenBudget ?? null,
+      spent: budgetCountsCacheRead ? shared.spent : shared.freshSpent,
+      remaining:
+        options.tokenBudget == null
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, options.tokenBudget - (budgetCountsCacheRead ? shared.spent : shared.freshSpent)),
+    },
+    forecast: computeRePlanForecast(),
+    revisions: state.steerRevisions.map((record) => record.revision),
+  });
+
+  /** The documented steer-plan verbs: read() / submit(revision). */
+  const steerPlan: SteerPlanApi = {
+    read: steerPlanRead,
+    submit: steerPlanSubmit,
+  };
+
+  // ── V2-P01: approval-decision recording + LLM classifier channel ──────────
+
+  /**
+   * Record one approval decision: into the run's decision log (report
+   * evidence), the run result's approvalDecisions, and the runtime event
+   * stream. Observability only — NEVER a resume identity input.
+   */
+  const recordApprovalDecision = (decision: ApprovalDecision): void => {
+    state.approvalDecisions.push(decision);
+    safeCallback("onRuntimeEvent", options.onRuntimeEvent, { type: "approval", decision });
+    log(`approval [${decision.riskClass ?? "unclassified"}] ${decision.decision}: ${decision.action}`);
+  };
+
+  /**
+   * Bounded transcript evidence for the classifier: the tail of the run log,
+   * capped at APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS. The log ring itself is
+   * already bounded (pushBoundedLog); the cap keeps the classifier request
+   * cheap and stops a mid-run secret from leaking wholesale.
+   */
+  const boundedApprovalEvidence = (): string => {
+    const tail = state.logs.slice(-40).join("\n");
+    return tail.length > APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS
+      ? `…${tail.slice(-APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS)}`
+      : tail;
+  };
+
+  /**
+   * Route ONE exact action to the LLM classifier (`auto` policy). Fail-closed:
+   * any classifier failure (auth/config/network/timeout/unparseable/budget
+   * exhausted) resolves null and the caller must escalate — never auto-approve.
+   * The classifier is a DIRECT ModelRuntime call: no agent slot, no journal
+   * entry, but its ESTIMATED spend is metered against the run budget (the P01
+   * invariant) via the estimate-only path (freshSpent too, matching the
+   * non-reporting-provider agent path).
+   */
+  const classifyApprovalAction = async (
+    riskClass: RiskClass,
+    action: string,
+  ): Promise<{ verdict: "allow" | "escalate" | null; estimatedTokens: number } | null> => {
+    if (options.tokenBudget !== null && budget.remaining() <= 0) return null;
+    const result = await approvalClassifier.classify({ action, riskClass, evidence: boundedApprovalEvidence() });
+    const estimatedTokens = result ? estimateTokens(result.prompt) + estimateTokens(result.reply ?? "") : 0;
+    if (estimatedTokens > 0) {
+      // Meter the classifier against the run budget exactly like the
+      // estimate-only agent path: no cache split, so the full estimate is
+      // fresh spend. Observability divergence note: the persisted aggregate
+      // (manager-side, built from onAgentEnd/onRetrySpend) does not see this
+      // figure — the run's live budget/tokenUsage do (the same boundary the
+      // crosschecker already sits outside of, in reverse).
+      shared.spent += estimatedTokens;
+      shared.freshSpent += estimatedTokens;
+      shared.tokenUsage.total += estimatedTokens;
+      safeCallback("onTokenUsage", options.onTokenUsage, shared.tokenUsage);
+    }
+    return result ? { verdict: result.verdict, estimatedTokens } : null;
+  };
+
   const agentLimitError = () =>
     new WorkflowError(
       `Agent limit exceeded (${maxAgents}). Use maxAgents option to increase the limit.`,
@@ -1632,6 +2633,11 @@ export async function runWorkflow<T = unknown>(
    */
   const assertFanOutApproved = async (count: number, concurrency: number, autoApproved?: boolean): Promise<void> => {
     if (autoApproved) return;
+    // V2-N6: consult the trusted-script allowlist FIRST — a previously
+    // HUMAN-approved script body hash skips the fan-out gate on re-run
+    // (approval per exact hash; any edit invalidates; host-side policy,
+    // excluded from hashAgentCall like autoApproved today).
+    if (isTrustedScript) return;
     if (fanOutApprovalThreshold == null || count <= fanOutApprovalThreshold) return;
     const agentsSoFar = shared.agentCount;
     const spentSoFar = shared.spent;
@@ -1639,19 +2645,81 @@ export async function runWorkflow<T = unknown>(
       agentsSoFar > 0
         ? `~${Math.max(0, Math.round(spentSoFar / agentsSoFar))} tokens/item`
         : "unknown (no agents have run yet)";
+    const perItemTokens = agentsSoFar > 0 ? Math.max(0, Math.round(spentSoFar / agentsSoFar)) : undefined;
     const toolset = options.tools?.length ? `${options.tools.length} tools` : "default toolset";
     const budgetNote = options.tokenBudget == null ? "no run token budget" : `${budget.remaining()} tokens remaining`;
+    // V2-P01: the fan-out is an "agent" risk-class action. The per-class
+    // policy decides what happens AT the threshold boundary (small fan-outs
+    // still auto-approve below the threshold — the policy never re-opens
+    // them): allow → flow, deny → refuse, ask → human gate, auto → LLM
+    // classifier first, escalate → human gate (headless fails closed).
+    const policy = resolveRiskPolicy(approvalPolicy, "agent");
+    if (policy === "allow") return;
+    if (policy === "deny") {
+      throw new WorkflowError(
+        `fan-out of ${count} items was denied by the approval policy (agent risk class is deny)`,
+        WorkflowErrorCode.WORKFLOW_ABORTED,
+        { recoverable: false },
+      );
+    }
+    // Serialized per-run grants: the exact fan-out action (size + toolset) is
+    // pre-approved for the rest of the run (allow-session) — never widening.
+    const action = `fan-out:${count}:${toolset}`;
+    const grantKey = approvalGrantKey("agent", action);
+    const grant = shared.approvalGrants.peek(grantKey);
+    if (grant === "session") return;
+    if (grant === "once") {
+      shared.approvalGrants.consumeOnce(grantKey);
+      return;
+    }
+    // V2-N3: gate-time cost preview — display-only (`details`), so the
+    // run-state-derived forecast stays out of the checkpoint identity (a
+    // resume whose spend differs must not re-block on a changed forecast line).
+    const details = buildGateCostLine({
+      plannedTokens: perItemTokens !== undefined ? perItemTokens * count : undefined,
+      plannedAgents: count,
+      budgetRemaining: budget.remaining(),
+      budgetTotal: options.tokenBudget ?? null,
+      spentTokens: shared.spent,
+      costUsd: shared.tokenUsage.cost,
+    });
+    if (policy === "auto") {
+      const classified = await classifyApprovalAction("agent", action);
+      if (classified?.verdict === "allow") {
+        recordApprovalDecision({
+          riskClass: "agent",
+          policy,
+          decision: "classifier-allow",
+          action,
+          estimatedTokens: classified.estimatedTokens,
+        });
+        return;
+      }
+      recordApprovalDecision({
+        riskClass: "agent",
+        policy,
+        decision: "classifier-escalate",
+        action,
+        estimatedTokens: classified?.estimatedTokens,
+      });
+      // Escalated (or classifier unavailable) → the human gate below;
+      // headless fails closed inside checkpoint (headless: "abort").
+    }
     const approved = await checkpoint(
       `parallel()/pipeline() fan-out of ${count} items exceeds the approval threshold (${fanOutApprovalThreshold}). ` +
         `It will launch up to ${count} agents (concurrency ${concurrency}; per-item toolset: ${toolset}; ` +
         `est. budget: ${perItem}; ${budgetNote}). Approve this fan-out?`,
-      { kind: "confirm", default: false, headless: "abort" },
+      { kind: "confirm", default: false, headless: "abort", details },
     );
     if (!approved) {
       throw new WorkflowError(`fan-out of ${count} items was not approved`, WorkflowErrorCode.WORKFLOW_ABORTED, {
         recoverable: false,
       });
     }
+    // Allow-session serialized grant: the exact fan-out action is approved for
+    // the rest of this run (action-exact, run-scoped — never widens).
+    shared.approvalGrants.grant(grantKey, "session");
+    recordApprovalDecision({ riskClass: "agent", policy, decision: "human-approve", action, grant: "session" });
   };
 
   // True on an intentional external abort (pause/stop/Esc, via options.signal)
@@ -1703,6 +2771,21 @@ export async function runWorkflow<T = unknown>(
       throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
         recoverable: false,
       });
+    }
+
+    // V2-QW3: run-level total-output ceiling gate. The accumulator counts the
+    // FINAL agent() result chars (post-P05-cap) across the whole run tree;
+    // once the total crosses the frozen ceiling the next agent() call is
+    // refused. Non-recoverable like TOKEN_BUDGET_EXHAUSTED — re-running the
+    // same script under the same ceiling hits the identical wall; a script can
+    // try/catch around the refusing call to proceed with less work. Never part
+    // of any resume hash (it budgets the RESULT, never the inputs).
+    if (maxTotalOutputChars !== null && shared.totalOutputChars >= maxTotalOutputChars) {
+      throw new WorkflowError(
+        `workflow total-output budget exhausted (${shared.totalOutputChars} / ${maxTotalOutputChars} chars)`,
+        WorkflowErrorCode.OUTPUT_BUDGET_EXCEEDED,
+        { recoverable: false },
+      );
     }
 
     const assignedPhase = agentOptions.phase ?? state.currentPhase;
@@ -2009,7 +3092,24 @@ export async function runWorkflow<T = unknown>(
         // phase's sub-budget gate sees only its own agents' spend.
         if (assignedPhase) {
           state.phaseSpend.set(assignedPhase, (state.phaseSpend.get(assignedPhase) ?? 0) + tokens);
+          // V2-P09: also fold into the run-WIDE phase accumulator (shared
+          // across nested workflow() frames) so the spend ledger's per-phase
+          // analytics cover the whole run tree, not just this frame's state.
+          shared.runPhaseSpend.set(assignedPhase, (shared.runPhaseSpend.get(assignedPhase) ?? 0) + tokens);
         }
+        // V2-P09: per-provider attribution from the settled call's final
+        // resolved model (onModelResolved already overwrote displayModel before
+        // recordTokens runs). The substrate of the spend ledger's per-provider
+        // analytics.
+        const settledProvider = displayModel ? providerFromCanonicalSpec(displayModel) : undefined;
+        if (settledProvider) {
+          shared.providerSpend.set(settledProvider, (shared.providerSpend.get(settledProvider) ?? 0) + tokens);
+        }
+        // V2-P11: spend just changed — re-evaluate the re-plan signal so the
+        // event fires before the hard caps trip (cheap: one pass over the
+        // declared phase budgets; observation only, never part of any resume
+        // identity).
+        evaluateRePlan("spend");
         return tokens;
       };
 
@@ -2144,6 +3244,11 @@ export async function runWorkflow<T = unknown>(
               label,
               // Identifiable name for persisted sessions (persistAgentSessions).
               sessionName: `workflow:${runId} ${label}`,
+              // V2-QW2(a): the phase this call was assigned at call time, so the
+              // settle ledger record stops carrying phase:undefined. Runtime
+              // metadata only — NEVER part of the resume identity (hashAgentCall's
+              // field set is untouched).
+              provenancePhase: assignedPhase,
               schema: agentOptions.schema,
               signal: agentController.signal,
               instructions: buildAgentInstructions(
@@ -2294,6 +3399,13 @@ export async function runWorkflow<T = unknown>(
               );
               result = capped.text;
             }
+            // V2-QW3: count the FINAL result chars (post-P05-cap) against the
+            // run-level total-output ceiling. Runs on the success path only — a
+            // failed/retried attempt produced no output. Cache-hit replay does
+            // not reach here (the journaled result returns earlier), which is
+            // exactly why the accumulator is journal-seeded on resume above.
+            // Never part of any resume hash (it measures the RESULT).
+            shared.totalOutputChars += countOutputChars(result);
             const tokens = recordTokens(result);
             // QW4: structured-output near-miss — a schema agent() that resolved
             // a non-null result while its operation traces contain NO
@@ -3320,7 +4432,13 @@ export async function runWorkflow<T = unknown>(
       } catch (error) {
         // Budget / agent-limit exhaustion: return the partial result, don't abort.
         const code = (error as { code?: string })?.code;
-        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) {
+        if (
+          code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED ||
+          code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED ||
+          // V2-QW3: the run-level output ceiling is a capacity bound exactly
+          // like the token budget — the loop terminates instead of aborting.
+          code === WorkflowErrorCode.OUTPUT_BUDGET_EXCEEDED
+        ) {
           termination = "capacity";
           break;
         }
@@ -3515,6 +4633,218 @@ export async function runWorkflow<T = unknown>(
       return opts.synthesizer(results, { failed, chunkCount: chunks.length, items });
     }
     return { results, failed, chunkCount: chunks.length };
+  };
+
+  // ── V2-P07: recursive() decomposition primitive (rlm-lite) ────────────────
+  // Oversized partitions recursively spawn context-sized grandchildren through
+  // the run manager (nested-capable agent() calls), with per-branch maxDepth,
+  // a per-level wave width (maxRecursiveRoots), and shrinking budget
+  // inheritance. The recursion TREE is a pure function of (items, maxDepth,
+  // split) — never wall-clock, never budget-gated — so recursive calls are
+  // journaled positional agent() calls at deterministic indices and resume
+  // replays the same tree. It NEVER routes through workflow() nesting (its own
+  // recursiveDepth counter; MAX_NESTED_WORKFLOW_DEPTH untouched).
+
+  /** Per-level budget share + positional identity handed to a branch. */
+  interface RecursiveBranchMeta {
+    /** Positional branch path ("0", "0/2", "0/2/1") — deterministic for a fixed tree. */
+    path: string;
+    /** The branch's inherited token-budget share (shrinks geometrically with depth). */
+    branchBudget: number;
+    /** Zero-based recursion depth of this branch (root = 0). */
+    depth: number;
+  }
+
+  /** A branch (subtree or leaf) whose work failed recoverably. */
+  interface RecursiveFailure {
+    /** Positional path of the failed branch. */
+    path: string;
+    /** Recursion depth of the failed branch. */
+    depth: number;
+  }
+
+  /** One visit outcome — the merged result plus aggregate tree statistics. */
+  interface RecursiveVisitOutcome {
+    result: unknown;
+    failed: RecursiveFailure[];
+    /** Leaf branches visited in this subtree. */
+    leafCount: number;
+    /** Deepest recursion level reached in this subtree. */
+    maxDepth: number;
+  }
+
+  /** The script-facing recursive() result envelope. */
+  interface RecursiveResult {
+    /** The merged root result (null when the whole tree failed). */
+    result: unknown;
+    /** Deepest recursion level reached. */
+    depth: number;
+    /** Leaf branches that produced a non-null result. */
+    completedBranches: number;
+    /** Leaf branches that failed (null). */
+    failedBranches: number;
+    /** Total leaf branches visited. */
+    totalBranches: number;
+  }
+
+  // V2-P07 durable bindings: per-runId keys in the run's durable store so
+  // recursion state (partition spec + completed coverage) persists for resume.
+  // Written idempotently (put deep-equal no-op / putOnce content-id dedupe) —
+  // deliberately OBSERVABILITY, never control flow: a durable short-circuit of
+  // a completed subtree would skip its agent() calls on resume and desync
+  // state.callSeq (downstream indices shift → first-miss → wasteful live
+  // rerun). Resume replay stays on the journal (prefix-preserving), which is
+  // what makes successful partitions never rerun.
+  const recursiveBranchId = (runId: string, path: string, depth: number, items: unknown): string =>
+    provenanceContentId({ runId, path, depth, items });
+  const recursiveBranchKey = (runId: string, path: string): string => `recursive:branches:${runId}:${path}`;
+  const recursiveRootKey = (runId: string): string => `recursive:root:${runId}`;
+
+  const recursive = async (
+    rootItems: unknown[],
+    opts: {
+      /** Pure partition function: items → child partitions. Deterministic. */
+      split: (items: unknown[], depth: number) => unknown[] | Promise<unknown[]>;
+      /** Leaf solver — usually one or more agent() calls. */
+      solve: (items: unknown[], depth: number, meta: RecursiveBranchMeta) => Promise<unknown> | unknown;
+      /** Optional branch synthesis; default passes the child results through. */
+      merge?: (
+        results: Array<unknown | null>,
+        meta: RecursiveBranchMeta & { failed: RecursiveFailure[]; items: unknown[] },
+      ) => Promise<unknown> | unknown;
+      /** Per-branch recursion depth (default 2; clamped to 1..MAX_RECURSIVE_DEPTH). */
+      maxDepth?: number;
+      /** Per-level wave width (default DEFAULT_RECURSIVE_MAX_ROOTS). */
+      maxRecursiveRoots?: number;
+      /** Fan-out concurrency (scheduling only — never part of any resume hash). */
+      concurrency?: number;
+      /** Skip the P12 fan-out approval gate for the recursion's fan-outs. */
+      autoApproved?: boolean;
+    },
+  ): Promise<RecursiveResult> => {
+    throwIfAborted();
+    if (!Array.isArray(rootItems)) throw new TypeError("recursive() expects an array as the first argument");
+    if (!opts || typeof opts.split !== "function")
+      throw new TypeError("recursive() requires { split: (items, depth) => partitions }");
+    if (!opts || typeof opts.solve !== "function")
+      throw new TypeError("recursive() requires { solve: (items, depth, meta) => result }");
+    if (opts.merge !== undefined && typeof opts.merge !== "function") {
+      throw new TypeError("recursive() merge() must be a function");
+    }
+    const maxDepth = normalizeBoundedCount(opts.maxDepth, DEFAULT_RECURSIVE_DEPTH, MAX_RECURSIVE_DEPTH, "maxDepth");
+    const maxRoots = normalizeBoundedCount(
+      opts.maxRecursiveRoots,
+      DEFAULT_RECURSIVE_MAX_ROOTS,
+      Number.MAX_SAFE_INTEGER,
+      "maxRecursiveRoots",
+    );
+    // Runaway guard: a solve() that itself calls recursive() in an unbounded
+    // chain is stopped here, mirroring the workflow() hard-ceiling guard (a
+    // runaway guard, not a sandbox). The shared counter makes the guard hold
+    // across nested recursive() calls.
+    if (shared.recursiveDepth >= MAX_RECURSIVE_DEPTH) {
+      throw new WorkflowError(
+        `recursive() nesting depth exceeded (max ${MAX_RECURSIVE_DEPTH}) — runaway nested recursive() calls are blocked`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    // Persist the root partition spec (durable binding; idempotent).
+    const durable = runDurableStore(runId);
+    if (durable) {
+      void durable.put(recursiveRootKey(runId), { items: rootItems, maxDepth, maxRoots }).catch(() => {});
+    }
+
+    const visit = async (items: unknown[], depth: number, path: string): Promise<RecursiveVisitOutcome> => {
+      const branchBudget = budgetInheritance(depth);
+      const persistBranch = (result: unknown): void => {
+        if (!durable) return;
+        void durable
+          .putOnce(recursiveBranchId(runId, path, depth, items), recursiveBranchKey(runId, path), {
+            depth,
+            items,
+            result,
+          })
+          .catch(() => {});
+      };
+      const leaf = async (): Promise<RecursiveVisitOutcome> => {
+        const result = await opts.solve(items, depth, { path, branchBudget, depth });
+        persistBranch(result);
+        return {
+          result,
+          failed: result === null ? [{ path, depth }] : [],
+          leafCount: 1,
+          maxDepth: depth,
+        };
+      };
+
+      // Per-branch depth limit: at maxDepth the branch is solved directly.
+      if (depth >= maxDepth) return leaf();
+
+      let parts: unknown[];
+      const split = await opts.split(items, depth);
+      if (!Array.isArray(split)) {
+        throw new TypeError("recursive() split() must return an array of sub-partitions");
+      }
+      parts = split;
+      // A split that doesn't actually partition (empty, or a single identical
+      // part) means "leaf": solve this branch directly instead of recursing.
+      if (parts.length === 0 || (parts.length === 1 && isDeepEqual(parts[0], items))) {
+        return leaf();
+      }
+      if (!parts.every((part) => Array.isArray(part))) {
+        throw new TypeError("recursive() split() must return an array of arrays");
+      }
+
+      // Fan out the children in deterministic waves of `maxRoots` width — wave
+      // boundaries are pure functions of (partition order, maxRoots), so the
+      // positional child agent() call sequence is identical on resume.
+      const childResults: Array<unknown> = [];
+      const failed: RecursiveFailure[] = [];
+      let leafCount = 0;
+      let deepest = depth;
+      for (let wave = 0; wave * maxRoots < parts.length; wave++) {
+        const waveParts = parts.slice(wave * maxRoots, (wave + 1) * maxRoots);
+        const outcomes = (await parallel(
+          waveParts.map((part, index) => () => visit(part, depth + 1, `${path}/${wave * maxRoots + index}`)),
+          { concurrency: opts.concurrency, autoApproved: opts.autoApproved },
+        )) as RecursiveVisitOutcome[];
+        for (const outcome of outcomes) {
+          childResults.push(outcome.result);
+          failed.push(...outcome.failed);
+          leafCount += outcome.leafCount;
+          deepest = Math.max(deepest, outcome.maxDepth);
+        }
+      }
+
+      // N03 all-failed-batch stop: every child failed → this branch fails
+      // wholesale (recorded as a branch failure, never silently retried). The
+      // children's LEAF failures are already in `failed` — the branch itself is
+      // not a leaf, so adding it would double-count failedBranches.
+      if (childResults.length > 0 && childResults.every((result) => result === null)) {
+        persistBranch(null);
+        return { result: null, failed, leafCount, maxDepth: deepest };
+      }
+
+      const merge = opts.merge ?? ((results: Array<unknown | null>) => results);
+      const merged = await merge(childResults, { path, branchBudget, depth, failed, items });
+      persistBranch(merged);
+      return { result: merged, failed, leafCount, maxDepth: deepest };
+    };
+
+    shared.recursiveDepth++;
+    try {
+      const outcome = await visit(rootItems, 0, "0");
+      return {
+        result: outcome.result,
+        depth: outcome.maxDepth,
+        completedBranches: outcome.leafCount - outcome.failed.length,
+        failedBranches: outcome.failed.length,
+        totalBranches: outcome.leafCount,
+      };
+    } finally {
+      shared.recursiveDepth--;
+    }
   };
 
   interface RouteCase {
@@ -4007,11 +5337,35 @@ export async function runWorkflow<T = unknown>(
         accepted,
       });
       lastResults = results;
+      // V2-N5: record the machine verdicts into the run's provenance ledger
+      // BEFORE the gate settles (accept or fail-closed). Content-derived ids
+      // (testGateVerdictEntries) make replay idempotent — a cached-prefix
+      // replay re-executes the same pure verdict and dedupes. Best-effort:
+      // provenance is observability, never a reason to fail the gate.
+      await recordTestGateVerdicts(results);
       if (accepted) return { ok: true, value: last, attempts: i + 1, tests: results };
       feedback = buildTestGateFeedback(results, opts.postconditions, i + 1);
     }
     // Fail closed: bounded rework exhausted, the evidence stays visible.
+    await recordTestGateVerdicts(lastResults);
     return { ok: false, value: last, attempts, tests: lastResults };
+  };
+
+  /**
+   * V2-N5 settle hook: route the final per-test verdicts into the run's
+   * durable-store ledger (no-op when the run bound no sink). One entry per
+   * test with a content-derived stable id; `state.currentPhase` is the phase
+   * at settle time (undefined outside a declared phase).
+   */
+  const recordTestGateVerdicts = async (results: TestGateStepResult[]): Promise<void> => {
+    if (results.length === 0) return;
+    try {
+      await Promise.all(
+        testGateVerdictEntries(results, state.currentPhase).map((entry) => recordProvenance(runId, entry)),
+      );
+    } catch {
+      // provenance is observability, not execution
+    }
   };
 
   // Deterministic, journaled, replayable human checkpoint. Spends no tokens, so it
@@ -4042,14 +5396,151 @@ export async function runWorkflow<T = unknown>(
     }
     shared.agentCount++;
 
+    // The reply every gate branch resolves (risk flow early-returns, human ask
+    // path, or headless default); declared before the branches below.
     let reply: unknown;
+
+    // ── V2-P01 risk-class flow + V2-N6 trusted-script skip ───────────────────
+    // Both sit AFTER the journal cache-hit return above, so resume replay never
+    // re-classifies, re-grants, or re-blocks (S1 intact — the same rule the
+    // big-plan classify already follows). The trusted-script skip takes
+    // precedence over the risk flow: an approved script body trusts all of its
+    // gates.
+    const riskClass = checkpointOptions.riskClass;
+    const action = checkpointOptions.action ?? promptText;
+    const grantKey = riskClass ? approvalGrantKey(riskClass, action) : null;
+
+    // V2-N6: a previously HUMAN-approved script body hash skips the gate — the
+    // checkpoint takes its declared default without contacting the
+    // gate/confirm. Approval-gate checkpoints only (kind confirm — input/select
+    // checkpoints are data collection, never gates, so they keep their flow).
+    if (isTrustedScript && (checkpointOptions.kind === "confirm" || checkpointOptions.kind === undefined)) {
+      const trustedReply = checkpointOptions.default ?? true;
+      recordApprovalDecision({
+        riskClass: riskClass ?? null,
+        policy: resolveRiskPolicy(approvalPolicy, riskClass ?? "read"),
+        decision: "trusted-script",
+        action,
+      });
+      throwIfAborted();
+      safeCallback("onAgentJournal", options.onAgentJournal, {
+        index: callIndex,
+        runId,
+        hash: callHash,
+        result: trustedReply,
+      });
+      return trustedReply;
+    }
+
+    // The reply every approved (non-ask) path resolves. A confirm checkpoint
+    // resolves TRUE (the gate is overridden by an explicit policy/grant
+    // authorization); input/select checkpoints resolve their declared default
+    // (the payload under review). Deliberately distinct from the trusted-script
+    // skip's `default ?? true`: a policy/grant is an EXPLICIT authorization to
+    // proceed, while a trusted script's declared default is the author's
+    // unattended behavior (which may itself be "deny").
+    const approvedReply = (): unknown =>
+      checkpointOptions.kind === "confirm" || checkpointOptions.kind === undefined
+        ? true
+        : (checkpointOptions.default ?? true);
+
+    // V2-P01: per-risk-class policy. Grants are checked first (serialized
+    // per-run, action-exact, never widening); then allow/deny/auto flow. Any
+    // path that resolves without the human falls through to the journal emit
+    // at the bottom (shared with the ask path's reply).
+    if (riskClass && grantKey !== null) {
+      const policy = resolveRiskPolicy(approvalPolicy, riskClass);
+      const grant = shared.approvalGrants.peek(grantKey);
+      if (grant === "session") {
+        recordApprovalDecision({ riskClass, policy, decision: "session-grant", action });
+        reply = approvedReply();
+        throwIfAborted();
+        safeCallback("onAgentJournal", options.onAgentJournal, {
+          index: callIndex,
+          runId,
+          hash: callHash,
+          result: reply,
+        });
+        return reply;
+      }
+      if (grant === "once") {
+        shared.approvalGrants.consumeOnce(grantKey);
+        recordApprovalDecision({ riskClass, policy, decision: "once-grant", action, grant: "once" });
+        reply = approvedReply();
+        throwIfAborted();
+        safeCallback("onAgentJournal", options.onAgentJournal, {
+          index: callIndex,
+          runId,
+          hash: callHash,
+          result: reply,
+        });
+        return reply;
+      }
+      if (policy === "allow") {
+        recordApprovalDecision({ riskClass, policy, decision: "policy-allow", action });
+        reply = approvedReply();
+        throwIfAborted();
+        safeCallback("onAgentJournal", options.onAgentJournal, {
+          index: callIndex,
+          runId,
+          hash: callHash,
+          result: reply,
+        });
+        return reply;
+      }
+      if (policy === "deny") {
+        recordApprovalDecision({ riskClass, policy, decision: "policy-deny", action });
+        reply = false;
+        throwIfAborted();
+        safeCallback("onAgentJournal", options.onAgentJournal, {
+          index: callIndex,
+          runId,
+          hash: callHash,
+          result: reply,
+        });
+        return reply;
+      }
+      if (policy === "auto") {
+        const classified = await classifyApprovalAction(riskClass, action);
+        if (classified?.verdict === "allow") {
+          recordApprovalDecision({
+            riskClass,
+            policy,
+            decision: "classifier-allow",
+            action,
+            estimatedTokens: classified.estimatedTokens,
+          });
+          reply = approvedReply();
+          throwIfAborted();
+          safeCallback("onAgentJournal", options.onAgentJournal, {
+            index: callIndex,
+            runId,
+            hash: callHash,
+            result: reply,
+          });
+          return reply;
+        }
+        // Escalated (or classifier unavailable — fail closed): the human
+        // decides via the ask path below; a headless run throws there.
+        recordApprovalDecision({
+          riskClass,
+          policy,
+          decision: "classifier-escalate",
+          action,
+          estimatedTokens: classified?.estimatedTokens,
+        });
+      }
+      // policy "ask" (or auto-escalated): fall through to the human ask path.
+    }
+
     if (options.checkpointGate) {
       // Visual approve/deny gate (e.g. the plannotator SSE bridge): publish the
       // checkpoint payload to the gate, then wait for the human verdict instead
       // of the inline confirm. Resume-safe: the journaled reply replays from the
       // cache hit above, so a re-run never re-blocks on the gate. Flush declared
       // stages first so an approval records against the current stage (approvePlan
-      // is only valid at stage 2 of the phase state machine).
+      // is only valid at stage 2 of the phase state machine). The V2-P01 risk
+      // class + V2-N3 display-only details ride along in the payload.
       await flushPhaseState();
       const plan = await options.checkpointGate.submitPlan({
         prompt: promptText,
@@ -4058,6 +5549,8 @@ export async function runWorkflow<T = unknown>(
         default: checkpointOptions.default,
         runId,
         callIndex,
+        ...(riskClass !== undefined ? { riskClass } : {}),
+        ...(checkpointOptions.details !== undefined ? { details: checkpointOptions.details } : {}),
       });
       // A big-plan bridge that could not auto-open the browser attaches the
       // manual review URL to the result (plannotator submitPlan's note); log
@@ -4099,6 +5592,18 @@ export async function runWorkflow<T = unknown>(
       // instead of silently rubber-stamping a large blueprint. The classify
       // read sits AFTER the journal cache-hit return above, so resume replay
       // never re-classifies and never re-blocks (S1 intact).
+      //
+      // V2-P01: a RISK-CLASSED checkpoint that reached headless was NOT
+      // policy-allowed (allow/classifier-allow returned above) — escalating to
+      // a human that isn't there fails CLOSED: a risky action is never
+      // silently rubber-stamped by a detached/background run.
+      if (riskClass !== undefined) {
+        throw new WorkflowError(
+          `checkpoint "${promptText}" (risk class ${riskClass}) requires human approval but none is available (headless run)`,
+          WorkflowErrorCode.WORKFLOW_ABORTED,
+          { recoverable: false },
+        );
+      }
       const classified = await classifyRunPlan({
         dir: join(baseCwd, ".pi", "workflows", "plans"),
         runId,
@@ -4119,6 +5624,31 @@ export async function runWorkflow<T = unknown>(
         );
       }
       reply = checkpointOptions.default ?? true;
+    }
+    // V2-P01: after a HUMAN decision through the ask path (gate/confirm), the
+    // serialized per-run grant is recorded — allow-session by default, one
+    // exact action for the rest of this run; allow-once via grantMode. A
+    // denial records the refusal; a headless fail-closed throw never reaches
+    // here. Grants are action-exact + run-scoped — never widening.
+    if (riskClass !== undefined && grantKey !== null) {
+      if (reply === true) {
+        const grant = checkpointOptions.grantMode === "once" ? "once" : "session";
+        shared.approvalGrants.grant(grantKey, grant);
+        recordApprovalDecision({
+          riskClass,
+          policy: resolveRiskPolicy(approvalPolicy, riskClass),
+          decision: "human-approve",
+          action,
+          grant,
+        });
+      } else if (reply === false) {
+        recordApprovalDecision({
+          riskClass,
+          policy: resolveRiskPolicy(approvalPolicy, riskClass),
+          decision: "human-deny",
+          action,
+        });
+      }
     }
     throwIfAborted();
     safeCallback("onAgentJournal", options.onAgentJournal, {
@@ -4147,7 +5677,21 @@ export async function runWorkflow<T = unknown>(
   // materialized for an ungated or headless run.
   let gateDeniedNote: string | undefined;
   if (isTopLevelRun && meta.gate === "approve") {
-    const approved = await checkpoint(meta.description, { kind: "confirm", default: true });
+    // V2-N3: gate-time consent line for the script-level approval —
+    // display-only (`details`), so the forecast never enters the checkpoint
+    // identity (a resume replays the journaled verdict without re-blocking on
+    // a changed forecast line). The checkpoint itself honors the V2-N6
+    // trusted-script skip (a previously human-approved script body hash skips
+    // the pre-body gate on re-run) AND journals its reply, so callSeq stays
+    // aligned between trusted and untrusted runs of the same script.
+    const details = buildGateCostLine({
+      plannedTokens: estimateTokens(meta.description),
+      budgetRemaining: budget.remaining(),
+      budgetTotal: options.tokenBudget ?? null,
+      spentTokens: shared.spent,
+      costUsd: shared.tokenUsage.cost,
+    });
+    const approved = await checkpoint(meta.description, { kind: "confirm", default: true, details });
     if (!approved) {
       // Denial or timeout (never an abort: a host abort surfaces via
       // throwIfAborted inside checkpoint and takes the run's canonical abort
@@ -4155,9 +5699,24 @@ export async function runWorkflow<T = unknown>(
       // crashing, so no partial script work can run after a rejected plan.
       gateDeniedNote = `meta.gate approval was denied or timed out — run ${runId} aborted before any agent work`;
       log(gateDeniedNote);
+    } else if (
+      // V2-N6: record the human approval on the allowlist so re-runs skip the
+      // fan-out/meta.gate/checkpoint gates (approval per exact hash — any edit
+      // invalidates). Two hard gates keep the write from widening:
+      //  - it must be a HUMAN approval — a headless auto-approve never writes;
+      //  - the run must be a MANAGED run (agentKillChannel is the manager's
+      //    unconditional per-execution handle) — one-shot direct embeds
+      //    (library/test usage) never persist trust, so a test or embedding
+      //    cannot silently arm the user's allowlist.
+      (options.confirm !== undefined || options.checkpointGate !== undefined) &&
+      options.agentKillChannel !== undefined
+    ) {
+      await trustedScripts.add({ hash: scriptHash, name: meta.name, source: "meta.gate-approval", runId });
     }
   }
 
+  const recall = bindRunRecall(options);
+  const lineage = bindRunLineage(options, (claim, sources) => lineageFetchClaimPages(claim, sources, agent, log));
   const runtimeImplementations = {
     agent,
     parallel,
@@ -4168,6 +5727,13 @@ export async function runWorkflow<T = unknown>(
     loopUntilDry,
     completenessCheck,
     chunked,
+    // V2-P07: recursive decomposition primitive (rlm-lite) — oversized
+    // partitions recursively spawn context-sized grandchildren through the run
+    // manager (own depth counter, shrinking budget inheritance, durable branch
+    // bindings). A control-flow combinator like chunked(): its knobs change
+    // WHICH journaled agent() calls occur, never their inputs, so it is
+    // excluded from hashAgentCall by the same precedent as chunked/timeboxed.
+    recursive,
     route,
     timeboxed,
     elapsedMs,
@@ -4191,6 +5757,42 @@ export async function runWorkflow<T = unknown>(
     // runId). Deterministic clock, idempotent writes — NEVER part of any
     // agent() call's resume identity (MUST NOT join hashAgentCall).
     durableStore: bindRunDurableStore(options),
+    // V2-QW5: read-only prior-run report query — getRunReport(runId) returns
+    // the report artifact (`<runsDir>/reports/<runId>.json`, null when
+    // missing) or getRunReport() lists recent reports newest-first, so a
+    // script can seed context from prior runs. Read-only by construction and
+    // deliberately NEVER part of any agent() call's resume identity (a
+    // cache-hit replay never re-reads a report).
+    getRunReport: bindRunGetReport(options),
+    // V2-P02: cross-run knowledge recall — recall({ query?, keywords?,
+    // phase?, pattern?, limit? }) ranks prior KB entries + run reports into a
+    // privacy-safe context block. Read-only; a cache-hit replay never re-reads
+    // the KB, and the global never joins any agent() resume identity (the
+    // opt-in seeded context flows through the ctx() blob fingerprint instead).
+    recall,
+    // V2-P04: cross-run lineage query — lineage({ runId?, source?, file?,
+    // phase?, agent?, pattern?, limit?, verify?, ttlMs? }) filters the
+    // project provenance ledger with deterministic decay; verify re-verifies
+    // stale claim-verify evidence via journaled agent() re-fetch steps (N02
+    // mechanics, resume-replayable). Read-only except for the verify path.
+    lineage,
+    // V2-P11: budget-adaptive re-plan signal — a synchronous deterministic
+    // read (forecast burn vs the token budget threshold); the runtime also
+    // emits `replan` runtime events on the live crossing edge. Read-only
+    // observation — NEVER part of any agent() resume identity.
+    replanSignal,
+    // V2-P08: live steering — steer-plan channel (PRIMARY half; the in-flight
+    // interrupt half is EXPLICITLY DEFERRED). steerPlan.read() returns the
+    // current plan/phase state snapshot; steerPlan.submit(revision) applies +
+    // journals a plan-rescope that replays deterministically on resume.
+    // Revisions are journaled deltas, NEVER part of any agent() resume
+    // identity (hashAgentCall's field set is untouched).
+    steerPlan,
+    // V2-P09 (re-scoped): cross-run token spend analytics — reads the
+    // project's durable spend ledger and aggregates per-phase/per-pattern/
+    // per-provider totals + trend. Read-only; NEVER part of any agent() resume
+    // identity.
+    spendAnalytics: bindSpendAnalytics({ cwd: baseCwd }),
     // P02: run-scoped supervisor — after each work-agent settle an economy
     // supervisor agent checks progress against a concrete measurable completion
     // criterion; on drift/stall it injects ONE corrective agent; on verified
@@ -4217,6 +5819,31 @@ export async function runWorkflow<T = unknown>(
   const { globals: projectGlobals, diagnostics: bindingDiagnostics } =
     WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(runtimeImplementations);
   for (const diagnostic of bindingDiagnostics) logger.warn(diagnostic.message);
+  // ── V2-P02: OPT-IN cross-run knowledge seeding (default OFF) ─────────────
+  // At top-level run start (never a nested frame — they inherit the shared
+  // runtime), the run recalls prior project knowledge and registers it as a
+  // shared ctx() blob. The registration is a pure function of the persisted
+  // KB/reports (deterministic per KB), so a resumed run re-registers the SAME
+  // blob when the KB is unchanged (identical shared-context fingerprint) and a
+  // CHANGED KB produces a fresh blob — invalidating stale cached replays
+  // instead of replaying identity. Default off; missing matches seed nothing.
+  if (isTopLevelRun && options.seedKnowledge !== undefined && options.seedKnowledge !== false) {
+    try {
+      await seedRunKnowledge({
+        cwd: options.cwd ?? process.cwd(),
+        seed: options.seedKnowledge,
+        recall,
+        ctx,
+        log,
+      });
+    } catch (error) {
+      // Opt-in knowledge seeding is context, never execution: a KB/disk
+      // failure must not fail the run — the script proceeds unseeded.
+      log(
+        `task-knowledge: knowledge seeding failed (${error instanceof Error ? error.message : String(error)}); run continues without seeded context`,
+      );
+    }
+  }
   // ── Pre-run guards at the vm wrapper — the single choke point every script ──
   // ── execution (top-level and each nested workflow() frame) passes through. ──
   //
@@ -4254,6 +5881,11 @@ export async function runWorkflow<T = unknown>(
   });
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
+  // V2-P09: whether an error escaped this frame's script execution uncaught —
+  // the ledger's best-effort status marker ("failed" vs "completed"). The
+  // manager decides the TRUE persisted status later; this is the runtime's
+  // honest best approximation at ledger-write time.
+  let runEscapedError = false;
   try {
     // A denied/timed-out meta.gate approval short-circuits the body: the run
     // completes with `result: false` and the denial note in its logs — no
@@ -4284,6 +5916,10 @@ export async function runWorkflow<T = unknown>(
       durationMs: Date.now() - started,
       runId,
       tokenUsage: shared.tokenUsage,
+      // V2-QW3: the run's accumulated agent-output chars — surfaced only when a
+      // ceiling was configured (undefined otherwise, JSON-dropped so a
+      // ceiling-less run's shape is unchanged).
+      totalOutputChars: maxTotalOutputChars !== null ? shared.totalOutputChars : undefined,
       // The manager's completion-time AGENT_EXHAUSTED gate + the tool's failure
       // text both read this; absent when every agent succeeded (undefined keys
       // are JSON-dropped, keeping lenient runs' persisted shape unchanged).
@@ -4292,6 +5928,10 @@ export async function runWorkflow<T = unknown>(
       // path (undefined when every schema agent called the tool cleanly).
       structuredOutputWarnings:
         shared.structuredOutputWarnings.length > 0 ? shared.structuredOutputWarnings : undefined,
+      // V2-P01: approval decisions (policy/grant/classifier/human/trusted-script)
+      // recorded on this run's live path — undefined when no risk-classed gate
+      // fired (JSON-dropped, so a policy-less run's shape is unchanged).
+      approvalDecisions: state.approvalDecisions.length > 0 ? state.approvalDecisions : undefined,
       // E3: only surfaced when the prefix actually broke (finite), so an intact
       // run's result shape stays unchanged; a nested workflow() parent uses it
       // to cut its own prefix at the child's fork point (see workflowFn).
@@ -4321,9 +5961,27 @@ export async function runWorkflow<T = unknown>(
     // journal — this stops burning an already-exhausted budget right now, at
     // the cost of that sibling's work being thrown away and re-run live when
     // the paused run resumes (it was never journaled, so it isn't cached).
+    runEscapedError = true;
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {
+    // V2-QW2/QW3/P08: coalesced end-of-run persistence of this frame's
+    // observability entries (phase budgets + output budget + steer revisions)
+    // in ONE store commit (single lock + single atomic file write) — the
+    // previous sequential per-key atomic writes (~8ms each under load) pushed
+    // the settle path past the pre-existing 30ms wall-clock settle tests'
+    // slack. A NESTED frame flushes its own batch here; the TOP-LEVEL frame
+    // skips this call and lands the whole settle in exactly ONE commit AFTER
+    // the drain that also carries the spend-ledger entry (see
+    // persistRunEndObservability), so the completion report snapshot
+    // (emitRunReport) always sees every key. Runs on both paths; idempotent —
+    // a replayed/resumed re-flush is a per-key byte-identical no-op.
+    // Best-effort: observability, never a reason to fail the run.
+    if (!isTopLevelRun) {
+      await persistFrameObservability().catch((error: unknown) => {
+        log(`nested frame observability flush failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     // Persist any phase-state transitions queued by phase() declarations that
     // never reached an awaited flush point (a planning-only frame with no
     // checkpoint/agent) so the state file reflects the final declared stage.
@@ -4382,6 +6040,24 @@ export async function runWorkflow<T = unknown>(
       // flushed them) so the store reflects the original run's state before
       // teardown.
       flushReplayDeltas();
+      // V2-QW2/QW3/P08/P09: ONE coalesced run-end durable-store commit — the
+      // frame's phase-budget/output-budget/steer-revision entries PLUS the
+      // run's cross-run token-spend ledger entry (`spendLedger:<runId>`, see
+      // src/spend-ledger.ts) land in a single atomic write (one lock + one
+      // file write) instead of the previous up-to-N+3 sequential atomic
+      // writes on the settle path (~8ms each under load — enough to make the
+      // pre-existing 30ms wall-clock settle tests load-flaky under cap-2).
+      // Runs AFTER the drain so in-flight stragglers' spend is captured, and
+      // BEFORE the store goes away so the manager's emitRunReport snapshot
+      // (read at completion, run-report.ts) always sees every key.
+      // Replay-idempotent (putMany dedupes each key like a standalone put)
+      // and RESUME-CORRECT (a resumed run writes its cumulative total under
+      // the SAME runId, replacing the stale pre-pause entry). Best-effort: an
+      // observability write failure must never fail an otherwise-completed
+      // run.
+      await persistRunEndObservability(runEscapedError ? "failed" : "completed").catch((error: unknown) => {
+        log(`run-end observability flush failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
       store.dispose();
       // Dispose any chained handoff session so it never outlives its run frame
       // (a no-op for injected test doubles without close()).
@@ -4673,6 +6349,80 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
     default: options.default ?? null,
     headless: options.headless ?? "default",
     timeoutMs: options.timeoutMs ?? null,
+    // V2-P01: the risk class and action identity participate in the outcome
+    // (they decide the policy branch and the grant scope), so they are part
+    // of the identity. Both keys are OMITTED entirely when absent — the
+    // encoding stays byte-identical to the legacy hash and old journals
+    // replay unchanged (the "optional riskClass key hash-stable" invariant).
+    // `details` (the V2-N3 cost preview) is deliberately NOT here: it is
+    // display-only and run-state-derived; hashing it would re-block every
+    // resume whose forecast line changed.
+    ...(options.riskClass ? { riskClass: options.riskClass } : {}),
+    ...(options.action ? { action: options.action } : {}),
+  });
+  return createHash("sha256").update(identity).digest("hex");
+}
+
+/**
+ * V2-P08: validate + normalize one steer-plan revision into its canonical
+ * applied form. Throws a descriptive TypeError on a malformed revision (shape
+ * violations only — a revision with no valid content is a valid pure-note
+ * revision). Idempotent: normalizing a normalized revision is a no-op, so the
+ * resume-replay re-application path re-validates safely. Pure — no wall clock,
+ * no RNG.
+ */
+function normalizeSteerRevision(revision: SteerPlanRevision): SteerPlanRevision {
+  const phases: SteerPlanPhaseRevision[] = [];
+  if (revision.phases !== undefined) {
+    if (!Array.isArray(revision.phases)) {
+      throw new TypeError("steerPlan.submit(revision): phases must be an array of { title, budget? } entries");
+    }
+    for (const entry of revision.phases) {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new TypeError("steerPlan.submit(revision): each phases entry must be an object");
+      }
+      if (typeof entry.title !== "string" || entry.title.length === 0) {
+        throw new TypeError("steerPlan.submit(revision): each phases entry needs a non-empty title string");
+      }
+      if (
+        entry.budget !== undefined &&
+        !(typeof entry.budget === "number" && Number.isFinite(entry.budget) && entry.budget > 0)
+      ) {
+        throw new TypeError("steerPlan.submit(revision): phase budgets must be positive finite numbers");
+      }
+      phases.push({ title: entry.title, ...(typeof entry.budget === "number" ? { budget: entry.budget } : {}) });
+    }
+  }
+  return {
+    ...(phases.length > 0 ? { phases } : {}),
+    ...(typeof revision.currentPhase === "string" && revision.currentPhase.length > 0
+      ? { currentPhase: revision.currentPhase }
+      : {}),
+    ...(typeof revision.note === "string" && revision.note.length > 0 ? { note: revision.note } : {}),
+    ...(typeof revision.reason === "string" && revision.reason.length > 0 ? { reason: revision.reason } : {}),
+  };
+}
+
+/**
+ * V2-P08: stable identity hash of one steer-plan revision — the resume-replay
+ * cache key for steerPlan.submit(). Fixed-field canonical JSON (absent-vs-null
+ * normalized, phases in submission order), so a deterministically-resubmitted
+ * revision replays byte-identically while a changed revision (a different
+ * budget, phase, note, or reason) is a journal miss and re-submits live — the
+ * checkpoint() replay contract. The revision is a journaled delta, never an
+ * agent()/checkpoint() resume-identity input: this hash lives ONLY in the
+ * steer journal entry, never in hashAgentCall's field set.
+ */
+function hashSteerPlanRevision(revision: SteerPlanRevision): string {
+  const identity = JSON.stringify({
+    phases: (revision.phases ?? []).map((entry) => ({
+      title: typeof entry?.title === "string" ? entry.title : "",
+      budget:
+        typeof entry?.budget === "number" && Number.isFinite(entry.budget) && entry.budget > 0 ? entry.budget : null,
+    })),
+    currentPhase: typeof revision.currentPhase === "string" ? revision.currentPhase : null,
+    note: typeof revision.note === "string" ? revision.note : null,
+    reason: typeof revision.reason === "string" ? revision.reason : null,
   });
   return createHash("sha256").update(identity).digest("hex");
 }
@@ -5136,6 +6886,23 @@ export function resolveMaxAgentResultChars(value: number | null | undefined, fal
     if (Number.isFinite(value)) return value >= 1 ? Math.floor(value) : fallback;
   }
   return fallback;
+}
+
+/**
+ * V2-QW3: deterministic character count of one agent() result, used by the
+ * run-level total-output accumulator. Strings count their length; everything
+ * else counts its JSON serialization (the same serialization the journal
+ * persists), and unserializable values count 0. Pure — never part of any
+ * resume hash (it measures the RESULT, never the inputs).
+ */
+export function countOutputChars(result: unknown): number {
+  if (typeof result === "string") return result.length;
+  if (result === null || result === undefined) return 0;
+  try {
+    return JSON.stringify(result)?.length ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 function normalizeConcurrency(value: unknown): number {

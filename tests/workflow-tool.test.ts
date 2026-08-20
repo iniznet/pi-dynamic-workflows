@@ -8,6 +8,10 @@ import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "../src/config.js";
 import { createWorkflowSnapshot, recomputeWorkflowSnapshot } from "../src/display.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { buildReplayFixture, type ReplayFixture } from "../src/replay-harness.js";
+import { createRunPersistence } from "../src/run-persistence.js";
+import type { JournalEntry } from "../src/workflow.js";
+import { runWorkflow } from "../src/workflow.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
 import {
@@ -675,6 +679,8 @@ const validArgsByBuiltinName: Record<string, unknown> = {
   "debug-loop": { bug: "the parser crashes on empty input" },
   "spec-conformance": { spec: { goal: "g", requirements: [{ id: "R1", statement: "s" }] } },
   "supervised-run": { task: "implement the widget", criterion: "all tests pass" },
+  "review-remediate": { diff: "some diff" },
+  "multi-model": { task: "is this design sound?", models: ["anthropic/claude-sonnet-4", "openrouter/deepseek/x"] },
 };
 
 test(
@@ -819,6 +825,46 @@ test(
 
 // ─── dryRun (validate without launching) ──────────────────────────────────────
 
+const replayScript = `export const meta = { name: 'replay_tool', description: 'replay via tool' }
+const a = await agent('tool task', { label: 'a' })
+return { a }`;
+
+/** Record a real run and persist it under `cwd` so the tool can replay it. */
+async function persistReplaySource(cwd: string): Promise<{ runId: string; fixture: ReplayFixture }> {
+  const journal: JournalEntry[] = [];
+  const record = await runWorkflow(replayScript, {
+    agent: {
+      async run() {
+        return { answer: "cached-answer" };
+      },
+    } as never,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  const runId = record.runId ?? "tool-replay-run";
+  createRunPersistence(cwd).save({
+    runId,
+    workflowName: record.meta.name,
+    script: replayScript,
+    status: "paused",
+    phases: [],
+    agents: [],
+    logs: [],
+    startedAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    journal,
+  });
+  return {
+    runId,
+    fixture: buildReplayFixture({
+      runId,
+      name: record.meta.name,
+      description: record.meta.description,
+      journal,
+    }),
+  };
+}
+
 test(
   "workflow tool: dryRun validates a script and launches no run",
   withToolTempCwd(async (cwd) => {
@@ -875,6 +921,222 @@ test(
           {} as never,
         ),
       /dryRun.*resumeFromRunId|resumeFromRunId.*dryRun/,
+    );
+  }),
+);
+
+// ─── dryRun estimate mode (V2-N4): static pre-flight cost & duration forecast ──
+
+const estimateScript = `export const meta = { name: 'estimate_tool', description: 'fan-out forecast', phases: [{ title: 'Research' }] }
+phase('Research', { budget: 800 })
+const items = await parallel([1, 2, 3].map((n) => () => agent('task ' + n, { phase: 'Research' })))
+await checkpoint('proceed?', { kind: 'confirm' })
+return { items }`;
+
+test(
+  "workflow tool: dryRun + estimate returns the static forecast without launching",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "est-1",
+      { script: estimateScript, dryRun: true, estimate: true },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const details = res.details as Record<string, unknown>;
+    assert.equal(details.estimate, true);
+    assert.equal(details.dryRun, true);
+    assert.equal(details.name, "estimate_tool");
+    assert.ok(typeof details.agentCount === "number" && (details.agentCount as number) >= 3, "sees the 3-item fan-out");
+    assert.ok(typeof details.totalTokens === "number" && (details.totalTokens as number) > 0, "forecasts token spend");
+    assert.ok(typeof details.durationMs === "number", "forecasts duration");
+    assert.ok(typeof details.checkpoints === "number" && (details.checkpoints as number) >= 1, "sees the checkpoint");
+    assert.ok(Array.isArray(details.warnings), "carries the warnings list");
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /Workflow estimate/);
+    assert.match(text, /Agents:/);
+    assert.equal(manager.listRuns().length, 0, "estimate must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: dryRun + estimate warns when the forecast exceeds tokenBudget",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "est-2",
+      { script: estimateScript, dryRun: true, estimate: true, tokenBudget: 1 },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const details = res.details as Record<string, unknown>;
+    assert.equal(details.exceedsBudget, true, "tiny budget flags the forecast as over budget");
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /⚠/);
+  }),
+);
+
+test(
+  "workflow tool: estimate requires dryRun and rejects replay sources",
+  withToolTempCwd(async (cwd) => {
+    const { runId } = await persistReplaySource(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () => tool.execute("est-3", { script: estimateScript, estimate: true }, undefined, undefined, {} as never),
+      /estimate.*dryRun|dryRun.*estimate/,
+    );
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "est-4",
+          { script: estimateScript, dryRun: true, estimate: true, replayFromRunId: runId },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      /estimate.*replay|replay.*estimate/,
+    );
+  }),
+);
+
+// ─── dryRun replay mode (V2-P10): full script-body execution over canned results ─
+
+test(
+  "workflow tool: dryRun + replayFromRunId executes the script body over the run's cached results",
+  withToolTempCwd(async (cwd) => {
+    const { runId } = await persistReplaySource(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "replay-1",
+      { script: replayScript, dryRun: true, replayFromRunId: runId },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const details = res.details as Record<string, unknown>;
+    assert.equal(details.dryRun, true);
+    assert.equal(details.replay, true);
+    assert.equal(details.agentCount, 1, "the replayed script body ran its agent call from cache");
+    // Compare via JSON: the result object lives in the vm realm (a different
+    // Object prototype), so deepEqual on identity would fail on equal values.
+    assert.equal(
+      JSON.stringify(details.result),
+      '{"a":{"answer":"cached-answer"}}',
+      "the cached result flows to the script body",
+    );
+    const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
+    assert.match(text, /replayed from canned results/);
+    assert.match(text, /no subagent was launched/);
+    // The only persisted run is the pre-seeded replay SOURCE — a replay never
+    // creates a run of its own.
+    assert.equal(manager.listRuns().length, 1, "a replay must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: dryRun + replayFixture executes against an inline canned fixture",
+  withToolTempCwd(async (cwd) => {
+    const { fixture } = await persistReplaySource(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const res = await tool.execute(
+      "replay-2",
+      { script: replayScript, dryRun: true, replayFixture: JSON.parse(JSON.stringify(fixture)) },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const details = res.details as Record<string, unknown>;
+    assert.equal(details.replay, true);
+    assert.equal(JSON.stringify(details.result), '{"a":{"answer":"cached-answer"}}');
+    assert.equal(manager.listRuns().length, 1, "the pre-seeded source run only");
+  }),
+);
+
+test(
+  "workflow tool: a replay miss surfaces as a clear tool error (script diverged from the fixture)",
+  withToolTempCwd(async (cwd) => {
+    const { fixture } = await persistReplaySource(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    const edited = replayScript.replace("tool task", "tool task EDITED");
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "replay-3",
+          { script: edited, dryRun: true, replayFixture: JSON.parse(JSON.stringify(fixture)) },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      /replay miss/,
+    );
+    assert.equal(manager.listRuns().length, 1, "a failed replay must not create a run");
+  }),
+);
+
+test(
+  "workflow tool: replay inputs are rejected without dryRun and when combined with each other/resume",
+  withToolTempCwd(async (cwd) => {
+    const { runId } = await persistReplaySource(cwd);
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    // Without dryRun: the replay source describes a simulation, not a launch.
+    await assert.rejects(
+      () =>
+        tool.execute("replay-4", { script: replayScript, replayFromRunId: runId }, undefined, undefined, {} as never),
+      /require `dryRun: true`/,
+    );
+    // Both replay sources at once.
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "replay-5",
+          { script: replayScript, dryRun: true, replayFromRunId: runId, replayFixture: {} },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      /one replay source/,
+    );
+    // Replay combined with resume (replay is a simulation, resume launches).
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "replay-6",
+          { script: replayScript, dryRun: true, replayFromRunId: runId, resumeFromRunId: "other" },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      /cannot be combined with `resumeFromRunId`/,
+    );
+    // The only persisted run is the pre-seeded replay source.
+    assert.equal(manager.listRuns().length, 1);
+  }),
+);
+
+test(
+  "workflow tool: replayFromRunId with an unknown run id reports it clearly",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    const tool = createWorkflowTool({ cwd, manager });
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "replay-7",
+          { script: replayScript, dryRun: true, replayFromRunId: "no-such-run" },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      /no persisted run "no-such-run"/,
     );
   }),
 );

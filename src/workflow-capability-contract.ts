@@ -47,6 +47,7 @@ export interface OptionShape {
     | "gate-options"
     | "test-gate-options"
     | "chunked-options"
+    | "recursive-options"
     | "route-options"
     | "timeboxed-options"
     | "consensus-options"
@@ -127,6 +128,7 @@ export interface WorkflowRuntimeImplementations {
   loopUntilDry: unknown;
   completenessCheck: unknown;
   chunked: unknown;
+  recursive: unknown;
   route: unknown;
   timeboxed: unknown;
   elapsedMs: unknown;
@@ -138,6 +140,9 @@ export interface WorkflowRuntimeImplementations {
   checkpoint: unknown;
   log: unknown;
   phase: unknown;
+  replanSignal: unknown;
+  spendAnalytics: unknown;
+  steerPlan: unknown;
   args: unknown;
   cwd: unknown;
   process: unknown;
@@ -146,6 +151,9 @@ export interface WorkflowRuntimeImplementations {
   subagentTools: unknown;
   durableStore: unknown;
   supervisedRun: unknown;
+  getRunReport: unknown;
+  recall: unknown;
+  lineage: unknown;
 }
 
 /** Exact static projection of one capability for generated references. */
@@ -370,6 +378,32 @@ const CHUNKED_OPTIONS: OptionShape = {
     option("synthesizer", "(results, meta) => unknown | Promise<unknown>", true),
   ],
 };
+const RECURSIVE_OPTIONS: OptionShape = {
+  id: "recursive-options",
+  options: [
+    option("split", "(items: unknown[], depth: number) => unknown[][] | Promise<unknown[][]>", false, null, [
+      "must be deterministic — the recursion tree (and thus the positional agent() call sequence) is a pure function of (items, maxDepth, split)",
+      "an empty split, or a single deep-equal part, is treated as a leaf (solved directly instead of recursing)",
+    ]),
+    option("solve", "(items, depth, meta) => unknown | Promise<unknown>", false, null, [
+      "leaf solver — usually one or more agent() calls; recoverable null fails the leaf branch",
+      "meta carries the branch's positional path and its inherited (shrinking) token-budget share",
+    ]),
+    option("merge", "(results, meta) => unknown | Promise<unknown>", true, null, [
+      "default passes the child results through; meta includes the branch's failed children",
+    ]),
+    option("maxDepth", "number", true, "2", ["per-branch recursion depth; clamped to 1..MAX_RECURSIVE_DEPTH"]),
+    option("maxRecursiveRoots", "number", true, "16", [
+      "per-level fan-out wave width; larger partitions are processed in deterministic waves",
+    ]),
+    option("concurrency", "number", true, "run concurrency", [
+      "scheduling-only (fan-out wave width); never part of any agent() call's resume identity",
+    ]),
+    option("autoApproved", "boolean", true, "false", [
+      "skip the P12 fan-out approval gate for the recursion's fan-outs",
+    ]),
+  ],
+};
 const ROUTE_OPTIONS: OptionShape = {
   id: "route-options",
   options: [
@@ -561,6 +595,43 @@ const capabilities: readonly CapabilityDescriptor[] = [
     ],
     evidence: ["tests/supervisor.test.ts"],
   }),
+  runtimeGlobal("getRunReport", {
+    signature:
+      "getRunReport(runId?) / getRunReport() / getRunReport({ limit? }) => Promise<RunReport | null | RunReportSummary[]>: read a prior run's report artifact (`<runsDir>/reports/<runId>.json`) or list recent reports newest-first",
+    constraints: [
+      "READ-ONLY by construction: reads the report artifact written at run completion/resume, never mutates the run, the journal, or the durable store",
+      "missing-file safe: an unknown/malformed runId resolves to null, and the listing skips malformed artifacts instead of throwing",
+      "lets a script seed context from a prior run's roster/phases/budget/truncations before launching new work",
+      "NEVER part of an agent() call's resume identity: getRunReport is excluded from hashAgentCall by contract (a cache-hit replay never re-reads a report)",
+      "report path resolution matches the manager's own writer (workflowProjectPaths(cwd).runsDir/reports/<runId>.json)",
+    ],
+    evidence: ["tests/run-report.test.ts", "tests/slices/f2-run-report-global.test.ts"],
+  }),
+  runtimeGlobal("recall", {
+    signature:
+      "recall({ query?, keywords?, phase?, pattern?, limit? }) => Promise<{ hits, context }>: rank prior cross-run task knowledge (KB entries distilled at run completion + run-report artifacts) into a privacy-safe context block",
+    constraints: [
+      "cross-run knowledge (V2-P02): the project KB under getAgentDir()/task-knowledge/<projectKey>.json is distilled at run completion from findings/decisions/constraints; recall searches KB entries AND run-report artifacts",
+      "keyword/phase/pattern search with deterministic ranking (score desc, recency desc, id tiebreak) — a pure function of the persisted KB/reports, never wall-clock",
+      "PRIVACY-GATED by construction: distilled entries exclude agent results, thinking, tool output, and raw logs (structured metadata + machine-gate ledger payloads only)",
+      "READ-ONLY: recall never mutates the run, the journal, the durable store, or the KB; a cache-hit replay never re-reads the KB",
+      "NEVER part of an agent() call's resume identity: recall is excluded from hashAgentCall by contract (seeding flows through the ctx() blob fingerprint instead)",
+      "opt-in future-run seeding via the run's seedKnowledge option (default OFF) registers the recalled context as a shared ctx() blob at run start — fresh per run, never replay identity",
+    ],
+    evidence: ["tests/slices/k1-task-knowledge.test.ts"],
+  }),
+  runtimeGlobal("lineage", {
+    signature:
+      "lineage({ runId?, source?, file?, phase?, agent?, pattern?, limit?, verify?, ttlMs? }) => Promise<{ entries, runs, decay, verification? }>: cross-run provenance-ledger query with deterministic evidence freshness/decay",
+    constraints: [
+      "cross-run lineage (V2-P04): reads the project's shared durable-store ledger + report artifacts; entries are attributed to runs via report `durable.ledger` snapshots",
+      "filters by runId/source/file/phase/agent/pattern; results sorted by the ledger's DETERMINISTIC timestamps (never wall-clock)",
+      "decay policy: an entry's age is its write-sequence distance (ms over the durable-store deterministic clock) behind the newest entry in the result set; fresh = age <= ttlMs (default 1000 writes)",
+      "verify: true re-verifies STALE claim-verify evidence by re-fetching the cited URLs through journaled agent() steps (N02 mechanics) and diffing the FNV-1a evidence hash — fail-closed on fetch failure, resume-replayable",
+      "READ-ONLY except for the verify path's journaled re-fetch agents; lineage itself NEVER joins any agent() resume identity (a cache-hit replay re-reads the same persisted ledger)",
+    ],
+    evidence: ["tests/slices/k1-task-knowledge.test.ts"],
+  }),
   runtimeGlobal("workflow", {
     signature: "workflow(savedName, childArgs?) => Promise<unknown>",
     constraints: [
@@ -667,6 +738,74 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "with synthesizer the helper returns the synthesizer output; else it returns { results, failed, chunkCount }",
     ],
     evidence: ["tests/slices/helpers/chunked.test.ts"],
+  }),
+  // V2-P07: recursive decomposition primitive (rlm-lite). Deliberately
+  // discovery: NONE — the capability IS documented in the generated reference
+  // docs (publishedFacts includes it), but it has no authoring-guidance
+  // coverage entry yet (the coverage manifest is not regenerable by script), so
+  // it stays out of the guidance inventory until it gets prose + a coverage
+  // entry.
+  runtimeGlobal("recursive", {
+    signature:
+      "recursive(items: unknown[], options: { split: (items: unknown[], depth: number) => unknown[][] | Promise<unknown[][]>; solve: (items: unknown[], depth: number, meta: { path: string; branchBudget: number; depth: number }) => unknown | Promise<unknown>; merge?: (results: Array<unknown | null>, meta: { depth: number; path: string; branchBudget: number; failed: Array<{ path: string; depth: number }>; items: unknown[] }) => unknown | Promise<unknown>; maxDepth?: number; maxRecursiveRoots?: number; concurrency?: number; autoApproved?: boolean }) => Promise<{ result: unknown; depth: number; completedBranches: number; failedBranches: number; totalBranches: number }>",
+    discovery: DiscoveryPlacement.NONE,
+    optionShape: "recursive-options",
+    constraints: [
+      "the recursion tree is a pure function of (items, maxDepth, split) — recursive calls are journaled positional agent() calls at deterministic indices, so resume replays the same tree",
+      "per-branch maxDepth is clamped to 1..MAX_RECURSIVE_DEPTH and a live nested-recursive() counter enforces the hard ceiling (its own depth counter — it never routes through workflow() nesting)",
+      "the per-level fan-out is processed in deterministic waves of maxRecursiveRoots width; an empty split or a single deep-equal part is a leaf (solved directly)",
+      "budget inheritance: each branch receives branchBudget = tokenBudget * 2^-depth (data, never a split gate — the tree stays deterministic)",
+      "an all-failed batch stops the branch wholesale (null result, recorded failure) — never silently retried",
+      "durable bindings persist the root partition spec + per-branch completed coverage (recursive:root/recursive:branches keys); replay-idempotent, never part of any agent() resume identity",
+    ],
+    evidence: ["tests/slices/helpers/recursive.test.ts"],
+  }),
+  // V2-P11: budget-adaptive re-plan signal. discovery: NONE — read-only
+  // observation surface; documented in the generated reference docs but not in
+  // the guidance inventory (same rationale as recursive).
+  runtimeGlobal("replanSignal", {
+    signature:
+      "replanSignal() => { triggered: boolean; events: number; forecast: { spent: number; plannedRemaining: number; projectedTotal: number; budget: number | null; threshold: number; overBudget: boolean } }",
+    discovery: DiscoveryPlacement.NONE,
+    constraints: [
+      "deterministic read derived from journal-derived state (seeded/live spend + declared phase budgets) — a resumed run computes a consistent value",
+      "triggered when spent + unspent phase budgets reaches tokenBudget * rePlanThreshold BEFORE the hard caps trip; scripts re-scope remaining phases via phase() re-declaration",
+      "the runtime emits a replan runtime event once per run on the live crossing edge; observation only — never a VM mutation",
+      "never part of any agent() resume identity",
+    ],
+    evidence: ["tests/slices/runtime/replan-spend-ledger.test.ts"],
+  }),
+  // V2-P09 (re-scoped): cross-run token spend analytics. discovery: NONE —
+  // read-only analytics surface (same rationale as recursive).
+  runtimeGlobal("spendAnalytics", {
+    signature:
+      "spendAnalytics(options?: { limit?: number }) => { runCount: number; totals: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number; freshSpend: number; agents: number }; perPhase: Array<{ name: string; spend: number; runs: number }>; perPattern: Array<{ name: string; spend: number; runs: number }>; perProvider: Array<{ name: string; spend: number; runs: number }>; trend: Array<{ runId: string; workflowName: string; status: string; total: number; agents: number; at: string }>; runs: Array<SpendLedgerEntry> }",
+    discovery: DiscoveryPlacement.NONE,
+    constraints: [
+      "reads the project's durable spend ledger (spendLedger:<runId> entries written at run end) — per-phase / per-pattern (workflow name) / per-provider totals + a deterministic per-run trend",
+      "fully deterministic (numeric sums + sorted keys; deterministic stamps + runId tiebreak) — never wall clock, never RNG",
+      "replay-idempotent ledger writes (deep-equal no-op; resume-correct per-runId replacement)",
+      "read-only — never part of any agent() resume identity",
+    ],
+    evidence: ["tests/slices/runtime/replan-spend-ledger.test.ts"],
+  }),
+  // V2-P08: live steering — steer-plan channel (PRIMARY half). discovery:
+  // NONE — journaled decision record + read-only snapshot (same rationale as
+  // replanSignal); documented in the generated reference docs.
+  runtimeGlobal("steerPlan", {
+    signature:
+      "steerPlan.read() => { runId: string; currentPhase: string | null; phases: Array<{ title: string; budget: number | null; spend: number }>; agentCount: number; callSeq: number; budget: { limit: number | null; spent: number; remaining: number }; forecast: { spent: number; plannedRemaining: number; projectedTotal: number; budget: number | null; threshold: number; overBudget: boolean }; revisions: Array<{ phases?: Array<{ title: string; budget?: number }>; currentPhase?: string; note?: string; reason?: string }> }; steerPlan.submit(revision: { phases?: Array<{ title: string; budget?: number }>; currentPhase?: string; note?: string; reason?: string }) => the applied (normalized) revision",
+    discovery: DiscoveryPlacement.NONE,
+    constraints: [
+      "verbs schema: read() = the current plan/phase state snapshot (declared phases with budgets + phase spend, current phase, agent count, run budget, the shared re-plan forecast, and the applied revisions); submit(revision) = a journaled plan-rescope whose applied revision is recorded in order",
+      "the revision rescope mirrors phase() re-declaration (a positive finite budget re-bases the phase ceiling, which the phase gate honors immediately; new phase titles pre-declare; currentPhase sets the steering target phase)",
+      "journaled + replayed deterministically on resume: submit() takes a callIndex, hashes the revision (fixed-field canonical JSON), and a resume-journal cache hit re-applies the SAME journaled revision (stage 'replay' steer event) — a changed revision is a journal miss and re-submits live (stage 'submit'), exactly the checkpoint() replay contract",
+      "persisted as steerRevisions:<runId> in the run's durable store (replay-idempotent, resume-correct) and surfaced in the run report's additive steerRevisions block",
+      "deterministic: steer revisions are journaled deltas — NEVER part of any agent()/checkpoint() resume identity (hashAgentCall's field set is untouched); never wall clock, never RNG",
+      "the in-flight cooperative interrupt half is EXPLICITLY DEFERRED: agent sessions expose only an AbortSignal channel (no interrupt-check hook), so steering happens at the next script call boundary — no mid-flight VM mutation ever",
+      "roadmap §4 V2-P08(a) reconciliation: the original file-target (a steer verb on the workflow_control/damage-control tool surface) is formally RE-TARGETED to this script-side surface — the journaled plan-rescope contract (submit at the next script call boundary, replayed deterministically on resume) is inherently script-visible, and a host-side steer verb would need new manager→run request plumbing that the deferred in-flight interrupt half already parks for the same reason",
+    ],
+    evidence: ["tests/slices/runtime/steer-plan.test.ts"],
   }),
   runtimeGlobal("route", {
     signature:
@@ -825,7 +964,25 @@ const capabilities: readonly CapabilityDescriptor[] = [
   toolInput("dryRun", "dryRun?: boolean = false", [
     "validates the script or named workflow without launching a run",
     "parses and checks the script, then returns its meta with no subagents launched",
+    "with replayFromRunId or replayFixture, executes the FULL script body against the recorded run's cached agent results instead — still no launch, no spend, no persistence",
     "mutually exclusive with resumeFromRunId",
+  ]),
+  toolInput("estimate", "estimate?: boolean (requires dryRun: true)", [
+    "V2-N4 pre-flight: turns the dryRun meta-only check into a static cost & duration forecast (agent count, token spend, duration, checkpoints, fan-out sizes, per-phase budgets) with an exceedsBudget/nearBudget warning against tokenBudget",
+    "the script is parsed and its call graph scanned — never executed; nothing is written and no run is started",
+    "best-effort static scan (see the workflow_estimate extension tool for the same forecast on a standalone surface)",
+    "mutually exclusive with replayFromRunId and replayFixture",
+  ]),
+  toolInput("replayFromRunId", "replayFromRunId?: string (requires dryRun: true)", [
+    "V2-P10 recorded-replay: replays THIS script against the persisted run's canned agent() results (read from its journal)",
+    "unchanged agent() calls whose identity hash matches replay the recorded result byte-identically; the first changed/new call throws REPLAY_MISS instead of launching a subagent",
+    "no subagent is launched, nothing is spent, nothing is persisted",
+    "mutually exclusive with replayFixture and resumeFromRunId",
+  ]),
+  toolInput("replayFixture", "replayFixture?: object (requires dryRun: true)", [
+    "V2-P10 recorded-replay: an inline canned fixture (schemaVersion 1 JSON) the script body executes against",
+    "same semantics as replayFromRunId: cache hits replay, diverging calls miss loudly (REPLAY_MISS), nothing launches",
+    "mutually exclusive with replayFromRunId and resumeFromRunId",
   ]),
   {
     id: "workflow.script.metadata",
@@ -977,6 +1134,7 @@ export const WORKFLOW_CAPABILITY_DEFINITION: WorkflowCapabilityDefinition = {
     GATE_OPTIONS,
     TEST_GATE_OPTIONS,
     CHUNKED_OPTIONS,
+    RECURSIVE_OPTIONS,
     ROUTE_OPTIONS,
     TIMEBOXED_OPTIONS,
     CONSENSUS_OPTIONS,

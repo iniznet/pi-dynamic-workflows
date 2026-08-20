@@ -19,11 +19,21 @@ import {
   type WorkflowSnapshot,
 } from "./display.js";
 import { formatErrorCode, WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { estimateWorkflowForecast, renderWorkflowEstimate } from "./estimate-forecast.js";
 import { lazyPeerImport, MissingPeerError, PEER_DEPENDENCIES } from "./peer-deps.js";
+import {
+  buildReplayFixtureFromRun,
+  isReplayMiss,
+  parseReplayFixture,
+  type ReplayFixture,
+  replayWorkflow,
+} from "./replay-harness.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { coerceArgs } from "./saved-commands.js";
 import {
   type CheckpointGate,
+  type CheckpointOptions,
+  estimateTokens,
   type PhasePipelineOptions,
   type PhaseStateIntegration,
   parseWorkflowScript,
@@ -194,7 +204,33 @@ const workflowToolSchema = Type?.Object({
   dryRun: Type.Optional(
     Type.Boolean({
       description:
-        "Validate the script (or named workflow) without starting a run: parses and checks the script, then returns immediately with the workflow's meta (name/phases) and launches no subagents. Useful for iterating on a script before committing to a run.",
+        "Validate the script (or named workflow) without starting a run: parses and checks the script, then returns immediately with the workflow's meta (name/phases) and launches no subagents. Useful for iterating on a script before committing to a run. With `replayFromRunId`/`replayFixture`, executes the full script body against recorded cached results (still no subagent).",
+    }),
+  ),
+  estimate: Type.Optional(
+    Type.Boolean({
+      description: [
+        "V2-N4 pre-flight: with dryRun: true, statically scan the script (parsed, never executed) and return the forecast: agent count (statically-visible + worst case), token spend, duration, checkpoints, fan-out sizes, per-phase budgets, and an exceedsBudget/nearBudget warning against tokenBudget. Read-only: nothing is written or launched.",
+        "Mutually exclusive with `replayFromRunId`/`replayFixture`.",
+      ].join(" "),
+    }),
+  ),
+  replayFromRunId: Type.Optional(
+    Type.String({
+      description: [
+        "V2-P10 replay: only with dryRun: true. Executes the script body END-TO-END against a prior run's canned agent() results (read from its persisted journal): hash-matching calls return the CACHED result, a changed/new call fails with REPLAY_MISS instead of launching.",
+        "No subagent runs, nothing is spent, nothing is persisted. Iterate penny-cheap: keep earlier agent() calls identical, replay after each edit; the first diverging call and everything after it miss loudly.",
+        "Mutually exclusive with `replayFixture` and `resumeFromRunId`.",
+      ].join(" "),
+    }),
+  ),
+  replayFixture: Type.Optional(
+    Type.Unsafe<Record<string, unknown>>({
+      type: "object",
+      description: [
+        "V2-P10 replay: only with dryRun: true. An inline canned fixture (schemaVersion-1 JSON: name, runId, optional args/mainModel, entries[{index, hash, result}]) the script body executes against — same semantics as replayFromRunId.",
+        "Mutually exclusive with `replayFromRunId` and `resumeFromRunId`.",
+      ].join(" "),
     }),
   ),
 });
@@ -224,6 +260,24 @@ export type WorkflowToolInput = {
   tokenBudget?: number;
   resumeFromRunId?: string;
   dryRun?: boolean;
+  /**
+   * V2-N4: only with `dryRun: true` — return the pre-flight cost & duration
+   * forecast for the script instead of the plain meta-only dryRun result.
+   * Read-only static scan (parse + call-graph walk, never executed), nothing
+   * is written, and no run is started.
+   */
+  estimate?: boolean;
+  /**
+   * V2-P10: only with `dryRun: true` — replay THIS script against the
+   * persisted run's canned agent() results (read from its journal) instead of
+   * launching. No subagents, no spend, no persistence.
+   */
+  replayFromRunId?: string;
+  /**
+   * V2-P10: only with `dryRun: true` — an inline canned replay fixture the
+   * script body executes against (see replayFromRunId for the semantics).
+   */
+  replayFixture?: Record<string, unknown>;
 };
 
 export interface WorkflowToolOptions {
@@ -384,6 +438,26 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       }
       const parsed = parseWorkflowScript(script);
 
+      // V2-P10: replay inputs describe a dryRun SIMULATION (full script-body
+      // execution over recorded results), never a live launch — reject them
+      // with the real run modes they'd otherwise silently collide with.
+      const hasReplaySource = params.replayFromRunId !== undefined || params.replayFixture !== undefined;
+      if (hasReplaySource && params.resumeFromRunId) {
+        throw new Error(
+          "workflow: `replayFromRunId`/`replayFixture` cannot be combined with `resumeFromRunId` — replay simulates the script over cached results; resume launches a run.",
+        );
+      }
+      if (hasReplaySource && !params.dryRun) {
+        throw new Error(
+          "workflow: `replayFromRunId`/`replayFixture` require `dryRun: true` — replay is the dryRun simulation mode and launches nothing.",
+        );
+      }
+      if (params.estimate && !params.dryRun) {
+        throw new Error(
+          "workflow: `estimate` requires `dryRun: true` — estimate is the dryRun pre-flight mode and launches nothing.",
+        );
+      }
+
       // dryRun: validate the script/name and return its meta without launching
       // a run (no manager activity, no subagents, no persisted run).
       if (params.dryRun) {
@@ -391,6 +465,78 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           throw new Error(
             "workflow: `dryRun` cannot be combined with `resumeFromRunId` — resume launches a run by definition.",
           );
+        }
+        // V2-N4: dryRun + estimate turns the meta-only check into a static
+        // pre-flight cost & duration forecast (parse + call-graph scan, never
+        // executed, nothing written). Mutually exclusive with the replay modes
+        // (an estimate has no canned-results execution to replay).
+        if (params.estimate) {
+          if (hasReplaySource) {
+            throw new Error(
+              "workflow: `estimate` cannot be combined with `replayFromRunId`/`replayFixture` — estimate is a static scan; replay simulates the script body over canned results.",
+            );
+          }
+          const estimate = estimateWorkflowForecast(script, { tokenBudget: params.tokenBudget ?? null });
+          return {
+            content: [{ type: "text", text: renderWorkflowEstimate(estimate) }],
+            details: {
+              dryRun: true,
+              estimate: true,
+              name: estimate.name,
+              agentCount: estimate.agentCount,
+              worstCaseAgentCount: estimate.worstCaseAgentCount,
+              promptTokens: estimate.promptTokens,
+              replyTokens: estimate.replyTokens,
+              totalTokens: estimate.totalTokens,
+              worstCaseTotalTokens: estimate.worstCaseTotalTokens,
+              durationMs: estimate.durationMs,
+              worstCaseDurationMs: estimate.worstCaseDurationMs,
+              checkpoints: estimate.checkpoints,
+              checkpointTokens: estimate.checkpointTokens,
+              fanOuts: estimate.fanOuts,
+              phases: estimate.phases,
+              warnings: estimate.warnings,
+              budget: estimate.budget,
+              exceedsBudget: estimate.exceedsBudget,
+              nearBudget: estimate.nearBudget,
+            },
+          };
+        }
+        // V2-P10: dryRun + a replay source turns the meta-only check into FULL
+        // script-body execution over a recorded run's CACHED agent() results —
+        // no subagent is ever launched. The replay runs in-process via the
+        // harness (never through the manager): no run is persisted, no spend is
+        // incurred (replayed calls charge zero tokens, like resume cache hits).
+        const replaySource = resolveDryRunReplaySource(params);
+        if (replaySource) {
+          let fixture: ReplayFixture;
+          if (replaySource.kind === "runId") {
+            const built = await buildReplayFixtureFromRun(replaySource.runId, { cwd });
+            if (!built) {
+              throw new Error(
+                `workflow: no persisted run "${replaySource.runId}" to replay — replayFromRunId reads a prior run's journal. ` +
+                  `Use /workflows status to list run ids.`,
+              );
+            }
+            fixture = built;
+          } else {
+            fixture = parseReplayFixture(params.replayFixture);
+          }
+          try {
+            const result = await replayWorkflow(script, fixture, {
+              args: runArgs,
+              cwd,
+              signal,
+            });
+            return replayDryRunResult(result);
+          } catch (error) {
+            if (isReplayMiss(error)) {
+              // A diverging call is the replay's intended loud signal — surface
+              // it as a plain tool error with the guidance, not as a crash.
+              throw new Error(`workflow dryRun replay: ${error.message}`);
+            }
+            throw error;
+          }
         }
         return dryRunResult(parsed.meta);
       }
@@ -439,7 +585,26 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         | undefined;
       const uiConfirm = uiCtx?.hasUI ? uiCtx.ui?.confirm : undefined;
       const confirm = uiConfirm
-        ? (promptText: string) => uiConfirm.call(uiCtx?.ui, "Workflow checkpoint", promptText)
+        ? (promptText: string, options: unknown) => {
+            // The manager forwards the run's CheckpointOptions verbatim but
+            // types them as unknown there — narrow structurally here (only
+            // optional reads, so the cast is safe). The checkpoint prompt is
+            // the identity text (hashed); every enrichment below is
+            // DISPLAY-ONLY — the V2-N3 forecast and the V2-P01 risk label
+            // must never enter hashCheckpoint's field subset (a resume whose
+            // spend differs must not re-block on a changed consent line).
+            const opts = (options ?? {}) as Partial<CheckpointOptions>;
+            const lines = [promptText];
+            if (opts.riskClass) lines.push(`Risk class: ${opts.riskClass}`);
+            if (opts.details) lines.push(opts.details);
+            if (opts.riskClass && opts.details === undefined) {
+              // V2-N3: gate-time consent line — a read-only prompt addition.
+              // A bare estimate of the gate's own decision cost (the fan-out
+              // gate carries its full count×per-item forecast via `details`).
+              lines.push(`Estimated cost of this gate's action: ~${estimateTokens(promptText)} tokens`);
+            }
+            return uiConfirm.call(uiCtx?.ui, "Workflow checkpoint", lines.join("\n\n"));
+          }
         : undefined;
 
       // Background execution is the default: return immediately so the turn ends
@@ -680,6 +845,67 @@ function dryRunResult(meta: WorkflowMeta): {
       },
     ],
     details: { dryRun: true, name: meta.name, description: meta.description, phases },
+  };
+}
+
+/**
+ * V2-P10: resolve the replay source for an extended dryRun. Validates the two
+ * replay inputs are mutually exclusive (each is only valid with dryRun: true,
+ * enforced by the caller's guards). Returns null when no replay was requested
+ * (the plain meta-only dryRun path).
+ */
+function resolveDryRunReplaySource(
+  params: WorkflowToolInput,
+): { kind: "runId"; runId: string } | { kind: "fixture" } | null {
+  const hasRunId = params.replayFromRunId !== undefined;
+  const hasFixture = params.replayFixture !== undefined;
+  if (hasRunId && hasFixture) {
+    throw new Error(
+      "workflow: `replayFromRunId` cannot be combined with `replayFixture` — provide one replay source, not both.",
+    );
+  }
+  if (hasRunId) return { kind: "runId", runId: params.replayFromRunId as string };
+  if (hasFixture) return { kind: "fixture" };
+  return null;
+}
+
+/**
+ * The tool result returned for an EXTENDED dryRun: the script body executed
+ * end-to-end over a recorded run's canned agent() results. Unlike the plain
+ * meta-only dryRun, this reports the computed result and the count of agent()
+ * calls replayed from cache — and it still launched nothing, spent nothing,
+ * and persisted nothing.
+ */
+function replayDryRunResult(result: WorkflowRunResult): {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+} {
+  const phases = result.phases ?? [];
+  const phaseInfo = phases.length ? ` Phases: ${phases.join(", ")}.` : "";
+  const dump = JSON.stringify(result.result);
+  const resultInfo =
+    dump !== undefined
+      ? `\n\n\`\`\`json\n${dump.slice(0, RESULT_DUMP_MAX_CHARS)}${dump.length > RESULT_DUMP_MAX_CHARS ? "\n… (result truncated)" : ""}\n\`\`\``
+      : "";
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Workflow **${result.meta.name}** replayed from canned results — the script body executed end-to-end over the recorded run's cached agent() results and **no subagent was launched**. ` +
+          `${result.agentCount} agent() call(s) replayed from cache (zero tokens).${phaseInfo}${resultInfo}` +
+          `\n\nTo iterate: keep earlier agent() calls identical and edit the rest, then re-run dryRun with the same replay source — the first changed call and everything after it will report a replay miss instead of launching.`,
+      },
+    ],
+    details: {
+      dryRun: true,
+      replay: true,
+      name: result.meta.name,
+      description: result.meta.description,
+      phases,
+      agentCount: result.agentCount,
+      result: result.result,
+    },
   };
 }
 

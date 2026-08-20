@@ -156,8 +156,8 @@ describe("form interactions (buildFormComponent)", () => {
     const trusted = makeModel();
     const untrustedForm = buildForm(untrusted);
     const trustedForm = buildForm(trusted, { trustedProject: true });
-    navigateTo(untrustedForm.root, 20); // scope row (20 fields, then scope, then save)
-    navigateTo(trustedForm.root, 20);
+    navigateTo(untrustedForm.root, 22); // scope row (22 fields, then scope, then save)
+    navigateTo(trustedForm.root, 22);
     untrustedForm.root.handleInput?.(KEY_CONFIRM);
     trustedForm.root.handleInput?.(KEY_CONFIRM);
     assert.equal(untrusted.scope, "global");
@@ -234,7 +234,7 @@ describe("form interactions (buildFormComponent)", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
     root.handleInput?.(KEY_CONFIRM); // stage keywordTriggerEnabled=false
-    navigateTo(root, 21); // save row (20 fields, scope, then save)
+    navigateTo(root, 23); // save row (22 fields, scope, then save)
     root.handleInput?.(KEY_CONFIRM); // open save confirm
     root.handleInput?.(KEY_CONFIRM); // confirm
     assert.deepEqual(done.mock.calls[0]?.arguments[0], {
@@ -247,7 +247,7 @@ describe("form interactions (buildFormComponent)", () => {
   it("save row with no changes resolves an empty payload", () => {
     const model = makeModel();
     const { root, done } = buildForm(model);
-    navigateTo(root, 21);
+    navigateTo(root, 23);
     root.handleInput?.(KEY_CONFIRM);
     root.handleInput?.(KEY_CONFIRM);
     assert.deepEqual(done.mock.calls[0]?.arguments[0], { cancelled: false, settings: {}, scope: "global" });
@@ -255,7 +255,7 @@ describe("form interactions (buildFormComponent)", () => {
 });
 
 describe("provider pool visual editor", () => {
-  const POOL_ROW = 19; // providerPool is the 20th registry row (0-based)
+  const POOL_ROW = 20; // providerPool is the 21st registry row (0-based)
   const modelPool = (models: Record<string, Record<string, unknown>>) =>
     ({ models }) as WorkflowSettings["providerPool"];
   // Two providers for the same logical model (gpt-5.5) + one fresh model: the

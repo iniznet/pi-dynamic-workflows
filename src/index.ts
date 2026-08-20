@@ -9,6 +9,28 @@ export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./ag
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
 export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
+export type {
+  ApprovalClassifier,
+  ApprovalClassifierInput,
+  ApprovalClassifierOptions,
+  ApprovalClassifierResult,
+  ApprovalDecision,
+  ApprovalDecisionKind,
+  ApprovalPolicyConfig,
+  GateCostLineInput,
+  RiskClass,
+  RiskPolicy,
+} from "./approval-policy.js";
+export {
+  ApprovalGrantStore,
+  approvalGrantKey,
+  buildApprovalClassifierPrompt,
+  buildGateCostLine,
+  createApprovalClassifier,
+  parseApprovalClassifierVerdict,
+  RISK_CLASSES,
+  resolveRiskPolicy,
+} from "./approval-policy.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
 export type { CodeReviewAngle } from "./code-review.js";
 export { CODE_REVIEW_ANGLES, diffShard, generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
@@ -31,7 +53,7 @@ export {
   renderWorkflowLines,
   renderWorkflowText,
 } from "./display.js";
-export type { ProvenanceEntry } from "./durable-store.js";
+export type { ProvenanceEntry, ProvenanceSourceKind } from "./durable-store.js";
 export {
   bindRunDurableStore,
   closeRunDurableStore,
@@ -39,9 +61,34 @@ export {
   DURABLE_STORE_SCHEMA_VERSION,
   DurableStore,
   deterministicRunClock,
+  provenanceContentId,
   recordProvenance,
   runDurableStore,
 } from "./durable-store.js";
+export type {
+  EditTransaction,
+  EditTransactionBeginResult,
+  EditTransactionCommitOptions,
+  EditTransactionCommitResult,
+  EditTransactionFs,
+  EditTransactionOptions,
+  EditTransactionRollbackResult,
+  EditTransactionSnapshot,
+  EditTransactionState,
+} from "./edit-transaction.js";
+export {
+  createEditTransaction,
+  DEFAULT_TEST_SCOPE_COMMAND,
+  deriveTestGateTestsFromPartition,
+  deriveTestGateTestsFromScope,
+  EDIT_TRANSACTION_FINGERPRINT_PHASE,
+  EDIT_TRANSACTION_MAX_SNAPSHOT_FILE_BYTES,
+  EDIT_TRANSACTION_MAX_SNAPSHOT_FILES,
+  EDIT_TRANSACTION_SUBDIR,
+  pruneEditTransactionSnapshots,
+  resolveRepoRoot,
+  testScopeFromPartition,
+} from "./edit-transaction.js";
 export {
   createEffortState,
   type EffortLevel,
@@ -58,6 +105,19 @@ export {
   WorkflowErrorCode,
   wrapError,
 } from "./errors.js";
+export type {
+  EstimateCallKind,
+  EstimateCallRecord,
+  EstimateFanOutRow,
+  EstimateOptions,
+  EstimatePhaseRow,
+  WorkflowEstimate,
+} from "./estimate-forecast.js";
+export {
+  estimateWorkflowForecast,
+  formatEstimateDuration,
+  renderWorkflowEstimate,
+} from "./estimate-forecast.js";
 export type {
   HostToolsBundle,
   SessionManagerLike,
@@ -116,6 +176,57 @@ export {
   TOOL_NOT_FOUND,
   TOOL_TIMEOUT,
 } from "./gateway/types.js";
+export type {
+  ActorContribution,
+  ActorDeliveryMode,
+  ActorDeliveryPolicy,
+  AdvisorActorConfig,
+  BeforeAgentStartActorPayload,
+  ContextActorPayload,
+  HostActorConfig,
+  HostActorConfigBase,
+  HostActorEventRecord,
+  HostActorEventType,
+  HostActorManagerOptions,
+  HostActorMessage,
+  HostActorPayload,
+  HostActorProfile,
+  HostActorState,
+  HostActorSummary,
+  SessionCompactActorPayload,
+  SessionStartActorPayload,
+  SpecActorConfig,
+  SpecCriterion,
+  SupervisorActorConfig,
+  WatchdogActorConfig,
+} from "./host-actors.js";
+export {
+  assertValidActorConfig,
+  boundedContextView,
+  createHostActorManager,
+  criterionMentioned,
+  defaultDeliveryForProfile,
+  defaultSubscriptionsForProfile,
+  extractAcceptanceCriteria,
+  fnv1aHex,
+  goalSimilarity,
+  HOST_ACTOR_EVENT_TYPES,
+  HOST_ACTOR_MESSAGE_CUSTOM_TYPE,
+  HOST_ACTORS_CONTEXT_VIEW_MAX_CHARS,
+  HostActorManager,
+  HostActorsConfigError,
+  isAcceptanceCriterionLine,
+  normalizeCriterionText,
+  normalizeDeliveryPolicy,
+  parseHostActorConfigs,
+  promptCarriesDoneMarker,
+  SPEC_ACCEPTANCE_MARKERS_DEFAULT,
+  SPEC_DONE_MARKERS_DEFAULT,
+  SPEC_SUBSCRIPTIONS_DEFAULT,
+  tokenSet,
+  triggerMatches,
+  WATCHDOG_SUBSCRIPTIONS_DEFAULT,
+} from "./host-actors.js";
 export type { PlannotatorBridge, PlannotatorConfig, ReviewPlan } from "./integrations/plannotator.js";
 export { createPlannotatorBridge, getPlanStatus, submitPlan, waitForApproval } from "./integrations/plannotator.js";
 export type { WorkflowLogger, WorkflowLoggerOptions } from "./logger.js";
@@ -154,6 +265,22 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
+export type {
+  MultiModelPanelConfig,
+  PanelMode,
+} from "./multi-model-panel.js";
+export {
+  basePanelModelSpec,
+  generateMultiModelPanelWorkflow,
+  normalizePanelModelSpecs,
+  PANEL_MAX_MODELS_ACT,
+  PANEL_MAX_MODELS_COMPARE,
+  PANEL_MIN_MODELS_ACT,
+  PANEL_MIN_MODELS_COMPARE,
+  panelMode,
+  panelModelSpecsSource,
+  resolvePanelModelSpecs,
+} from "./multi-model-panel.js";
 export {
   isMissingPeerError,
   lazyPeerImport,
@@ -228,9 +355,54 @@ export {
   PLAN_THEN_EXECUTE_NUMERIC_ARGS,
 } from "./plan-then-execute.js";
 export type {
+  FindingLifecycleRecord,
+  FindingLifecycleStatus,
+  RemediationInjection,
+  ReviewFinding,
+} from "./remediation.js";
+export {
+  canTransitionFinding,
+  DEFAULT_REMEDIATION_ROUNDS,
+  FINDING_LIFECYCLE_STATUSES,
+  FINDING_TRANSITIONS,
+  findingContentId,
+  injectRemediationLoop,
+  MAX_REMEDIATION_ROUNDS,
+  normalizeFindings,
+  remediationNormalizersSource,
+} from "./remediation.js";
+export type {
+  ReplayAgentOptions,
+  ReplayFixture,
+  ReplayFixtureEntry,
+  ReplayFixtureSource,
+  ReplayMiss,
+  ReplaySignature,
+} from "./replay-harness.js";
+// V2-P10 recorded-replay simulation harness: record a run's agent() call→result
+// pairs into canned fixtures and replay workflow scripts against the cached
+// results (mock runtime) for penny iteration, golden-master regression, and
+// no-launch CI. Extends the workflow tool's dryRun with full script-body
+// execution over a fixture or a persisted run's journal.
+export {
+  buildReplayFixture,
+  buildReplayFixtureFromRun,
+  createReplayAgent,
+  createReplayResumeJournal,
+  isReplayMiss,
+  parseReplayFixture,
+  REPLAY_FIXTURE_SCHEMA_VERSION,
+  replayFixtureToJournalEntries,
+  replaySignature,
+  replayWorkflow,
+  replayWorkflowFromJournal,
+  stringifyReplaySignature,
+} from "./replay-harness.js";
+export type {
   PersistedRunState,
   RunCheckpoint,
   RunCheckpointState,
+  RunJournalForReplay,
   RunLeaseInfo,
   RunPersistence,
   RunStatus,
@@ -248,14 +420,23 @@ export {
   generateRunId,
   listActiveRuns,
   loadRunState,
+  readRunJournalForReplay,
   resumeRun,
   saveCheckpoint,
 } from "./run-persistence.js";
-export type { RunReport, RunReportAgent, RunReportPhase } from "./run-report.js";
+export type {
+  RunReport,
+  RunReportAgent,
+  RunReportOutputBudget,
+  RunReportPhase,
+  RunReportSummary,
+} from "./run-report.js";
 export {
   buildRunReport,
   deriveTruncationReports,
+  listRunReports,
   RUN_REPORT_SCHEMA_VERSION,
+  readRunReport,
   terminationReason,
   writeRunReport,
 } from "./run-report.js";
@@ -265,6 +446,12 @@ export {
   registerSavedWorkflow,
 } from "./saved-commands.js";
 export { SharedStore } from "./shared-store.js";
+export type { WorkspaceFingerprintCapture } from "./spec-conformance.js";
+export {
+  normalizeWorkspaceFingerprint,
+  workspaceFingerprintKey,
+  workspaceFingerprintSource,
+} from "./spec-conformance.js";
 export type { SpecArtifact, SpecGenerationConfig, SpecGenerationFormat, SpecRequirement } from "./spec-generation.js";
 export {
   generateSpecGenerationWorkflow,
@@ -275,8 +462,13 @@ export {
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export type {
+  MachineCriterionFunction,
+  MachineCriterionSpec,
+  MachineCriterionVerdict,
   RunSupervisorContext,
   SupervisedRunConfig,
+  SupervisedRunCriterion,
+  SupervisedRunCriterionMode,
   SupervisedRunOptions,
   SupervisedRunOutcome,
   SupervisorBudget,
@@ -289,9 +481,13 @@ export {
   bindRunSupervisor,
   buildCorrectionPrompt,
   buildSupervisorPrompt,
+  buildTaskPrompt,
   createSupervisorController,
+  describeCriterion,
   generateSupervisedRunWorkflow,
+  normalizeMachineFunctionVerdict,
   parseSupervisorVerdict,
+  resolveSupervisedRunCriterion,
   SUPERVISED_RUN_NUMERIC_ARGS,
   SUPERVISOR_DEFAULT_MAX_ROUNDS,
   SUPERVISOR_VERDICT_SCHEMA,
@@ -312,6 +508,19 @@ export {
   validateTestGateTests,
 } from "./test-gate.js";
 export type {
+  TrustedScriptRecord,
+  TrustedScriptsStore,
+  TrustedScriptsStoreOptions,
+} from "./trusted-scripts.js";
+export {
+  createTrustedScriptsStore,
+  scriptBodyHash,
+  TRUSTED_SCRIPTS_FILENAME,
+  TRUSTED_SCRIPTS_PROJECT_SUBDIR,
+  TRUSTED_SCRIPTS_SCHEMA_VERSION,
+  TRUSTED_SCRIPTS_SUBDIR,
+} from "./trusted-scripts.js";
+export type {
   AutoResumeDelayParams,
   SchedulableWorkflowManager,
   TimerHandle,
@@ -323,6 +532,7 @@ export type {
   AgentOptions,
   CappedAgentResult,
   CheckpointGate,
+  CheckpointOptions,
   JournalEntry,
   PhaseOptions,
   PhaseStateIntegration,
@@ -334,6 +544,7 @@ export type {
 } from "./workflow.js";
 export {
   capAgentResultText,
+  countOutputChars,
   estimateTokens,
   parseWorkflowScript,
   resolveMaxAgentResultChars,

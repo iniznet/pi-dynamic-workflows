@@ -38,6 +38,15 @@ export enum WorkflowErrorCode {
   /** Token budget exhausted. */
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /**
+   * V2-QW3: the run's total agent-output ceiling (maxTotalOutputChars) was
+   * crossed — the sum of FINAL agent() result chars (post-P05-cap) across the
+   * whole run tree exceeded the ceiling, so the next agent() call is refused.
+   * Non-recoverable by construction (like TOKEN_BUDGET_EXHAUSTED): re-running
+   * the same script under the same ceiling hits the identical wall; a script
+   * can try/catch around the refusing call to proceed with less work.
+   */
+  OUTPUT_BUDGET_EXCEEDED = "OUTPUT_BUDGET_EXCEEDED",
+  /**
    * The provider's subscription/usage/quota/rate limit was hit. Distinct from the
    * user's self-imposed TOKEN_BUDGET_EXHAUSTED: a provider limit refills on its own,
    * so the run is checkpointed (paused) and replayed by resume() rather than failed.
@@ -100,6 +109,17 @@ export enum WorkflowErrorCode {
   MODEL_NOT_FOUND = "MODEL_NOT_FOUND",
   /** Agent execution failed. */
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
+  /**
+   * V2-P10 replay harness: the script diverged from the canned fixture — an
+   * agent() call at a given index has no recorded entry with a matching
+   * hashAgentCall hash, so the recorded-run simulation refuses to replay a
+   * result that was computed for different inputs. Non-recoverable by
+   * construction (the same script/environment would miss identically): the
+   * guidance is re-record the fixture from a fresh run (or run live), never
+   * silently fabricate a result. This code never appears in a real run —
+   * only in replays where the injected runner throws instead of launching.
+   */
+  REPLAY_MISS = "REPLAY_MISS",
   /**
    * The agent was terminated by an explicit workflow_damage_control kill-agent
    * request — a user-directed, per-agent cancellation, never a provider/script

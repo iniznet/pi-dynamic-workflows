@@ -210,6 +210,23 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     nullable: true,
   },
   {
+    // V2-QW3: run-level total-output ceiling. Caps the sum of FINAL agent()
+    // result chars (post-P05-cap) across the whole run tree; the next agent()
+    // call throws OUTPUT_BUDGET_EXCEEDED once the total crosses the ceiling.
+    // null/empty = no default ceiling (opt-in like the token budget). Mirrors
+    // normalizeSettings (workflow-settings.ts) + the env clamp (config.ts).
+    key: "maxTotalOutputChars",
+    type: "number",
+    label: "Max total output chars",
+    help: "Run-level ceiling on the sum of agent() result chars (post per-agent cap), clamped to [1, 2^53-1]. Once the run's total output crosses it, the next agent() throws OUTPUT_BUDGET_EXCEEDED (non-recoverable, catchable). null/empty disables the default ceiling; per-run runWorkflow({ maxTotalOutputChars }) wins. Never part of any resume hash.",
+    min: 1,
+    max: Number.MAX_SAFE_INTEGER,
+    group: "Advanced",
+    defaultDisplay: "none",
+    envVar: WORKFLOW_ENV_VARS.maxTotalOutputChars,
+    nullable: true,
+  },
+  {
     key: "excludeSubagentTools",
     type: "string[]",
     label: "Exclude subagent tools",
@@ -298,6 +315,20 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     group: "Advanced",
     defaultDisplay: "(unset)",
     envVar: WORKFLOW_ENV_VARS.providerPool,
+  },
+  {
+    // V2-P12: session-scoped host-event actors gate. Default off — no manager,
+    // no observers, zero cost (subagentDamageControlTools precedent). When on,
+    // the extension registers before_agent_start / context / session_compact
+    // observers and loads actor defs from getAgentDir()/workflows/actors/.
+    key: "hostActors",
+    type: "enum",
+    label: "Host-event actors",
+    help: "Session-scoped host-event actors (V2-P12): watchdog (goal-drift detector), advisor (decision-point reviewer), spec (acceptance ledger), supervisor (directive steer) subscribed to before_agent_start/context/session_compact. on (opt-in) registers the observers and loads actor defs + persisted state from ~/.pi/agent/workflows/actors/; off (default) keeps them inert. SESSION-scoped — cross-process residency is a documented gap.",
+    options: ["off", "on"],
+    group: "Advanced",
+    defaultDisplay: "off",
+    envVar: WORKFLOW_ENV_VARS.hostActors,
   },
 ];
 

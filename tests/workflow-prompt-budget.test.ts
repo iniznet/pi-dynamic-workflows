@@ -89,7 +89,31 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // (README + docs/workflow-authoring.md), not the always-on tool description.
 // The clause increases the measured definition from 5,959 to 6,159 bytes
 // (+200), and the accepted ceiling moves with it.
-const TOOL_DEFINITION_BUDGET_BYTES = 6_159;
+//
+// V2-P05 + V2-P06: the two new built-ins (`review-remediate`, `multi-model`)
+// extend the `name` field's built-in list by two names. The measured
+// definition grows from 6,159 to 6,189 bytes (+30), and the accepted ceiling
+// moves with it.
+//
+// V2-P10: two new dryRun-replay inputs (`replayFromRunId`, `replayFixture`)
+// extend the tool's simulation surface — the model can iterate a script
+// against a recorded run's cached agent() results without launching, spending,
+// or persisting anything. Descriptions are deliberately terse (the full
+// fixture contract lives in the replay harness docs); the two parameters + a
+// one-line dryRun clause grow the measured definition from 6,189 to 7,239
+// bytes (+1,050), and the accepted ceiling moves with it.
+//
+// V2-N4 (f1-fix): landed the roadmap's dryRun --estimate pre-flight on the
+// contract-targeted surface (workflow-tool.ts dryRun branch) — an optional
+// `estimate` boolean reusing the existing static forecast machinery
+// (estimateWorkflowForecast). The description is deliberately terse (the
+// call-graph scan contract lives in the estimate-forecast module docs and
+// the capability contract's workflow-tool-input entry); the single boolean
+// parameter + two-line description grow the measured definition from 7,239
+// to 7,679 bytes (+440), and the accepted ceiling moves with it. (A 617-byte
+// verbose first draft measured 7,909 bytes and was trimmed to keep the
+// always-on cost honest.)
+const TOOL_DEFINITION_BUDGET_BYTES = 7_679;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

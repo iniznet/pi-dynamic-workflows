@@ -2,6 +2,10 @@
  * Configuration constants for pi-dynamic-workflows.
  */
 
+// Type-only to avoid a runtime import cycle: approval-policy.ts imports VALUE
+// bindings from this module, so importing its types is erased at compile time
+// and never re-enters it at load (workflow-settings.ts precedent below).
+import type { RiskClass, RiskPolicy } from "./approval-policy.js";
 // Provider-pool env override: provider-pool-config.ts is a runtime leaf (it
 // only imports types from provider-pool.ts, which imports from errors.ts), so
 // this value import never creates a cycle back into config.ts.
@@ -26,6 +30,30 @@ export const MAX_AGENTS_PER_RUN = 1000;
  * can never drift between the runtime and the settings surface.
  */
 export const DEFAULT_SUBAGENT_EXTENSION_TOOLS = "on" as const;
+
+/**
+ * V2-P12: per-actor activation budget — the maximum number of deliveries one
+ * host-event actor may make per session before its delivery is suppressed
+ * (recorded as a `delivery_suppressed` event). The per-actor budget knob the
+ * proposal calls for (roadmap-v2.md V2-P12 invariants); the run-level spend
+ * interplay stays on the workflow side (out of scope for this slice).
+ */
+export const HOST_ACTORS_ACTIVATION_CAP_DEFAULT = 32;
+
+/**
+ * V2-P12: per-actor serial-mailbox journal cap. Each actor's processed-event
+ * queue (the persisted audit trail under getAgentDir()/workflows/actors/) is
+ * bounded FIFO — the newest `HOST_ACTORS_QUEUE_MAX` events are retained.
+ */
+export const HOST_ACTORS_QUEUE_MAX = 64;
+
+/**
+ * V2-P12: default watchdog drift threshold. A before_agent_start prompt whose
+ * Jaccard token-set similarity to the actor's declared goal falls below this
+ * value is flagged as goal drift. Pure, deterministic heuristic — never part
+ * of any resume hash.
+ */
+export const HOST_ACTORS_WATCHDOG_DRIFT_THRESHOLD_DEFAULT = 0.2;
 
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
@@ -70,6 +98,41 @@ export const MAX_NESTED_WORKFLOW_DEPTH = 8;
 /** Maximum automatic retry attempts after a recoverable agent failure. */
 export const MAX_AGENT_RETRIES = 3;
 
+// ─── V2-P07: recursive() decomposition primitive knobs ───────────────────────
+
+/**
+ * Hard ceiling on `recursive()` decomposition depth — the per-branch recursion
+ * limit is clamped to at most this value and the live nested-`recursive()`
+ * counter is enforced against it (the own-depth-counter counterpart of
+ * MAX_NESTED_WORKFLOW_DEPTH: recursive() never routes through workflow()
+ * nesting). A runaway guard, not a sandbox: a split function that never
+ * reduces partition size is stopped by this ceiling with a clear
+ * SCRIPT_VALIDATION_ERROR.
+ */
+export const MAX_RECURSIVE_DEPTH = 8;
+
+/** Default per-branch recursion depth for recursive() when opts.maxDepth is omitted. */
+export const DEFAULT_RECURSIVE_DEPTH = 2;
+
+/**
+ * Default per-level fan-out wave width for recursive() (maxRecursiveRoots).
+ * Mirrors MAX_CONCURRENCY so a recursion level's partition fan-out is bounded
+ * by the same width the run limiter bounds real agent parallelism with.
+ */
+export const DEFAULT_RECURSIVE_MAX_ROOTS = 16;
+
+// ─── V2-P11: budget-adaptive re-planning knob ────────────────────────────────
+
+/**
+ * Default re-plan threshold (fraction of the run's token budget): when the
+ * forecast burn `spent + Σ remaining phase budgets` reaches
+ * `tokenBudget * DEFAULT_REPLAN_THRESHOLD`, the runtime emits a re-plan
+ * signal BEFORE the hard caps trip so the script can re-scope remaining
+ * phases. Read-only observation — never a VM mutation, never part of any
+ * agent() resume identity.
+ */
+export const DEFAULT_REPLAN_THRESHOLD = 0.9;
+
 /**
  * Base exponential-backoff delay between retry attempts after a recoverable
  * agent failure (default 1s; each further retry doubles up to 8× the base).
@@ -94,6 +157,18 @@ export const DEFAULT_TOKEN_BUDGET = null;
  * (it transforms the RESULT, never the inputs — resume replay stays stable).
  */
 export const DEFAULT_MAX_AGENT_RESULT_CHARS = 50_000;
+
+/**
+ * V2-QW3: default run-level total-output ceiling. No default — the ceiling is
+ * opt-in exactly like the token budget (a run must pass `maxTotalOutputChars`
+ * or the user must set PI_WORKFLOW_MAX_TOTAL_OUTPUT_CHARS). The accumulator
+ * counts the FINAL agent() result chars (post-P05-cap) across the whole run
+ * tree and the pre-call gate trips OUTPUT_BUDGET_EXCEEDED once the total
+ * crosses the ceiling. Never part of any agent() resume identity (it
+ * transforms the RESULT budget, never the inputs — same exclusion as
+ * maxAgentResultChars).
+ */
+export const DEFAULT_MAX_TOTAL_OUTPUT_CHARS = null;
 
 /** Legacy project-relative directory for persisted workflow run state. New writes use workflowProjectPaths(). */
 export const WORKFLOW_RUNS_DIR = ".pi/workflows/runs";
@@ -169,6 +244,43 @@ export const DEFAULT_TEST_GATE_TOOL = "bash" as const;
  */
 export const DEFAULT_CROSSCHECK_TIMEOUT_MS = 30_000;
 
+// ─── V2-P01: risk-classified approval policy + auto-approval classifier ─────
+
+/**
+ * Default per-risk-class approval policy (V2-P01). Low-risk reads auto-flow;
+ * every higher-risk class asks a human before proceeding (the P12 count
+ * threshold still applies at the fan-out gate — the policy refines what
+ * happens AT the threshold, it never re-opens small fan-outs). `auto` routes
+ * one exact action to the LLM classifier; `deny` refuses outright. Overridable
+ * per run via WorkflowRunOptions.approvalPolicy — approval is host-side
+ * policy, never part of any agent() resume identity.
+ */
+export const DEFAULT_APPROVAL_POLICY: Record<RiskClass, RiskPolicy> = {
+  read: "allow",
+  write: "ask",
+  execute: "ask",
+  network: "ask",
+  agent: "ask",
+};
+
+/**
+ * Cap (milliseconds) on ONE approval-classifier ModelRuntime call (V2-P01).
+ * A hung classifier must not stall the gate; withTimeout resolves the call
+ * unavailable and the caller escalates (fail closed), never auto-approves.
+ */
+export const DEFAULT_APPROVAL_CLASSIFIER_TIMEOUT_MS = 30_000;
+
+/** Response token cap for the approval classifier's verdict. */
+export const DEFAULT_APPROVAL_CLASSIFIER_MAX_TOKENS = 128;
+
+/**
+ * Cap (chars) on the bounded transcript evidence fed to the approval
+ * classifier — the classifier sees recent run activity only, never the whole
+ * transcript, so the request stays cheap and the evidence can't leak a
+ * mid-run secret wholesale.
+ */
+export const APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS = 6_000;
+
 // NOTE (cross-slice, B2-owned): surfacing `defaultUntaggedTier` in
 // settings.json (workflow-settings.ts schema + workflow-settings-fields.ts UI)
 // and wiring it through extensions/workflow.ts is deliberately NOT done here —
@@ -184,6 +296,22 @@ export const DEFAULT_CROSSCHECK_TIMEOUT_MS = 30_000;
 
 /** Prefix for every workflow settings override env var. */
 export const WORKFLOW_ENV_PREFIX = "PI_WORKFLOW_";
+
+/**
+ * V2-QW3: resolve the run-level total-output ceiling for one run. An explicit
+ * value (number | null) wins and is used as-is (null disables the ceiling);
+ * undefined falls back to the PI_WORKFLOW_MAX_TOTAL_OUTPUT_CHARS env var, then
+ * null (no ceiling). Reads env per call (plan-size.ts's resolveApprovalLimits
+ * precedent) so tests can set process.env between runs; the workflow runtime
+ * freezes the result once per run. Never part of any resume hash.
+ */
+export function resolveMaxTotalOutputChars(
+  value: number | null | undefined,
+  env: EnvSource = process.env,
+): number | null {
+  if (value !== undefined) return value;
+  return envNullableInteger(env[WORKFLOW_ENV_VARS.maxTotalOutputChars], 1, Number.MAX_SAFE_INTEGER) ?? null;
+}
 
 /**
  * Env var name per settings key. `as const satisfies` keeps this exhaustive:
@@ -204,12 +332,16 @@ export const WORKFLOW_ENV_VARS = {
   deliveredResultMaxChars: "PI_WORKFLOW_DELIVERED_RESULT_MAX_CHARS",
   // P05: char cap on a single agent() result (see DEFAULT_MAX_AGENT_RESULT_CHARS).
   maxAgentResultChars: "PI_WORKFLOW_MAX_AGENT_RESULT_CHARS",
+  // V2-QW3: run-level total-output ceiling (see DEFAULT_MAX_TOTAL_OUTPUT_CHARS).
+  maxTotalOutputChars: "PI_WORKFLOW_MAX_TOTAL_OUTPUT_CHARS",
   excludeSubagentTools: "PI_WORKFLOW_EXCLUDE_SUBAGENT_TOOLS",
   subagentHostTools: "PI_WORKFLOW_SUBAGENT_HOST_TOOLS",
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
   subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
   subagentExtensionTools: "PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS",
   subagentDamageControlTools: "PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS",
+  // V2-P12: session-scoped host-event actors (watchdog/advisor/spec) gate.
+  hostActors: "PI_WORKFLOW_HOST_ACTORS",
   // Full-JSON override (see providerPoolFromEnv) — headless/CI channel for the
   // same `providerPool` key that settings.json carries under "workflows".
   providerPool: PROVIDER_POOL_ENV_VAR,
@@ -299,6 +431,14 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
     Number.MAX_SAFE_INTEGER,
   );
   if (maxAgentResultChars !== undefined) settings.maxAgentResultChars = maxAgentResultChars;
+  // V2-QW3: run-level total-output ceiling default (positive integer; "" /
+  // "null" = no default ceiling — same nullable semantics as the token budget).
+  const maxTotalOutputChars = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.maxTotalOutputChars],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (maxTotalOutputChars !== undefined) settings.maxTotalOutputChars = maxTotalOutputChars;
   const excludeSubagentTools = env[WORKFLOW_ENV_VARS.excludeSubagentTools]
     ?.split(",")
     .map((name) => name.trim())
@@ -353,6 +493,12 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
     ];
     if (ids.length) settings.subagentExtensionTools = ids;
   }
+  // V2-P12: host-event actors gate ("on" registers before_agent_start / context
+  // / session_compact observers; anything else drops to default off).
+  const hostActors = env[WORKFLOW_ENV_VARS.hostActors]?.trim();
+  if (hostActors === "on" || hostActors === "off") {
+    settings.hostActors = hostActors;
+  }
   const providerPool = providerPoolFromEnv(env);
   if (providerPool !== undefined) settings.providerPool = providerPool;
   return settings;
@@ -365,6 +511,61 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
 export function applyEnvSettingsOverride(settings: WorkflowSettings, env: EnvSource = process.env): WorkflowSettings {
   return { ...settings, ...workflowSettingsFromEnv(env) };
 }
+
+// ─── V2-N4: pre-flight estimate (workflow --estimate) forecast assumptions ──
+
+/**
+ * Default reply-token assumption per agent for the pre-flight forecast
+ * (V2-N4). The shipped estimator (estimateTokens) is a per-VALUE estimator:
+ * a static AST scan can measure the prompt, but the reply size is unknowable
+ * before the model runs. This is the documented best-effort default for the
+ * reply side of the forecast, overridable per call via
+ * EstimateOptions.replyTokensPerAgent. NEVER part of any resume identity —
+ * the forecast is a read-only pre-flight, distinct from the runtime budget
+ * (which meters real spend).
+ */
+export const ESTIMATE_REPLY_TOKENS_PER_AGENT_DEFAULT = 2_000;
+
+/**
+ * Default effective token throughput (tokens per second) for the pre-flight
+ * DURATION forecast (V2-N4). Converts a token forecast into wall-clock time
+ * (tokens ÷ throughput + per-agent overhead). A pure, deterministic model
+ * constant — never a wall-clock runtime value, never part of any resume hash.
+ * Overridable per call via EstimateOptions.tokensPerSecond.
+ */
+export const ESTIMATE_TOKENS_PER_SECOND_DEFAULT = 60;
+
+/**
+ * Default fixed per-agent overhead (ms) in the duration forecast (V2-N4):
+ * scheduling, toolset assembly, latency, and settle costs that no token-count
+ * model can see. Added once per agent execution. Overridable per call via
+ * EstimateOptions.agentOverheadMs.
+ */
+export const ESTIMATE_AGENT_OVERHEAD_MS_DEFAULT = 8_000;
+
+/**
+ * Budget-proximity threshold for the pre-flight forecast (V2-N4): when the
+ * forecast total reaches `tokenBudget * ESTIMATE_WARNING_BUDGET_FRACTION` the
+ * estimate flags `nearBudget` (and `exceedsBudget` once it passes 100%).
+ * Mirrors DEFAULT_REPLAN_THRESHOLD's 0.9 reading of "unsustainable burn" so
+ * the two surfaces agree on where a forecast starts looking risky.
+ */
+export const ESTIMATE_WARNING_BUDGET_FRACTION = 0.9;
+
+/**
+ * Relative per-tier cost weights for the pre-flight forecast (V2-N4). There
+ * is NO dollar denomination anywhere in the tree (V2-P09 verify() finding), so
+ * "per-model tier pricing" is a RELATIVE cost proxy: agent tokens are weighted
+ * by their resolved tier (small = 0.25×, medium = 1× reference, big = 3×) and
+ * summed into the estimate's costWeightedTokens. Unknown/unset tiers use the
+ * 1× reference. Pure config — overridable per call via
+ * EstimateOptions.tierCostWeights.
+ */
+export const ESTIMATE_TIER_COST_WEIGHTS: Readonly<Record<string, number>> = {
+  small: 0.25,
+  medium: 1,
+  big: 3,
+};
 
 /** Default keyword that arms workflows mode from interactive input. */
 export const DEFAULT_KEYWORD_TRIGGER_WORD = "workflow";

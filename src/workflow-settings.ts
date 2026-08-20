@@ -89,6 +89,16 @@ export interface WorkflowSettings {
    */
   maxAgentResultChars?: number | null;
   /**
+   * V2-QW3: default run-level total-output ceiling (chars), applied to runs
+   * that don't pass their own `maxTotalOutputChars`. null explicitly means
+   * "no ceiling" (a project override can cancel a global ceiling); omitted
+   * also means no ceiling. The accumulator counts the FINAL agent() result
+   * chars (post-per-agent-cap) across the whole run tree; once the total
+   * crosses the ceiling the next agent() call throws OUTPUT_BUDGET_EXCEEDED.
+   * Never part of any agent() resume identity.
+   */
+  maxTotalOutputChars?: number | null;
+  /**
    * Extra tool names to deny in workflow subagent sessions, on top of the
    * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
    * other recursive-orchestration tools you have installed (e.g. a pi-subagents
@@ -160,6 +170,18 @@ export interface WorkflowSettings {
    */
   subagentDamageControlTools?: "off" | "readonly" | "on";
   /**
+   * Session-scoped host-event actors (design: roadmap-v2.md V2-P12): the
+   * watchdog (goal-drift detector) / advisor (quiet decision-point reviewer) /
+   * spec (acceptance ledger) / supervisor (directive steer) actors registered
+   * against the host's before_agent_start / context / session_compact events.
+   * "on" (opt-in) activates the actor manager and its observers for this
+   * session (defs + persisted state under getAgentDir()/workflows/actors/);
+   * "off" (default) keeps the manager inert — no observers, zero cost.
+   * SESSION-scoped: survives across workflow runs within a pi session;
+   * cross-process residency is a documented gap (supervisor.ts:25-27).
+   */
+  hostActors?: "off" | "on";
+  /**
    * Provider pool (design: tasks/provider-load-balance/design.md): per-provider
    * concurrency caps + run-sticky provider routing for workflow subagents.
    * Raw settings object — the deep value-level normalization is deliberate
@@ -205,6 +227,9 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   deliveredResultMaxChars: ["number"],
   // P05: positive integer cap, or null to disable the default cap.
   maxAgentResultChars: ["number", "null"],
+  // V2-QW3: run-level total-output ceiling; positive integer, or null to
+  // disable the default ceiling.
+  maxTotalOutputChars: ["number", "null"],
   // null is a tombstone for "cleared": loading it normalizes to an empty list
   // (see normalizeSettings) so a project override can wipe a global exclusion
   // list instead of being schema-rejected.
@@ -228,6 +253,9 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // passes the type schema; normalizeSettings accepts only "off"/"readonly"/"on"
   // and drops anything else (default off = no defs anywhere).
   subagentDamageControlTools: ["string"],
+  // Same lenient drop-on-violation style: any string passes; normalizeSettings
+  // accepts only "on"/"off" (default off = no actor observers).
+  hostActors: ["string"],
   // Any object passes the type schema; value-level leniency (unknown keys,
   // wrong-typed values, invalid entries) is applied later by
   // normalizeProviderPoolConfig when the pool factory constructs the pool.
@@ -416,6 +444,14 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     const maxAgentResultChars = normalizeInteger(raw.maxAgentResultChars, 1, Number.MAX_SAFE_INTEGER);
     if (maxAgentResultChars !== undefined) settings.maxAgentResultChars = maxAgentResultChars;
   }
+  // V2-QW3: null tombstone cancels the default run-level output ceiling (a
+  // project override can wipe a global ceiling); a positive integer sets it.
+  if (raw.maxTotalOutputChars === null) {
+    settings.maxTotalOutputChars = null;
+  } else {
+    const maxTotalOutputChars = normalizeInteger(raw.maxTotalOutputChars, 1, Number.MAX_SAFE_INTEGER);
+    if (maxTotalOutputChars !== undefined) settings.maxTotalOutputChars = maxTotalOutputChars;
+  }
   if (raw.fanOutApprovalThreshold === null) {
     // Tombstone: an explicit null disables the fan-out approval gate (a
     // project override can wipe a global threshold).
@@ -469,6 +505,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
     raw.subagentDamageControlTools === "on"
   ) {
     settings.subagentDamageControlTools = raw.subagentDamageControlTools;
+  }
+  if (raw.hostActors === "on" || raw.hostActors === "off") {
+    settings.hostActors = raw.hostActors;
   }
   if (raw.providerPool && typeof raw.providerPool === "object" && !Array.isArray(raw.providerPool)) {
     // Raw pass-through: deep validation happens in provider-pool-config.ts's

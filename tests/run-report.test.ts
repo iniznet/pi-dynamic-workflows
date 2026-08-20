@@ -97,7 +97,7 @@ return "ok"`,
 
 test("buildRunReport: per-agent roster with model/tier/outcome/tokens", () => {
   const report = buildRunReport(fixtureState(), { mainModel: "session/main-model" });
-  assert.equal(report.schemaVersion, 1);
+  assert.equal(report.schemaVersion, 3);
   assert.equal(report.runId, "fixture-run-1");
   assert.equal(report.status, "completed");
   assert.equal(report.terminationReason, "completed");
@@ -160,6 +160,24 @@ test("terminationReason covers every persisted status", () => {
 test("buildRunReport: budget block from the persisted budget + total", () => {
   const report = buildRunReport(fixtureState());
   assert.deepEqual(report.budget, { limit: 1000, spent: 200 });
+});
+
+test("buildRunReport: V2-QW2 per-phase budgets surface from the durable entries view", async () => {
+  const store = new DurableStore({ dir: tempDir(), projectKey: "report-budgets", now: (s) => `t-${s}` });
+  // The durable entries carry the persisted carve keys workflow.ts phase() writes.
+  await store.put("phaseBudgets:fixture-run-1:build", 400);
+  await store.put("phaseBudgets:fixture-run-1:review", 200);
+  const report = buildRunReport(fixtureState(), {
+    durable: store.snapshot() as { entries: Record<string, unknown>; ledger: unknown[] },
+  });
+  const build = report.phases.find((p) => p.name === "build");
+  assert.equal(build?.budget, 400, "the persisted carve reaches the report phase row");
+  const review = report.phases.find((p) => p.name === "review");
+  assert.equal(review?.budget, 200);
+  // The report schema version is bumped for the additive shape.
+  assert.equal(report.schemaVersion, 3);
+  // Without a durable view the budget stays absent (shape unchanged).
+  assert.equal(buildRunReport(fixtureState()).phases[0]?.budget, undefined);
 });
 
 test("buildRunReport: durable view (entries + ledger) folds in when supplied", async () => {
@@ -280,6 +298,33 @@ test("manager emits a completed run report at completion", async () =>
     assert.equal(report.agents[0]?.label, "agent 1");
     assert.ok(report.durable, "the report folds in the run's durable-store view");
     assert.deepEqual(report.durable?.entries.seen, ["ok", "ok"]);
+  }));
+
+test("manager emits V2-QW2 per-phase budgets in the completed report (persisted carve)", async () =>
+  withFakeHomeAsync(tempDir(), async () => {
+    const cwd = tempDir();
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.on("error", () => {});
+    const budgetScript = `export const meta = { name: "budgeted", description: "d" }
+phase("research", { budget: 120 })
+await agent("one", { label: "researcher" })
+phase("build", { budget: 60 })
+await agent("two", { label: "builder" })
+return "ok"`;
+    const { runId, promise } = manager.startInBackground(budgetScript);
+    await promise.catch(() => {});
+    await waitForStatus(manager, runId, "completed");
+
+    const reportPath = join(runsDir, "reports", `${runId}.json`);
+    const report = JSON.parse(readFileSync(reportPath, "utf-8")) as RunReport;
+    assert.equal(report.schemaVersion, 3);
+    const research = report.phases.find((p) => p.name === "research");
+    assert.ok(research, "the research phase row is present");
+    assert.equal(research?.budget, 120, "the persisted carve reaches the emitted report");
+    const build = report.phases.find((p) => p.name === "build");
+    assert.equal(build?.budget, 60);
   }));
 
 test("manager emits a paused report at pause and a resumed report at resume", async () =>

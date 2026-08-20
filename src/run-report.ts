@@ -15,7 +15,9 @@
  * Contents:
  *   - per-agent roster (label, phase, model/tier, outcome, tokens, worktree
  *     provenance reference)
- *   - per-phase budget spend (QW5: economy tier + routing reason per phase)
+ *   - per-phase budget spend (QW5: economy tier + routing reason per phase;
+ *     V2-QW2: the persisted per-phase soft sub-budget when phase() declared one
+ *     and the run's durable sink persisted it)
  *   - approvals (persisted checkpoint verdicts)
  *   - truncations (QW3: capEmbedded reports, parsed from the persisted log
  *     stream — the capEmbedded log site in workflow.ts records truncations as
@@ -23,6 +25,7 @@
  *   - the run's durable-store view (provenance ledger + entries) when present
  */
 
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { WorkflowErrorCode } from "./errors.js";
@@ -38,7 +41,7 @@ import { parseWorkflowScript } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 /** Report schema version — bump only on a breaking shape change. */
-export const RUN_REPORT_SCHEMA_VERSION = 1 as const;
+export const RUN_REPORT_SCHEMA_VERSION = 3 as const;
 
 /** Subdirectory under the runs dir where report artifacts live. Reports are
  *  written here (not as `<runId>.report.json` next to the run record) so the
@@ -66,9 +69,11 @@ export interface RunReportAgent {
 
 export interface RunReportPhase {
   name: string;
-  /** Soft per-phase sub-budget, when it was declared at runtime and the run
-   *  persisted it. Budgets are live-only today (the phase() helper carves them
-   *  in memory); absent here when not persisted. */
+  /** Soft per-phase sub-budget, when it was declared at runtime AND the run
+   *  bound a durable sink that persisted it (V2-QW2: phase() carves persist
+   *  per-phase keys `phaseBudgets:<runId>:<title>` into the run's durable
+   *  store; the report reads them from the durable entries view). Absent for
+   *  runs that declared no budget, or when no durable view was supplied. */
   budget?: number;
   /** Sum of the phase's agents' token figures (the persisted per-agent scalar
    *  estimate / reported total). */
@@ -90,6 +95,19 @@ export interface RunReportTruncation {
   count: number;
 }
 
+/**
+ * V2-QW3: the run-level total-output budget accounting, persisted by the
+ * runtime into the run's durable store at run end (`outputBudget:<runId>`)
+ * and read back by the report from the durable entries view. Absent entirely
+ * when the run configured no `maxTotalOutputChars` ceiling.
+ */
+export interface RunReportOutputBudget {
+  /** The run's frozen `maxTotalOutputChars` ceiling (null = disabled). */
+  limit: number | null;
+  /** The run's final accumulated agent-output chars (post-P05-cap). */
+  spent: number;
+}
+
 export interface RunReportApproval {
   taskId: string;
   /** The checkpoint verdict status ("completed" = approved, "failed" = denied...). */
@@ -97,8 +115,23 @@ export interface RunReportApproval {
   at?: string;
 }
 
+/**
+ * V2-P08: one applied steer-plan revision surfaced in the run report (the
+ * runtime persists them as `steerRevisions:<runId>` in the run's durable
+ * store; the report reads the raw persisted records back). Additive — never
+ * read by resume().
+ */
+export interface RunReportSteerRevision {
+  note?: string;
+  reason?: string;
+  currentPhase?: string;
+  phases?: Array<{ title: string; budget?: number }>;
+  /** The journal callIndex the revision was recorded at (frame-scoped). */
+  callIndex?: number;
+}
+
 export interface RunReport {
-  schemaVersion: 1;
+  schemaVersion: 3;
   runId: string;
   workflowName: string;
   status: RunStatus;
@@ -118,16 +151,80 @@ export interface RunReport {
     freshSpend?: number;
   };
   budget?: { limit: number | null; spent: number };
+  /**
+   * V2-QW3: run-level total-output accounting, when the run configured a
+   * `maxTotalOutputChars` ceiling (read from the durable entries view's
+   * `outputBudget:<runId>` key, written by workflow.ts at run end). Absent
+   * on runs with no ceiling. Additive — never read by resume().
+   */
+  outputBudget?: RunReportOutputBudget;
   agents: RunReportAgent[];
   phases: RunReportPhase[];
   approvals: RunReportApproval[];
   truncations: RunReportTruncation[];
+  /**
+   * V2-P08: the applied steer-plan revisions (journaled plan-rescopes), read
+   * from the durable entries view's `steerRevisions:<runId>` key (written by
+   * workflow.ts). Absent when the run submitted no steer revision, or when no
+   * durable view was supplied. Additive — never read by resume().
+   */
+  steerRevisions?: RunReportSteerRevision[];
   /** The run's durable-store view (entries + provenance ledger), when the run
    *  bound one and it is still registered at report time. */
   durable?: {
     entries: Record<string, unknown>;
-    ledger: Array<{ id?: string; source?: string; file?: string; agent?: string; phase?: string; timestamp?: string }>;
+    ledger: Array<{
+      id?: string;
+      source?: string;
+      file?: string;
+      agent?: string;
+      phase?: string;
+      detail?: unknown;
+      timestamp?: string;
+    }>;
   };
+  /**
+   * V2-P09 (re-scoped): the run's cross-run token-spend ledger entry
+   * (`spendLedger:<runId>`, written by workflow.ts at run end into the run's
+   * durable store), parsed from the durable entries view. Absent when the run
+   * bound no durable sink, or the entry is malformed/not yet written. Additive
+   * — never read by resume().
+   */
+  spendLedger?: unknown;
+  /**
+   * V2-N2: the run's conformance-trend block (`conformanceTrend:<runId>`,
+   * written by the spec-conformance script into the run's durable store),
+   * parsed from the durable entries view. Absent when the run bound no durable
+   * sink, the script was not spec-conformance, or the workspace was not
+   * fingerprint-able. Additive — never read by resume().
+   */
+  conformanceTrend?: RunReportConformanceTrend | null;
+}
+
+/**
+ * V2-N2: the machine-readable trend block the run report surfaces — the
+ * spec-conformance script's fingerprint-keyed score ledger entry for THIS run
+ * with its delta vs the prior audit of the same workspace fingerprint.
+ * Deliberately a shallow shape (no raw evidence payloads): the trend is an
+ * observability summary; the durable ledger holds the full records.
+ */
+export interface RunReportConformanceTrend {
+  /** The N01 workspace-fingerprint content-derived key this run audited. */
+  fingerprint: string;
+  /** The run that produced this trend record. */
+  runId: string;
+  /** This run's machine-computed conformance score (0-100). */
+  score: number;
+  covered: number;
+  total: number;
+  /** The prior audit's score on the same fingerprint (null when first). */
+  priorScore: number | null;
+  /** score - priorScore (null when there was no prior audit). */
+  scoreDelta: number | null;
+  /** Requirements that regressed covered → missing vs the prior audit. */
+  regression: string[];
+  /** Requirements that improved missing → covered vs the prior audit. */
+  improvement: string[];
 }
 
 export interface BuildRunReportOptions {
@@ -163,6 +260,161 @@ export function terminationReason(state: PersistedRunState): string {
     default:
       return String(state.status);
   }
+}
+
+/**
+ * V2-QW3: output-budget key in the run's durable-store entries
+ * (`outputBudget:<runId>`, written by workflow.ts's end-of-run flush).
+ */
+const OUTPUT_BUDGET_PREFIX = "outputBudget";
+
+/**
+ * Extract the run's persisted output-budget accounting from the durable
+ * entries view (V2-QW3). Returns undefined when the run persisted no output
+ * budget (no durable view, or no ceiling configured) so the report shape
+ * stays unchanged for ceiling-less runs.
+ */
+function readOutputBudget(entries: Record<string, unknown>, runId: string): RunReportOutputBudget | undefined {
+  const raw = entries[`${OUTPUT_BUDGET_PREFIX}:${runId}`];
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    !("limit" in raw) ||
+    !("spent" in raw) ||
+    typeof (raw as { limit: unknown }).limit !== "number" ||
+    typeof (raw as { spent: unknown }).spent !== "number"
+  ) {
+    return undefined;
+  }
+  return { limit: (raw as { limit: number }).limit, spent: (raw as { spent: number }).spent };
+}
+
+/**
+ * V2-P08: steer-revision key in the run's durable-store entries
+ * (`steerRevisions:<runId>`, written by workflow.ts's steerPlan.submit and
+ * the end-of-run flush).
+ */
+const STEER_REVISIONS_PREFIX = "steerRevisions";
+
+/**
+ * Extract the run's persisted applied steer revisions from the durable
+ * entries view (V2-P08). Returns undefined when the run persisted no steer
+ * revision (no durable view, or no submit happened) so the report shape stays
+ * unchanged for unsteered runs.
+ */
+function readSteerRevisions(entries: Record<string, unknown>, runId: string): RunReportSteerRevision[] | undefined {
+  const raw = entries[`${STEER_REVISIONS_PREFIX}:${runId}`];
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const revisions: RunReportSteerRevision[] = [];
+  for (const record of raw) {
+    if (typeof record !== "object" || record === null) continue;
+    const revision =
+      typeof (record as { revision?: unknown }).revision === "object" &&
+      (record as { revision?: unknown }).revision !== null
+        ? ((record as { revision?: unknown }).revision as Record<string, unknown>)
+        : (record as Record<string, unknown>);
+    const row: RunReportSteerRevision = {};
+    if (typeof revision.note === "string") row.note = revision.note;
+    if (typeof revision.reason === "string") row.reason = revision.reason;
+    if (typeof revision.currentPhase === "string") row.currentPhase = revision.currentPhase;
+    if (Array.isArray(revision.phases)) {
+      const phases: Array<{ title: string; budget?: number }> = [];
+      for (const entry of revision.phases) {
+        if (typeof entry !== "object" || entry === null) continue;
+        const phaseRow: { title: string; budget?: number } = {
+          title:
+            typeof (entry as { title?: unknown }).title === "string"
+              ? ((entry as { title?: unknown }).title as string)
+              : "",
+        };
+        if (typeof (entry as { budget?: unknown }).budget === "number") {
+          phaseRow.budget = (entry as { budget?: unknown }).budget as number;
+        }
+        if (phaseRow.title.length > 0) phases.push(phaseRow);
+      }
+      if (phases.length > 0) row.phases = phases;
+    }
+    if (typeof (record as { callIndex?: unknown }).callIndex === "number") {
+      row.callIndex = (record as { callIndex?: unknown }).callIndex as number;
+    }
+    revisions.push(row);
+  }
+  return revisions.length > 0 ? revisions : undefined;
+}
+
+/**
+ * One row of the recent-reports listing (V2-QW5), derived from the report
+ * artifact itself so a listing never needs to parse the run record too.
+ */
+export interface RunReportSummary {
+  runId: string;
+  workflowName: string;
+  status: string;
+  startedAt: string;
+  completedAt?: string;
+  reportPath: string;
+}
+
+/**
+ * V2-QW5: read one run's report artifact (`<runsDir>/reports/<runId>.json`),
+ * missing-file safe. Returns the parsed report, or null when the file is
+ * absent or malformed (a malformed/legacy artifact must never throw the
+ * caller — the report is an observability artifact, not a contract).
+ */
+export async function readRunReport(runsDir: string, runId: string): Promise<RunReport | null> {
+  try {
+    const raw = await readFile(runReportPath(runsDir, runId), "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || typeof (parsed as { runId?: unknown }).runId !== "string") {
+      return null;
+    }
+    return parsed as RunReport;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * V2-QW5: list recent report artifacts under `<runsDir>/reports/*.json`,
+ * newest-first (sorted by the report's startedAt, runId as a stable tiebreak).
+ * Malformed/empty entries are skipped silently (best-effort observability).
+ * `limit` bounds the returned rows (default 25). Deterministic for a fixed
+ * set of report files — never wall-clock dependent.
+ */
+export async function listRunReports(runsDir: string, limit: number = 25): Promise<RunReportSummary[]> {
+  let names: string[];
+  try {
+    names = await readdir(join(runsDir, RUN_REPORTS_SUBDIR));
+  } catch {
+    // No reports dir yet → empty listing, never an error.
+    return [];
+  }
+  const rows: RunReportSummary[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const report = await readRunReport(runsDir, name.slice(0, -".json".length));
+    if (report === null) continue;
+    rows.push({
+      runId: report.runId,
+      workflowName: report.workflowName,
+      status: report.status,
+      startedAt: report.startedAt,
+      ...(report.completedAt !== undefined ? { completedAt: report.completedAt } : {}),
+      reportPath: runReportPath(runsDir, report.runId),
+    });
+  }
+  rows.sort((a, b) =>
+    a.startedAt === b.startedAt
+      ? a.runId < b.runId
+        ? 1
+        : a.runId > b.runId
+          ? -1
+          : 0
+      : a.startedAt < b.startedAt
+        ? 1
+        : -1,
+  );
+  return rows.slice(0, limit);
 }
 
 /**
@@ -221,9 +473,32 @@ function tierForModel(
 }
 
 /**
+ * V2-QW2: phase-budget key prefix in the run's durable-store entries
+ * (`phaseBudgets:<runId>:<title>`, written by workflow.ts phase()).
+ */
+const PHASE_BUDGETS_PREFIX = "phaseBudgets";
+
+/**
+ * Extract the run's persisted phase budgets from the durable entries view
+ * (V2-QW2). Returns undefined when the run persisted no budget (no durable
+ * view, or no phase declared a budget) so the report shape stays unchanged.
+ */
+function readPhaseBudgets(entries: Record<string, unknown>, runId: string): Record<string, number> | undefined {
+  const prefix = `${PHASE_BUDGETS_PREFIX}:${runId}:`;
+  let budgets: Record<string, number> | undefined;
+  for (const [key, value] of Object.entries(entries)) {
+    if (!key.startsWith(prefix) || typeof value !== "number") continue;
+    if (budgets === undefined) budgets = {};
+    budgets[key.slice(prefix.length)] = value;
+  }
+  return budgets;
+}
+
+/**
  * Per-phase QW5 row: the phase's declared model (script meta), the actual
- * models its agents ran on, the reverse-matched tier, and an honest routing
- * reason string.
+ * models its agents ran on, the reverse-matched tier, an honest routing
+ * reason string, and (V2-QW2) the persisted soft sub-budget when one was
+ * declared and the run bound a durable sink that persisted it.
  */
 export function derivePhaseReport(
   title: string,
@@ -231,6 +506,7 @@ export function derivePhaseReport(
   declaredModel: string | undefined,
   config: ModelTierConfig | null,
   mainModel: string | undefined,
+  budget: number | undefined,
 ): RunReportPhase {
   const phaseAgents = agents.filter((a) => (a.phase ?? undefined) === title);
   const spend = phaseAgents.reduce((sum, a) => sum + (typeof a.tokens === "number" ? a.tokens : 0), 0);
@@ -253,9 +529,55 @@ export function derivePhaseReport(
     name: title,
     spend,
     agentCount: phaseAgents.length,
+    ...(budget !== undefined ? { budget } : {}),
     ...(declaredModel !== undefined ? { model: declaredModel } : {}),
     ...(tier !== undefined ? { tier } : {}),
     routingReason,
+  };
+}
+
+/**
+ * V2-N2: conformance-trend key in the run's durable-store entries
+ * (`conformanceTrend:<runId>`, written by the spec-conformance script's Report
+ * phase via putOnce — replay-idempotent, one record per run).
+ */
+const CONFORMANCE_TREND_PREFIX = "conformanceTrend";
+
+/**
+ * Extract the run's conformance-trend block from the durable entries view
+ * (V2-N2). Returns undefined when the run persisted no trend record (no
+ * durable view, the script was not spec-conformance, or the workspace was not
+ * fingerprint-able) so the report shape stays unchanged for other patterns.
+ * Malformed records degrade to null (never a throw — the trend is an
+ * observability artifact, not a contract).
+ */
+function readConformanceTrend(
+  entries: Record<string, unknown>,
+  runId: string,
+): RunReportConformanceTrend | null | undefined {
+  const raw = entries[`${CONFORMANCE_TREND_PREFIX}:${runId}`];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null) return null;
+  const record = raw as Record<string, unknown>;
+  if (
+    typeof record.fingerprint !== "string" ||
+    typeof record.runId !== "string" ||
+    typeof record.score !== "number" ||
+    typeof record.covered !== "number" ||
+    typeof record.total !== "number"
+  ) {
+    return null;
+  }
+  return {
+    fingerprint: record.fingerprint,
+    runId: record.runId,
+    score: record.score,
+    covered: record.covered,
+    total: record.total,
+    priorScore: typeof record.priorScore === "number" ? record.priorScore : null,
+    scoreDelta: typeof record.scoreDelta === "number" ? record.scoreDelta : null,
+    regression: Array.isArray(record.regression) ? record.regression.filter((x) => typeof x === "string") : [],
+    improvement: Array.isArray(record.improvement) ? record.improvement.filter((x) => typeof x === "string") : [],
   };
 }
 
@@ -274,10 +596,29 @@ export function buildRunReport(state: PersistedRunState, options: BuildRunReport
     // to the persisted titles alone.
   }
   const declaredByTitle = new Map(metaPhases.map((p) => [p.title, p.model]));
+  // V2-QW2: the run's persisted phase budgets, read from the durable entries
+  // view (`phaseBudgets:<runId>:<title>` keys written by workflow.ts phase()).
+  const phaseBudgets =
+    options.durable && typeof options.durable.entries === "object" && options.durable.entries !== null
+      ? readPhaseBudgets(options.durable.entries as Record<string, unknown>, state.runId)
+      : undefined;
+  // V2-QW3: the run's persisted total-output accounting, read from the same
+  // durable entries view (written by workflow.ts's end-of-run flush).
+  const outputBudget =
+    options.durable && typeof options.durable.entries === "object" && options.durable.entries !== null
+      ? readOutputBudget(options.durable.entries as Record<string, unknown>, state.runId)
+      : undefined;
+  // V2-P08: the run's applied steer-plan revisions, read from the same durable
+  // entries view (written by workflow.ts's steerPlan.submit + end-of-run
+  // flush). Absent for unsteered runs or when no durable view was supplied.
+  const steerRevisions =
+    options.durable && typeof options.durable.entries === "object" && options.durable.entries !== null
+      ? readSteerRevisions(options.durable.entries as Record<string, unknown>, state.runId)
+      : undefined;
 
   const phaseTitles = state.phases ?? [];
   const phases = phaseTitles.map((title) =>
-    derivePhaseReport(title, state.agents ?? [], declaredByTitle.get(title), config, mainModel),
+    derivePhaseReport(title, state.agents ?? [], declaredByTitle.get(title), config, mainModel, phaseBudgets?.[title]),
   );
 
   const agents: RunReportAgent[] = (state.agents ?? []).map((a) => ({
@@ -298,6 +639,21 @@ export function buildRunReport(state: PersistedRunState, options: BuildRunReport
     verdict: c.status,
     ...(c.timestamp !== undefined ? { at: c.timestamp } : {}),
   }));
+
+  // V2-P09 (re-scoped): the run's own spend-ledger entry, read from the durable
+  // entries view (written by workflow.ts at run end). The raw parsed value is
+  // surfaced as-is — the report is an observability artifact, not a contract.
+  const spendLedger =
+    options.durable && typeof options.durable.entries === "object" && options.durable.entries !== null
+      ? (options.durable.entries as Record<string, unknown>)[`spendLedger:${state.runId}`]
+      : undefined;
+  // V2-N2: the run's conformance-trend block, read from the same durable
+  // entries view (written by the spec-conformance script's Report phase via
+  // putOnce). Absent for other patterns / non-fingerprintable workspaces.
+  const conformanceTrend =
+    options.durable && typeof options.durable.entries === "object" && options.durable.entries !== null
+      ? readConformanceTrend(options.durable.entries as Record<string, unknown>, state.runId)
+      : undefined;
 
   const truncations = deriveTruncationReports(state.logs);
 
@@ -332,11 +688,15 @@ export function buildRunReport(state: PersistedRunState, options: BuildRunReport
     ...(state.durationMs !== undefined ? { durationMs: state.durationMs } : {}),
     ...(tokenUsage !== undefined ? { tokenUsage } : {}),
     ...(budget !== undefined ? { budget } : {}),
+    ...(outputBudget !== undefined ? { outputBudget } : {}),
+    ...(steerRevisions !== undefined ? { steerRevisions } : {}),
     agents,
     phases,
     approvals,
     truncations,
     ...(options.durable ? { durable: options.durable as RunReport["durable"] } : {}),
+    ...(spendLedger !== undefined ? { spendLedger } : {}),
+    ...(conformanceTrend !== undefined ? { conformanceTrend } : {}),
   };
 }
 

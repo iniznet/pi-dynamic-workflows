@@ -316,3 +316,44 @@ export const CODEBASE_AUDIT_RETURN_SEAM: ImpactScopeSeam = [
   "return { findings, validated, report };",
   "return { findings, validated, report, impactPartition };",
 ];
+
+// ─── V2-QW4: impact-scope on spec-conformance + multi-perspective + ───────────
+// ─── adversarial-review (the roadmap's seam extension: injection was wired ───
+// ─── only to code-review + codebase-audit before). Each pattern's fan-out ─────
+// ─── prompt gains the same impactScopeBlock() the P08 patterns embed. ─────────
+
+/** spec-conformance's evidence fan-out prompt seam (every evidence agent embeds the partition). */
+export const SPEC_CONFORMANCE_PROMPT_SEAM: ImpactScopeSeam = [
+  "'\\nFULL SPEC (call store_get on the pointer if referenced): ' + specCtx,",
+  "'\\nFULL SPEC (call store_get on the pointer if referenced): ' + specCtx + impactScopeBlock(),",
+];
+
+/** spec-conformance's return statement seam: expose the partition in the run result. */
+export const SPEC_CONFORMANCE_RETURN_SEAM: ImpactScopeSeam = [
+  "return { spec: { goal: spec.goal, requirementCount: requirements.length }, perRequirement, covered, total: requirements.length, score, missing, extras, report, trend }",
+  "return { spec: { goal: spec.goal, requirementCount: requirements.length }, perRequirement, covered, total: requirements.length, score, missing, extras, report, trend, impactPartition }",
+];
+
+/** multi-perspective's analysis fan-out prompt seam (every analyst embeds the partition). */
+export const MULTI_PERSPECTIVE_PROMPT_SEAM: ImpactScopeSeam = [
+  "+ topic, { label: ",
+  "+ topic + impactScopeBlock(), { label: ",
+];
+
+/** multi-perspective's return statement seam: expose the partition in the run result. */
+export const MULTI_PERSPECTIVE_RETURN_SEAM: ImpactScopeSeam = [
+  "return { analyses, synthesis };",
+  "return { analyses, synthesis, impactPartition };",
+];
+
+/** adversarial-review's refute fan-out prompt seam (every reviewer embeds the partition). */
+export const ADVERSARIAL_REVIEW_PROMPT_SEAM: ImpactScopeSeam = [
+  "'TASK: ' + task + '\\nFINDING: ' + f,",
+  "'TASK: ' + task + '\\nFINDING: ' + f + impactScopeBlock(),",
+];
+
+/** adversarial-review's return statement seam: expose the partition in the run result. */
+export const ADVERSARIAL_REVIEW_RETURN_SEAM: ImpactScopeSeam = [
+  "return { total: findings.length, survivors, report }",
+  "return { total: findings.length, survivors, report, impactPartition }",
+];

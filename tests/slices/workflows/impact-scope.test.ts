@@ -14,17 +14,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import vm from "node:vm";
+import {
+  generateAdversarialReviewWorkflow,
+  generateMultiPerspectiveWorkflow,
+} from "../../../src/adversarial-review.js";
 import { generateCodeReviewWorkflow } from "../../../src/code-review.js";
 import { generateCodebaseAuditWorkflow } from "../../../src/deep-research.js";
 import {
+  ADVERSARIAL_REVIEW_PROMPT_SEAM,
+  ADVERSARIAL_REVIEW_RETURN_SEAM,
   CODE_REVIEW_RETURN_SEAM,
   CODEBASE_AUDIT_PROMPT_SEAM,
   CODEBASE_AUDIT_RETURN_SEAM,
   codeReviewImpactSeams,
   injectImpactScopePhase,
+  MULTI_PERSPECTIVE_PROMPT_SEAM,
+  MULTI_PERSPECTIVE_RETURN_SEAM,
   normalizeImpactPartition,
   normalizeImpactPartitionSource,
+  SPEC_CONFORMANCE_PROMPT_SEAM,
+  SPEC_CONFORMANCE_RETURN_SEAM,
 } from "../../../src/impact-scope.js";
+import { generateSpecConformanceWorkflow } from "../../../src/spec-conformance.js";
 import type { JournalEntry } from "../../../src/workflow.js";
 import { parseWorkflowScript, runWorkflow } from "../../../src/workflow.js";
 
@@ -360,4 +371,99 @@ test("impact-scoped audit: a full run replays from the journal without re-callin
     ["parser", "cli"],
     "the replayed run reconstructs the same partition",
   );
+});
+
+// ─── V2-QW4: impact-scope on spec-conformance + multi-perspective + ───────────
+// ─── adversarial-review (seams + E2E flow) ────────────────────────────────────
+
+test("V2-QW4: spec-conformance gains the Impact Analysis phase and scopes every evidence agent", async () => {
+  const base = generateSpecConformanceWorkflow();
+  const script = injectImpactScopePhase({
+    baseScript: base,
+    target: "audit target",
+    promptSeams: [SPEC_CONFORMANCE_PROMPT_SEAM],
+    returnSeam: SPEC_CONFORMANCE_RETURN_SEAM,
+  });
+  const { meta } = parseWorkflowScript(script);
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Impact Analysis", "Requirements", "Evidence", "Audit", "Report"],
+  );
+  assert.ok(script.includes("label: 'impact analysis'"));
+  assert.ok(script.includes("+ specCtx + impactScopeBlock(),"), "every evidence agent embeds the partition");
+  assert.ok(script.includes("report, trend, impactPartition }"), "the result exposes the partition");
+});
+
+test("V2-QW4: multi-perspective gains the Impact Analysis phase and scopes every analyst", async () => {
+  const base = generateMultiPerspectiveWorkflow("climate policy", ["economic", "environmental"]);
+  const script = injectImpactScopePhase({
+    baseScript: base,
+    target: "analysis target",
+    promptSeams: [MULTI_PERSPECTIVE_PROMPT_SEAM],
+    returnSeam: MULTI_PERSPECTIVE_RETURN_SEAM,
+  });
+  const { meta } = parseWorkflowScript(script);
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Impact Analysis", "Perspective Analysis", "Synthesis"],
+  );
+  assert.ok(script.includes("label: 'impact analysis'"));
+  assert.ok(
+    script.includes('"Analyze from economic perspective: " + topic + impactScopeBlock(), { label: "economic" }'),
+  );
+  assert.ok(script.includes("return { analyses, synthesis, impactPartition };"));
+});
+
+test("V2-QW4: adversarial-review gains the Impact Analysis phase and scopes every refute reviewer", async () => {
+  const base = generateAdversarialReviewWorkflow();
+  const script = injectImpactScopePhase({
+    baseScript: base,
+    target: "review target",
+    promptSeams: [ADVERSARIAL_REVIEW_PROMPT_SEAM],
+    returnSeam: ADVERSARIAL_REVIEW_RETURN_SEAM,
+  });
+  const { meta } = parseWorkflowScript(script);
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Impact Analysis", "Investigate", "Refute", "Consensus"],
+  );
+  assert.ok(script.includes("label: 'impact analysis'"));
+  assert.ok(script.includes("'TASK: ' + task + '\\nFINDING: ' + f + impactScopeBlock(),"));
+  assert.ok(script.includes("return { total: findings.length, survivors, report, impactPartition }"));
+});
+
+test("V2-QW4 E2E: an impact-scoped adversarial-review runs the partition through the refute fan-out", async () => {
+  const prompts: string[] = [];
+  const result = await runWorkflow(
+    injectImpactScopePhase({
+      baseScript: generateAdversarialReviewWorkflow(),
+      target: "The review target is the task: investigate the parser",
+      promptSeams: [ADVERSARIAL_REVIEW_PROMPT_SEAM],
+      returnSeam: ADVERSARIAL_REVIEW_RETURN_SEAM,
+    }),
+    {
+      agent: {
+        async run(prompt: string) {
+          prompts.push(prompt);
+          if (prompt.includes("impact-analysis planner")) return PARTITION_FIXTURE;
+          if (prompt.includes("Investigate the following")) return { findings: ["finding one", "finding two"] };
+          if (prompt.includes("skeptical reviewer")) return { real: true, reason: "confirmed" };
+          if (prompt.includes("final review report")) return "consensus report";
+          return null;
+        },
+      },
+      persistLogs: false,
+      args: { task: "investigate the parser", reviewers: 2 },
+    },
+  );
+  const r = result.result as { survivors?: unknown[]; impactPartition?: { slices: Array<{ name: string }> } };
+  assert.ok(prompts[0].includes("impact-analysis planner"), "impact analysis runs before any review work");
+  const refutePrompt = prompts.find((p) => p.includes("skeptical reviewer"));
+  assert.ok(refutePrompt?.includes("<impact-partition>"), "the refute reviewer embeds the partition");
+  assert.ok(refutePrompt?.includes("src/parse.js"), "the partition's scoped files reach the reviewer");
+  assert.deepEqual(
+    [...((r.impactPartition as { slices: Array<{ name: string }> } | undefined)?.slices ?? [])].map((s) => s.name),
+    ["parser", "cli"],
+  );
+  assert.equal((r.survivors ?? []).length, 2, "both findings survive the threshold with all-real votes");
 });

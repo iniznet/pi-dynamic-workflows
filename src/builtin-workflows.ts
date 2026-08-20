@@ -1,8 +1,8 @@
 /**
- * Shared registry of the 10 curated built-in workflow patterns
+ * Shared registry of the 12 curated built-in workflow patterns
  * (`deep-research`, `adversarial-review`, `code-review`, `multi-perspective`,
  * `codebase-audit`, `plan-then-execute`, `spec-generation`, `debug-loop`,
- * `spec-conformance`, `supervised-run`).
+ * `spec-conformance`, `supervised-run`, `review-remediate`, `multi-model`).
  *
  * This is the single place that turns a pattern's name + caller-supplied args
  * into a runnable script (and, where a pattern needs it, an exec context such
@@ -28,13 +28,21 @@ import { DEBUG_LOOP_NUMERIC_ARGS, generateDebugLoopWorkflow } from "./debug-loop
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
 import {
+  ADVERSARIAL_REVIEW_PROMPT_SEAM,
+  ADVERSARIAL_REVIEW_RETURN_SEAM,
   CODE_REVIEW_RETURN_SEAM,
   CODEBASE_AUDIT_PROMPT_SEAM,
   CODEBASE_AUDIT_RETURN_SEAM,
   codeReviewImpactSeams,
   injectImpactScopePhase,
+  MULTI_PERSPECTIVE_PROMPT_SEAM,
+  MULTI_PERSPECTIVE_RETURN_SEAM,
+  SPEC_CONFORMANCE_PROMPT_SEAM,
+  SPEC_CONFORMANCE_RETURN_SEAM,
 } from "./impact-scope.js";
+import { generateMultiModelPanelWorkflow } from "./multi-model-panel.js";
 import { generatePlanThenExecuteWorkflow, PLAN_THEN_EXECUTE_NUMERIC_ARGS } from "./plan-then-execute.js";
+import { injectRemediationLoop } from "./remediation.js";
 import { generateSpecConformanceWorkflow, SPEC_CONFORMANCE_NUMERIC_ARGS } from "./spec-conformance.js";
 import { generateSpecGenerationWorkflow, SPEC_GENERATION_FORMATS } from "./spec-generation.js";
 import { generateSupervisedRunWorkflow, SUPERVISED_RUN_NUMERIC_ARGS } from "./supervisor.js";
@@ -97,10 +105,14 @@ export interface BuiltinWorkflowResolveContext {
 export const BUILTIN_TOOLSET_TOOLS: Readonly<Record<string, readonly string[]>> = {
   "code-review": ["read", "grep", "find"],
   "spec-generation": ["read", "bash", "write"],
-  "adversarial-review": ["read", "grep"],
+  // V2-QW4: adversarial-review's impact-analysis phase (and its finder surface)
+  // locates the task's impact radius with find alongside read/grep.
+  "adversarial-review": ["read", "grep", "find"],
   "codebase-audit": ["read", "grep", "find"],
   "plan-then-execute": ["read", "write", "bash"],
-  "multi-perspective": ["read", "grep"],
+  // V2-QW4: multi-perspective's impact-analysis phase traces the topic's real
+  // surface with find alongside read/grep.
+  "multi-perspective": ["read", "grep", "find"],
   // D1 P03/P07: the new patterns need the command surface (reproduce/probe)
   // plus the code surface (inspect/fix) — debug-loop also writes the fix.
   "debug-loop": ["read", "grep", "find", "bash", "write"],
@@ -108,6 +120,13 @@ export const BUILTIN_TOOLSET_TOOLS: Readonly<Record<string, readonly string[]>> 
   // P02: the work agent (task/corrective) needs the full work surface; the
   // supervisor turn itself is pure-reasoning (toolNames: []) and needs none.
   "supervised-run": ["read", "grep", "find", "bash", "write"],
+  // V2-P06: review-remediate finders/verifiers read + grep, the remediation
+  // fixer and the re-reviewer edit files and run the machine verification
+  // command.
+  "review-remediate": ["read", "grep", "find", "bash", "write"],
+  // V2-P05: panel members reason (read/grep to ground), the act-mode actor
+  // executes (write + bash for the machine verification surface).
+  "multi-model": ["read", "grep", "find", "bash", "write"],
   "code-dev": ["read", "grep", "find", "bash", "write"],
 };
 
@@ -187,7 +206,7 @@ function requireStringArray(value: unknown, argName: string, patternName: string
   return value;
 }
 
-/** The 10 curated built-in workflow patterns, keyed by their stable name. */
+/** The 12 curated built-in workflow patterns, keyed by their stable name. */
 export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "deep-research",
@@ -218,14 +237,24 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
       "Investigate a task, then cross-check each finding with skeptical reviewers. args: { task: string, reviewers?: number, threshold?: number, maxFindings?: number }.",
     async resolve(cwd, args, context) {
       const record = asRecord(args);
-      requireNonEmptyString(record.task, "task", "adversarial-review");
+      const task = requireNonEmptyString(record.task, "task", "adversarial-review");
       validateNumericArgs(record, ADVERSARIAL_REVIEW_NUMERIC_ARGS, "adversarial-review");
       return {
-        script: generateAdversarialReviewWorkflow(),
+        // V2-QW4: the pattern gains the impact-analysis phase — one agent maps
+        // the task's impact radius (codegraph callers/callees + read/grep/find)
+        // and every refute reviewer prompt embeds the partition
+        // (impactScopeBlock). The target is baked from the resolved task.
+        script: injectImpactScopePhase({
+          baseScript: generateAdversarialReviewWorkflow(),
+          target: `The review target is the task: ${task}; the refute fan-out must be scoped to the task's impact radius.`,
+          promptSeams: [ADVERSARIAL_REVIEW_PROMPT_SEAM],
+          returnSeam: ADVERSARIAL_REVIEW_RETURN_SEAM,
+        }),
         // Investigate/refute agents check the task against the codebase with
-        // read/grep; they never need the write/bash/edit surface. The captured
-        // codegraph_* research defs append on top when the supplier yields them
-        // (P04) so skeptical review can trace callers/impact without extra defs.
+        // read/grep/find (find traces the impact radius); they never need the
+        // write/bash/edit surface. The captured codegraph_* research defs append
+        // on top when the supplier yields them (P04) so skeptical review can
+        // trace callers/impact without extra defs.
         tools: await builtinToolsetTools(cwd, "adversarial-review", context?.extensionTools),
         toolset: "adversarial-review",
       };
@@ -301,10 +330,20 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
           ? requireStringArray(record.perspectives, "perspectives", "multi-perspective")
           : [...DEFAULT_MULTI_PERSPECTIVES];
       return {
-        script: generateMultiPerspectiveWorkflow(topic, perspectives),
-        // Analysts check the topic against the codebase with read/grep; the
-        // captured codegraph_*/web/vision defs append on top (P04) so every
-        // perspective can trace the topic's real surface before opining.
+        // V2-QW4: the pattern gains the impact-analysis phase — one agent maps
+        // the topic's impact surface and every perspective analyst prompt
+        // embeds the partition (impactScopeBlock). The target is baked from the
+        // resolved topic (deterministic per invocation).
+        script: injectImpactScopePhase({
+          baseScript: generateMultiPerspectiveWorkflow(topic, perspectives),
+          target: `The analysis target is the topic: ${topic}; ${perspectives.length} perspective(s) must be scoped to the topic's impact surface.`,
+          promptSeams: [MULTI_PERSPECTIVE_PROMPT_SEAM],
+          returnSeam: MULTI_PERSPECTIVE_RETURN_SEAM,
+        }),
+        // Analysts check the topic against the codebase with read/grep/find
+        // (find traces the impact radius); the captured codegraph_*/web/vision
+        // defs append on top (P04) so every perspective can trace the topic's
+        // real surface before opining.
         tools: await builtinToolsetTools(cwd, "multi-perspective", context?.extensionTools),
         toolset: "multi-perspective",
       };
@@ -433,12 +472,22 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
           'Built-in workflow "spec-conformance" requires args.spec to be a spec object or a non-empty JSON string.',
         );
       }
+      const workspace = typeof record.workspace === "string" && record.workspace.trim() ? record.workspace.trim() : ".";
       if (record.workspace !== undefined && typeof record.workspace !== "string") {
         throw new Error(`Built-in workflow "spec-conformance" requires args.workspace to be a string when present.`);
       }
       validateNumericArgs(record, SPEC_CONFORMANCE_NUMERIC_ARGS, "spec-conformance");
       return {
-        script: generateSpecConformanceWorkflow(),
+        // V2-QW4: the pattern gains the impact-analysis phase — one agent maps
+        // the audited workspace's impact surface and every requirement's
+        // evidence agent prompt embeds the partition (impactScopeBlock). The
+        // target is baked from the resolved workspace.
+        script: injectImpactScopePhase({
+          baseScript: generateSpecConformanceWorkflow(),
+          target: `The audit target is the workspace ${workspace}; the requirement evidence fan-out must be scoped to the implementation surface that evidences each requirement.`,
+          promptSeams: [SPEC_CONFORMANCE_PROMPT_SEAM],
+          returnSeam: SPEC_CONFORMANCE_RETURN_SEAM,
+        }),
         // Evidence auditors grep symbols and probe behavior with bash; the
         // captured codegraph_*/web/vision defs append on top (P04) so a
         // requirement can be traced to its implementing symbols.
@@ -464,6 +513,91 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // pure-reasoning (toolNames: []) and needs no tools.
         tools: await builtinToolsetTools(cwd, "supervised-run", context?.extensionTools),
         toolset: "supervised-run",
+      };
+    },
+  },
+  {
+    name: "review-remediate",
+    description:
+      "Full code review + remediation loop: 8 finders + verify pass → ranked findings, then per-finding durable lifecycle (open → in-progress → fixed → verified → closed), gated fixes, testGate-closed re-review, and a machine compliance pass. args: { diff?: string, diffSource?: string, diffTruncated?: boolean, diffLength?: number, maxCandidates?: number, verifyBatchSize?: number, remediationRounds?: number }.",
+    // Same GAP-3 diffSource resolution as code-review: a model passing
+    // diffSource:'git diff HEAD' gets a real diff before resolve() validates.
+    async prepareArgs(cwd, args, onNotify) {
+      const record = asRecord(args);
+      if (record.diffSource !== undefined && typeof record.diffSource !== "string") {
+        throw new Error('Built-in workflow "review-remediate" requires args.diffSource to be a string when present.');
+      }
+      const diff = typeof record.diff === "string" ? record.diff : "";
+      const diffSource = typeof record.diffSource === "string" ? record.diffSource.trim() : "";
+      if (diff.trim() || !diffSource) return args;
+      const fetched = await fetchDiffFromSource(diffSource, cwd, onNotify);
+      return { ...record, diff: fetched, diffSource };
+    },
+    async resolve(cwd, args, context) {
+      const record = asRecord(args);
+      requireNonEmptyString(record.diff, "diff", "review-remediate");
+      const diff = typeof record.diff === "string" ? record.diff : "";
+      validateNumericArgs(record, CODE_REVIEW_NUMERIC_ARGS, "review-remediate");
+      if (record.remediationRounds !== undefined && typeof record.remediationRounds !== "number") {
+        throw new Error(
+          'Built-in workflow "review-remediate" requires args.remediationRounds to be a number when present.',
+        );
+      }
+      return {
+        // V2-P06: the full code-review machinery (impact-scoped — P08) plus the
+        // remediation loop (per-finding durable lifecycle, testGate-closed
+        // re-review, machine compliance). The target is baked from the resolved
+        // diff's length (deterministic per invocation).
+        script: injectRemediationLoop({
+          baseScript: injectImpactScopePhase({
+            baseScript: generateCodeReviewWorkflow(),
+            target: `The change under review is a code diff (${diff.length} characters); the review angles and remediation fixes must be scoped to its impact radius.`,
+            promptSeams: codeReviewImpactSeams(),
+            returnSeam: CODE_REVIEW_RETURN_SEAM,
+          }),
+        }),
+        // Finders/verifiers pull file context with read/grep/find; the
+        // remediation fixer and re-reviewer edit files and run the machine
+        // verification command (write + bash). The captured codegraph_* defs
+        // append on top (P04).
+        tools: await builtinToolsetTools(cwd, "review-remediate", context?.extensionTools),
+        toolset: "review-remediate",
+      };
+    },
+  },
+  {
+    name: "multi-model",
+    description:
+      'Fan the same task across 2-8 distinct models (compare-not-merge verdicts → judge envelope), optionally act mode (1-4 reference models → one reconciling executor). args: { task: string, models?: string[], mode?: "compare" | "act", judgeModel?: string, actorModel?: string }.',
+    async resolve(cwd, args, context) {
+      const record = asRecord(args);
+      requireNonEmptyString(record.task, "task", "multi-model");
+      if (record.mode !== undefined && record.mode !== "compare" && record.mode !== "act") {
+        throw new Error('Built-in workflow "multi-model" requires args.mode to be "compare" or "act" when present.');
+      }
+      if (record.models !== undefined) {
+        if (
+          !Array.isArray(record.models) ||
+          !record.models.every((m) => typeof m === "string" && m.trim().length > 0)
+        ) {
+          throw new Error(
+            'Built-in workflow "multi-model" requires args.models to be an array of non-empty model-spec strings when present.',
+          );
+        }
+      }
+      for (const key of ["judgeModel", "actorModel"]) {
+        if (record[key] !== undefined && typeof record[key] !== "string") {
+          throw new Error(`Built-in workflow "multi-model" requires args.${key} to be a string when present.`);
+        }
+      }
+      return {
+        script: generateMultiModelPanelWorkflow(),
+        // Panel members ground their verdicts with read/grep/find (pure
+        // reasoning otherwise); the act-mode actor edits files and runs
+        // commands (write + bash). The captured codegraph_* defs append on top
+        // (P04) so a member can trace the task's real surface.
+        tools: await builtinToolsetTools(cwd, "multi-model", context?.extensionTools),
+        toolset: "multi-model",
       };
     },
   },

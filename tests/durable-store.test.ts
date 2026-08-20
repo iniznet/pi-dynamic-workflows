@@ -101,6 +101,55 @@ test("DurableStore re-executed writes are idempotent (identical state)", async (
   assert.equal(replay, first, "replay leaves the store file byte-identical");
 });
 
+test("DurableStore putMany lands one atomic commit for a batch (settle-path coalescing)", async () => {
+  const dir = tempDir();
+  const store = makeStore(dir);
+  // Multiple keys in one commit: a single seq bump per changed key, single file.
+  await store.putMany([
+    ["phaseBudgets:r:a", 400],
+    ["outputBudget:r", { limit: 1000, spent: 0 }],
+    ["steerRevisions:r", [{ revision: { phases: [{ title: "b", budget: 200 }] }, callIndex: 3 }]],
+    ["spendLedger:r", { runId: "r", total: 42 }],
+  ]);
+  assert.equal(store.get("phaseBudgets:r:a"), 400);
+  assert.deepEqual(store.get("outputBudget:r"), { limit: 1000, spent: 0 });
+  assert.deepEqual(store.get("steerRevisions:r"), [
+    { revision: { phases: [{ title: "b", budget: 200 }] }, callIndex: 3 },
+  ]);
+  assert.deepEqual(store.get("spendLedger:r"), { runId: "r", total: 42 });
+  const file = JSON.parse(readFileSync(join(dir, "test-project.json"), "utf-8")) as { seq: number };
+  assert.equal(file.seq, 4, "each changed key bumps seq exactly once, in ONE commit");
+  assert.ok(
+    !readdirSync(dir).some((f) => f.endsWith(".tmp")),
+    "the batch write is atomic (tmp+rename) — no orphan tmp",
+  );
+  // A fresh instance sees the batch (single on-disk commit persisted all keys).
+  const fresh = makeStore(dir);
+  assert.equal(fresh.get("phaseBudgets:r:a"), 400);
+  assert.deepEqual(fresh.get("spendLedger:r"), { runId: "r", total: 42 });
+});
+
+test("DurableStore putMany is replay-idempotent (per-key deep-equal no-ops)", async () => {
+  const dir = tempDir();
+  const store = makeStore(dir);
+  await store.put("phaseBudgets:r:a", 400);
+  await store.putMany([
+    ["phaseBudgets:r:a", 400], // unchanged — no-op
+    ["outputBudget:r", { limit: 1000, spent: 5 }], // changed
+  ]);
+  assert.equal(store.get("phaseBudgets:r:a"), 400);
+  assert.deepEqual(store.get("outputBudget:r"), { limit: 1000, spent: 5 });
+  const file = JSON.parse(readFileSync(join(dir, "test-project.json"), "utf-8")) as { seq: number };
+  assert.equal(file.seq, 2, "an all-unchanged re-executed batch is a no-op; only the changed key bumps seq");
+});
+
+test("DurableStore putMany with no entries is a no-op", async () => {
+  const dir = tempDir();
+  const store = makeStore(dir);
+  await store.putMany([]);
+  assert.ok(!readdirSync(dir).some((f) => f.endsWith(".json")), "an empty batch never touches the disk");
+});
+
 test("DurableStore putOnce dedupes by id (a re-executed increment lands once)", async () => {
   const dir = tempDir();
   const store = makeStore(dir);

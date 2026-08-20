@@ -18,7 +18,88 @@
  */
 
 import { type NumericArgSpec, numericArgCoercionSource } from "./builtin-args.js";
+import { provenanceContentId, provenanceContentIdSource } from "./durable-store.js";
 import { normalizeSpecArtifact, normalizeSpecArtifactSource } from "./spec-generation.js";
+
+/**
+ * V2-N2: the machine-captured workspace state the trend ledger keys on — the
+ * N01 fingerprint contract (workflow-manager.ts captureWorkspaceFingerprint)
+ * reproduced in the vm from a bash-captured agent step's verbatim output.
+ * `gitStatus` is sorted so the canonical form is independent of git's own
+ * output ordering for a fixed workspace state.
+ */
+export interface WorkspaceFingerprintCapture {
+  treeHash: string | null;
+  gitStatus: string[];
+}
+
+/**
+ * Defensive normalization of a bash-captured workspace fingerprint step
+ * (`{ exitCode?, output }` from the agent relaying `git rev-parse HEAD^{tree}`
+ * + `git status --porcelain -uall`). The FIRST non-blank output line must be a
+ * 40-hex git tree hash (anything else — a git error, an empty repo — means the
+ * workspace is not fingerprint-able) and the remaining lines are the sorted
+ * porcelain status. Status lines are NOT trimmed: the ` XY path` leading-space
+ * column is significant (` M file` worktree-modified vs `M  file` staged) and
+ * must stay part of the canonical form. A non-verifiable capture degrades to
+ * null: the trend ledger is then SKIPPED (logged), never fabricated.
+ */
+export function normalizeWorkspaceFingerprint(raw: unknown): WorkspaceFingerprintCapture | null {
+  const record = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const output = typeof record.output === "string" ? record.output : "";
+  const lines = output.split(/\r?\n/).map((line) => line.trim());
+  const nonBlank = lines.filter((line) => line.length > 0);
+  if (nonBlank.length === 0) return null;
+  const first = nonBlank[0];
+  if (!/^[0-9a-f]{40}$/.test(first)) return null;
+  // The porcelain status lines keep their original leading-space column; the
+  // rows start after the FIRST non-blank raw line (the tree hash).
+  const rawLines = output.split(/\r?\n/);
+  const firstRaw = rawLines.findIndex((line) => line.trim().length > 0);
+  const statusRows = rawLines.slice(firstRaw + 1).filter((line) => line.trim().length > 0);
+  return { treeHash: first, gitStatus: statusRows.sort() };
+}
+
+/**
+ * The deterministic fingerprint key for the trend ledger: the content-derived
+ * id of the canonical `{ treeHash, gitStatus }` capture. The SAME workspace
+ * state always yields the SAME key, so score records dedupe across runs;
+ * a changed workspace produces a distinct key (a fresh trend line). Null when
+ * the capture is not fingerprint-able.
+ */
+export function workspaceFingerprintKey(fp: WorkspaceFingerprintCapture | null): string | null {
+  if (!fp) return null;
+  return provenanceContentId({ source: "workspace-fingerprint", treeHash: fp.treeHash, gitStatus: fp.gitStatus });
+}
+
+/**
+ * Emit the vm-embeddable equivalents of {@link normalizeWorkspaceFingerprint}
+ * and {@link workspaceFingerprintKey} for the generated script. Kept textually
+ * in sync with the TS references — the parity test in
+ * tests/slices/workflows/ executes BOTH copies against the same fixtures.
+ */
+export function workspaceFingerprintSource(): string {
+  return [
+    "const normalizeWorkspaceFingerprint = (raw) => {",
+    "  const record = raw && typeof raw === 'object' ? raw : {}",
+    "  const output = typeof record.output === 'string' ? record.output : ''",
+    "  const lines = output.split(/\\r?\\n/).map((l) => l.trim())",
+    "  const nonBlank = lines.filter((l) => l.length > 0)",
+    "  if (nonBlank.length === 0) return null",
+    "  const first = nonBlank[0]",
+    "  if (!/^[0-9a-f]{40}$/.test(first)) return null",
+    "  // Porcelain status rows keep their leading-space XY column (staged vs worktree-modified).",
+    "  const rawLines = output.split(/\\r?\\n/)",
+    "  const firstRaw = rawLines.findIndex((l) => l.trim().length > 0)",
+    "  const statusRows = rawLines.slice(firstRaw + 1).filter((l) => l.trim().length > 0)",
+    "  return { treeHash: first, gitStatus: statusRows.sort() }",
+    "}",
+    "const workspaceFingerprintKey = (fp) => {",
+    "  if (!fp) return null",
+    "  return provenanceContentId({ source: 'workspace-fingerprint', treeHash: fp.treeHash, gitStatus: fp.gitStatus })",
+    "}",
+  ].join("\n");
+}
 
 /** Bounds the per-requirement evidence fan-out (token economy: one agent per requirement). */
 export const SPEC_CONFORMANCE_NUMERIC_ARGS: readonly NumericArgSpec[] = [
@@ -137,6 +218,12 @@ export function conformanceNormalizersSource(): string {
     "// normalizeSpecArtifact mirrors src/spec-generation.ts (the unit-tested",
     "// reference); a parity test keeps the two copies behaviorally identical.",
     normalizeSpecArtifactSource(),
+    // V2-N5: the deterministic content-derived id used for machine-gate ledger
+    // records — identical algorithm to the host settle sites (durable-store.ts).
+    provenanceContentIdSource(),
+    "const computeProvenanceId = provenanceContentId",
+    // V2-N2: the workspace-fingerprint normalizer + key (N01 contract, vm copy).
+    workspaceFingerprintSource(),
     "const normalizeConformanceSpec = (raw) => {",
     "  const record = raw && typeof raw === 'object' ? raw : {}",
     "  const artifactRaw = record.spec !== undefined ? record.spec : raw",
@@ -257,6 +344,22 @@ const cap = (value, maxChars) => {
   return text.length > maxChars ? text.slice(0, maxChars) + '…' : text
 }
 
+// V2-N2: capture the workspace fingerprint ONCE at audit start (a bash-captured
+// agent step relays 'git rev-parse HEAD^{tree}' + 'git status --porcelain -uall'
+// verbatim; normalizeWorkspaceFingerprint is a MACHINE decision — the first
+// line must be a 40-hex tree hash). Non-git / unavailable workspaces degrade
+// to null and the trend ledger is skipped (logged), never fabricated. The step
+// is a normal journaled agent() call, so a resumed run replays it.
+const fingerprintStep = await agent(
+  'Run the following shell commands with the bash tool and report their REAL exit status and FULL standard output verbatim (do not summarize, do not truncate, do not invent output).\\n\\nCommands:\\n1. git rev-parse HEAD^{tree}\\n2. git status --porcelain -uall',
+  { label: 'workspace fingerprint', tier: 'small', toolNames: ['bash'], schema: { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['output'] } }
+)
+const workspaceFp = normalizeWorkspaceFingerprint(fingerprintStep)
+const fingerprintKey = workspaceFingerprintKey(workspaceFp)
+if (!fingerprintKey) {
+  log('Spec conformance: the workspace is not fingerprint-able (not a git repo, or git unavailable); the conformance-trend ledger is skipped.')
+}
+
 const EVIDENCE_SCHEMA = {
   type: 'object',
   properties: {
@@ -344,6 +447,81 @@ const perRequirement = requirements.map((req) => ({
 }))
 const covered = perRequirement.filter((r) => r.status === 'covered').length
 const score = requirements.length > 0 ? Math.round((covered / requirements.length) * 100) : 0
+// V2-N5: record each requirement's machine verdict into the run's provenance
+// ledger (content-derived ids — same requirement + same verdict dedupes on
+// replay; a changed verdict produces a distinct entry). The score payload
+// rides in the detail field for lineage queries. Best-effort: a ledger write
+// must never fail the audit.
+for (const pr of perRequirement) {
+  try {
+    await durableStore.record({
+      id: computeProvenanceId({ source: 'spec-conformance', req: pr.id, phase: 'Report', status: pr.status, evidenceCount: (pr.evidence || []).length }),
+      source: 'spec-conformance',
+      file: pr.id,
+      phase: 'Report',
+      detail: { status: pr.status, score, covered, total: requirements.length, evidenceCount: (pr.evidence || []).length },
+    })
+  } catch (e) {
+    log('spec-conformance: provenance record failed (audit continues): ' + String(e))
+  }
+}
+// V2-N2: conformance-trend ledger — fingerprint-keyed scores with a delta vs
+// the last audit of the SAME fingerprint (read-only compare over the durable
+// provenance ledger's DETERMINISTIC timestamps; this run's own record is
+// excluded by its content-derived id). The trend record is durableStore state
+// — putOnce + record dedupe make replay idempotent — NEVER resume identity.
+let trend = null
+if (fingerprintKey) {
+  const runId = (typeof steerPlan !== 'undefined' && steerPlan && typeof steerPlan.read === 'function') ? steerPlan.read().runId : null
+  if (runId) {
+    const trendId = computeProvenanceId({ source: 'spec-conformance-trend', runId, fingerprint: fingerprintKey, score, covered, total: requirements.length })
+    let priorEntries = []
+    try {
+      priorEntries = (typeof durableStore.ledgerEntries === 'function' ? durableStore.ledgerEntries() : [])
+        .filter((e) => e && e.source === 'spec-conformance-trend' && e.file === fingerprintKey && e.id !== trendId)
+    } catch (e) {
+      priorEntries = []
+    }
+    priorEntries.sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : 0))
+    const prior = priorEntries.length > 0 ? priorEntries[priorEntries.length - 1] : null
+    const priorDetail = (prior && prior.detail && typeof prior.detail === 'object') ? prior.detail : null
+    const priorScore = (priorDetail && typeof priorDetail.score === 'number') ? priorDetail.score : null
+    const scoreDelta = priorScore === null ? null : score - priorScore
+    const priorStatusOf = (reqId) => {
+      if (!priorDetail || !Array.isArray(priorDetail.perRequirement)) return null
+      const row = priorDetail.perRequirement.find((p) => p && p.id === reqId)
+      return row && typeof row.status === 'string' ? row.status : null
+    }
+    const regression = perRequirement.filter((r) => r.status === 'missing' && priorStatusOf(r.id) === 'covered').map((r) => r.id)
+    const improvement = perRequirement.filter((r) => r.status === 'covered' && priorStatusOf(r.id) === 'missing').map((r) => r.id)
+    const trendRecord = {
+      fingerprint: fingerprintKey,
+      runId,
+      score,
+      covered,
+      total: requirements.length,
+      priorScore,
+      scoreDelta,
+      regression,
+      improvement,
+      perRequirement: perRequirement.map((r) => ({ id: r.id, status: r.status })),
+    }
+    try {
+      await durableStore.record({ id: trendId, source: 'spec-conformance-trend', file: fingerprintKey, phase: 'Report', detail: trendRecord })
+      await durableStore.putOnce('conformanceTrend:' + runId, 'conformanceTrend:' + runId, trendRecord)
+    } catch (e) {
+      log('spec-conformance: trend ledger write failed (audit continues): ' + String(e))
+    }
+    trend = trendRecord
+    if (priorScore !== null) {
+      log('Spec conformance trend: score ' + score + '% vs prior ' + priorScore + '% on the same workspace fingerprint' + (scoreDelta !== null ? ' (delta ' + (scoreDelta >= 0 ? '+' : '') + scoreDelta + ')' : '') + (regression.length > 0 ? '; REGRESSIONS: ' + regression.join(', ') : '') + (improvement.length > 0 ? '; improvements: ' + improvement.join(', ') : ''))
+    } else {
+      log('Spec conformance trend: first audit recorded for this workspace fingerprint (score ' + score + '%).')
+    }
+  } else {
+    log('Spec conformance: no run identity available; the conformance-trend ledger is skipped.')
+  }
+}
 const report = await agent(
   'You are a spec-conformance report writer. Write a concise conformance report for this spec audit: per-requirement status (covered/missing), the mechanical evidence for each covered requirement, ' +
   'the missing list, the extras list, and the overall conformance score. Be factual — the score and statuses below are machine-computed from the evidence ledger; do not change them.' +
@@ -354,5 +532,5 @@ const report = await agent(
   { label: 'report writer', tier: ${tierReport} }
 )
 
-return { spec: { goal: spec.goal, requirementCount: requirements.length }, perRequirement, covered, total: requirements.length, score, missing, extras, report }`;
+return { spec: { goal: spec.goal, requirementCount: requirements.length }, perRequirement, covered, total: requirements.length, score, missing, extras, report, trend }`;
 }

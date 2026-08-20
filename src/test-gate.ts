@@ -1,4 +1,5 @@
 import { DEFAULT_TEST_GATE_ATTEMPTS, DEFAULT_TEST_GATE_TOOL } from "./config.js";
+import { type ProvenanceEntry, provenanceContentId } from "./durable-store.js";
 
 /**
  * P01 — testGate machine-checked postcondition machinery.
@@ -272,3 +273,32 @@ export function buildTestGateFeedback(
 
 /** Shared defaults re-exported so the workflow runtime reads one source of truth. */
 export { DEFAULT_TEST_GATE_ATTEMPTS, DEFAULT_TEST_GATE_TOOL };
+
+/**
+ * V2-N5: one provenance ledger entry per machine-verified test (the FINAL
+ * attempt's verdict — the accepted attempt, or the last one when the gate
+ * fails closed). Content-derived stable ids: the SAME command + SAME verdict
+ * always yield the SAME id, so a replayed gate (cached-prefix replay
+ * re-executes the pure machine verdict) dedupes and never re-appends, while a
+ * changed verdict produces a distinct entry. The verdict payload rides in
+ * `detail`; `file` carries the test command as the entry's evidence subject.
+ */
+export function testGateVerdictEntries(
+  results: readonly TestGateStepResult[],
+  phase: string | undefined,
+): ProvenanceEntry[] {
+  return results.map((result) => ({
+    id: provenanceContentId({
+      source: "testGate",
+      phase,
+      command: result.command,
+      passed: result.passed,
+      exitCode: result.exitCode,
+      detail: result.detail,
+    }),
+    source: "testGate",
+    file: result.command,
+    phase,
+    detail: { passed: result.passed, exitCode: result.exitCode, detail: result.detail },
+  }));
+}
