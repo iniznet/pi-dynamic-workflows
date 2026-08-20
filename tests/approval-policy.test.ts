@@ -519,7 +519,12 @@ test("N6: a previously HUMAN-approved script hash skips meta.gate + checkpoint +
   // The allowlist write requires a MANAGED run (agentKillChannel — the
   // manager's unconditional per-execution handle): one-shot direct embeds
   // never persist trust, so tests/embeddings can't arm the user's allowlist.
-  const managedRun = { killedCallIds: new Set<string>(), killControllers: new Map<string, AbortController>() };
+  const managedRun = {
+    killedCallIds: new Set<string>(),
+    idleAbortedCallIds: new Set<string>(),
+    idleEscalatedCallIds: new Set<string>(),
+    killControllers: new Map<string, AbortController>(),
+  };
 
   // Run 1: nothing is trusted yet — meta.gate asks, the checkpoint asks, and
   // the fan-out asks; the human approves everything. The meta.gate approval
@@ -555,7 +560,12 @@ test("N6: a previously HUMAN-approved script hash skips meta.gate + checkpoint +
 test("N6: any edit to the script invalidates the allowlist (approval per exact hash)", async () => {
   const { store, trusted } = memoryTrustedStore();
   const confirm = async () => true;
-  const managedRun = { killedCallIds: new Set<string>(), killControllers: new Map<string, AbortController>() };
+  const managedRun = {
+    killedCallIds: new Set<string>(),
+    idleAbortedCallIds: new Set<string>(),
+    idleEscalatedCallIds: new Set<string>(),
+    killControllers: new Map<string, AbortController>(),
+  };
   await runWorkflow<{ a: boolean; b: number }>(gatedScript, {
     agent: okAgent,
     persistLogs: false,

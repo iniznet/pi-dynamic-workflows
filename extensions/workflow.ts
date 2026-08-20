@@ -14,7 +14,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { builtinToolsetTools, CODE_DEV_TOOLSET } from "../src/builtin-workflows.js";
-import { DEFAULT_SUBAGENT_EXTENSION_TOOLS } from "../src/config.js";
+import { applyCommandWatchdogToTools } from "../src/command-watchdog.js";
+import { DEFAULT_SUBAGENT_EXTENSION_TOOLS, resolveCommandWatchdogOptions } from "../src/config.js";
 import { DEFAULT_IDLE_AGENT_MS, formatElapsed, tokenFigures, type WorkflowAgentSnapshot } from "../src/display.js";
 import {
   claimWorkflowRuntime,
@@ -341,6 +342,11 @@ export default function extension(pi: ExtensionAPI) {
   // builtinToolsetTools only materializes coding/read-only tools).
   const extensionToolsMode = settings.subagentExtensionTools ?? DEFAULT_SUBAGENT_EXTENSION_TOOLS;
   const extensionToolsSupplier = createExtensionToolsSupplier(extensionToolsMode);
+  // I1 command watchdog: ONE lazy supplier resolved from the CURRENT merged
+  // settings per toolset build — shared by the assembler, the builtin pattern
+  // toolsets, the toolsets map, and the workflow-tool/command resolve paths so
+  // every subagent bash def goes through the same watchdog when knobs are on.
+  const commandWatchdog = () => resolveCommandWatchdogOptions(loadSettings());
   const managerOptions = {
     loadSavedWorkflow: (name: string) => storage.load(name)?.script,
     // Named toolsets survive on the persisted run (the tag, not the functions),
@@ -353,26 +359,37 @@ export default function extension(pi: ExtensionAPI) {
     // via the same supplier, so first execution (registry resolve) and resume
     // (this map) resolve byte-identically.
     toolsets: {
+      // I1: the watchdog wrap covers only the HOST-ORIGIN coding+web defs
+      // (captured extension defs are never rebind — third-party bash stays
+      // untouched).
       "web-research": async () => [
-        ...createCodingTools(cwd),
-        ...createWebTools(),
+        ...applyCommandWatchdogToTools(
+          [...createCodingTools(cwd), ...createWebTools()],
+          cwd,
+          resolveCommandWatchdogOptions(loadSettings()),
+        ),
         ...((await extensionToolsSupplier?.()) ?? []),
       ],
-      "code-review": () => builtinToolsetTools(cwd, "code-review", extensionToolsSupplier),
-      "spec-generation": () => builtinToolsetTools(cwd, "spec-generation", extensionToolsSupplier),
-      "adversarial-review": () => builtinToolsetTools(cwd, "adversarial-review", extensionToolsSupplier),
-      "codebase-audit": () => builtinToolsetTools(cwd, "codebase-audit", extensionToolsSupplier),
-      "plan-then-execute": () => builtinToolsetTools(cwd, "plan-then-execute", extensionToolsSupplier),
-      "multi-perspective": () => builtinToolsetTools(cwd, "multi-perspective", extensionToolsSupplier),
+      "code-review": () => builtinToolsetTools(cwd, "code-review", extensionToolsSupplier, commandWatchdog),
+      "spec-generation": () => builtinToolsetTools(cwd, "spec-generation", extensionToolsSupplier, commandWatchdog),
+      "adversarial-review": () =>
+        builtinToolsetTools(cwd, "adversarial-review", extensionToolsSupplier, commandWatchdog),
+      "codebase-audit": () => builtinToolsetTools(cwd, "codebase-audit", extensionToolsSupplier, commandWatchdog),
+      "plan-then-execute": () => builtinToolsetTools(cwd, "plan-then-execute", extensionToolsSupplier, commandWatchdog),
+      "multi-perspective": () => builtinToolsetTools(cwd, "multi-perspective", extensionToolsSupplier, commandWatchdog),
       // P04: the named SUPERSET toolset = every pattern's task-fit subset ∪ the
       // captured extension research defs. Gated by the same single default as
       // everything else (subagentExtensionTools): off → no captured defs.
-      [CODE_DEV_TOOLSET]: () => builtinToolsetTools(cwd, CODE_DEV_TOOLSET, extensionToolsSupplier),
+      [CODE_DEV_TOOLSET]: () => builtinToolsetTools(cwd, CODE_DEV_TOOLSET, extensionToolsSupplier, commandWatchdog),
     },
     // On top of the always-on workflow/workflow_control denial in subagents
     // (#107), let users block additional recursive-orchestration tools.
     excludeSubagentTools: settings.excludeSubagentTools,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
+    // I2 idle automation: run-level defaults for the idle watcher's threshold
+    // and auto-retry budget (null = conditional default for the budget).
+    defaultAgentIdleTimeoutMs: settings.agentIdleTimeoutMs ?? null,
+    defaultAgentIdleRetries: settings.agentIdleRetries ?? null,
     defaultTokenBudget: settings.defaultTokenBudget ?? null,
     // T1-01: budget-gate knob. Default true keeps the legacy full-spend budget
     // (cacheRead counts); false gates on fresh spend (input+output only).
@@ -380,6 +397,11 @@ export default function extension(pi: ExtensionAPI) {
     concurrency: settings.defaultConcurrency,
     defaultAgentRetries: settings.defaultAgentRetries,
     persistAgentSessions: settings.persistAgentSessions,
+    // I1 command watchdog: shared lazy supplier forwarded to the agent runner
+    // so the worktree-fresh / 'off'-mode raw default bash defs also reach the
+    // watchdog-wrapped backend (the default toolset is already wrapped by the
+    // assembler above).
+    commandWatchdog,
   };
   // P2-1 WIRE: lazily-started host tool gateway. Constructing it opens nothing;
   // the bridge only comes up when a run needs host tools (design C: automatic
@@ -494,6 +516,11 @@ export default function extension(pi: ExtensionAPI) {
         };
   const subagentToolsAssembler = new SubagentToolsAssembler({
     mode: settings.subagentTools ?? "all",
+    cwd,
+    // I1 command watchdog: resolved per toolset build from the CURRENT merged
+    // settings (env + file), so a settings change between runs takes effect
+    // without a reload. Disabled (both knobs 0) → thin passthrough.
+    commandWatchdog,
     // The host bundle baseline (coding + proxied host + web tools) is owned by
     // the policy above; MCP tools ride on top of it.
     hostTools: () => hostToolsPolicy.defaultTools(),
@@ -516,7 +543,11 @@ export default function extension(pi: ExtensionAPI) {
       // The explicit opt-in toolset now auto-starts first (fixing the
       // silent-empty result a never-started gateway used to produce); in
       // "off" mode ensureStarted is a no-op so manual start remains required.
-      "host-tools": () => hostToolsPolicy.hostToolsToolset(),
+      // I1: the proxied defs are HOST-ORIGIN tools — their bash def is
+      // watchdog-wrapped when the knobs are on (the design's documented
+      // rebind; MCP/third-party bash is never touched).
+      "host-tools": async () =>
+        applyCommandWatchdogToTools(await hostToolsPolicy.hostToolsToolset(), cwd, commandWatchdog()),
       // MCP-only toolset: works in every host-tools mode, including "off", so
       // a script can explicitly opt in to MCP-backed tools without the host
       // bundle (toolset: "mcp-tools").
@@ -745,6 +776,9 @@ export default function extension(pi: ExtensionAPI) {
         // research defs on their FIRST execution — the same supplier the
         // toolsets map uses for resume, so both paths stay identical.
         extensionTools: extensionToolsSupplier,
+        // I1: same lazy watchdog supplier the assembler/toolsets use, so the
+        // `name` first-execution bash defs match resume byte-for-byte.
+        commandWatchdog,
         checkpointGate,
         // Phase 0/1 wiring (audit actions 1+3): the per-cwd persisted state
         // machine becomes the pipeline's persistence root, so wayfinder →
@@ -1049,7 +1083,7 @@ export default function extension(pi: ExtensionAPI) {
     getExtensionToolSources: () =>
       getExtensionToolSourceResults(settings.subagentExtensionTools ?? DEFAULT_SUBAGENT_EXTENSION_TOOLS),
   });
-  registerBuiltinWorkflows(pi, { cwd, manager, storage, extensionTools: extensionToolsSupplier });
+  registerBuiltinWorkflows(pi, { cwd, manager, storage, extensionTools: extensionToolsSupplier, commandWatchdog });
   registerAllSavedWorkflows(pi, cwd, storage, manager);
   registerEffortCommand(pi, effort);
   // "Workflows mode": type `workflow(s)` to arm a forced workflow at submit

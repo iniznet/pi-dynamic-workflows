@@ -79,6 +79,17 @@ The terminating structured-output tool renders its call and captured payload in 
 
 Agent option not in the contract table: `keepWorktree` — edits are always finalized (`git add -A` + `commit --allow-empty`); with it the branch+path are retained, otherwise discarded. Worktrees live at `<repoRoot>/.pi/worktrees/<id>` (branch `pi/wf/<id>`); leftovers from crashed runs are swept at startup.
 
+## Idle detection (settings-gated, off by default)
+
+Two runtime envelopes catch subagents that stop producing work without failing. Both are configured under `~/.pi/workflows/settings.json` (or their `PI_WORKFLOW_*` env overrides) and are pure runtime behavior — never part of any `agent()` resume hash, so journal replay is byte-identical regardless of the knobs.
+
+- `commandIdleTimeoutMs` (ms) — the command watchdog kills a subagent `bash` command that emits no output for this long. The partial output returns to the same agent session as a normal tool result with a deterministic `[killed: idle Ns — no output within the watchdog budget; process tree aborted]` marker, and the agent continues its turn; after the first kill in one attempt the marker also names the running kill count and the configured knobs. No command-level auto-retry — the AI decides next steps.
+- `commandHardTimeoutMs` (ms) — run-level default bash timeout forwarded to the bash tool as seconds when the model passes no explicit per-call `timeout` (the model's timeout always wins; clamped to the SDK ceiling).
+- `agentIdleTimeoutMs` (ms) — a run-level watcher aborts an in-flight agent call with no tool-result/token/activity movement for this long and auto-resumes it via the journaled retry machinery. Prefer a value above the 30 s soft idle hint and below `agentTimeoutMs` when both are configured.
+- `agentIdleRetries` — the auto-retry budget for agent-idle aborts (unset → 1 when the timeout is enabled, else 0; explicit `0` exhausts on the first abort). Independent of `agentRetries`.
+
+Three consecutive command-idle kills within one attempt mark the attempt stalling and the run-level watcher aborts it on its next tick — a hard bound on the kill/rerun churn loop.
+
 ## Workspace change-scope enforcement (phase-gated runs)
 
 When a `phaseState` integration is wired, every phase boundary captures a workspace fingerprint (read-only `git rev-parse HEAD^{tree}` + `status --porcelain -uall`) and the run asserts that only intended files changed since the previous boundary. The intended set is the workflow system's own artifact dirs (everything under `.pi/`) plus the script's **declared outputs**: `export const meta = { name, description, outputs: ['docs/report.md', 'src/gen/'] }` — exact paths or `/`-suffixed dirs, relative to the run's cwd. The execute phase's agent work is asserted at the run's terminal settle (the last boundary snapshot fires at approval, before execute agents run), and a violation is recorded forward-only with the phase state (`scopeViolations`, like `fingerprints`).

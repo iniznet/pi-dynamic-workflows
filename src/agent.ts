@@ -19,6 +19,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
+import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "./command-watchdog.js";
 import { DEFAULT_UNTAGGED_TIER, UNTAGGED_TIER_ECONOMY, UNTAGGED_TIER_INHERIT_MAIN } from "./config.js";
 import { recordProvenance } from "./durable-store.js";
 import {
@@ -529,6 +530,15 @@ export interface WorkflowAgentOptions {
    * absent, so real runs emit automatically.
    */
   provenanceRunId?: string;
+  /**
+   * I1 command watchdog: lazy supplier of the resolved watchdog knobs, applied
+   * by this runner to every DEFAULT bash def it creates (the 'off'-mode raw
+   * createCodingTools fallback and the worktree-fresh createCodingTools(runCwd)
+   * rebind). Default toolsets handed in via `tools` are already wrapped at the
+   * toolset-assembly choke point and are NOT double-wrapped here. Absent →
+   * current behavior (no wrap).
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
 }
 
 // pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
@@ -659,6 +669,8 @@ function memoizedDefaultTierConfig(mainModel: string | undefined, registry: Mode
  * end state.
  */
 const HISTORY_TAIL_MESSAGES = 120;
+/** I2 activity bridge (df-3): throttle between onActivity emissions (~250ms, mirrors F21's history throttle). */
+const ACTIVITY_EMIT_THROTTLE_MS = 250;
 
 /**
  * F12: grace period after an abort before a run-owned session is force-
@@ -851,8 +863,25 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   onModelFallback?: (info: { tier: string; requestedSpec: string }) => void;
   /** Called with a compact snapshot of this subagent's message/tool history. */
   onHistory?: (history: AgentHistoryEntry[]) => void;
+  /**
+   * I2 idle automation (df-3): called (throttled to ~250ms) on ANY activity
+   * in the session's FULL event stream — tool_execution_start/update/end and
+   * message_start/update/end — NOT just message boundaries. The run-level
+   * idle watcher stamps lastActiveAtMs from these, so streaming bash output
+   * (`tool_execution_update` partial results) or one long message never makes
+   * a productive agent look idle. Runtime metadata only — never a resume
+   * hash input.
+   */
+  onActivity?: () => void;
   /** Run this agent in a different working directory (e.g. an isolated worktree). */
   cwd?: string;
+  /**
+   * I1 command watchdog: per-call override of the instance-level watchdog
+   * supplier (applied to the worktree-fresh createCodingTools(runCwd) defs).
+   * Absent → the instance/run-level supplier applies. Never a resume hash
+   * input.
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /**
    * Restrict the subagent's coding tools to these names (an agentType
    * definition's `tools` allowlist). Undefined = all coding tools. The
@@ -1075,6 +1104,8 @@ type PendingOperationTrace = OperationTrace & { toolCallId: string };
 export class WorkflowAgent {
   private readonly cwd: string;
   private readonly baseTools: ToolDefinition[];
+  /** I1 command watchdog supplier (see WorkflowAgentOptions.commandWatchdog). */
+  private readonly commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /** Extra subagent tool-name denylist, merged with the always-on defaults. */
   private readonly excludeTools: string[];
   private readonly sessionOptions: Partial<CreateAgentSessionOptions>;
@@ -1150,7 +1181,13 @@ export class WorkflowAgent {
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
-    this.baseTools = options.tools ?? createCodingTools(this.cwd);
+    // I1 command watchdog: wrap the RUNNER-OWNED default bash defs ('off'-mode
+    // raw defaults — when no toolset is handed in). Caller-supplied tools are
+    // already watchdog-wrapped at the toolset-assembly choke point and must NOT
+    // be double-wrapped (nested idle timers). Absent knobs → thin passthrough.
+    this.commandWatchdog = options.commandWatchdog;
+    this.baseTools =
+      options.tools ?? applyCommandWatchdogToTools(createCodingTools(this.cwd), this.cwd, options.commandWatchdog?.());
     this.excludeTools = options.excludeTools ?? [];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
@@ -1356,8 +1393,16 @@ export class WorkflowAgent {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
+    // I1 command watchdog: the worktree-fresh defs are wrapped here too (the
+    // bypass the default-toolset choke point would otherwise leave open); the
+    // per-call watchdog override wins over the instance-level supplier, and
+    // absent knobs → thin passthrough (byte-identical).
     const runCwd = options.cwd ?? this.cwd;
-    const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    const watchdog = options.commandWatchdog ?? this.commandWatchdog;
+    const baseTools =
+      runCwd === this.cwd
+        ? this.baseTools
+        : applyCommandWatchdogToTools(createCodingTools(runCwd), runCwd, watchdog?.());
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
     const customTools: ToolDefinition[] = applyToolPolicy(
@@ -1619,7 +1664,19 @@ export class WorkflowAgent {
 
     // Observe the session's tool surface: collect typed operation traces and,
     // for handoff sessions, arm the first-edit swap gate. Both share one
-    // subscription so concurrent tool batches stay in one event stream.
+    // subscription so concurrent tool batches stay in one event stream. The
+    // SAME stream also drives the I2 activity bridge (df-3): every
+    // tool_execution_*/message_* event counts as activity (250ms-throttled),
+    // so streaming bash output and one long message keep the run-level idle
+    // watcher's lastActiveAtMs fresh.
+    let lastActivityEmit = 0;
+    const emitActivity = () => {
+      if (!options.onActivity) return;
+      const now = Date.now();
+      if (now - lastActivityEmit < ACTIVITY_EMIT_THROTTLE_MS) return;
+      lastActivityEmit = now;
+      options.onActivity();
+    };
     const removeToolListener = session.subscribe((event) => {
       if (event.type === "tool_execution_start") {
         const trace: PendingOperationTrace = {
@@ -1648,6 +1705,19 @@ export class WorkflowAgent {
         if (trace) {
           trace.outcome = event.isError ? `error: ${summarizeToolError(event.result)}` : "ok";
         }
+      }
+      // I2 activity bridge (df-3): the FULL session event stream — the model
+      // working (tool_execution_*) and the model talking (message_*). Never
+      // keyed on bash_execution_update (session.executeBash-only).
+      if (
+        event.type === "tool_execution_start" ||
+        event.type === "tool_execution_update" ||
+        event.type === "tool_execution_end" ||
+        event.type === "message_start" ||
+        event.type === "message_update" ||
+        event.type === "message_end"
+      ) {
+        emitActivity();
       }
     });
 

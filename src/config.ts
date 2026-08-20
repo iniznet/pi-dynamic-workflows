@@ -2,14 +2,20 @@
  * Configuration constants for pi-dynamic-workflows.
  */
 
-// Type-only to avoid a runtime import cycle: approval-policy.ts imports VALUE
-// bindings from this module, so importing its types is erased at compile time
-// and never re-enters it at load (workflow-settings.ts precedent below).
 import type { RiskClass, RiskPolicy } from "./approval-policy.js";
+import type { CommandWatchdogOptions } from "./command-watchdog.js";
 // Provider-pool env override: provider-pool-config.ts is a runtime leaf (it
 // only imports types from provider-pool.ts, which imports from errors.ts), so
 // this value import never creates a cycle back into config.ts.
 import { PROVIDER_POOL_ENV_VAR, providerPoolFromEnv } from "./gateway/provider-pool-config.js";
+// Type-only to avoid a runtime import cycle: approval-policy.ts imports VALUE
+// bindings from this module, so importing its types is erased at compile time
+// and never re-enters it at load (workflow-settings.ts precedent below).
+// The agent-label ALS comes from the dependency-free idle-context module, NOT
+// command-watchdog.js — command-watchdog imports the SDK barrel (pi-tui at
+// module scope), which would break this module's headless pi-tui-free guarantee
+// (import-survival.test.ts). The watchdog OPTION TYPE is type-only (erased).
+import { agentLabelContext } from "./idle-context.js";
 import type { ExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 import { isKnownExtensionToolSourceId } from "./subagent/extension-tools-capture.js";
 // Type-only to avoid a runtime import cycle: workflow-settings.ts imports value
@@ -19,6 +25,42 @@ import type { WorkflowSettings } from "./workflow-settings.js";
 
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
+
+// ─── I1 command watchdog knobs (idle-detector design-final.json §commandWatchdog) ──
+// Conservative defaults: 0 = disabled → current behavior (thin passthrough).
+// A command that emits no onData bytes for commandIdleTimeoutMs is killed via
+// the bash tool's signal (process-tree abort) and returns partial output + a
+// kill marker; commandHardTimeoutMs is a run-level default bash timeout (the
+// model's explicit per-call timeout ALWAYS wins). Both are pure runtime
+// envelopes — never part of any agent() resume hash.
+
+/** Default command idle timeout (ms); 0 = disabled. */
+export const DEFAULT_COMMAND_IDLE_TIMEOUT_MS = 0;
+/** Default run-level command hard timeout (ms); 0 = disabled. */
+export const DEFAULT_COMMAND_HARD_TIMEOUT_MS = 0;
+/**
+ * SDK bash timeout ceiling (dist/core/tools/bash.js resolveTimeoutMs): a
+ * timeout in SECONDS must not exceed MAX_TIMEOUT_SECONDS = 2_147_483. The
+ * hard-timeout knob is clamped to this ×1000 at resolution so the forwarded
+ * value can never trip the SDK's "Invalid timeout" guard.
+ */
+export const MAX_COMMAND_HARD_TIMEOUT_MS = 2_147_483_000;
+/** Default consecutive idle kills before the run-level watcher escalates. */
+export const DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS = 3;
+
+// ─── I2 run-level idle automation defaults (design-final.json §agentIdleAutomation) ──
+// Conservative defaults: 0/null = disabled → current behavior (no watcher, no
+// auto-resume). The run-level watcher aborts an in-flight agent call with no
+// tool-result/token/activity movement for agentIdleTimeoutMs and lets the
+// EXISTING journaled retry machinery auto-resume it; agentIdleRetries is the
+// auto-retry budget (unset → 1 when the idle timeout is enabled, else 0 — the
+// conditional default is resolved at run start, not in settings normalization).
+// Pure runtime envelopes — never part of any agent() resume hash.
+
+/** Default agent idle timeout (ms); 0/null = disabled. */
+export const DEFAULT_AGENT_IDLE_TIMEOUT_MS = 0;
+/** Default agent idle auto-retry budget; null = conditional (1 when enabled, else 0). */
+export const DEFAULT_AGENT_IDLE_RETRIES: number | null = null;
 
 /**
  * Default for the `subagentExtensionTools` setting (P04): "on" captures the
@@ -342,6 +384,12 @@ export const WORKFLOW_ENV_VARS = {
   subagentDamageControlTools: "PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS",
   // V2-P12: session-scoped host-event actors (watchdog/advisor/spec) gate.
   hostActors: "PI_WORKFLOW_HOST_ACTORS",
+  // I1 command watchdog: idle-kill threshold + run-level hard timeout (ms).
+  commandIdleTimeoutMs: "PI_WORKFLOW_COMMAND_IDLE_TIMEOUT_MS",
+  commandHardTimeoutMs: "PI_WORKFLOW_COMMAND_HARD_TIMEOUT_MS",
+  // I2 run-level idle automation (resolved at execution start).
+  agentIdleTimeoutMs: "PI_WORKFLOW_AGENT_IDLE_TIMEOUT_MS",
+  agentIdleRetries: "PI_WORKFLOW_AGENT_IDLE_RETRIES",
   // Full-JSON override (see providerPoolFromEnv) — headless/CI channel for the
   // same `providerPool` key that settings.json carries under "workflows".
   providerPool: PROVIDER_POOL_ENV_VAR,
@@ -499,6 +547,24 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   if (hostActors === "on" || hostActors === "off") {
     settings.hostActors = hostActors;
   }
+  // I1 command watchdog knobs: nullable positive ints (ms), null/absent = off.
+  const commandIdleTimeoutMs = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.commandIdleTimeoutMs],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (commandIdleTimeoutMs !== undefined) settings.commandIdleTimeoutMs = commandIdleTimeoutMs;
+  const commandHardTimeoutMs = envNullableInteger(
+    env[WORKFLOW_ENV_VARS.commandHardTimeoutMs],
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  if (commandHardTimeoutMs !== undefined) settings.commandHardTimeoutMs = commandHardTimeoutMs;
+  // I2 run-level idle automation knobs: nullable positive ints (ms / retries).
+  const agentIdleTimeoutMs = envNullableInteger(env[WORKFLOW_ENV_VARS.agentIdleTimeoutMs], 1, Number.MAX_SAFE_INTEGER);
+  if (agentIdleTimeoutMs !== undefined) settings.agentIdleTimeoutMs = agentIdleTimeoutMs;
+  const agentIdleRetries = envNullableInteger(env[WORKFLOW_ENV_VARS.agentIdleRetries], 0, Number.MAX_SAFE_INTEGER);
+  if (agentIdleRetries !== undefined) settings.agentIdleRetries = agentIdleRetries;
   const providerPool = providerPoolFromEnv(env);
   if (providerPool !== undefined) settings.providerPool = providerPool;
   return settings;
@@ -510,6 +576,44 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
  */
 export function applyEnvSettingsOverride(settings: WorkflowSettings, env: EnvSource = process.env): WorkflowSettings {
   return { ...settings, ...workflowSettingsFromEnv(env) };
+}
+
+/**
+ * I1: resolve the command-watchdog knobs from a settings object. All knobs
+ * 0/absent → undefined = disabled → thin passthrough (current behavior).
+ * Applied at the toolset-assembly choke point, so the resolved values follow
+ * the CURRENT settings each toolset build. `commandHardTimeoutMs` is clamped
+ * to the SDK bash ceiling (MAX_COMMAND_HARD_TIMEOUT_MS) and non-finite values
+ * are rejected (hard-timeout-validation); the s/ms forwarding is pinned by a
+ * unit test so unit confusion can never regress.
+ *
+ * The resolved options ALSO carry the production label fn (reads the workflow
+ * layer's agent-label ALS, set around every agentRunner.run) and the
+ * consecutive-kill bound, so command idle-kills are recorded under the AGENT
+ * label in the shared registry and the run-level watcher's isStalling bound
+ * fires in production (df-5) — not only under a manually-seeded test.
+ */
+export function resolveCommandWatchdogOptions(
+  settings: Pick<WorkflowSettings, "commandIdleTimeoutMs" | "commandHardTimeoutMs">,
+): CommandWatchdogOptions | undefined {
+  const idleTimeoutMs = normalizeWatchdogMs(settings.commandIdleTimeoutMs);
+  const hardTimeoutMs = normalizeWatchdogMs(settings.commandHardTimeoutMs, MAX_COMMAND_HARD_TIMEOUT_MS);
+  if (idleTimeoutMs <= 0 && hardTimeoutMs <= 0) return undefined;
+  return {
+    idleTimeoutMs,
+    hardTimeoutMs,
+    maxConsecutiveIdleKills: DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS,
+    // df-5 production label: the workflow layer's per-agent label when a
+    // subagent is running (falls back to the command text otherwise).
+    label: () => agentLabelContext.getStore(),
+  };
+}
+
+/** Normalize a nullable ms knob to a non-negative integer; non-finite/negative → 0. */
+function normalizeWatchdogMs(value: number | null | undefined, max: number = Number.MAX_SAFE_INTEGER): number {
+  if (value === null || value === undefined) return 0;
+  if (!Number.isFinite(value) || value < 1) return 0;
+  return Math.min(max, Math.floor(value));
 }
 
 // ─── V2-N4: pre-flight estimate (workflow --estimate) forecast assumptions ──

@@ -24,6 +24,7 @@ import {
   validateNumericArgs,
 } from "./builtin-args.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
+import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "./command-watchdog.js";
 import { DEBUG_LOOP_NUMERIC_ARGS, generateDebugLoopWorkflow } from "./debug-loop.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
 import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
@@ -81,9 +82,16 @@ export type ExtensionToolsSupplier = () => ToolDefinition[] | Promise<ToolDefini
  * BUILTIN_TOOLSET_TOOLS — is what makes the append real: builtinToolsetTools
  * only materializes createCodingTools/createReadOnlyTools, so a bare name
  * would filter out to nothing (the silent no-op P04 fixes).
+ *
+ * I1: `commandWatchdog` is the same-shaped lazy supplier for the command
+ * watchdog knobs (idle-detector). When active, the pattern toolset's bash def
+ * gets its execute rebound to the watchdog-wrapped local backend — the
+ * toolset-assembly choke point for builtin patterns (agent.ts is out of scope
+ * for I1/I2).
  */
 export interface BuiltinWorkflowResolveContext {
   extensionTools?: ExtensionToolsSupplier;
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
 }
 
 /**
@@ -146,6 +154,7 @@ export async function builtinToolsetTools(
   cwd: string,
   toolset: string,
   extensionTools?: ExtensionToolsSupplier,
+  commandWatchdog?: () => CommandWatchdogOptions | undefined,
 ): Promise<ToolDefinition[]> {
   const names = BUILTIN_TOOLSET_TOOLS[toolset];
   if (!names) return [];
@@ -157,12 +166,22 @@ export async function builtinToolsetTools(
   const selected = names
     .map((name) => available.get(name))
     .filter((tool): tool is ToolDefinition => tool !== undefined);
+  // I1 command watchdog: the HOST-ORIGIN selected defs (createCodingTools /
+  // createReadOnlyTools) get their bash execute rebound to the watchdog-wrapped
+  // local backend when the knobs are active; the captured third-party extension
+  // defs ride along unwrapped (never rebind a non-host bash). Absent/disabled →
+  // thin passthrough.
+  const resolvedWatchdog = commandWatchdog?.();
+  const watchdogWrapped =
+    resolvedWatchdog && (resolvedWatchdog.idleTimeoutMs > 0 || resolvedWatchdog.hardTimeoutMs > 0)
+      ? applyCommandWatchdogToTools(selected, cwd, resolvedWatchdog)
+      : selected;
   // P04: the captured research defs append WHOLESALE on top of the task-fit
   // subset (codegraph_*/web_fetch_md/web_docs_*/describe_image, default-ON) —
   // they are the research surface, not names the pattern's subset lists.
   // Deduped against the already-selected defs (first-wins preserved).
-  const selectedNames = new Set(selected.map((tool) => tool.name));
-  return [...selected, ...extension.filter((def) => !selectedNames.has(def.name))];
+  const selectedNames = new Set(watchdogWrapped.map((tool) => tool.name));
+  return [...watchdogWrapped, ...extension.filter((def) => !selectedNames.has(def.name))];
 }
 
 interface BuiltinWorkflowDescriptor {
@@ -226,7 +245,17 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // WorkflowManagerOptions.toolsets). The captured web-research
         // extension defs (web_fetch_md/web_docs_*) ride along via the same
         // supplier so the run's research surface matches the default toolset.
-        tools: [...createCodingTools(cwd), ...createWebTools(), ...((await context?.extensionTools?.()) ?? [])],
+        // I1: the watchdog wrap covers only the HOST-ORIGIN coding+web defs
+        // (captured extension defs are never rebind — third-party bash stays
+        // untouched).
+        tools: [
+          ...applyCommandWatchdogToTools(
+            [...createCodingTools(cwd), ...createWebTools()],
+            cwd,
+            context?.commandWatchdog?.(),
+          ),
+          ...((await context?.extensionTools?.()) ?? []),
+        ],
         toolset: "web-research",
       };
     },
@@ -255,7 +284,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // write/bash/edit surface. The captured codegraph_* research defs append
         // on top when the supplier yields them (P04) so skeptical review can
         // trace callers/impact without extra defs.
-        tools: await builtinToolsetTools(cwd, "adversarial-review", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "adversarial-review", context?.extensionTools, context?.commandWatchdog),
         toolset: "adversarial-review",
       };
     },
@@ -313,7 +342,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // locate call sites); they never write or run commands. The captured
         // codegraph_*/web/vision defs append on top (P04) so finders can trace
         // callers/impact and verify claims without extra defs.
-        tools: await builtinToolsetTools(cwd, "code-review", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "code-review", context?.extensionTools, context?.commandWatchdog),
         toolset: "code-review",
       };
     },
@@ -344,7 +373,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // (find traces the impact radius); the captured codegraph_*/web/vision
         // defs append on top (P04) so every perspective can trace the topic's
         // real surface before opining.
-        tools: await builtinToolsetTools(cwd, "multi-perspective", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "multi-perspective", context?.extensionTools, context?.commandWatchdog),
         toolset: "multi-perspective",
       };
     },
@@ -372,7 +401,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // Check agents inspect the scoped tree with read/grep/find; the
         // captured codegraph_* defs append on top (P04) so checks can trace
         // callers/impact/callees of the audited symbols directly.
-        tools: await builtinToolsetTools(cwd, "codebase-audit", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "codebase-audit", context?.extensionTools, context?.commandWatchdog),
         toolset: "codebase-audit",
       };
     },
@@ -401,7 +430,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // stages are prompt-only but share the run's toolset. The captured
         // codegraph_*/web/vision defs append on top (P04) so implementers can
         // trace the objective's real surface before editing.
-        tools: await builtinToolsetTools(cwd, "plan-then-execute", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "plan-then-execute", context?.extensionTools, context?.commandWatchdog),
         toolset: "plan-then-execute",
       };
     },
@@ -431,7 +460,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // probes (bash), and the writer can persist the artifact (write). The
         // captured codegraph_*/web/vision defs append on top (P04) so the
         // drafter can trace the topic's real surface before writing.
-        tools: await builtinToolsetTools(cwd, "spec-generation", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "spec-generation", context?.extensionTools, context?.commandWatchdog),
         toolset: "spec-generation",
       };
     },
@@ -453,7 +482,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // the code surface (inspect + edit the fix). The captured
         // codegraph_*/web/vision defs append on top (P04) so the hypothesizer
         // can trace callers/impact of the suspected symbols.
-        tools: await builtinToolsetTools(cwd, "debug-loop", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "debug-loop", context?.extensionTools, context?.commandWatchdog),
         toolset: "debug-loop",
       };
     },
@@ -491,7 +520,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // Evidence auditors grep symbols and probe behavior with bash; the
         // captured codegraph_*/web/vision defs append on top (P04) so a
         // requirement can be traced to its implementing symbols.
-        tools: await builtinToolsetTools(cwd, "spec-conformance", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "spec-conformance", context?.extensionTools, context?.commandWatchdog),
         toolset: "spec-conformance",
       };
     },
@@ -511,7 +540,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // captured codegraph_*/web/vision defs append on top (P04) so the work
         // can trace the task's real surface. The supervisor turn itself is
         // pure-reasoning (toolNames: []) and needs no tools.
-        tools: await builtinToolsetTools(cwd, "supervised-run", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "supervised-run", context?.extensionTools, context?.commandWatchdog),
         toolset: "supervised-run",
       };
     },
@@ -560,7 +589,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // remediation fixer and re-reviewer edit files and run the machine
         // verification command (write + bash). The captured codegraph_* defs
         // append on top (P04).
-        tools: await builtinToolsetTools(cwd, "review-remediate", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "review-remediate", context?.extensionTools, context?.commandWatchdog),
         toolset: "review-remediate",
       };
     },
@@ -596,7 +625,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
         // reasoning otherwise); the act-mode actor edits files and runs
         // commands (write + bash). The captured codegraph_* defs append on top
         // (P04) so a member can trace the task's real surface.
-        tools: await builtinToolsetTools(cwd, "multi-model", context?.extensionTools),
+        tools: await builtinToolsetTools(cwd, "multi-model", context?.extensionTools, context?.commandWatchdog),
         toolset: "multi-model",
       };
     },
@@ -723,11 +752,20 @@ export async function prepareBuiltinWorkflowArgs(
 export async function resolveWorkflowInvocation(
   name: string,
   args: unknown,
-  ctx: { storage: WorkflowStorage; cwd: string; extensionTools?: ExtensionToolsSupplier },
+  ctx: {
+    storage: WorkflowStorage;
+    cwd: string;
+    extensionTools?: ExtensionToolsSupplier;
+    commandWatchdog?: () => CommandWatchdogOptions | undefined;
+  },
 ): Promise<BuiltinWorkflowInvocation | undefined> {
   const saved = ctx.storage.load(name);
   if (saved) return { script: saved.script };
   const builtin = findBuiltinWorkflow(name);
-  if (builtin) return builtin.resolve(ctx.cwd, args, { extensionTools: ctx.extensionTools });
+  if (builtin)
+    return builtin.resolve(ctx.cwd, args, {
+      extensionTools: ctx.extensionTools,
+      commandWatchdog: ctx.commandWatchdog,
+    });
   return undefined;
 }

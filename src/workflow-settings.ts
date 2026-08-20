@@ -182,6 +182,38 @@ export interface WorkflowSettings {
    */
   hostActors?: "off" | "on";
   /**
+   * I1 command watchdog: kill a subagent bash command that emits no output
+   * for this many ms (idle detector). null/0 = disabled (current behavior).
+   * The killed command returns its partial output + a kill marker with
+   * exitCode null to the SAME agent session, which continues its turn. Pure
+   * runtime envelope — never part of any agent() resume hash.
+   */
+  commandIdleTimeoutMs?: number | null;
+  /**
+   * I1 command watchdog: run-level default bash timeout in ms, forwarded to
+   * the bash tool when the model passes no explicit per-call `timeout` (the
+   * model's timeout ALWAYS wins). null/0 = disabled. Clamped to the SDK bash
+   * ceiling at knob resolution.
+   */
+  commandHardTimeoutMs?: number | null;
+  /**
+   * I2 run-level idle automation: abort an in-flight agent call that shows no
+   * tool-result/token/activity movement for this many ms and auto-resume it
+   * via the journaled retry machinery. null/0 = disabled. SHOULD exceed the
+   * soft hint DEFAULT_IDLE_AGENT_MS (30s) and sit below agentTimeoutMs when
+   * both are configured.
+   */
+  agentIdleTimeoutMs?: number | null;
+  /**
+   * I2 run-level idle automation: auto-retry budget for agent-idle aborts.
+   * null = conditional default (1 when agentIdleTimeoutMs is enabled, else 0);
+   * an explicit 0 exhausts on the first abort (AGENT_IDLE_EXHAUSTED). The
+   * budget is INDEPENDENT of agentRetries — idle retries consume IDLE slots
+   * only and never extend provider-outage retries. Retried attempts run the
+   * original prompt plus a fixed deterministic nudge.
+   */
+  agentIdleRetries?: number | null;
+  /**
    * Provider pool (design: tasks/provider-load-balance/design.md): per-provider
    * concurrency caps + run-sticky provider routing for workflow subagents.
    * Raw settings object — the deep value-level normalization is deliberate
@@ -256,6 +288,12 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // Same lenient drop-on-violation style: any string passes; normalizeSettings
   // accepts only "on"/"off" (default off = no actor observers).
   hostActors: ["string"],
+  // I1 command watchdog: nullable ms ints (null/0 = disabled, current behavior).
+  commandIdleTimeoutMs: ["number", "null"],
+  commandHardTimeoutMs: ["number", "null"],
+  // I2 run-level idle automation: nullable ms int / retry count.
+  agentIdleTimeoutMs: ["number", "null"],
+  agentIdleRetries: ["number", "null"],
   // Any object passes the type schema; value-level leniency (unknown keys,
   // wrong-typed values, invalid entries) is applied later by
   // normalizeProviderPoolConfig when the pool factory constructs the pool.
@@ -508,6 +546,23 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (raw.hostActors === "on" || raw.hostActors === "off") {
     settings.hostActors = raw.hostActors;
+  }
+  // I1 command watchdog: null tombstone / positive finite ints (ms).
+  for (const key of ["commandIdleTimeoutMs", "commandHardTimeoutMs", "agentIdleTimeoutMs"] as const) {
+    if (raw[key] === null) {
+      settings[key] = null;
+    } else {
+      const normalized = normalizeInteger(raw[key], 1, Number.MAX_SAFE_INTEGER);
+      if (normalized !== undefined) settings[key] = normalized;
+    }
+  }
+  // I2 idle retry budget: null tombstone / non-negative int (0 = exhaust on
+  // first abort). Separate loop because 0 is a valid value here.
+  if (raw.agentIdleRetries === null) {
+    settings.agentIdleRetries = null;
+  } else {
+    const normalized = normalizeInteger(raw.agentIdleRetries, 0, Number.MAX_SAFE_INTEGER);
+    if (normalized !== undefined) settings.agentIdleRetries = normalized;
   }
   if (raw.providerPool && typeof raw.providerPool === "object" && !Array.isArray(raw.providerPool)) {
     // Raw pass-through: deep validation happens in provider-pool-config.ts's

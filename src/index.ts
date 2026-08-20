@@ -99,6 +99,8 @@ export {
 } from "./effort-command.js";
 export {
   isAbortError,
+  isAgentIdle,
+  isAgentIdleExhausted,
   isTimeoutError,
   isWorkflowError,
   WorkflowError,

@@ -35,6 +35,7 @@ import {
   type RiskClass,
   resolveRiskPolicy,
 } from "./approval-policy.js";
+import type { CommandWatchdogOptions } from "./command-watchdog.js";
 import {
   APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS,
   DEFAULT_AGENT_TIMEOUT_MS,
@@ -61,6 +62,7 @@ import {
 import { createSubagentToolDiscovery, type SubagentToolDiscovery } from "./discovery.js";
 import { isWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import type { ProviderPool } from "./gateway/provider-pool.js";
+import { agentLabelContext } from "./idle-context.js";
 import { createWorkflowLogger, pushBoundedLog } from "./logger.js";
 import { createModelCrosschecker, type ModelCrosschecker, parseCrosscheckVerdict } from "./model-crosscheck.js";
 import { parseModelRoutingFromMeta, resolveModelForPhase, tierNameForTask } from "./model-routing.js";
@@ -362,6 +364,19 @@ const SHARED_CONTEXT_POINTER_SUFFIX = "]]";
 /** Cap on distinct ctx() blobs per run; past it ctx() degrades to returning the raw text. */
 const MAX_SHARED_CONTEXT_BLOBS = 16;
 
+/**
+ * I2 idle automation: fixed deterministic retry-prompt nudge appended to the
+ * original prompt when an in-budget AGENT_IDLE abort is retried. Renders the
+ * CONFIGURED threshold only (never wall-clock) so the retried attempt's prompt
+ * is deterministic given the run's knobs — and the nudge is NEVER part of
+ * hashAgentCall (computed once from the original prompt before the loop), so
+ * resume replay is byte-identical regardless of idle retries.
+ */
+export const IDLE_NUDGE =
+  "This attempt was aborted because no progress was detected for the configured idle timeout. " +
+  "Prefer progress-emitting commands for long-running steps: stream or print periodic output, " +
+  "and pass an explicit bash `timeout` for commands that may take a while. Continue the task now.";
+
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
@@ -486,6 +501,17 @@ export interface JournalEntry {
  *  - `killedCallIds` is the committed kill set — a call id in it is never
  *    started (queued kill) and, if its attempt was already in flight, the
  *    attempt settles as an AGENT_KILLED item error, never a retry.
+ *  - `idleAbortedCallIds` is the run-level idle watcher's committed in-budget
+ *    abort set — a call id in it settles as AGENT_IDLE (an idle retry slot,
+ *    see idleSlots in agent()) instead of a generic WORKFLOW_ABORTED. Written
+ *    BEFORE the watcher aborts the attempt's controller; consumed (deleted)
+ *    by the attempt catch so a later attempt of the same call is never
+ *    misclassified.
+ *  - `idleEscalatedCallIds` is the watcher's committed escalation set — a call
+ *    id in it (ALSO added to killedCallIds) settles as AGENT_IDLE_EXHAUSTED:
+ *    recoverable so fan-outs absorb the item, explicitly excluded from the
+ *    retry branch, never blind-retried. Distinct from a manual kill-agent
+ *    (AGENT_KILLED) so surfaces can name the real cause.
  *  - `killControllers` maps a call id to its CURRENT attempt's AbortController
  *    so an in-flight kill can abort the live subagent session. Registered at
  *    attempt setup, removed in the attempt's finally. The manager adds the id
@@ -495,6 +521,10 @@ export interface JournalEntry {
 export interface AgentKillChannel {
   /** Call ids (deltaKeys) that damage control has marked killed for this run. */
   killedCallIds: Set<string>;
+  /** Call ids committed by the idle watcher for an IN-BUDGET idle abort (settles AGENT_IDLE). */
+  idleAbortedCallIds: Set<string>;
+  /** Call ids committed by the idle watcher for a budget-exhausted ESCALATION (settles AGENT_IDLE_EXHAUSTED). */
+  idleEscalatedCallIds: Set<string>;
   /** Live per-attempt AbortControllers, keyed by call id (deltaKey). */
   killControllers: Map<string, AbortController>;
 }
@@ -934,6 +964,41 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   fanOutApprovalThreshold?: number | null;
   /** Retry attempts after a recoverable agent failure. Default 0. */
   agentRetries?: number;
+  /**
+   * I2 idle automation: run-level agent idle timeout (ms) — the run-level
+   * watcher aborts an in-flight agent call with no tool-result/token/activity
+   * movement for this long and auto-resumes it through the existing journaled
+   * retry machinery (AGENT_IDLE; idle slots only). Frozen at run start like
+   * tokenBudget; inherited by nested workflow() frames via the options spread.
+   * Absent/0/null = disabled (no watcher armed). NEVER part of any agent()
+   * resume hash (same exclusion as agentTimeoutMs/retryBackoffMs).
+   */
+  agentIdleTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: the auto-retry budget for agent-idle aborts.
+   * `null`/unset = the conditional default (1 when agentIdleTimeoutMs is
+   * enabled, else 0); an explicit 0 exhausts on the FIRST idle abort (the
+   * watcher escalates immediately). Idle slots are added to the attempt loop
+   * but ONLY consumable by AGENT_IDLE failures — enabling idle never grants
+   * extra provider-outage retries. NEVER part of any agent() resume hash.
+   */
+  agentIdleRetries?: number | null;
+  /**
+   * I2 activity bridge (df-3): throttled (~250ms) activity events from the
+   * subagent session's FULL event stream (tool_execution_* + message_*),
+   * forwarded by agent.ts's onActivity. The manager stamps lastActiveAtMs from
+   * them so streaming bash output or one long message keeps an agent alive.
+   * Runtime metadata only — NEVER part of any agent() resume hash.
+   */
+  onAgentActivity?: (event: { id: string; label?: string }) => void;
+  /**
+   * I1 command watchdog: lazy supplier of the resolved watchdog knobs, applied
+   * by the agent runner itself so EVERY subagent bash def reaches the
+   * watchdog-wrapped backend (default toolsets are already wrapped at the
+   * toolset-assembly choke point; this closes the worktree-fresh and 'off'-mode
+   * raw-default bypasses). Absent → current behavior (no wrap).
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /**
    * T2-08: run-level default for the per-agent `retryOnlyIfSpendUnder` knob
    * (see AgentOptions) — applied to every agent() call that doesn't set its
@@ -3017,7 +3082,21 @@ export async function runWorkflow<T = unknown>(
 
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
-      const maxAttempts = retryAttempts + 1;
+      // I2 idle automation: idle retry slots (idleSlots = agentIdleRetries ?? 1
+      // when the idle timeout is enabled, else 0) are ADDED to the attempt
+      // bound but ONLY consumable by AGENT_IDLE failures — a non-idle failure
+      // still caps at retryAttempts, so enabling idle never grants extra
+      // provider-outage retries (idle-retries-conditional-default). The value
+      // mirrors the manager's watcher budget (`agentIdleRetries ?? 1`), so the
+      // watcher escalates to AGENT_IDLE_EXHAUSTED exactly when the last idle
+      // slot is spent.
+      const resolvedAgentIdleTimeoutMs = options.agentIdleTimeoutMs ?? 0;
+      const idleSlots = resolvedAgentIdleTimeoutMs > 0 ? (options.agentIdleRetries ?? 1) : 0;
+      const maxAttempts = retryAttempts + 1 + idleSlots;
+      // Remaining per-class retry budgets: AGENT_IDLE consumes an idle slot,
+      // every other recoverable failure consumes a provider-outage slot.
+      let providerRetriesLeft = retryAttempts;
+      let idleRetriesLeft = idleSlots;
       const retryBackoffMs = normalizeRetryBackoffMs(options.retryBackoffMs);
 
       safeCallback("onAgentStart", options.onAgentStart, {
@@ -3165,6 +3244,11 @@ export async function runWorkflow<T = unknown>(
       };
 
       try {
+        // I2 idle automation: set in the catch when an in-budget AGENT_IDLE
+        // abort is retried, read at the NEXT attempt's setup (lives OUTSIDE the
+        // per-attempt declarations so it survives the loop's `continue`). The
+        // retried attempt then runs the original prompt + IDLE_NUDGE.
+        let retryFromIdleAbort = false;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           usage = undefined;
           poolRetryPending = false;
@@ -3190,7 +3274,19 @@ export async function runWorkflow<T = unknown>(
             // attempt started — never run it. AGENT_KILLED is recoverable so
             // parallel()/pipeline() absorb the item (a killed agent is never
             // run-fatal by itself); the gate THROWS before the retry branch, so
-            // a killed call is never retried either.
+            // a killed call is never retried either. An IDLE escalation is the
+            // same shape but a different cause: the watcher committed the id to
+            // BOTH idleEscalatedCallIds and killedCallIds, so it is reported
+            // AGENT_IDLE_EXHAUSTED (never a misleading manual-kill label) and
+            // stays excluded from the retry branch.
+            if (agentKillChannel?.idleEscalatedCallIds.has(deltaKey)) {
+              store.discardDelta(deltaKey);
+              throw new WorkflowError(
+                "agent idle budget exhausted (escalated by the idle watcher)",
+                WorkflowErrorCode.AGENT_IDLE_EXHAUSTED,
+                { recoverable: true, agentLabel: label },
+              );
+            }
             if (agentKillChannel?.killedCallIds.has(deltaKey)) {
               // No writes could have landed (the call never ran) — discard is a
               // cheap no-op that keeps a stale pending delta from leaking if
@@ -3240,92 +3336,114 @@ export async function runWorkflow<T = unknown>(
             // right to consume) tokens; a queued kill threw at the gate above
             // and never reaches here.
             attemptEnteredRunner = true;
-            const runPromise = agentRunner.run(prompt, {
-              label,
-              // Identifiable name for persisted sessions (persistAgentSessions).
-              sessionName: `workflow:${runId} ${label}`,
-              // V2-QW2(a): the phase this call was assigned at call time, so the
-              // settle ledger record stops carrying phase:undefined. Runtime
-              // metadata only — NEVER part of the resume identity (hashAgentCall's
-              // field set is untouched).
-              provenancePhase: assignedPhase,
-              schema: agentOptions.schema,
-              signal: agentController.signal,
-              instructions: buildAgentInstructions(
-                assignedPhase,
-                agentOptions,
-                agentDef,
-                resolvedIsolation,
-                // T2-07: the run's shared-context registry; buildAgentInstructions
-                // emits the full blob once (first agent) and store-key notes to
-                // every later agent.
-                shared,
-              ),
-              model: modelSpec,
-              tier: agentOptions.tier,
-              // T2-03: the run's untagged-agent default tier knob (economy /
-              // inherit:main / literal tier name); undefined lets the
-              // WorkflowAgent fall back to its own constructor/global default.
-              defaultUntaggedTier: options.defaultUntaggedTier,
-              // GAP-2: the run's pipeline stage (clamped 0..1) so the
-              // prompt-aware tier fallback classifies wayfinder/prewalk recon
-              // to the cheap tier. Undefined on non-pipeline runs (unchanged
-              // behavior).
-              pipelineStage,
-              modelRegistry: options.modelRegistry,
-              // Provider pool: the run's pool + this call's sticky key (the
-              // deltaKey) — retry attempts re-acquire the same pinned provider;
-              // settlement (release/spend/limit-event) happens at the final
-              // attempt below, never on recoverable retry-continue.
-              providerPool: options.providerPool,
-              poolStickyKey: deltaKey,
-              toolNames: agentOptions.toolNames ?? agentDef?.tools,
-              disallowedToolNames: agentDef?.disallowedTools,
-              // Typed operation traces: the script line of THIS call (the
-              // differentiator across journal entries) plus the callback that
-              // delivers the per-tool-call {line, op, outcome} traces.
-              scriptLine,
-              onOperations: (traces) => {
-                operations = traces;
-              },
-              // Prewalk session handoff: chain the handoff session at phase
-              // boundaries (see chainHandoff) so phase N+1 inherits the phase N
-              // trajectory instead of re-reading context.
-              handoff: chainHandoff,
-              onSwap: (info) => {
-                log(
-                  `${info.reason} swap: execution mode on session ${info.sessionId} ` +
-                    `(${info.fromModel ?? "?"} → ${info.toModel ?? "?"})`,
-                );
-              },
-              // Per-agent store tools track this agent's writes by the
-              // run-unique deltaKey so the delta can be journaled and replayed
-              // correctly on resume, even when a nested workflow() run shares
-              // this store concurrently with the parent run.
-              systemTools: createAgentStoreTools(store, deltaKey),
-              cwd: runCwd,
-              onModelResolved: (id: string) => {
-                displayModel = id;
-              },
-              onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
-                // Untagged agents' implicit default tier degrading to the session
-                // default must stay visible in the run's own log/event stream, not
-                // just a console.warn (#131) — an explicit model/tier pin instead
-                // throws MODEL_NOT_FOUND and never reaches this callback.
-                log(`default "${tier}" tier model "${requestedSpec}" unavailable — using the session default`);
-              },
-              onUsage: (u: AgentUsage) => {
-                usage = u;
-              },
-              onHistory: (history: AgentHistoryEntry[]) => {
-                safeCallback("onAgentHistory", options.onAgentHistory, {
-                  id: deltaKey,
-                  label,
-                  phase: assignedPhase,
-                  history,
-                });
-              },
-            });
+            // I2 idle nudge: a retry of an in-budget AGENT_IDLE abort runs the
+            // original prompt + the fixed IDLE_NUDGE (never wall-clock, never
+            // part of hashAgentCall — the hash is precomputed from `prompt`).
+            const attemptPrompt = retryFromIdleAbort ? `${prompt}\n\n${IDLE_NUDGE}` : prompt;
+            // I2 activity bridge: the run's agent label is exposed to the
+            // command-watchdog's per-exec label fn via the shared ALS, so the
+            // shared CommandActivityRegistry records kills under the AGENT
+            // label and the run-level watcher's isStalling(agent.label) bound
+            // actually fires in production (df-5).
+            const runPromise = agentLabelContext.run(label, () =>
+              agentRunner.run(attemptPrompt, {
+                label,
+                // Identifiable name for persisted sessions (persistAgentSessions).
+                sessionName: `workflow:${runId} ${label}`,
+                // V2-QW2(a): the phase this call was assigned at call time, so the
+                // settle ledger record stops carrying phase:undefined. Runtime
+                // metadata only — NEVER part of the resume identity (hashAgentCall's
+                // field set is untouched).
+                provenancePhase: assignedPhase,
+                schema: agentOptions.schema,
+                signal: agentController.signal,
+                instructions: buildAgentInstructions(
+                  assignedPhase,
+                  agentOptions,
+                  agentDef,
+                  resolvedIsolation,
+                  // T2-07: the run's shared-context registry; buildAgentInstructions
+                  // emits the full blob once (first agent) and store-key notes to
+                  // every later agent.
+                  shared,
+                ),
+                model: modelSpec,
+                tier: agentOptions.tier,
+                // T2-03: the run's untagged-agent default tier knob (economy /
+                // inherit:main / literal tier name); undefined lets the
+                // WorkflowAgent fall back to its own constructor/global default.
+                defaultUntaggedTier: options.defaultUntaggedTier,
+                // GAP-2: the run's pipeline stage (clamped 0..1) so the
+                // prompt-aware tier fallback classifies wayfinder/prewalk recon
+                // to the cheap tier. Undefined on non-pipeline runs (unchanged
+                // behavior).
+                pipelineStage,
+                modelRegistry: options.modelRegistry,
+                // Provider pool: the run's pool + this call's sticky key (the
+                // deltaKey) — retry attempts re-acquire the same pinned provider;
+                // settlement (release/spend/limit-event) happens at the final
+                // attempt below, never on recoverable retry-continue.
+                providerPool: options.providerPool,
+                poolStickyKey: deltaKey,
+                toolNames: agentOptions.toolNames ?? agentDef?.tools,
+                disallowedToolNames: agentDef?.disallowedTools,
+                // Typed operation traces: the script line of THIS call (the
+                // differentiator across journal entries) plus the callback that
+                // delivers the per-tool-call {line, op, outcome} traces.
+                scriptLine,
+                onOperations: (traces) => {
+                  operations = traces;
+                },
+                // Prewalk session handoff: chain the handoff session at phase
+                // boundaries (see chainHandoff) so phase N+1 inherits the phase N
+                // trajectory instead of re-reading context.
+                handoff: chainHandoff,
+                onSwap: (info) => {
+                  log(
+                    `${info.reason} swap: execution mode on session ${info.sessionId} ` +
+                      `(${info.fromModel ?? "?"} → ${info.toModel ?? "?"})`,
+                  );
+                },
+                // Per-agent store tools track this agent's writes by the
+                // run-unique deltaKey so the delta can be journaled and replayed
+                // correctly on resume, even when a nested workflow() run shares
+                // this store concurrently with the parent run.
+                systemTools: createAgentStoreTools(store, deltaKey),
+                cwd: runCwd,
+                onModelResolved: (id: string) => {
+                  displayModel = id;
+                },
+                onModelFallback: ({ tier, requestedSpec }: { tier: string; requestedSpec: string }) => {
+                  // Untagged agents' implicit default tier degrading to the session
+                  // default must stay visible in the run's own log/event stream, not
+                  // just a console.warn (#131) — an explicit model/tier pin instead
+                  // throws MODEL_NOT_FOUND and never reaches this callback.
+                  log(`default "${tier}" tier model "${requestedSpec}" unavailable — using the session default`);
+                },
+                onUsage: (u: AgentUsage) => {
+                  usage = u;
+                },
+                onHistory: (history: AgentHistoryEntry[]) => {
+                  safeCallback("onAgentHistory", options.onAgentHistory, {
+                    id: deltaKey,
+                    label,
+                    phase: assignedPhase,
+                    history,
+                  });
+                },
+                // I2 activity bridge (df-3): throttle-forward the session's
+                // activity events (tool_execution_* + message_*) to the manager,
+                // which stamps lastActiveAtMs from them — closing the
+                // "streaming bash output / one long message" idle-detection gaps.
+                onActivity: () => {
+                  safeCallback("onAgentActivity", options.onAgentActivity, { id: deltaKey, label });
+                },
+                // I1 command watchdog: per-run lazy knob supplier threaded into the
+                // agent runner so the worktree-fresh createCodingTools(runCwd) path
+                // (and 'off'-mode raw defaults) also get the watchdog-wrapped bash.
+                commandWatchdog: options.commandWatchdog,
+              }),
+            );
             // After a timeout the run() promise still settles later, rejecting with
             // "aborted" once agentController fires; the race has already resolved,
             // so swallow that to avoid an unhandled rejection.
@@ -3482,6 +3600,32 @@ export async function runWorkflow<T = unknown>(
             return result;
           } catch (error) {
             if (isAborted()) throw error;
+            // I2 idle classification, checked BEFORE the manual-kill gate (an
+            // idle escalation commits to BOTH idleEscalatedCallIds and
+            // killedCallIds, so the more specific marker must win): the idle
+            // watcher aborted this attempt via its own controller.
+            //  - AGENT_IDLE_EXHAUSTED (escalated): thrown like the manual-kill
+            //    gate — never reaches the retry branch, never blind-retried;
+            //    the watcher already flipped the live row.
+            //  - AGENT_IDLE (in-budget): classified as a WorkflowError and
+            //    FALLS THROUGH to the shared settle path so the retry gate
+            //    consumes an IDLE slot (never a provider-outage retry). The
+            //    marker is CONSUMED (deleted) here so a later attempt of the
+            //    same call can never be misclassified by a stale commit.
+            // Both roll back + fold spend exactly like the manual-kill gate.
+            if (agentKillChannel?.idleEscalatedCallIds.has(deltaKey)) {
+              store.discardDelta(deltaKey);
+              if (attemptEnteredRunner) recordTokens(null);
+              throw new WorkflowError(
+                "agent idle budget exhausted (escalated by the idle watcher)",
+                WorkflowErrorCode.AGENT_IDLE_EXHAUSTED,
+                { recoverable: true, agentLabel: label },
+              );
+            }
+            const idleAborted = agentKillChannel?.idleAbortedCallIds.has(deltaKey) ?? false;
+            if (idleAborted) {
+              agentKillChannel?.idleAbortedCallIds.delete(deltaKey);
+            }
             // In-flight kill gate: this attempt's agent was aborted by damage
             // control (kill-agent aborted its controller) — surface the distinct
             // AGENT_KILLED item error instead of the raw abort so it is never
@@ -3509,7 +3653,13 @@ export async function runWorkflow<T = unknown>(
               });
             }
 
-            const workflowError = wrapError(error, { agentLabel: label });
+            const workflowError = idleAborted
+              ? new WorkflowError(
+                  "agent aborted for idling (no progress for the configured idle timeout)",
+                  WorkflowErrorCode.AGENT_IDLE,
+                  { recoverable: true, agentLabel: label },
+                )
+              : wrapError(error, { agentLabel: label });
             settledErrorCode = workflowError.code;
             logger.error(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${workflowError.message}`);
             const tokens = recordTokens(null);
@@ -3525,7 +3675,18 @@ export async function runWorkflow<T = unknown>(
             // result this attempt's writes should be attributed to.
             store.discardDelta(deltaKey);
 
-            if (workflowError.recoverable && attempt < maxAttempts) {
+            if (
+              workflowError.recoverable &&
+              attempt < maxAttempts &&
+              workflowError.code !== WorkflowErrorCode.AGENT_IDLE_EXHAUSTED
+            ) {
+              // I2 idle automation: an AGENT_IDLE failure consumes an IDLE slot;
+              // every other recoverable failure consumes a PROVIDER-OUTAGE slot.
+              // This is the gate that keeps idle retries independent of
+              // agentRetries — the documented default (agentIdleRetries unset +
+              // agentRetries 0) still auto-resumes an idle abort exactly once.
+              const isIdleAbort = workflowError.code === WorkflowErrorCode.AGENT_IDLE;
+              const slotsLeft = isIdleAbort ? idleRetriesLeft : providerRetriesLeft;
               // T2-08 retry spend guard: an attempt that already recorded more
               // than `retryOnlyIfSpendUnder` tokens (per-call override, else the
               // run-level default) is NOT retried — retrying a huge-context
@@ -3542,7 +3703,21 @@ export async function runWorkflow<T = unknown>(
                 log(
                   `agent "${label}" attempt ${attempt}/${maxAttempts} failed spending ${tokens} tokens (retryOnlyIfSpendUnder ${spendGuard}); skipping auto-retry — the agent settles exhausted`,
                 );
+              } else if (slotsLeft <= 0) {
+                log(
+                  `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; ` +
+                    (isIdleAbort
+                      ? "idle-retry budget exhausted — the watcher escalates on the next abort"
+                      : "provider-retry budget exhausted — the agent settles"),
+                );
               } else {
+                if (isIdleAbort) idleRetriesLeft--;
+                else providerRetriesLeft--;
+                // I2 idle nudge: the NEXT attempt (the loop's `continue` below)
+                // runs the ORIGINAL prompt + the fixed IDLE_NUDGE so the model
+                // prefers progress-emitting commands and explicit bash timeouts
+                // (deterministic given config; never part of any resume hash).
+                if (isIdleAbort) retryFromIdleAbort = true;
                 const delayMs = retryBackoffDelayMs(retryBackoffMs, attempt);
                 log(
                   `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying` +

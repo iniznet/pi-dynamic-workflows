@@ -31,6 +31,27 @@ export interface ModelGenerationTokenUsage {
 export enum WorkflowErrorCode {
   /** Agent exceeded timeout. */
   AGENT_TIMEOUT = "AGENT_TIMEOUT",
+  /**
+   * The agent was aborted for idling — no tool-result/token/activity movement
+   * for the run's resolved agentIdleTimeoutMs while an in-budget idle retry
+   * slot remained. Recoverable: the attempt lands in the EXISTING retry loop
+   * (same call index, same precomputed hash) and consumes an IDLE slot only
+   * (idleSlots = agentIdleRetries ?? 1 when the idle timeout is enabled) —
+   * never a provider-outage retry. See AGENT_IDLE_EXHAUSTED for the escalated
+   * form once the idle budget is spent.
+   */
+  AGENT_IDLE = "AGENT_IDLE",
+  /**
+   * The agent was aborted for idling AFTER its idle-retry budget was spent —
+   * the run-level watcher's escalation. Recoverable: true so parallel()/
+   * pipeline() absorb the item exactly like AGENT_KILLED (never run-fatal by
+   * itself); explicitly excluded from the retry branch, so an escalated call
+   * is never blind-retried. Distinct from AGENT_KILLED (a user-directed
+   * kill-agent) so surfaces can tell "idled through its budget" from
+   * "explicitly killed" — the escalation marker names the configured
+   * threshold and budget.
+   */
+  AGENT_IDLE_EXHAUSTED = "AGENT_IDLE_EXHAUSTED",
   /** Workflow was aborted by user. */
   WORKFLOW_ABORTED = "WORKFLOW_ABORTED",
   /** Agent limit exceeded. */
@@ -302,6 +323,16 @@ export function providerUnavailableWorkflowError(text: string | undefined, label
 /** Report whether an unknown failure is a provider-overload checkpoint condition. */
 export function isProviderOverloaded(error: unknown): error is WorkflowError {
   return isWorkflowError(error) && error.code === WorkflowErrorCode.PROVIDER_OVERLOADED;
+}
+
+/** Report whether an unknown failure is an in-budget agent-idle abort. */
+export function isAgentIdle(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.AGENT_IDLE;
+}
+
+/** Report whether an unknown failure is an idle-budget-exhausted escalation. */
+export function isAgentIdleExhausted(error: unknown): error is WorkflowError {
+  return isWorkflowError(error) && error.code === WorkflowErrorCode.AGENT_IDLE_EXHAUSTED;
 }
 
 /**

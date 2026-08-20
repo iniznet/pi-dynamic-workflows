@@ -255,6 +255,21 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
+   * I2 idle automation: the run's resolved per-agent idle timeout (ms), fixed
+   * at start/resume like agentTimeoutMs so a resumed run keeps the watcher
+   * threshold it started with. Absent on legacy runs — resume applies the
+   * manager's CURRENT default for them (same legacy-fallback semantics as
+   * agentTimeoutMs). 0/null = watcher disabled.
+   */
+  agentIdleTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: the run's resolved agent-idle auto-retry budget,
+   * fixed at start/resume like agentRetries. null = conditional default
+   * (1 when the idle timeout is enabled, else 0). An explicit 0 exhausts on
+   * the first idle abort.
+   */
+  agentIdleRetries?: number | null;
+  /**
    * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
    * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
    * auto-resume attempt has been recorded yet.

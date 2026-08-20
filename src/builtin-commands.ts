@@ -16,6 +16,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import type { BuiltinWorkflowInvocation, ExtensionToolsSupplier } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
+import type { CommandWatchdogOptions } from "./command-watchdog.js";
 import { DIFF_EXEC_KILL_SIGNAL, DIFF_EXEC_MAX_BUFFER, DIFF_EXEC_TIMEOUT_MS } from "./diff-exec.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -92,9 +93,10 @@ async function resolveBuiltinOrNotify(
   args: unknown,
   ctx: ExtensionCommandContext,
   extensionTools?: ExtensionToolsSupplier,
+  commandWatchdog?: () => CommandWatchdogOptions | undefined,
 ): Promise<BuiltinWorkflowInvocation | undefined> {
   try {
-    return await requireBuiltin(name).resolve(cwd, args, { extensionTools });
+    return await requireBuiltin(name).resolve(cwd, args, { extensionTools, commandWatchdog });
   } catch (error) {
     ctx.ui.notify(`/${name}: ${error instanceof Error ? error.message : String(error)}`, "warning");
     return undefined;
@@ -109,9 +111,14 @@ export function registerBuiltinWorkflows(
     storage?: WorkflowStorage;
     /** P04: captured extension defs appended to every pattern's task-fit toolset. */
     extensionTools?: ExtensionToolsSupplier;
+    /**
+     * I1 command watchdog: lazy supplier of the resolved watchdog knobs,
+     * threaded into every pattern's task-fit toolset (bash def-swap).
+     */
+    commandWatchdog?: () => CommandWatchdogOptions | undefined;
   },
 ): void {
-  const { cwd, manager, extensionTools } = opts;
+  const { cwd, manager, extensionTools, commandWatchdog } = opts;
   const storage = opts.storage ?? createWorkflowStorage(cwd);
 
   /**
@@ -149,7 +156,14 @@ export function registerBuiltinWorkflows(
         // Resolve through the shared builtin registry (builtin-workflows.ts) so
         // this command and the workflow tool's `name` input always run the exact
         // same generated script and exec context (tools/toolset) for this pattern.
-        const resolved = await resolveBuiltinOrNotify("deep-research", cwd, { question }, ctx, extensionTools);
+        const resolved = await resolveBuiltinOrNotify(
+          "deep-research",
+          cwd,
+          { question },
+          ctx,
+          extensionTools,
+          commandWatchdog,
+        );
         if (!resolved) return;
         startBackground(
           manager,
@@ -176,7 +190,14 @@ export function registerBuiltinWorkflows(
         if (runSavedShadowIfPresent("adversarial-review", args, ctx)) return;
         const task = args.trim();
         if (!task) return ctx.ui.notify("Usage: /adversarial-review <task or question>", "warning");
-        const resolved = await resolveBuiltinOrNotify("adversarial-review", cwd, { task }, ctx, extensionTools);
+        const resolved = await resolveBuiltinOrNotify(
+          "adversarial-review",
+          cwd,
+          { task },
+          ctx,
+          extensionTools,
+          commandWatchdog,
+        );
         if (!resolved) return;
         startBackground(manager, ctx, "adversarial-review", resolved.script, { task });
       },
@@ -276,7 +297,14 @@ export function registerBuiltinWorkflows(
         // diff already truncated here would report itself as not truncated, and the
         // original length is needed for accurate "characters omitted" accounting.
         const reviewArgs = { diff, diffSource, diffTruncated, diffLength: originalLength };
-        const resolved = await resolveBuiltinOrNotify("code-review", cwd, reviewArgs, ctx, extensionTools);
+        const resolved = await resolveBuiltinOrNotify(
+          "code-review",
+          cwd,
+          reviewArgs,
+          ctx,
+          extensionTools,
+          commandWatchdog,
+        );
         if (!resolved) return;
         startBackground(manager, ctx, "code-review", resolved.script, reviewArgs);
       },
@@ -303,6 +331,7 @@ export function registerBuiltinWorkflows(
           { topic, perspectives: rest },
           ctx,
           extensionTools,
+          commandWatchdog,
         );
         if (!resolved) return;
         startBackground(manager, ctx, "multi-perspective", resolved.script);
@@ -322,7 +351,14 @@ export function registerBuiltinWorkflows(
         if (!scope || checks.length === 0) {
           return ctx.ui.notify('Usage: /codebase-audit <scope> "<check1>" ["<check2>" …]', "warning");
         }
-        const resolved = await resolveBuiltinOrNotify("codebase-audit", cwd, { scope, checks }, ctx, extensionTools);
+        const resolved = await resolveBuiltinOrNotify(
+          "codebase-audit",
+          cwd,
+          { scope, checks },
+          ctx,
+          extensionTools,
+          commandWatchdog,
+        );
         if (!resolved) return;
         startBackground(manager, ctx, "codebase-audit", resolved.script);
       },

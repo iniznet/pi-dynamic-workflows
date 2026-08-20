@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type AgentUsage, usageComponentsTotal, type WorkflowAgent } from "./agent.js";
+import { type CommandWatchdogOptions, getCommandWatchdogRegistry } from "./command-watchdog.js";
 import type { SubagentToolDiscovery } from "./discovery.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { closeRunDurableStore, recordProvenance, runDurableStore } from "./durable-store.js";
@@ -26,7 +27,7 @@ import type {
 
 export type { WorkspaceFingerprint } from "./phases/state-machine.js";
 
-import { DEFAULT_MAX_AGENT_RESULT_CHARS } from "./config.js";
+import { DEFAULT_AGENT_IDLE_RETRIES, DEFAULT_AGENT_IDLE_TIMEOUT_MS, DEFAULT_MAX_AGENT_RESULT_CHARS } from "./config.js";
 import {
   buildResumeJournal,
   capJournalBudget,
@@ -230,6 +231,23 @@ interface ManagedRunBase {
    */
   agentRetries?: number;
   /**
+   * I2 idle automation: the run's resolved per-agent idle timeout (ms),
+   * fixed at run start/resume like agentTimeoutMs — a resumed run must keep
+   * the watcher threshold it started with, not re-resolve against the
+   * manager's CURRENT default. 0/null = the run-level idle watcher is
+   * disabled (current behavior). Pure runtime envelope — never part of any
+   * agent() resume hash.
+   */
+  agentIdleTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: the run's resolved agent-idle auto-retry budget,
+   * fixed at run start/resume like agentRetries. null = conditional default
+   * (1 when the idle timeout is enabled, else 0 — resolved once at run start,
+   * never in settings normalization). An explicit 0 exhausts on the first
+   * idle abort.
+   */
+  agentIdleRetries?: number | null;
+  /**
    * Human-approval checkpoints for this run (see RunCheckpoint in
    * run-persistence.ts). The manager carries them in memory and writeRunToDisk
    * persists them with every write — before this field existed, a manager
@@ -387,6 +405,21 @@ export interface ExecOptions {
   /** Retry attempts after recoverable agent failures for this execution. */
   agentRetries?: number;
   /**
+   * I2 idle automation: per-run agent idle timeout (ms) — abort an in-flight
+   * agent call with no tool-result/token/activity movement for this long and
+   * let the EXISTING journaled retry machinery auto-resume it. null/omitted
+   * falls back to the manager default (disabled). SHOULD exceed the 30s soft
+   * hint and sit below agentTimeoutMs when both are configured. Pure runtime
+   * envelope — never part of any agent() resume hash.
+   */
+  agentIdleTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: per-run agent-idle auto-retry budget. null = the
+   * conditional default (1 when the idle timeout is enabled, else 0); an
+   * explicit 0 exhausts on the first idle abort.
+   */
+  agentIdleRetries?: number | null;
+  /**
    * Whether agents that end with a failure (exhausted recoverable retries, or a
    * parallel-absorbed item error) make this run settle failed (journal kept,
    * resumable) instead of completing with silent nulls. Frozen at start like
@@ -516,6 +549,29 @@ export interface WorkflowManagerOptions {
   defaultMaxAgentResultChars?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
+  /**
+   * I2 idle automation: default per-agent idle timeout (ms) for runs that do
+   * not pass their own agentIdleTimeoutMs. null/0 = disabled (current
+   * behavior — no watcher, no auto-resume). SHOULD exceed the 30s soft hint
+   * and sit below defaultAgentTimeoutMs when both are configured. Pure
+   * runtime envelope — never part of any agent() resume hash.
+   */
+  defaultAgentIdleTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: default agent-idle auto-retry budget for runs that do
+   * not pass their own agentIdleRetries. null = conditional (1 when the idle
+   * timeout is enabled, else 0).
+   */
+  defaultAgentIdleRetries?: number | null;
+  /**
+   * I2 idle automation: how often a running execution's idle watcher re-checks
+   * its in-flight agents (ms). The per-run effective interval is clamped to at
+   * most a quarter of the run's agentIdleTimeoutMs so a short timeout is still
+   * checked with useful granularity. Defaults to DEFAULT_IDLE_CHECK_INTERVAL_MS.
+   * Exposed for tests that want to observe the watcher without waiting out the
+   * default interval.
+   */
+  idleCheckIntervalMs?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
   defaultTokenBudget?: number | null;
   /**
@@ -541,6 +597,14 @@ export interface WorkflowManagerOptions {
    * untagged runs.
    */
   defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  /**
+   * I1 command watchdog: lazy supplier of the resolved watchdog knobs, shared
+   * with the toolset-assembly choke point. Forwarded to the agent runner so
+   * EVERY subagent bash def reaches the watchdog-wrapped backend — including
+   * the worktree-fresh createCodingTools(runCwd) path and 'off'-mode raw
+   * defaults that bypass the assembler. Absent → current behavior (no wrap).
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /**
    * Extra tool NAMES to deny in every subagent session, on top of the always-on
    * `workflow`/`workflow_control` defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
@@ -617,10 +681,13 @@ export type WorkflowManagerReloadOptions = Pick<
   | "defaultAgentTimeoutMs"
   | "defaultMaxAgentResultChars"
   | "defaultAgentRetries"
+  | "defaultAgentIdleTimeoutMs"
+  | "defaultAgentIdleRetries"
   | "defaultTokenBudget"
   | "defaultTokenBudgetCountsCacheRead"
   | "toolsets"
   | "defaultTools"
+  | "commandWatchdog"
   | "excludeSubagentTools"
   | "subagentToolDiscovery"
   | "persistAgentSessions"
@@ -685,6 +752,75 @@ const MAX_FULL_AGENT_DETAIL_IN_MEMORY = 50;
  * in-memory copy). The deadline, not a poll, bounds the wait (deterministic).
  */
 const DEFAULT_SETTLE_WATCHDOG_MS = 30_000;
+
+/**
+ * How often a running execution's idle watcher re-checks its in-flight agents
+ * (see armIdleWatchdog). The per-run effective interval is clamped to at most a
+ * quarter of the run's agentIdleTimeoutMs (so a short timeout still gets useful
+ * granularity) and floored at 50ms; `idleCheckIntervalMs` overrides the
+ * default. Exposed for tests that want to observe the watcher without waiting
+ * out the default interval.
+ */
+const DEFAULT_IDLE_CHECK_INTERVAL_MS = 5_000;
+
+/**
+ * Per-execution state of the run-level idle watcher (see armIdleWatchdog).
+ * Host-side ephemeral — never persisted, restarted fresh on resume (the same
+ * contract as the lease heartbeat and lastActiveAtMs): a resumed execution
+ * arms a brand-new watcher with a brand-new budget.
+ *
+ * - `idleKillCounts` is the committed idle-kill budget per call id (deltaKey),
+ *   persisting ACROSS attempts of the same call (design-final.json
+ *   agentIdleAutomation.abortPath) — the escalation threshold is the number of
+ *   aborts, not attempts.
+ * - `idleKilledCallIds` is the abort-storm guard for the CURRENT attempt: an
+ *   already-aborted attempt is never aborted again. Cleared when a retry
+ *   attempt's controller reappears (see idleWatchdogTick's re-observation).
+ * - `abortedControllers` remembers the EXACT controller object the watcher
+ *   aborted per call, so a reappearing controller can be told apart from the
+ *   still-winding-down aborted one (a retry attempt registers a NEW object).
+ * - `escalatedCallIds` marks calls whose budget was exhausted — the watcher
+ *   routes the final abort through the manual-kill channel (killedCallIds) so
+ *   the attempt settles AGENT_KILLED (recoverable, absorbed by parallel()/
+ *   pipeline(), never blind-retried) with a clear escalation marker.
+ */
+interface IdleWatchdogState {
+  /** The run's resolved agent idle timeout (ms). Always > 0 while armed. */
+  idleTimeoutMs: number;
+  /** The run's resolved idle-retry budget (aborts allowed before escalation). */
+  idleRetries: number;
+  /** The per-run effective check interval (ms) — the tick re-arms with this. */
+  checkMs: number;
+  /** Committed idle-kill counter per call id (deltaKey). */
+  idleKillCounts: Map<string, number>;
+  /** Call ids whose CURRENT attempt was idle-aborted. */
+  idleKilledCallIds: Set<string>;
+  /** The controller object the watcher aborted per call id. */
+  abortedControllers: Map<string, AbortController>;
+  /** Call ids escalated (budget exhausted) this execution. */
+  escalatedCallIds: Set<string>;
+}
+
+/**
+ * Deterministic escalation marker (design-final.json agentIdleAutomation.
+ * escalation): a fixed template rendering ONLY configured/counted values — the
+ * resolved agentIdleTimeoutMs, the committed abort count, and the budget.
+ * Never wall-clock, so the text is stable given the same run knobs; it is
+ * surfaced on the run log and the escalated agent's snapshot row (never in
+ * any transcript or resume hash).
+ */
+function buildAgentIdleExhaustedMarker(idleTimeoutMs: number, aborts: number, budget: number): string {
+  return (
+    `[workflow] agent exhausted its idle budget: aborted after ${idleTimeoutMs}ms of inactivity across ` +
+    `${aborts} abort${aborts === 1 ? "" : "s"} (budget ${budget}); raise agentIdleTimeoutMs/agentIdleRetries or ` +
+    `shorten the task`
+  );
+}
+
+/** Deterministic per-abort log line for an in-budget idle kill (no wall-clock). */
+function buildAgentIdleAbortLog(label: string, idleTimeoutMs: number, killNumber: number, budget: number): string {
+  return `[workflow] agent "${label}" idle for ${idleTimeoutMs}ms — aborted by the idle watchdog and auto-resuming (idle kill ${killNumber}/${budget})`;
+}
 
 /**
  * Side-index key for journal upserts: the entry's OWN (runId, index) pair —
@@ -1065,6 +1201,8 @@ export class WorkflowManager extends EventEmitter {
   private settleWatchdogMs: number;
   /** How often a running execution renews its lease (see armLeaseHeartbeat). */
   private leaseRenewIntervalMs: number;
+  /** How often a running execution's idle watcher re-checks agents (see armIdleWatchdog). */
+  private idleCheckIntervalMs: number;
   /** Pending settle watchdogs keyed by runId — see armSettleWatchdog. */
   private settleWatchdogs = new Map<string, { timer: ReturnType<typeof setTimeout>; managed: ManagedRun }>();
   /**
@@ -1072,6 +1210,18 @@ export class WorkflowManager extends EventEmitter {
    * executing run; cleared when its execution settles (disarmLeaseHeartbeat).
    */
   private leaseHeartbeats = new Map<string, { timer: ReturnType<typeof setTimeout>; managed: ManagedRun }>();
+  /**
+   * Active run-level idle watchdogs keyed by runId — see armIdleWatchdog. One
+   * per executing run with the run's resolved idle automation enabled; cleared
+   * when its execution settles (disarmIdleWatchdog). Identity-checked against
+   * the ManagedRun it was armed for like the lease heartbeat, so a superseded
+   * execution's watcher can never abort (or re-arm for) a newer execution of
+   * the same runId.
+   */
+  private idleWatchdogs = new Map<
+    string,
+    { timer: ReturnType<typeof setTimeout>; managed: ManagedRun; state: IdleWatchdogState }
+  >();
   private persistence: RunPersistence;
   private cwd: string;
   private concurrency: number;
@@ -1088,11 +1238,15 @@ export class WorkflowManager extends EventEmitter {
   private defaultAgentTimeoutMs: number | null;
   private defaultMaxAgentResultChars: number | null;
   private defaultAgentRetries: number;
+  private defaultAgentIdleTimeoutMs: number | null;
+  private defaultAgentIdleRetries: number | null;
   private defaultTokenBudget: number | null;
   /** T1-01 budget-gate knob default (see WorkflowManagerOptions). */
   private tokenBudgetCountsCacheRead: boolean;
   private toolsets?: Record<string, () => ToolDefinition[] | Promise<ToolDefinition[]>>;
   private defaultTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
+  /** I1 command watchdog supplier (see WorkflowManagerOptions.commandWatchdog). */
+  private commandWatchdog?: () => CommandWatchdogOptions | undefined;
   private excludeSubagentTools?: string[];
   private subagentToolDiscovery?: SubagentToolDiscovery;
   private persistAgentSessions: boolean;
@@ -1111,10 +1265,13 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultMaxAgentResultChars = options.defaultMaxAgentResultChars ?? DEFAULT_MAX_AGENT_RESULT_CHARS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.defaultAgentIdleTimeoutMs = options.defaultAgentIdleTimeoutMs ?? DEFAULT_AGENT_IDLE_TIMEOUT_MS;
+    this.defaultAgentIdleRetries = options.defaultAgentIdleRetries ?? DEFAULT_AGENT_IDLE_RETRIES;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
     this.toolsets = options.toolsets;
     this.defaultTools = options.defaultTools;
+    this.commandWatchdog = options.commandWatchdog;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     // N01: manager option wins; else the headless/CI env channel; else the
@@ -1126,6 +1283,7 @@ export class WorkflowManager extends EventEmitter {
     this.settleWatchdogMs = options.settleWatchdogMs ?? DEFAULT_SETTLE_WATCHDOG_MS;
     this.leaseRenewIntervalMs =
       options.leaseRenewIntervalMs ?? Math.max(1_000, Math.floor(DEFAULT_RUN_LEASE_TTL_MS / 3));
+    this.idleCheckIntervalMs = options.idleCheckIntervalMs ?? DEFAULT_IDLE_CHECK_INTERVAL_MS;
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
     this.opportunisticWorktreePrune();
@@ -1195,10 +1353,13 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
     this.defaultMaxAgentResultChars = options.defaultMaxAgentResultChars ?? DEFAULT_MAX_AGENT_RESULT_CHARS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
+    this.defaultAgentIdleTimeoutMs = options.defaultAgentIdleTimeoutMs ?? DEFAULT_AGENT_IDLE_TIMEOUT_MS;
+    this.defaultAgentIdleRetries = options.defaultAgentIdleRetries ?? DEFAULT_AGENT_IDLE_RETRIES;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.tokenBudgetCountsCacheRead = options.defaultTokenBudgetCountsCacheRead !== false;
     this.toolsets = options.toolsets;
     this.defaultTools = options.defaultTools;
+    this.commandWatchdog = options.commandWatchdog;
     this.excludeSubagentTools = options.excludeSubagentTools;
     this.subagentToolDiscovery = options.subagentToolDiscovery;
     this.persistAgentSessions = options.persistAgentSessions ?? false;
@@ -1309,6 +1470,9 @@ export class WorkflowManager extends EventEmitter {
       drainTimeoutMs: exec.drainTimeoutMs,
       concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
+      agentIdleTimeoutMs:
+        exec.agentIdleTimeoutMs !== undefined ? exec.agentIdleTimeoutMs : this.defaultAgentIdleTimeoutMs,
+      agentIdleRetries: exec.agentIdleRetries !== undefined ? exec.agentIdleRetries : this.defaultAgentIdleRetries,
       agentTimestamps: new Map(),
       agentsById: new Map(),
       trimmedAgentDetailUpTo: 0,
@@ -1349,6 +1513,8 @@ export class WorkflowManager extends EventEmitter {
         drainTimeoutMs: managed.drainTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
+        agentIdleTimeoutMs: managed.agentIdleTimeoutMs,
+        agentIdleRetries: managed.agentIdleRetries,
       });
     } catch (err) {
       // Nothing was persisted; the entry is discarded. Release the lease and
@@ -1391,6 +1557,10 @@ export class WorkflowManager extends EventEmitter {
     executing.drainTimeoutMs = exec.drainTimeoutMs;
     executing.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
     executing.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
+    executing.agentIdleTimeoutMs =
+      exec.agentIdleTimeoutMs !== undefined ? exec.agentIdleTimeoutMs : this.defaultAgentIdleTimeoutMs;
+    executing.agentIdleRetries =
+      exec.agentIdleRetries !== undefined ? exec.agentIdleRetries : this.defaultAgentIdleRetries;
     this.runs.set(executing.runId, executing);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
@@ -1464,6 +1634,8 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget,
       concurrency,
       agentRetries,
+      agentIdleTimeoutMs,
+      agentIdleRetries,
       retryBackoffMs,
       retryOnlyIfSpendUnder,
       confirm,
@@ -1502,6 +1674,24 @@ export class WorkflowManager extends EventEmitter {
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
       managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
+    // I2 idle automation: same freeze-at-start pattern as agentRetries (see
+    // ManagedRun doc comments) — read the run's frozen values first, so a
+    // resumed run keeps the watcher threshold/budget it started with instead
+    // of re-resolving against the manager's CURRENT defaults. The exec.*
+    // fallbacks are a safety net for direct executeRun callers that skipped
+    // the start paths. 0/null = watcher disabled for this run.
+    const resolvedAgentIdleTimeoutMs =
+      managed.agentIdleTimeoutMs !== undefined
+        ? managed.agentIdleTimeoutMs
+        : agentIdleTimeoutMs !== undefined
+          ? agentIdleTimeoutMs
+          : this.defaultAgentIdleTimeoutMs;
+    const resolvedAgentIdleRetries =
+      managed.agentIdleRetries !== undefined
+        ? managed.agentIdleRetries
+        : agentIdleRetries !== undefined
+          ? agentIdleRetries
+          : this.defaultAgentIdleRetries;
     // Frozen at start like the other knobs (undefined = lenient, never set by
     // the caller; the workflow TOOL sends true/false explicitly).
     const resolvedFailOnExhaustedAgent =
@@ -1552,7 +1742,12 @@ export class WorkflowManager extends EventEmitter {
     // killAgent() feature-detects it — absent on direct runWorkflow embeds,
     // where the kill gates in workflow.ts are no-ops and today's behavior is
     // preserved exactly.
-    const agentKills: AgentKillChannel = { killedCallIds: new Set(), killControllers: new Map() };
+    const agentKills: AgentKillChannel = {
+      killedCallIds: new Set(),
+      idleAbortedCallIds: new Set(),
+      idleEscalatedCallIds: new Set(),
+      killControllers: new Map(),
+    };
     managed.agentKills = agentKills;
     // Lease heartbeat (F01): this execution owns the run's exclusive lease —
     // keep renewing it so a run that outlives DEFAULT_RUN_LEASE_TTL_MS is never
@@ -1560,6 +1755,17 @@ export class WorkflowManager extends EventEmitter {
     // the execution settles (success or failure); a pause()/stop() that already
     // released the lease makes later ticks no-op via the status/isCurrent gates.
     this.armLeaseHeartbeat(managed);
+    // I2 run-level idle watcher (agentIdleAutomation): abort an in-flight
+    // agent call with no tool-result/token/activity movement for the run's
+    // resolved agentIdleTimeoutMs and let the EXISTING journaled retry
+    // machinery auto-resume it (escalating after the idle-retry budget). Armed
+    // ONLY when the run resolved a positive timeout (zero overhead otherwise),
+    // disarmed in the finally below with the lease heartbeat, and identity-
+    // checked against this execution like every other per-run timer.
+    this.armIdleWatchdog(managed, {
+      idleTimeoutMs: resolvedAgentIdleTimeoutMs,
+      idleRetries: resolvedAgentIdleRetries,
+    });
     // N01: workspace change-scope fingerprint — attach the host-side capture
     // (read-only tree hash + git status) to the run's persisted phase state
     // machine so every phase boundary records a forward-only snapshot
@@ -1604,6 +1810,24 @@ export class WorkflowManager extends EventEmitter {
         signal: managed.controller.signal,
         concurrency: resolvedConcurrency,
         agentRetries: resolvedAgentRetries,
+        // I2 idle automation: frozen per-run knobs threaded into the attempt
+        // loop (idleSlots = agentIdleRetries ?? 1 when enabled) so an idle
+        // abort consumes an IDLE slot — never a provider-outage retry.
+        agentIdleTimeoutMs: resolvedAgentIdleTimeoutMs,
+        agentIdleRetries: resolvedAgentIdleRetries,
+        // I2 activity bridge (df-3): stamp the per-agent heartbeat from the
+        // throttled full-session activity stream (streaming bash output / one
+        // long message are NOT message-boundary events, so without this a
+        // productive agent could be idle-aborted).
+        onAgentActivity: ({ id }) => {
+          const owner = managed.agentsById.get(id);
+          if (owner) owner.lastActiveAtMs = Date.now();
+        },
+        // I1 command watchdog: per-run lazy knob supplier forwarded to the
+        // agent runner so the worktree-fresh / 'off'-mode raw default bash
+        // defs also reach the watchdog-wrapped backend (default toolsets are
+        // already wrapped at the toolset-assembly choke point).
+        commandWatchdog: this.commandWatchdog,
         retryBackoffMs,
         // T2-08: pass-through (not frozen — see ExecOptions.retryOnlyIfSpendUnder).
         retryOnlyIfSpendUnder,
@@ -1798,6 +2022,24 @@ export class WorkflowManager extends EventEmitter {
             agent.recoverable = event.recoverable;
             agent.failingOperation = event.failingOperation;
             if (event.model) agent.model = event.model;
+            // I2 idle automation: a call escalated by the idle watcher settles
+            // through the manual-kill channel WITHOUT ever reaching onAgentEnd
+            // (the attempt catch throws AGENT_IDLE_EXHAUSTED before the settle
+            // path), so the escalation row-flip happens in the watcher tick
+            // itself; the row for an in-budget idle kill that exhausts retries
+            // settles here with its AGENT_IDLE code. Either way the call has now
+            // settled — GC its watcher state (idle-abort counters, storm guard,
+            // escalation flag) and any unconsumed channel markers. Host-side
+            // ephemeral by design: a resumed execution re-arms a fresh watcher
+            // anyway.
+            const idleState = this.idleWatchdogs.get(managed.runId)?.state;
+            if (idleState) {
+              idleState.idleKillCounts.delete(event.id);
+              idleState.idleKilledCallIds.delete(event.id);
+              idleState.abortedControllers.delete(event.id);
+              idleState.escalatedCallIds.delete(event.id);
+            }
+            managed.agentKills?.idleAbortedCallIds.delete(event.id);
             // S1-4: a slow agent that ends AFTER newer siblings pushed it out
             // of the retention window must not re-inflate memory — drop its
             // freshly-set full detail immediately, keep the preview.
@@ -2101,6 +2343,9 @@ export class WorkflowManager extends EventEmitter {
       }
       // The execution settled — stop renewing its lease (see armLeaseHeartbeat).
       this.disarmLeaseHeartbeat(managed);
+      // The execution settled — stop the idle watcher (see armIdleWatchdog); a
+      // superseded execution's watcher can never abort a newer execution.
+      this.disarmIdleWatchdog(managed);
       // P06: the run's durable store is run-scoped — unregister it (and any
       // nested-frame stores) now that the execution has fully settled, so a
       // long-lived process never accumulates per-run sinks. The terminal-settle
@@ -2544,6 +2789,193 @@ export class WorkflowManager extends EventEmitter {
   }
 
   /**
+   * Run-level idle watcher (I2 — design-final.json §agentIdleAutomation):
+   * abort an in-flight agent call with no tool-result/token/activity movement
+   * for the run's resolved `agentIdleTimeoutMs` and let the EXISTING journaled
+   * retry machinery auto-resume it. Armed by executeRun() ONLY when the run
+   * resolved a positive timeout (zero overhead otherwise) and disarmed in its
+   * finally, scoped exactly to the execution that owns the run — mirrors
+   * armLeaseHeartbeat's identity-checked bookkeeping, so a superseded
+   * execution's watcher can never abort (or re-arm for) a newer execution of
+   * the same runId. The timer is unref'd so a pending watcher never keeps the
+   * process alive on its own.
+   *
+   * The idle-retry budget is resolved once here at run start (idle-retries-
+   * conditional-default): `agentIdleRetries ?? 1` when the timeout is enabled.
+   * Watcher state is host-side ephemeral — never persisted, restarted fresh
+   * on resume (the same contract as the lease heartbeat / lastActiveAtMs), so
+   * resume replay can never diverge from a live run's kill accounting.
+   */
+  private armIdleWatchdog(
+    managed: ExecutingRun,
+    knobs: { idleTimeoutMs: number | null | undefined; idleRetries: number | null | undefined },
+  ): void {
+    const idleTimeoutMs = knobs.idleTimeoutMs ?? 0;
+    if (idleTimeoutMs <= 0) return;
+    const existing = this.idleWatchdogs.get(managed.runId);
+    if (existing?.managed === managed) return; // already armed for this execution
+    if (existing) clearTimeout(existing.timer); // superseded execution's watcher — replace it
+    // The per-run effective check interval is clamped to at most a quarter of
+    // the timeout so a short threshold still gets useful granularity.
+    const checkMs = Math.max(50, Math.min(this.idleCheckIntervalMs, Math.floor(idleTimeoutMs / 4)));
+    const state: IdleWatchdogState = {
+      idleTimeoutMs,
+      idleRetries: knobs.idleRetries ?? 1,
+      checkMs,
+      idleKillCounts: new Map(),
+      idleKilledCallIds: new Set(),
+      abortedControllers: new Map(),
+      escalatedCallIds: new Set(),
+    };
+    const timer = setTimeout(() => {
+      this.idleWatchdogTick(managed, state);
+    }, checkMs);
+    timer.unref?.();
+    this.idleWatchdogs.set(managed.runId, { timer, managed, state });
+  }
+
+  /** Cancel a pending idle watcher — called only by the exact execution it was armed for. */
+  private disarmIdleWatchdog(managed: ManagedRun): void {
+    const existing = this.idleWatchdogs.get(managed.runId);
+    if (existing?.managed !== managed) return;
+    clearTimeout(existing.timer);
+    this.idleWatchdogs.delete(managed.runId);
+  }
+
+  /**
+   * Idle watcher tick: re-arm for the next tick, then scan this execution's
+   * in-flight agents. Safety gates, in order:
+   *  - isCurrent/status/run-abort: a settled, superseded, or run-level-aborted
+   *    execution stops watching (a run that is already winding down must not
+   *    burn its agents' idle budgets).
+   *  - manual kill-agent keeps priority: an id already in the kill channel's
+   *    committed set is never touched by the idle watcher.
+   *  - abort-storm guard: a call whose CURRENT attempt was already idle-aborted
+   *    is skipped (its count/budget is settled by the retry outcome).
+   *  - no live controller: a queued call or one resting in retry backoff has
+   *    no attempt to abort — skipped (mirrors the queued-kill gate).
+   *  - threshold: idleMs (since the last stamped activity) must clear the
+   *    resolved timeout, OR the attempt is stalling (df-5 — K consecutive
+   *    command idle-kills this attempt, read from the shared command-activity
+   *    registry) in which case the hard churn bound fires even while tool
+   *    results keep stamping activity.
+   *
+   * The abort itself rides the exact lever a hard timeout uses: the per-attempt
+   * agentController → session.abort → tool signal → tree kill. Commit-before-
+   * abort mirrors kill-agent: idleKillCounts/idleKilledCallIds are written
+   * BEFORE controller.abort(), so the attempt's catch sees the committed state
+   * when the rejection lands. When the committed count has reached the idle
+   * budget, the watcher ESCALATES: the call id is committed to the kill
+   * channel's killedCallIds so the attempt settles AGENT_KILLED (recoverable,
+   * absorbed by parallel()/pipeline(), never blind-retried — the AGENT_IDLE_
+   * EXHAUSTED contract) with a clear deterministic marker on the run log.
+   */
+  private idleWatchdogTick(managed: ExecutingRun, state: IdleWatchdogState): void {
+    try {
+      if (!this.isCurrent(managed) || this.idleWatchdogs.get(managed.runId)?.managed !== managed) return;
+      if (managed.status !== "running" || managed.controller.signal.aborted) {
+        this.disarmIdleWatchdog(managed);
+        return;
+      }
+      // Re-arm for the next tick (the fired timer is one-shot; replace the map
+      // entry so a superseded execution's timer can never fire for us).
+      const nextTimer = setTimeout(() => {
+        this.idleWatchdogTick(managed, state);
+      }, state.checkMs);
+      nextTimer.unref?.();
+      this.idleWatchdogs.set(managed.runId, { timer: nextTimer, managed, state });
+      const channel = managed.agentKills;
+      if (!channel) return;
+      const now = Date.now();
+      const registry = getCommandWatchdogRegistry();
+      // (1) Re-observation (df-2 fresh-grace-per-retry): a controller that
+      // reappears for an idle-aborted call is a RETRY attempt — clear the
+      // abort-storm guard and stamp the fresh per-attempt grace so the retried
+      // attempt runs its full idle window before a second abort. Identity
+      // distinguishes it from the still-winding-down aborted controller (a
+      // retry attempt registers a NEW AbortController object).
+      for (const deltaKey of [...state.idleKilledCallIds]) {
+        const live = channel.killControllers.get(deltaKey);
+        if (live && live !== state.abortedControllers.get(deltaKey)) {
+          state.idleKilledCallIds.delete(deltaKey);
+          state.abortedControllers.delete(deltaKey);
+          const owner = managed.agentsById.get(deltaKey);
+          if (owner) owner.lastActiveAtMs = now;
+        }
+      }
+      for (const agent of managed.agentsById.values()) {
+        if (agent.status !== "running") continue;
+        const deltaKey = agent.callId ?? agent.label;
+        if (channel.killedCallIds.has(deltaKey)) continue; // manual kill keeps priority
+        if (state.idleKilledCallIds.has(deltaKey)) continue; // already aborted this attempt
+        if (state.escalatedCallIds.has(deltaKey)) continue; // escalation settled this call
+        const controller = channel.killControllers.get(deltaKey);
+        if (!controller) continue; // queued / resting between attempts — no live session
+        const count = state.idleKillCounts.get(deltaKey) ?? 0;
+        // df-5 hard bound: a stalling attempt (K consecutive command idle-kills
+        // this attempt, per the shared registry) is aborted even while tool
+        // results flow — otherwise the kill/rerun churn would stamp activity
+        // forever and shield the attempt from this watcher.
+        const stalling = registry.isStalling(agent.label);
+        const idleMs = now - (agent.lastActiveAtMs ?? agent.startedAtMs ?? now);
+        if (idleMs < state.idleTimeoutMs && !stalling) continue;
+        if (count >= state.idleRetries) {
+          // Budget exhausted — escalate: commit to the manual-kill channel so
+          // the attempt settles AGENT_IDLE_EXHAUSTED (recoverable, absorbed,
+          // never blind-retried — explicitly excluded from the retry branch)
+          // with the clear marker naming the reason + knobs. The id is ALSO
+          // committed to idleEscalatedCallIds so the attempt's catch can tell
+          // an idle escalation from a user-directed kill-agent (AGENT_KILLED).
+          state.idleKillCounts.set(deltaKey, count + 1);
+          state.escalatedCallIds.add(deltaKey);
+          channel.idleEscalatedCallIds.add(deltaKey);
+          channel.killedCallIds.add(deltaKey);
+          const marker = buildAgentIdleExhaustedMarker(state.idleTimeoutMs, count + 1, state.idleRetries);
+          pushBoundedLog(managed.snapshot.logs, marker);
+          console.warn(`[workflow-manager] idle escalation: ${marker}`);
+          // A killed call never reaches onAgentEnd (the attempt catch throws
+          // AGENT_IDLE_EXHAUSTED before the settle path), so flip the live row
+          // here like reconcileAgentAfterKill does for a manual kill — the failure
+          // must be visible on every surface. Recoverable: true mirrors the
+          // AGENT_IDLE_EXHAUSTED contract (absorbed by fan-outs, never
+          // run-fatal by itself).
+          const owner = managed.agentsById.get(deltaKey);
+          if (owner) {
+            owner.status = "error";
+            owner.error = marker;
+            owner.errorCode = WorkflowErrorCode.AGENT_IDLE_EXHAUSTED;
+            owner.recoverable = true;
+          }
+          controller.abort();
+          continue;
+        }
+        // In-budget idle kill: commit BEFORE abort (same ordering as kill-agent)
+        // so the attempt's catch sees the committed state when the rejection
+        // lands, then abort via the per-attempt controller. The call id is
+        // committed to the channel's idleAbortedCallIds so the catch classifies
+        // the abort AGENT_IDLE (an idle retry slot) instead of a generic
+        // WORKFLOW_ABORTED; the catch consumes (deletes) the marker so a later
+        // attempt of the same call can never be misclassified.
+        state.idleKillCounts.set(deltaKey, count + 1);
+        state.idleKilledCallIds.add(deltaKey);
+        state.abortedControllers.set(deltaKey, controller);
+        channel.idleAbortedCallIds.add(deltaKey);
+        pushBoundedLog(
+          managed.snapshot.logs,
+          buildAgentIdleAbortLog(agent.label, state.idleTimeoutMs, count + 1, state.idleRetries),
+        );
+        controller.abort();
+      }
+    } catch (error) {
+      console.warn(
+        `[workflow-manager] idle watchdog for run ${managed.runId} threw: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * Watchdog callback: the aborted execution never settled within
    * settleWatchdogMs — force-release its run from the in-memory registry (see
    * armSettleWatchdog). Safe for every resting status the run can have at this
@@ -2926,6 +3358,8 @@ export class WorkflowManager extends EventEmitter {
           drainTimeoutMs: managed.drainTimeoutMs,
           concurrency: managed.concurrency,
           agentRetries: managed.agentRetries,
+          agentIdleTimeoutMs: managed.agentIdleTimeoutMs,
+          agentIdleRetries: managed.agentIdleRetries,
           // Why a usage-limit/provider-outage pause happened, so the navigator /
           // a future cold start can show it and (eventually) re-arm resume after
           // the budget refills / the endpoint recovers.
@@ -3320,6 +3754,23 @@ export class WorkflowManager extends EventEmitter {
       concurrency: exec.concurrency !== undefined ? exec.concurrency : (persisted.concurrency ?? this.concurrency),
       agentRetries:
         exec.agentRetries !== undefined ? exec.agentRetries : (persisted.agentRetries ?? this.defaultAgentRetries),
+      // I2 idle automation: same explicit-wins-else-persisted rule as the other
+      // per-run knobs — a resumed run keeps the watcher threshold/budget it
+      // started with, never re-resolving against the manager's CURRENT
+      // defaults. A legacy run without a persisted value falls back to the
+      // manager's current values (same legacy-fallback semantics as
+      // concurrency/agentRetries above). Pure runtime envelope — never part of
+      // any resume hash.
+      agentIdleTimeoutMs:
+        exec.agentIdleTimeoutMs !== undefined
+          ? exec.agentIdleTimeoutMs
+          : persisted.agentIdleTimeoutMs !== undefined
+            ? persisted.agentIdleTimeoutMs
+            : this.defaultAgentIdleTimeoutMs,
+      agentIdleRetries:
+        exec.agentIdleRetries !== undefined
+          ? exec.agentIdleRetries
+          : (persisted.agentIdleRetries ?? this.defaultAgentIdleRetries),
       drainTimeoutMs: exec.drainTimeoutMs !== undefined ? exec.drainTimeoutMs : persisted.drainTimeoutMs,
       // failOnExhaustedAgent is a SAFETY knob and stays frozen at run start —
       // unlike the other knobs there is DELIBERATELY no exec override path:

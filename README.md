@@ -358,6 +358,28 @@ Pausing and resuming a run keeps the limits it started with — `maxAgents`, `ag
 </details>
 
 <details>
+<summary><strong>Idle detection and command watchdog</strong></summary>
+
+Two runtime envelopes catch subagents that stop producing work without failing. Both are settings-gated (off by default, so fresh installs keep the previous behavior) and both are pure runtime behavior — never part of any `agent()` resume hash, so journal replay and edit-and-resume are byte-identical regardless of the knobs.
+
+**Command watchdog (per bash call).** When `commandIdleTimeoutMs` is set, a subagent `bash` command that emits no output for that long is killed via a process-tree abort. Its partial output returns to the SAME agent session as a normal tool result — exit code `null` (the SDK's killed shape, treated as success) followed by a deterministic marker, `[killed: idle Ns — no output within the watchdog budget; process tree aborted]` — and the agent continues its turn and decides next steps. There is no command-level auto-retry (the AI decides); instead, after the first kill in one attempt the marker also names the running kill count and the configured knobs (`… (kill #2 this attempt; knobs: commandIdleTimeoutMs=120000, commandHardTimeoutMs=0)`), so the model can self-correct instead of blind-looping. `commandHardTimeoutMs` is a run-level default bash timeout, forwarded to the bash tool as seconds when the model passes no explicit per-call `timeout` — the model's timeout ALWAYS wins — and clamped to the SDK bash ceiling at resolution. Escalation: three consecutive command-idle kills within a single attempt mark that attempt stalling, and the run-level agent idle watcher aborts it on its next tick — a hard bound on the kill/rerun churn loop.
+
+**Agent idle automation (per agent call).** When `agentIdleTimeoutMs` is set, a run-level watcher aborts an in-flight agent call that shows no tool-result/token/activity movement for that long and auto-resumes it through the existing journaled retry machinery, using a retry budget independent of `agentRetries` (enabling idle never grants extra provider-outage retries). Prefer a value above the 30-second soft idle hint the panel uses for visual dimming and below `agentTimeoutMs` when both are configured. `agentIdleRetries` is that auto-retry budget: unset → 1 when the timeout is enabled (else 0), an explicit `0` exhausts on the first abort (`AGENT_IDLE_EXHAUSTED`). Aborted attempts are retried with a fixed nudge telling the model to prefer progress-emitting commands and explicit bash timeouts for long-running steps.
+
+Configure all four under `~/.pi/workflows/settings.json` (or their `PI_WORKFLOW_*` env overrides — see the table below):
+
+```jsonc
+{
+  "commandIdleTimeoutMs": 120000,  // kill a bash command emitting nothing for 2 min
+  "commandHardTimeoutMs": 0,       // run-level default bash timeout; 0 = off (model timeout always wins)
+  "agentIdleTimeoutMs": 60000,     // abort + auto-resume an agent call idle for 1 min
+  "agentIdleRetries": 2            // auto-retry budget; unset → 1 when enabled, 0 exhausts first abort
+}
+```
+
+</details>
+
+<details>
 <summary><strong>Provider pool (multi-provider load balancing)</strong></summary>
 
 Parallel subagents fan out and can hit a single provider's TPM / concurrent-request limit before the run finishes. The provider pool mixes two or more providers serving the same logical model: each `agent()` acquires ONE provider endpoint up front (weighted routing, per-provider concurrency caps), and that pinned choice never changes for the session.
@@ -468,6 +490,10 @@ Every workflow setting can be overridden per key with a `PI_WORKFLOW_*` environm
 | `defaultConcurrency` | `PI_WORKFLOW_DEFAULT_CONCURRENCY` | integer 1–16 |
 | `providerPool` | `PI_WORKFLOW_PROVIDER_POOL` | full JSON override — see provider pool above |
 | `defaultAgentRetries` | `PI_WORKFLOW_DEFAULT_AGENT_RETRIES` | integer 0–3 |
+| `commandIdleTimeoutMs` | `PI_WORKFLOW_COMMAND_IDLE_TIMEOUT_MS` | positive integer (ms); `null`/empty disables — kill a bash command emitting no output for this long |
+| `commandHardTimeoutMs` | `PI_WORKFLOW_COMMAND_HARD_TIMEOUT_MS` | positive integer (ms); `null`/empty disables — run-level default bash timeout (model timeout wins); clamped to the SDK ceiling |
+| `agentIdleTimeoutMs` | `PI_WORKFLOW_AGENT_IDLE_TIMEOUT_MS` | positive integer (ms); `null`/empty disables — abort + auto-resume an idle agent call |
+| `agentIdleRetries` | `PI_WORKFLOW_AGENT_IDLE_RETRIES` | integer 0+; `null`/empty = conditional (1 when the idle timeout is enabled, else 0) |
 | `progressPanelMode` | `PI_WORKFLOW_PROGRESS_PANEL_MODE` | `compact` / `detailed` |
 | `progressPanelMaxAgents` | `PI_WORKFLOW_PROGRESS_PANEL_MAX_AGENTS` | integer 1–1000 |
 | `persistAgentSessions` | `PI_WORKFLOW_PERSIST_AGENT_SESSIONS` | `true` / `false` |

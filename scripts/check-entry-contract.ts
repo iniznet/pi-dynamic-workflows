@@ -347,10 +347,21 @@ const ENTRY_CONTRACT: Record<string, string> = {
   AGENTS_DIR: "config constant",
   DEFAULT_RETRY_BACKOFF_MS: "config constant (run retry backoff)",
   MAX_RETRY_BACKOFF_MS: "config constant (run retry backoff)",
+  // ── I1 command watchdog knobs (idle-detector) ──
+  DEFAULT_COMMAND_IDLE_TIMEOUT_MS: "config constant (I1 command idle watchdog)",
+  DEFAULT_COMMAND_HARD_TIMEOUT_MS: "config constant (I1 command hard timeout)",
+  MAX_COMMAND_HARD_TIMEOUT_MS: "config constant (I1 SDK timeout ceiling)",
+  DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS: "config constant (I1 kill escalation)",
+  resolveCommandWatchdogOptions: "config helper (I1 knob resolution)",
+  // ── I2 run-level idle automation defaults (idle-detector) ──
+  DEFAULT_AGENT_IDLE_TIMEOUT_MS: "config constant (I2 agent idle watcher threshold)",
+  DEFAULT_AGENT_IDLE_RETRIES: "config constant (I2 agent idle retry budget)",
   // ── errors / gate codes (callers switch on these) ──
   WorkflowError: "public error type",
   WorkflowErrorCode: "public error-code enum",
   isWorkflowError: "public guard",
+  isAgentIdle: "public guard (I2 in-budget idle abort)",
+  isAgentIdleExhausted: "public guard (I2 idle-budget escalation)",
   isAbortError: "public guard",
   isTimeoutError: "public guard",
   wrapError: "public helper",

@@ -29,6 +29,7 @@
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "../command-watchdog.js";
 import { createAssemblerSubagentToolDiscovery, type SubagentToolDiscovery } from "../discovery.js";
 import { isExcludedHostTool } from "../gateway/subagent-host-tools.js";
 import type { McpToolsManager } from "./mcp-tools.js";
@@ -40,6 +41,21 @@ export type SubagentToolsMode = "all" | string[];
 export interface SubagentToolsAssemblerOptions {
   /** The effective subagentTools mode, resolved from settings ("all" default). */
   mode: SubagentToolsMode;
+  /**
+   * Workspace the host bundle was built for — needed ONLY to rebuild bash
+   * defs at the watchdog injection (createBashToolDefinition(cwd, …)).
+   * Optional: when absent, the command watchdog is skipped for this toolset
+   * (the watchdog itself is opt-in anyway).
+   */
+  cwd?: string;
+  /**
+   * I1 command watchdog (idle-detector): lazy supplier of the resolved
+   * watchdog knobs, evaluated per assemble() so a settings change between
+   * runs takes effect. When active (idleTimeoutMs>0 || hardTimeoutMs>0),
+   * every bash-named def in the merged toolset has its execute rebound to the
+   * watchdog-wrapped local backend. Undefined → current behavior (no wrap).
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /**
    * The merged host bundle factory (hostToolsPolicy.defaultTools()): coding
    * tools + proxied host tools + web tools. Resolved lazily per assemble().
@@ -110,6 +126,8 @@ function filterDamageControlTools(defs: ToolDefinition[], excludeTools: string[]
 
 export class SubagentToolsAssembler {
   private readonly mode: SubagentToolsMode;
+  private readonly cwd?: string;
+  private readonly commandWatchdog?: () => CommandWatchdogOptions | undefined;
   private readonly hostTools: () => Promise<ToolDefinition[]> | ToolDefinition[];
   private readonly mcpTools: McpToolsManager;
   private readonly chromeTools?: () => ToolDefinition[] | Promise<ToolDefinition[]>;
@@ -119,6 +137,8 @@ export class SubagentToolsAssembler {
 
   constructor(options: SubagentToolsAssemblerOptions) {
     this.mode = options.mode;
+    this.cwd = options.cwd;
+    this.commandWatchdog = options.commandWatchdog;
     this.hostTools = options.hostTools;
     this.mcpTools = options.mcpTools;
     this.chromeTools = options.chromeTools;
@@ -144,8 +164,17 @@ export class SubagentToolsAssembler {
       this.extensionTools?.() ?? [],
       this.damageControlTools?.() ?? [],
     ]);
+    // I1 command watchdog (single delivery choke point at the toolset-assembly
+    // layer): the HOST-ORIGIN bash defs (coding/read-only, created in-process)
+    // get their execute rebound to the watchdog-wrapped local backend when the
+    // resolved knobs are active. Scoped to the host bundle ONLY — a
+    // third-party/MCP def named "bash" (remote server, different semantics)
+    // is never rebind to the local backend, and chrome/extension/damage-control
+    // defs ride along unwrapped. Absent/disabled → thin passthrough.
+    const watchdog = this.commandWatchdog?.();
+    const hostWrapped = watchdog && this.cwd ? applyCommandWatchdogToTools(host, this.cwd, watchdog) : host;
     const merged = [
-      ...host,
+      ...hostWrapped,
       ...filterMcpTools(mcp, this.mode, this.excludeTools),
       ...filterExtensionTools(extension, this.excludeTools),
       ...filterDamageControlTools(damageControl, this.excludeTools),

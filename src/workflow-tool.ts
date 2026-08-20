@@ -4,6 +4,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import type { TSchema } from "typebox";
 import type { ExtensionToolsSupplier } from "./builtin-workflows.js";
 import { BUILTIN_WORKFLOW_NAMES, prepareBuiltinWorkflowArgs, resolveWorkflowInvocation } from "./builtin-workflows.js";
+import type { CommandWatchdogOptions } from "./command-watchdog.js";
 import { MAX_AGENT_RETRIES, MAX_AGENTS_PER_RUN, MAX_CONCURRENCY } from "./config.js";
 import {
   createToolUpdateWorkflowDisplay,
@@ -295,8 +296,24 @@ export interface WorkflowToolOptions {
    * the manager's toolsets map.
    */
   extensionTools?: ExtensionToolsSupplier;
+  /**
+   * I1 command watchdog: lazy supplier of the resolved watchdog knobs, passed
+   * into builtin pattern toolsets (same shape as the assembler's supplier).
+   * Active knobs rebind the pattern's bash def to the watchdog-wrapped local
+   * backend. Absent/disabled → current behavior.
+   */
+  commandWatchdog?: () => CommandWatchdogOptions | undefined;
   /** Default per-agent timeout for runs created by this tool. null means no hard timeout. */
   defaultAgentTimeoutMs?: number | null;
+  /**
+   * I2 idle automation: default per-agent idle timeout (ms) for the fallback
+   * manager this tool builds when no manager is passed (the extension always
+   * passes one). null/0 = disabled. Pure runtime envelope — never part of any
+   * agent() resume hash.
+   */
+  defaultAgentIdleTimeoutMs?: number | null;
+  /** I2 idle automation: default agent-idle auto-retry budget for the fallback manager. */
+  defaultAgentIdleRetries?: number | null;
   /** Default max concurrent agents when no tool-level concurrency is passed. */
   defaultConcurrency?: number;
   /** Default retry attempts after recoverable agent failures. */
@@ -344,6 +361,8 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       loadSavedWorkflow: (name: string) => storage.load(name)?.script,
       defaultAgentTimeoutMs: defaults.agentTimeoutMs,
       defaultAgentRetries: defaults.agentRetries,
+      defaultAgentIdleTimeoutMs: defaults.agentIdleTimeoutMs,
+      defaultAgentIdleRetries: defaults.agentIdleRetries,
     });
 
   return defineTool({
@@ -413,6 +432,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           storage,
           cwd,
           extensionTools: options.extensionTools,
+          commandWatchdog: options.commandWatchdog,
         });
         if (!resolved) {
           throw new Error(
@@ -916,6 +936,8 @@ function resolveWorkflowToolDefaults(
   agentTimeoutMs: number | null;
   concurrency?: number;
   agentRetries: number;
+  agentIdleTimeoutMs: number | null;
+  agentIdleRetries: number | null;
   fanOutApprovalThreshold: number | null | undefined;
 } {
   const settings = loadWorkflowSettings({ cwd });
@@ -926,6 +948,11 @@ function resolveWorkflowToolDefaults(
         : (settings.defaultAgentTimeoutMs ?? null),
     concurrency: options.defaultConcurrency ?? options.concurrency ?? settings.defaultConcurrency,
     agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
+    // I2 idle automation: run-level defaults for the fallback manager this
+    // tool builds when no manager is passed (the extension always passes one;
+    // the extension's own managerOptions carries the same knobs).
+    agentIdleTimeoutMs: options.defaultAgentIdleTimeoutMs ?? settings.agentIdleTimeoutMs ?? null,
+    agentIdleRetries: options.defaultAgentIdleRetries ?? settings.agentIdleRetries ?? null,
     // P12: an explicit tool-level value wins; else the settings key (a null
     // tombstone disables the gate; absent → the run's default threshold).
     fanOutApprovalThreshold:
