@@ -30,7 +30,7 @@ export const PLAN_APPROVAL_STEP_LIMIT_ENV = "PLAN_APPROVAL_STEP_LIMIT";
 export const PLAN_APPROVAL_BYTES_LIMIT_ENV = "PLAN_APPROVAL_BYTES_LIMIT";
 
 /** The two size-route thresholds. A plan is LARGE when either is exceeded. */
-export interface ApprovalLimits {
+interface ApprovalLimits {
   /** Execution step count threshold (steps > stepLimit ⇒ LARGE). */
   stepLimit: number;
   /** Compact serialized byte threshold (bytes > bytesLimit ⇒ LARGE). */
@@ -116,7 +116,7 @@ export function isPlanBig(plan: unknown, overrides?: Partial<ApprovalLimits>): b
  * addressed at `<runId>-c<callIndex>.json` (D-02), so one CLI verdict can
  * never rubber-stamp a LATER checkpoint of the same run.
  */
-export interface CheckpointIdentity {
+interface CheckpointIdentity {
   /** The journaled call index of the checkpoint within its run. */
   callIndex: number;
 }
@@ -127,12 +127,12 @@ export interface CheckpointIdentity {
  * `<runId>` — the path the Phase 1 prewalk stage writes (src/phases/prewalk.ts)
  * and `/workflows implement` fans out from.
  */
-export function planFileBase(runId: string, checkpoint?: CheckpointIdentity): string {
+function planFileBase(runId: string, checkpoint?: CheckpointIdentity): string {
   return checkpoint === undefined ? runId : `${runId}-c${checkpoint.callIndex}`;
 }
 
 /** Result of {@link classifyRunPlan}: the effective plan + its size verdict. */
-export interface ClassifiedRunPlan {
+interface ClassifiedRunPlan {
   /** The plan that was measured (the run-plan file content, else the payload). */
   plan: unknown;
   /** Where the measured plan came from. */
@@ -179,7 +179,7 @@ export async function classifyRunPlan(options: {
 }
 
 /** Result of {@link ensurePendingRunPlan}. */
-export interface EnsurePendingRunPlanResult {
+interface EnsurePendingRunPlanResult {
   /** The runId the plan is addressed at (always `<dir>/<runId>.json`). */
   id: string;
   /** True when a plan file was written/augmented; false on a decided no-op. */

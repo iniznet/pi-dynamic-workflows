@@ -10,7 +10,7 @@ const SKILL_ROOT = "skills/workflow-authoring";
 const SKILL_PATH = `${SKILL_ROOT}/SKILL.md`;
 
 /** Canonical task profiles used for stable byte-based on-demand context measurements. */
-export const WORKFLOW_AUTHORING_PROFILES = [
+const WORKFLOW_AUTHORING_PROFILES = [
   {
     name: "write",
     files: [
@@ -84,12 +84,12 @@ interface ByteSurface {
 }
 
 /** One registered skill's always-on discovery-entry byte cost. */
-export interface SkillDiscoverySurface extends ByteSurface {
+interface SkillDiscoverySurface extends ByteSurface {
   root: string;
 }
 
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
-export interface WorkflowContextMeasurement {
+interface WorkflowContextMeasurement {
   formatVersion: 3;
   encoding: "utf8";
   sources: ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"];

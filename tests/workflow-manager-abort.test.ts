@@ -373,8 +373,14 @@ test(
     // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
 
-    // Wait for the resumed run to complete
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait for the resumed run to complete — poll for the terminal state instead
+    // of a fixed sleep: the pre-pause promise already settled at pause, so the
+    // await above is not a wait for the resumed execution, and the resumed
+    // settle's wall time varies with suite load (a fixed 50ms window flaked the
+    // sibling pause/resume test under cap-2). 5s deadline bounds a real hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run should complete successfully");
@@ -426,8 +432,13 @@ return { a, b }`;
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
 
-      // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
-      await new Promise((r) => setTimeout(r, 50));
+      // Wait for resumed run to complete (agent 1 replayed from journal, agent
+      // 2 live — the shared deferred promise is already resolved, so agent 2
+      // settles as soon as it starts). Poll for the terminal state: the settle
+      // wall time varies with suite load and a fixed sleep flaked under cap-2.
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       const finalRun = manager.getRun(runId);
       assert.equal(finalRun?.status, "completed", "resumed multi-agent run should complete");

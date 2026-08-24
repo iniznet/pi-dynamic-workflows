@@ -48,7 +48,7 @@ export type HostToolsMode = "auto" | "on" | "off";
 /**
  * Options for {@link buildMergedHostTools}.
  */
-export interface MergedHostToolsOptions {
+interface MergedHostToolsOptions {
   /** Workspace the coding tools operate on. */
   cwd: string;
   /**
@@ -164,7 +164,7 @@ export function buildMergedHostTools(pi: ExtensionAPI, options: MergedHostToolsO
   return hostToolsFromDefinitions([...builtins, ...createWebTools(), ...extensionTools], options.sessionManager);
 }
 
-export interface SubagentHostToolsPolicyOptions {
+interface SubagentHostToolsPolicyOptions {
   gateway: HostToolGateway;
   /** Resolved from settings at generation start; defaults to "auto". */
   mode: HostToolsMode;

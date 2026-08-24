@@ -46,6 +46,7 @@ import { generatePlanThenExecuteWorkflow, PLAN_THEN_EXECUTE_NUMERIC_ARGS } from 
 import { injectRemediationLoop } from "./remediation.js";
 import { generateSpecConformanceWorkflow, SPEC_CONFORMANCE_NUMERIC_ARGS } from "./spec-conformance.js";
 import { generateSpecGenerationWorkflow, SPEC_GENERATION_FORMATS } from "./spec-generation.js";
+import { withSubagentReadGuidance } from "./subagent/read-guidance.js";
 import { generateSupervisedRunWorkflow, SUPERVISED_RUN_NUMERIC_ARGS } from "./supervisor.js";
 import { createWebTools } from "./web-tools.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -89,7 +90,7 @@ export type ExtensionToolsSupplier = () => ToolDefinition[] | Promise<ToolDefini
  * toolset-assembly choke point for builtin patterns (agent.ts is out of scope
  * for I1/I2).
  */
-export interface BuiltinWorkflowResolveContext {
+interface BuiltinWorkflowResolveContext {
   extensionTools?: ExtensionToolsSupplier;
   commandWatchdog?: () => CommandWatchdogOptions | undefined;
 }
@@ -181,7 +182,8 @@ export async function builtinToolsetTools(
   // they are the research surface, not names the pattern's subset lists.
   // Deduped against the already-selected defs (first-wins preserved).
   const selectedNames = new Set(watchdogWrapped.map((tool) => tool.name));
-  return [...watchdogWrapped, ...extension.filter((def) => !selectedNames.has(def.name))];
+  // T-02: search-first read nudge on the selected coding defs (idempotent).
+  return withSubagentReadGuidance([...watchdogWrapped, ...extension.filter((def) => !selectedNames.has(def.name))]);
 }
 
 interface BuiltinWorkflowDescriptor {
@@ -528,7 +530,7 @@ export const BUILTIN_WORKFLOWS: readonly BuiltinWorkflowDescriptor[] = [
   {
     name: "supervised-run",
     description:
-      "Delegate a task to a work agent and supervise it: after every settle an economy supervisor agent (pure-reasoning) checks progress against a concrete measurable completion criterion, injects ONE corrective agent on drift/stall, and declares done when the criterion is verified met. args: { task: string, criterion: string, maxRounds?: number }.",
+      "Delegate a task to a work agent and supervise it: after every settle an economy supervisor agent (pure-reasoning) checks progress against a concrete measurable completion criterion, injects ONE corrective agent on drift/stall, and declares done when the criterion is verified met. Prefer a MACHINE-TEST criterion (DS-3): phrase the criterion as something the supervisor can verify mechanically — a grep/find hit, a file existing, a test passing — over a subjective quality judgment. args: { task: string, criterion: string, maxRounds?: number }.",
     async resolve(cwd, args, context) {
       const record = asRecord(args);
       requireNonEmptyString(record.task, "task", "supervised-run");

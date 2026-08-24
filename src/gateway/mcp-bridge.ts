@@ -79,7 +79,7 @@ interface ActiveCall {
  * Propagates to the JSON-RPC response layer, which maps it to the TOOL_TIMEOUT
  * error code so clients can distinguish a timed-out call from a tool failure.
  */
-export class ToolTimeoutError extends Error {
+class ToolTimeoutError extends Error {
   /** JSON-RPC error code for tool timeouts. */
   readonly code: number = TOOL_TIMEOUT;
   /** Name of the tool that missed its deadline. */

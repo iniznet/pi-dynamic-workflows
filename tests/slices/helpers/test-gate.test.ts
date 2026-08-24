@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { machineValidateTest, validateTestGateTests } from "../../../src/test-gate.js";
+import { buildTestGatePrompt, machineValidateTest, validateTestGateTests } from "../../../src/test-gate.js";
 import { runWorkflow } from "../../../src/workflow.js";
 
 /**
@@ -283,4 +283,21 @@ test("validateTestGateTests: rejects malformed assertions and validates regexes"
   assert.throws(() => validateTestGateTests([{ command: "x", assert: { outputMatches: "[" } }], "bash"), TypeError);
   assert.throws(() => validateTestGateTests([{ command: "x", assert: { exitCode: 0 } }], "grep"), TypeError);
   assert.doesNotThrow(() => validateTestGateTests([{ command: "x", assert: { outputMatches: "^a" } }], "bash"));
+});
+
+// ─── DS-7: relay-prompt cap fidelity ─────────────────────────────────────────
+
+test("buildTestGatePrompt: states the 50k output cap so tail assertions behave deterministically (DS-7)", () => {
+  const bash = buildTestGatePrompt({ command: "npm test", assert: { exitCode: 0 } }, "bash");
+  assert.match(bash, /REAL exit status/);
+  assert.match(bash, /FULL standard output verbatim/);
+  assert.match(bash, /caps a captured output at 50000 characters/);
+  assert.match(bash, /leading content wins/);
+  assert.doesNotMatch(bash, /do not truncate/);
+  assert.match(bash, /npm test/);
+
+  const grep = buildTestGatePrompt({ command: "TODO", assert: { outputContains: "x" } }, "grep");
+  assert.match(grep, /grep tool/);
+  assert.match(grep, /EVERY matched line verbatim/);
+  assert.doesNotMatch(grep, /50,000|capped at/);
 });

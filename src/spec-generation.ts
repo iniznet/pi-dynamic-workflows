@@ -127,7 +127,7 @@ export interface SpecGenerationConfig {
  * Defaults: drafts=medium, reviewer=big, markdown writer=small. Baked at
  * generation time so the script text (and resume hashes) is deterministic.
  */
-export interface SpecGenerationTierOptions {
+interface SpecGenerationTierOptions {
   tierDraft?: string;
   tierReview?: string;
   tierWriter?: string;

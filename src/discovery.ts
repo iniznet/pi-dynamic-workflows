@@ -29,7 +29,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { SubagentToolsMode } from "./subagent/subagent-tools-assembler.js";
 
 /** Where a discovered def comes from — the assembler's named-toolset surfaces. */
-export type SubagentToolSourceId = "host" | "mcp" | "extension" | "chrome" | "damage-control";
+type SubagentToolSourceId = "host" | "mcp" | "extension" | "chrome" | "damage-control";
 
 /** One source's defs; a function defers resolution until first use (lazy + cached). */
 export interface SubagentToolRegistrySource {
@@ -38,7 +38,7 @@ export interface SubagentToolRegistrySource {
 }
 
 /** One discoverable tool. `resolvable` = the current run's toolset can hand it to an agent. */
-export interface SubagentToolDescriptor {
+interface SubagentToolDescriptor {
   name: string;
   description: string;
   source: SubagentToolSourceId;
@@ -51,7 +51,7 @@ export interface SubagentToolDescriptor {
 }
 
 /** Result of {@link SubagentToolDiscovery.select} — the route a script hands to agent({ toolNames }). */
-export interface SubagentToolSelection {
+interface SubagentToolSelection {
   capability: string;
   /**
    * Tool names the CURRENT run can actually resolve — safe to pass straight
@@ -70,7 +70,7 @@ export interface SubagentToolSelection {
 }
 
 /** Options for {@link SubagentToolDiscovery}. */
-export interface SubagentToolDiscoveryOptions {
+interface SubagentToolDiscoveryOptions {
   /** Extra tool names to deny (mirrors settings.excludeSubagentTools). */
   excludeTools?: string[];
   /**

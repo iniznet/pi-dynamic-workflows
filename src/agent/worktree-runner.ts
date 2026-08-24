@@ -95,7 +95,7 @@ export interface ImplementTaskSpec {
 }
 
 /** One protocol step's outcome: real boolean + captured output. */
-export interface ImplementStepResult {
+interface ImplementStepResult {
   name: string;
   ok: boolean;
   output: string;
@@ -115,7 +115,7 @@ export interface ImplementProtocolResult {
 }
 
 /** Command/knob overrides for {@link implementProtocol}, sourced from the runner config. */
-export interface ImplementRuntimeOptions {
+interface ImplementRuntimeOptions {
   testCommand?: string;
   typecheckCommand?: string;
   commandTimeoutMs?: number;

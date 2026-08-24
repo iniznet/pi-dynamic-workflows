@@ -32,7 +32,7 @@ export interface NumericArgSpec {
   integer?: boolean;
 }
 
-export interface NumericArgOutcome {
+interface NumericArgOutcome {
   value?: number;
   error?: string;
 }

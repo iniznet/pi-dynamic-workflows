@@ -27,7 +27,7 @@ export const SUBAGENT_SPAWN_BLOCKED = -31002;
 export const APPROVAL_REQUIRED = -31003;
 
 /** A flag that must be true before a phase may be entered. */
-export interface PhasePrerequisite {
+interface PhasePrerequisite {
   /** The state flag acting as the gate. */
   flag: "humanApproved" | "wayfinderComplete" | "prewalkComplete" | "plannotatorSubmitted";
   /** Human-readable reason shown in the gate failure. */
@@ -83,7 +83,7 @@ export interface WorkspaceFingerprint {
  * injects the real capture (tree hash + porcelain status) and the machine
  * persists the result alongside active-state.json.
  */
-export type WorkspaceFingerprintProvider = (phase: PhaseStage) => WorkspaceFingerprint | Promise<WorkspaceFingerprint>;
+type WorkspaceFingerprintProvider = (phase: PhaseStage) => WorkspaceFingerprint | Promise<WorkspaceFingerprint>;
 
 /**
  * N01: the inputs a scope enforcer sees after a forward phase transition — the
@@ -112,7 +112,7 @@ export interface WorkspaceScopeCheck {
  * its documented policy (flag / reject / ui.confirm). The machine itself stays
  * fs/git-free and holds no policy.
  */
-export type WorkspaceScopeEnforcer = (check: WorkspaceScopeCheck) => void | Promise<void>;
+type WorkspaceScopeEnforcer = (check: WorkspaceScopeCheck) => void | Promise<void>;
 
 /**
  * N01: persisted result of a scope assertion at one phase boundary. Written by
@@ -295,7 +295,7 @@ function normalizeScopeViolations(value: unknown): Partial<Record<PhaseStage, Sc
  * synchronous accessors (`canSpawnSubagents`, `assertCanSpawnSubagents`)
  * always reflect the latest persisted snapshot without an extra read.
  */
-export interface WorkflowStateManagerOptions {
+interface WorkflowStateManagerOptions {
   /**
    * Gate transitions on prerequisite flags (PHASE_PREREQUISITES). Off by
    * default: legacy callers that declare stage jumps without running every

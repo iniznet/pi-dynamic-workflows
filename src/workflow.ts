@@ -145,7 +145,7 @@ import { workflowProjectKey, workflowProjectPaths } from "./workflow-paths.js";
  * (never wall-clock), and the global is deliberately NEVER part of any
  * agent() call's resume identity (a cache-hit replay never re-reads the KB).
  */
-export type Recall = (options?: RecallOptions) => Promise<RecallResult>;
+type Recall = (options?: RecallOptions) => Promise<RecallResult>;
 
 /**
  * V2-P04: script-facing cross-run lineage query. `lineage({ runId?,
@@ -155,7 +155,7 @@ export type Recall = (options?: RecallOptions) => Promise<RecallResult>;
  * claim-verify evidence through journaled agent steps (N02 mechanics).
  * Read-only except for the verify path's journaled re-fetch agents.
  */
-export type Lineage = (options?: LineageQueryOptions) => Promise<LineageResult>;
+type Lineage = (options?: LineageQueryOptions) => Promise<LineageResult>;
 
 /**
  * V2-P02: bind the read-only `recall` runtime global for one run frame.
@@ -287,7 +287,7 @@ function bindRunGetReport(options: WorkflowRunOptions): GetRunReport {
  * `getRunReport()` (optionally `{ limit }`) lists recent reports newest-first.
  * Read-only; never part of any resume identity.
  */
-export type GetRunReport = (
+type GetRunReport = (
   runIdOrOptions?: string | { limit?: number },
 ) => Promise<import("./run-report.js").RunReport | null | Array<import("./run-report.js").RunReportSummary>>;
 
@@ -328,7 +328,7 @@ const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
  * `autoApproved` bypasses the P12 large fan-out approval gate (TUI pause /
  * headless abort) for scripts that deliberately run big headless fan-outs.
  */
-export interface FanOutOptions {
+interface FanOutOptions {
   /** Max thunks invoked concurrently (default: MAX_CONCURRENCY). */
   concurrency?: number;
   /** Skip the large fan-out approval gate for this fan-out. */
@@ -363,6 +363,28 @@ const SHARED_CONTEXT_POINTER_PREFIX = "[[ctx:";
 const SHARED_CONTEXT_POINTER_SUFFIX = "]]";
 /** Cap on distinct ctx() blobs per run; past it ctx() degrades to returning the raw text. */
 const MAX_SHARED_CONTEXT_BLOBS = 16;
+
+/**
+ * T-06: per-blob character cap on the FULL shared-ctx text emitted into the
+ * first agent's instructions. The full text stays in the run store (store_get
+ * returns it uncapped) and stays part of the resume identity (the fingerprint
+ * hashes the full blob text) — only the once-per-run instruction copy is
+ * bounded, so a run with a huge objective/scope blob (worst case ~2.5K tok
+ * fresh input) can't blow up the first agent's context. Deterministic slice
+ * with a visible marker; instructions are never part of any resume hash.
+ */
+const MAX_SHARED_CONTEXT_EMIT_CHARS = 4000;
+
+/**
+ * Deterministic cap for a shared-ctx blob's instruction copy (T-06): returns
+ * the text unchanged when it fits, else a 4,000-char head slice with a marker
+ * pointing at the store key so the first agent can read the tail on demand.
+ */
+function capSharedContextEmit(text: string, key: string): string {
+  if (text.length <= MAX_SHARED_CONTEXT_EMIT_CHARS) return text;
+  const marker = `\n… ${text.length - MAX_SHARED_CONTEXT_EMIT_CHARS} characters omitted from this instruction copy — store_get("${key}") returns the full text.`;
+  return `${text.slice(0, MAX_SHARED_CONTEXT_EMIT_CHARS)}${marker}`;
+}
 
 /**
  * I2 idle automation: fixed deterministic retry-prompt nudge appended to the
@@ -743,7 +765,7 @@ export type WorkflowRuntimeEvent =
  * from journal-derived state only (seeded/live spend + declared phase
  * budgets + phase-attributed spend). See evaluateRePlan.
  */
-export interface RePlanForecast {
+interface RePlanForecast {
   /** Tokens spent so far (honors the tokenBudgetCountsCacheRead knob). */
   spent: number;
   /** Sum of unspent declared phase budgets (the remaining plan). */
@@ -4247,10 +4269,50 @@ export async function runWorkflow<T = unknown>(
   };
 
   /**
+   * DS-1: journaled second-model ask. The cross-check reply decides the
+   * agreement/disagreement branch AND the judge pass below, so a resume replay
+   * must reproduce the ORIGINAL answer — a live re-ask could flip the verdict
+   * and desync the journal prefix (the judge call would go missing, everything
+   * downstream would run live, and the resumed run's verify/judgePanel/
+   * consensus result would differ from the original). checkpoint()-style
+   * helper call: consumes its own callIndex + identity hash, replays the
+   * journaled reply on a cache hit, and journals the live reply on a miss.
+   * Deliberately NOT an agent() call: consumes no agent slot and never touches
+   * shared.spent/tokenUsage (the economy-tier no-double-charge invariant stays
+   * intact — only the "journals nothing" clause of model-crosscheck.ts's doc
+   * flips).
+   */
+  const journaledCrosscheckAsk = async (question: string, modelSpec: string): Promise<string | null> => {
+    const callIndex = state.callSeq++;
+    const callHash = hashCrosscheckAsk(question, modelSpec);
+    const journalKey = journalEntryKey(runId, callIndex);
+    const cached = options.resumeJournal?.get(journalKey);
+    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+      return cached.result as string | null;
+    }
+    if (cached == null || cached.hash !== callHash) {
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+      // A cross-check miss is a live boundary too — the calls that follow it
+      // run live against the store, so apply the buffered replay deltas now.
+      flushReplayDeltas();
+    }
+    const reply = await modelCrosschecker.ask(question, modelSpec);
+    safeCallback("onAgentJournal", options.onAgentJournal, {
+      index: callIndex,
+      runId,
+      hash: callHash,
+      result: reply,
+    });
+    return reply;
+  };
+
+  /**
    * Shared cross-check driver: ask the second model, compare, and on
    * disagreement run the caller-supplied judge pass. Returns null when the
    * second model is unavailable — the helper then falls back to its primary
-   * verdict (graceful fallback, never silent: the skip is logged).
+   * verdict (graceful fallback, never silent: the skip is logged). The ask is
+   * journaled (see journaledCrosscheckAsk) so resume replay reproduces the
+   * original cross-check outcome byte-identically.
    */
   const runDistinctModelCrosscheck = async (request: {
     /** The independent question for the second model (no primary tally leaked). */
@@ -4274,7 +4336,9 @@ export async function runWorkflow<T = unknown>(
       helper: "crosscheck",
     });
     try {
-      const reply = await modelCrosschecker.ask(request.question, request.modelSpec);
+      // DS-1: journaled ask — replay reuses the original reply instead of a
+      // live re-ask (which could flip the branch and desync the journal).
+      const reply = await journaledCrosscheckAsk(request.question, request.modelSpec);
       const crossVerdict = parseCrosscheckVerdict(reply);
       if (crossVerdict === null) {
         log(
@@ -5137,6 +5201,9 @@ export async function runWorkflow<T = unknown>(
    * resumed run replays cached agent() calls fast, so the same timeboxed() call
    * may NOT time out where the original run did. Treat it as steering, never
    * as part of run identity; never embed elapsed values in prompts/hashes.
+   * DS-2: never BRANCH on timeboxed()/elapsedMs() output — pass timing bounds
+   * through args and report the expiry as an outcome. Same wall-clock rule for
+   * elapsedMs() (see its doc): elapsed values are never resume identity.
    */
   const timeboxed = async <T>(
     fn: (context: { elapsed: () => number; remaining: () => number; expired: () => boolean }) => Promise<T> | T,
@@ -6499,6 +6566,21 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
 }
 
 /**
+ * DS-1: stable identity hash of one distinct-model cross-check ask — the
+ * resume-replay cache key for the journaled second-model question. Fixed-field
+ * canonical JSON over exactly the inputs that shape the reply (the question
+ * text and the model spec), so an unchanged ask replays the ORIGINAL answer
+ * while an edited question (or a different second model) is a journal miss and
+ * re-asks live. NOT the routing-policy identity: ROUTING_POLICY_VERSION stays
+ * part of hashAgentCall (see its doc) and is deliberately NOT folded in here —
+ * the cross-check ask is not a routing-policy default, so a policy bump must
+ * not invalidate every journaled cross-check answer.
+ */
+function hashCrosscheckAsk(question: string, modelSpec: string): string {
+  return createHash("sha256").update(JSON.stringify({ question, modelSpec })).digest("hex");
+}
+
+/**
  * Stable identity hash for a checkpoint() call — a cache miss on resume when
  * anything that could change its outcome changes. Must cover every
  * CheckpointOptions field that participates in the outcome, not just
@@ -6833,7 +6915,11 @@ function buildAgentInstructions(
     const contextLines: string[] = [];
     for (const blob of sharedCtx.sharedContext) {
       if (!sharedCtx.sharedContextEmitted) {
-        contextLines.push(`${blob.pointer} — shared run context (${blob.key}):\n${blob.text}`);
+        // T-06: the full text is capped for the once-per-run instruction copy
+        // (the store keeps the uncapped blob — store_get reads the tail).
+        contextLines.push(
+          `${blob.pointer} — shared run context (${blob.key}):\n${capSharedContextEmit(blob.text, blob.key)}`,
+        );
       } else {
         contextLines.push(
           `${blob.pointer} refers to shared run context stored under "${blob.key}" — call store_get("${blob.key}") to read it before doing work when your task references it.`,

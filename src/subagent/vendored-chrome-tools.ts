@@ -86,7 +86,7 @@ function rectText(rect: any): string {
 // ---------------------------------------------------------------------------
 
 /** One label row inside a {@link SnapshotDigest}. */
-export interface SnapshotDigestLabel {
+interface SnapshotDigestLabel {
   uid: string;
   role: string;
   label: string;
@@ -106,7 +106,7 @@ export interface SnapshotDigest {
 }
 
 /** Structured diff produced by {@link diffDigests}; optional fields are present only when changed. */
-export interface SnapshotDigestDiff {
+interface SnapshotDigestDiff {
   url?: { before: string; after: string };
   title?: { before: string; after: string };
   textHashChanged: boolean;
@@ -431,7 +431,7 @@ function workspaceCwd(ctx: ExtensionContext): string {
 /**
  * Options for {@link createVendoredChromeTools}.
  */
-export interface VendoredChromeToolsOptions {
+interface VendoredChromeToolsOptions {
   /**
    * The HOST session key ("session:<hostId>") tagging every bridge action.
    * Wired to the host session id at session_start so all subagent chrome

@@ -107,7 +107,7 @@ export const SPEC_CONFORMANCE_NUMERIC_ARGS: readonly NumericArgSpec[] = [
 ];
 
 /** One mechanical evidence entry for a requirement (fabric-spec acceptance ledger). */
-export interface ConformanceEvidence {
+interface ConformanceEvidence {
   kind: "symbol" | "registration" | "behavior" | "probe";
   target: string;
   detail: string;
@@ -117,7 +117,7 @@ export interface ConformanceEvidence {
 }
 
 /** The normalized spec projection the audit operates on. */
-export interface ConformanceSpec {
+interface ConformanceSpec {
   goal: string;
   requirements: Array<{ id: string; statement: string }>;
 }
@@ -271,20 +271,10 @@ export function conformanceNormalizersSource(): string {
  * Defaults: evidence = medium (symbol/probe work), auditor = medium, report =
  * small (renders machine-computed statuses). Baked at generation time.
  */
-export interface SpecConformanceTierOptions {
+interface SpecConformanceTierOptions {
   tierEvidence?: string;
   tierAudit?: string;
   tierReport?: string;
-}
-
-/** Documentation-only config shape; the generated script reads these from `args` at runtime. */
-export interface SpecConformanceConfig {
-  /** Spec artifact (or spec-generation run result) to audit against. */
-  spec: unknown;
-  /** Workspace sub-path the evidence agents audit (default "."). */
-  workspace?: string;
-  /** Caps how many requirements get an evidence agent. */
-  maxRequirements?: number;
 }
 
 /**

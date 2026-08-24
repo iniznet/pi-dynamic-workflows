@@ -70,19 +70,19 @@ import { workflowProjectKey } from "./workflow-paths.js";
 export const DURABLE_STORE_SCHEMA_VERSION = 1 as const;
 
 /** Subdirectory under getAgentDir() where per-project store files live. */
-export const DURABLE_STORE_SUBDIR = "durable-store";
+const DURABLE_STORE_SUBDIR = "durable-store";
 
 /** Default lock expiry (ms) for one read-modify-write critical section. */
-export const DURABLE_STORE_LOCK_TTL_MS = 10_000;
+const DURABLE_STORE_LOCK_TTL_MS = 10_000;
 
 /** How many exclusive-create attempts before giving up on a busy lock. */
-export const DURABLE_STORE_LOCK_ATTEMPTS = 50;
+const DURABLE_STORE_LOCK_ATTEMPTS = 50;
 
 /** Delay between lock retries (ms). */
-export const DURABLE_STORE_LOCK_RETRY_MS = 20;
+const DURABLE_STORE_LOCK_RETRY_MS = 20;
 
 /** FIFO cap on the putOnce id trail (bounds the persisted writeIds array). */
-export const DURABLE_STORE_MAX_WRITE_IDS = 2_000;
+const DURABLE_STORE_MAX_WRITE_IDS = 2_000;
 
 /**
  * Deterministic provenance clock: a fixed epoch base (never the wall clock)
@@ -145,7 +145,7 @@ export interface ProvenanceEntry {
 }
 
 /** Shape of the persisted store file (versioned). */
-export interface DurableStoreFile {
+interface DurableStoreFile {
   version: number;
   seq: number;
   entries: Record<string, unknown>;
@@ -154,7 +154,7 @@ export interface DurableStoreFile {
   writeIds: string[];
 }
 
-export interface DurableStoreOptions {
+interface DurableStoreOptions {
   /** The run's stable identity; registers the store as the run's provenance sink. */
   runId?: string;
   /** Project-scoped persistence namespace (workflowProjectKey(cwd)). */

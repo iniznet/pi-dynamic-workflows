@@ -7,7 +7,7 @@ export interface WorkflowDeliveryChoiceScenario {
 }
 
 /** Pure scoring result for one captured workflow tool invocation. */
-export interface WorkflowDeliveryChoiceEvaluation {
+interface WorkflowDeliveryChoiceEvaluation {
   passed: boolean;
   resolvedBackground: boolean | null;
   resolvedTokenBudget: number | null;

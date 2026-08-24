@@ -40,13 +40,24 @@ test("deep-research script enforces minSupport deterministically and routes to C
   // (plus the N02 verification artifact).
   assert.match(body, /CONFLICTS JSON/);
   assert.match(body, /return \{ question, queries, supported, conflicts, report, verification \}/);
+  // T-04: the report embeds are capped at a deterministic 4,000 chars each.
+  assert.match(body, /reportEmbed = \(value\) =>/);
+  assert.match(body, /text\.slice\(0, 4000\) \+ '…'/);
+  assert.match(body, /reportEmbed\(supported\)/);
+  assert.match(body, /reportEmbed\(conflicts\)/);
+  assert.match(body, /reportEmbed\(verification\)/);
+  assert.doesNotMatch(body, /SUPPORTED CLAIMS JSON:\\n' \+ JSON\.stringify\(supported\)/);
 });
 
 test("deep-research script caps the embedded source list before JSON.stringify (T1-03)", () => {
   const body = generateDeepResearchWorkflow();
   // The Verify phase computes a deterministic capped projection, then embeds it.
   assert.match(body, /const embeddedSources = \[\]/);
-  assert.match(body, /c\.slice\(0, 397\) \+ '…'/);
+  // DS-5: per-claim truncation cuts at a sentence boundary (never mid-clause).
+  assert.match(body, /const truncateClaim = \(text, cap\) =>/);
+  assert.match(body, /truncateClaim\(c, 400\)/);
+  assert.match(body, /truncateClaim\(c, 200\)/);
+  assert.doesNotMatch(body, /c\.slice\(0, 397\)/);
   assert.match(body, /JSON\.stringify\(embeddedSources\)/);
   assert.match(body, /embedBudget -= size/);
   assert.match(body, /token cap\); tail sources are omitted/);
@@ -202,6 +213,44 @@ test("deep-research: the cross-check source payload is capped for large lists an
     big.logs.some((l) => l.includes("for cross-check (token cap)") && l.includes("60")),
     "capping the embedded source list must be logged, never silent",
   );
+});
+
+// ─── DS-5: sentence-boundary claim truncation ────────────────────────────────
+
+test("deep-research: a >400-char claim is cut at a sentence boundary, never mid-clause (DS-5)", async () => {
+  const longClaim =
+    "Sentence one explains the first fact clearly and completely with full detail. " +
+    "Second sentence continues with more specifics that push this claim well past the four hundred character cap. " +
+    "x".repeat(300);
+  const sources = [{ url: "https://a.example", claims: [longClaim] }];
+  let crossCheckPrompt = "";
+  await runWorkflow(generateDeepResearchWorkflow(), {
+    agent: {
+      async run(prompt: string) {
+        if (prompt.includes("planning web research")) return { queries: ["q"] };
+        if (prompt.includes("Research this query")) return { sources };
+        if (prompt.includes("fact-checking cross-checker")) {
+          crossCheckPrompt = prompt;
+          return { supported: [] };
+        }
+        return "report";
+      },
+    } as never,
+    persistLogs: false,
+    args: { question: "Q?", angles: 2, minSupport: 2 },
+  });
+  const payload = (crossCheckPrompt.split("SOURCES JSON:")[1] ?? "").trim();
+  const parsed = JSON.parse(payload) as Array<{ url: string; claims: string[] }>;
+  const claim = parsed[0]?.claims[0] ?? "";
+  assert.ok(claim.length <= 400, "the embedded claim respects the 400-char cap");
+  assert.ok(claim.endsWith("…"), "the truncation marker is kept");
+  const truncated = claim.slice(0, -1); // drop '…'
+  assert.ok(
+    /[.!?]/.test(truncated),
+    `the cut lands at a sentence boundary, not mid-clause (got: ...${truncated.slice(-40)})`,
+  );
+  assert.ok(claim.includes("Sentence one"), "the first sentence survives intact");
+  assert.ok(claim.length < longClaim.length, "a long claim must actually be truncated (cap fires)");
 });
 
 // ─── T2-05: per-phase tier defaults baked into the generated script ─────────

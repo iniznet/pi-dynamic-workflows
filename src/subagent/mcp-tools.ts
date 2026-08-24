@@ -21,7 +21,7 @@ import { type McpCallResult, McpHttpClient, type McpToolInfo } from "./mcp-clien
 import { loadMcpConfig, type McpServerConfig } from "./mcp-config.js";
 
 /** Options for {@link McpToolsManager}. */
-export interface McpToolsManagerOptions {
+interface McpToolsManagerOptions {
   /** Explicit mcp.json path (passed through to loadMcpConfig). */
   configPath?: string;
   /** Base for resolving a relative configPath (passed through). */

@@ -157,6 +157,73 @@ describe("SubagentToolsAssembler", () => {
     assert.ok(!tools.some((tool) => tool.name.startsWith("chrome_")), "no chrome defs in the default toolset");
   });
 
+  test("T-05: the default 'all' merge skips MCP defs over the 4 KB ceiling; an explicit allowlist keeps them", async () => {
+    const bigSchema = {
+      type: "object",
+      properties: {
+        // A >4 KB description forces the serialized def over MCP_TOOL_DEFS_WARN_BYTES.
+        payload: { type: "string", description: "x".repeat(5000) },
+      },
+    };
+    const server = track(
+      await createMockMcpServer({
+        tools: [
+          { name: "small-tool", inputSchema: { type: "object", properties: {} } },
+          { name: "big-tool", inputSchema: bigSchema },
+        ],
+      }),
+    );
+    const manager = makeManager(server);
+    // Default "all" merge: the oversized def is skipped (bounded by 4 KB).
+    const all = makeAssembler(manager, "all");
+    const allTools = await all.assemble();
+    assert.ok(allTools.some((tool) => tool.name === "mcp_svelte_small-tool"));
+    assert.ok(
+      !allTools.some((tool) => tool.name === "mcp_svelte_big-tool"),
+      "an oversized MCP def must not ride the default untagged merge",
+    );
+    // Explicit allowlist (string[] mode): the guard is OFF so the same def stays.
+    const allow = makeAssembler(manager, ["mcp_svelte_big-tool", "mcp_svelte_small-tool"]);
+    const allowTools = await allow.assemble();
+    assert.ok(
+      allowTools.some((tool) => tool.name === "mcp_svelte_big-tool"),
+      "explicitly-selected per-server tools are never dropped by the size guard",
+    );
+  });
+
+  test("T-02: the merged read def keeps the SDK offset/limit guidance plus the search-first nudge", async () => {
+    const realisticRead = {
+      ...fakeTool("read"),
+      description:
+        "Read the contents of a file. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+    };
+    const assembler = new SubagentToolsAssembler({
+      mode: "all",
+      hostTools: () => [realisticRead, fakeTool("bash")],
+      mcpTools: makeManager(await mcpServerTools()),
+    });
+    const tools = await assembler.assemble();
+    const readDef = tools.find((tool) => tool.name === "read");
+    assert.ok(readDef, "the host bundle read def is present");
+    assert.match(readDef.description, /Use offset\/limit for large files/i);
+    assert.match(readDef.description, /Search first with grep\/find before reading/i);
+    assert.match(readDef.description, /prefer targeted offset\/limit ranges over whole-file reads/i);
+  });
+
+  test("T-08: workflow-authoring guidance BODY text never leaks into assembled tool descriptions", async () => {
+    const assembler = makeAssembler(makeManager(await mcpServerTools()), "all");
+    const tools = await assembler.assemble();
+    const surfaces = tools
+      .flatMap((tool) => [tool.description, tool.promptSnippet ?? "", ...(tool.promptGuidelines ?? [])])
+      .join("\n");
+    // Distinctive guidance BODY phrases from the SHA-locked corpus. The skill
+    // NAME/description stub legitimately appears in read-capable system prompts
+    // (SDK design) — the BODY must not, and these anchors prove it stays lazy.
+    assert.doesNotMatch(surfaces, /Keep work IDs outside helper results that may omit failed agents/i);
+    assert.doesNotMatch(surfaces, /name the deliverable, the constraints that matter, and where to look/i);
+    assert.doesNotMatch(surfaces, /Begin generated supported workflow capabilities/i);
+  });
+
   test("an empty/absent chrome supplier contributes no chrome tools", async () => {
     const none = makeAssembler(makeManager(await mcpServerTools()), "all");
     const tools = await none.assemble();

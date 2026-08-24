@@ -28,6 +28,30 @@ Call `agent(prompt, { label, schema? })`; it returns text, a schema-validated va
 
 When JavaScript reads fields, pass a small plain JSON Schema. Schema noncompliance after repair throws and bypasses agent retries. Catch it only to return an explicit incomplete outcome without reading missing fields. Return objects, arrays, strings, numbers, booleans, and `null`—not functions, promises, cycles, `BigInt`, or runtime handles.
 
+## Task prompts (T-07)
+
+Keep every `agent()` task prompt tight: the prompt text is billed fresh on
+uncached turns and cached on every later one, so long boilerplate is expensive.
+Embed only the decision-relevant facts — name the deliverable, the constraints
+that matter, and where to look. Spill large shared context (objectives, scope,
+reference material) through `ctx()` and embed the pointer instead of the text;
+keep page-length source material in files the agent reads with `read`
+(offset/limit) rather than inlining it. A tight prompt is also a deterministic
+prompt: identical inputs produce identical resume hashes, and a changed prompt
+only invalidates the calls downstream of the change.
+
+## Timing is not deterministic
+
+`timeboxed()` and `elapsedMs()` read the wall clock: the `timedOut` flag,
+`elapsedMs`, and `remaining()` values are timing-dependent, never journaled,
+and never part of any resume hash. Never branch on them — a resumed run
+replays cached `agent()` calls fast, so the same `timeboxed()` call may NOT
+time out where the original run did (and `elapsedMs()` may report a totally
+different elapsed time). Pass timing bounds through `args` (a script-authored
+parameter that IS part of the deterministic identity) and treat a timebox
+expiry as a recoverable, reported outcome — never as a control-flow decision
+or an input to a prompt.
+
 ## Shared context
 
 Fan-out scripts (reviewers, finders, gatherers, per-step verifiers) used to

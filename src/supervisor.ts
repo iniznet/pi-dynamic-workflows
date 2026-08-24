@@ -50,10 +50,10 @@ export const SUPERVISED_RUN_NUMERIC_ARGS: readonly NumericArgSpec[] = [
 export const SUPERVISOR_DEFAULT_MAX_ROUNDS = 5;
 
 /** Stable label prefix for the supervisor's own turns (display only — never hashed). */
-export const SUPERVISOR_LABEL_PREFIX = "supervisor";
+const SUPERVISOR_LABEL_PREFIX = "supervisor";
 
 /** Stable label prefix for corrective agents injected by the supervisor. */
-export const SUPERVISOR_CORRECTION_LABEL_PREFIX = "corrective";
+const SUPERVISOR_CORRECTION_LABEL_PREFIX = "corrective";
 
 /**
  * Structured verdict the supervisor agent must return. A module-level constant

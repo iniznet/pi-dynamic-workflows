@@ -62,7 +62,7 @@ export function safeSetInterval(callback: () => void, ms: number): SafeTimer {
  * one; the default produces the generic `Error` used by the web-tools fetch
  * path.
  */
-export type TimeoutErrorFactory = (ms: number, label: string) => Error;
+type TimeoutErrorFactory = (ms: number, label: string) => Error;
 
 /**
  * Run `promise` with a timeout.

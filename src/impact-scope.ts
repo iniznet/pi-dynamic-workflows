@@ -26,10 +26,10 @@ import { CODE_REVIEW_ANGLES } from "./code-review.js";
 /** Cap on partition slices; more slices are dropped (deterministically, in input order). */
 export const IMPACT_MAX_SLICES = 8;
 /** Cap on scopedFiles/testScope entries per slice. */
-export const IMPACT_MAX_FILES_PER_SLICE = 16;
+const IMPACT_MAX_FILES_PER_SLICE = 16;
 
 /** One parallel work slice of the partition. */
-export interface ImpactScopeSlice {
+interface ImpactScopeSlice {
   /** Stable slice id, unique within the partition. */
   name: string;
   /** What this slice covers. */
@@ -141,11 +141,6 @@ export function normalizeImpactPartitionSource(): string {
   ].join("\n");
 }
 
-/** T2-05: the impact-analysis agent's tier knob (default medium). */
-export interface ImpactAnalysisTierOptions {
-  tierImpact?: string;
-}
-
 /**
  * Emit the vm-embeddable impact-analysis phase source: `phase('Impact
  * Analysis')` + ONE agent call (schema IMPACT_SCHEMA, target baked at
@@ -155,7 +150,7 @@ export interface ImpactAnalysisTierOptions {
  * it defines its own schema and normalizer, so the same fragment can be
  * injected into any generated script.
  */
-export function generateImpactAnalysisPhaseSource(options: { target: string; tierImpact?: string }): string {
+function generateImpactAnalysisPhaseSource(options: { target: string; tierImpact?: string }): string {
   const target = JSON.stringify(options.target);
   const tierImpact = JSON.stringify(options.tierImpact ?? "medium");
   return [
@@ -226,10 +221,10 @@ export function generateImpactAnalysisPhaseSource(options: { target: string; tie
 }
 
 /** One [marker, replacement] pair applied to the generated script. */
-export type ImpactScopeSeam = readonly [marker: string, replacement: string];
+type ImpactScopeSeam = readonly [marker: string, replacement: string];
 
 /** Inputs to {@link injectImpactScopePhase}. */
-export interface ImpactScopeInjection {
+interface ImpactScopeInjection {
   /** The generated base script to wrap (must declare meta.phases + a phase() call). */
   baseScript: string;
   /** Impact-agent prompt target, baked into the phase source at generation time. */

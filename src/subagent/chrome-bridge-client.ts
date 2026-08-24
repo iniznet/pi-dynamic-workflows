@@ -23,14 +23,14 @@
  */
 
 /** Wire-level shape of a bridge `/command` response. */
-export interface BridgeCommandResponse {
+interface BridgeCommandResponse {
   ok?: boolean;
   result?: unknown;
   error?: string;
 }
 
 /** Options for {@link ChromeBridgeClient}. */
-export interface ChromeBridgeClientOptions {
+interface ChromeBridgeClientOptions {
   /** Bridge base URL; defaults to the env-overridable 127.0.0.1:17318. */
   url?: string;
   /** Injectable fetch (test seam); defaults to the global fetch. */
@@ -62,7 +62,7 @@ const DEFAULT_PORT = resolveChromeBridgePort(process.env.PI_CHROME_BRIDGE_PORT);
 export const PI_CHROME_AUTH_GLOBAL_KEY = "__piChromeProfileBridgeAuth__";
 
 /** Shape of the persisted auth grant on globalThis. */
-export interface ChromeAuthGrant {
+interface ChromeAuthGrant {
   until: number | "indefinite";
 }
 

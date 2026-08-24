@@ -113,7 +113,7 @@ export const RENAME_RETRY_ATTEMPTS = 5;
 export const RENAME_RETRY_DELAY_MS = 20;
 
 /** Options for {@link writeJsonFileAtomic}. */
-export interface WriteJsonFileAtomicOptions {
+interface WriteJsonFileAtomicOptions {
   /**
    * Ensure the parent directory exists (recursive mkdir) before writing. Dir
    * semantics stay at the call site: the caller decides whether the parent is

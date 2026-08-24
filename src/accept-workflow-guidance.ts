@@ -6,7 +6,7 @@ import { readLf, WORKFLOW_AUTHORING_FROZEN_FILES } from "./workflow-authoring-co
 const COVERAGE_MANIFEST_PATH = "src/workflow-authoring-coverage.ts";
 
 /** A reviewed frozen-guidance hash transition recorded in the coverage manifest. */
-export interface WorkflowGuidanceAcceptance {
+interface WorkflowGuidanceAcceptance {
   path: string;
   previousSha256: string;
   sha256: string;

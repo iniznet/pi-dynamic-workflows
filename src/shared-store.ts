@@ -35,7 +35,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 
 /** Size / TTL guardrails applied to every store write. */
-export interface SharedStoreLimits {
+interface SharedStoreLimits {
   /** Max live keys; oldest keys are evicted first beyond this. */
   maxKeys?: number;
   /** Approx max total size of all values, in JSON bytes; oldest evicted to stay under. */

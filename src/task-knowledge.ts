@@ -58,14 +58,11 @@ import type { PersistedRunState } from "./run-persistence.js";
 import { listRunReports, readRunReport } from "./run-report.js";
 import { workflowProjectKey, workflowProjectPaths } from "./workflow-paths.js";
 
-/** On-disk schema version of the project knowledge base. */
-export const TASK_KNOWLEDGE_SCHEMA_VERSION = 1 as const;
-
 /** Subdirectory under getAgentDir() where per-project KB files live. */
-export const TASK_KNOWLEDGE_SUBDIR = "task-knowledge";
+const TASK_KNOWLEDGE_SUBDIR = "task-knowledge";
 
 /** The single store key holding the KB entry list (one JSON array). */
-export const TASK_KNOWLEDGE_ENTRIES_KEY = "kb:entries";
+const TASK_KNOWLEDGE_ENTRIES_KEY = "kb:entries";
 
 /**
  * Default evidence-decay window (ms over the durable-store's DETERMINISTIC
@@ -74,19 +71,19 @@ export const TASK_KNOWLEDGE_ENTRIES_KEY = "kb:entries";
  * within this window; 1000 ledger writes past an entry marks it stale (≈ a
  * few research runs). Not wall-clock time — deterministic for a fixed ledger.
  */
-export const EVIDENCE_DECAY_TTL_DEFAULT_MS = 1_000;
+const EVIDENCE_DECAY_TTL_DEFAULT_MS = 1_000;
 
 /** Cap on report artifacts scanned by one recall/lineage query. */
-export const TASK_KNOWLEDGE_REPORT_SCAN_LIMIT = 50;
+const TASK_KNOWLEDGE_REPORT_SCAN_LIMIT = 50;
 
 /** Default hit limit for recall/lineage queries. */
-export const TASK_KNOWLEDGE_DEFAULT_LIMIT = 25;
+const TASK_KNOWLEDGE_DEFAULT_LIMIT = 25;
 
 /** Cap on the context text block a recall result assembles. */
-export const TASK_KNOWLEDGE_CONTEXT_MAX_CHARS = 8_000;
+const TASK_KNOWLEDGE_CONTEXT_MAX_CHARS = 8_000;
 
 /** The distilled-content categories a run contributes to the KB. */
-export type TaskKnowledgeKind = "finding" | "decision" | "constraint" | "summary";
+type TaskKnowledgeKind = "finding" | "decision" | "constraint" | "summary";
 
 /**
  * One structured KB entry: a privacy-safe, content-identified knowledge item
@@ -131,7 +128,7 @@ export interface RecallOptions {
 }
 
 /** One ranked recall hit — a KB entry or a run-report artifact row. */
-export interface RecallHit {
+interface RecallHit {
   kind: "knowledge" | "report";
   id: string;
   runId: string;
@@ -181,7 +178,7 @@ export interface LineageQueryOptions {
 }
 
 /** One ledger entry hit with its deterministic decay verdict. */
-export interface LineageEntryHit {
+interface LineageEntryHit {
   id?: string;
   source?: string;
   file?: string;
@@ -200,7 +197,7 @@ export interface LineageEntryHit {
 }
 
 /** A re-verification outcome for one stale claim-verify entry. */
-export interface LineageVerification {
+interface LineageVerification {
   id: string;
   claim: string;
   previousHash: string;
@@ -211,7 +208,7 @@ export interface LineageVerification {
 }
 
 /** Run context attached to a lineage result (from report artifacts). */
-export interface LineageRunContext {
+interface LineageRunContext {
   runId: string;
   workflowName: string;
   status: string;
@@ -251,7 +248,7 @@ const KNOWLEDGE_STOPWORDS = new Set(
  * alphabetical tiebreak), cap at 12. A pure function of the input — recall
  * ranking and KB entry ids never depend on wall clock or RNG.
  */
-export function extractKnowledgeKeywords(...texts: string[]): string[] {
+function extractKnowledgeKeywords(...texts: string[]): string[] {
   const counts = new Map<string, number>();
   for (const text of texts) {
     for (const raw of String(text ?? "")
@@ -286,7 +283,7 @@ export function taskKnowledgeStorePath(cwd: string): string {
  * is reloaded from disk per open, so host-side writers and in-script readers
  * always see the freshest persisted state.
  */
-export function openTaskKnowledgeStore(cwd: string, fs?: Partial<PersistenceFsLayer>): DurableStore {
+function openTaskKnowledgeStore(cwd: string, fs?: Partial<PersistenceFsLayer>): DurableStore {
   return new DurableStore({
     projectKey: workflowProjectKey(cwd),
     dir: join(getAgentDir(), TASK_KNOWLEDGE_SUBDIR),
@@ -757,7 +754,7 @@ export async function buildRecallResult(cwd: string, options: RecallOptions = {}
  * Read the project's cross-run provenance ledger from disk (the durable-store
  * file shared by every run of the project). Missing/corrupt → empty list.
  */
-export function readProjectLedger(cwd: string): ProvenanceEntry[] {
+function readProjectLedger(cwd: string): ProvenanceEntry[] {
   const projectKey = workflowProjectKey(cwd);
   const file = readDurableStoreFile(projectDurableStorePath(projectKey));
   return file ? file.ledger : [];
@@ -776,7 +773,7 @@ function entryMatchesPattern(entry: ProvenanceEntry, pattern: RegExp): boolean {
  * Never wall-clock — ledger timestamps come from the store's deterministic
  * clock, so the verdict is a pure function of the ledger's own ordering.
  */
-export function decayVerdict(
+function decayVerdict(
   timestamp: string | undefined,
   newestTimestamp: string | undefined,
   ttlMs: number,

@@ -57,7 +57,7 @@ const UNTRUSTED_OPEN = '<fetched-content untrusted="true">';
 const UNTRUSTED_CLOSE = "</fetched-content>";
 
 /** Options shared by both web tools. */
-export interface WebToolOptions {
+interface WebToolOptions {
   /** Per-request deadline; defaults to {@link DEFAULT_TIMEOUT_MS}. */
   timeoutMs?: number;
   /** Injectable fetch implementation (test seam); defaults to the global fetch. */
@@ -266,7 +266,7 @@ export function parseBingResults(html: string, limit: number): Array<{ url: stri
  * stable XML, so results survive Bing HTML redesigns, consent walls, and
  * JS-only markup that would defeat the HTML-scrape parser.
  */
-export function parseRssResults(xml: string, limit: number): Array<{ url: string; title: string }> {
+function parseRssResults(xml: string, limit: number): Array<{ url: string; title: string }> {
   const out: Array<{ url: string; title: string }> = [];
   const seen = new Set<string>();
   for (const m of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {

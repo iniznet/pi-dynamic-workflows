@@ -42,7 +42,7 @@ export interface ClaimEvidencePage {
  * (V2-QW1): the substring-match outcome plus the FNV-1a evidence fingerprint.
  * Same claim + same evidence always produce the same envelope.
  */
-export interface ClaimVerdict {
+interface ClaimVerdict {
   claim: string;
   /** The claim's sorted distinct cited source URLs (the corroboration universe). */
   sources: string[];
@@ -54,7 +54,7 @@ export interface ClaimVerdict {
 }
 
 /** Options for {@link verifyClaimAgainstPages}. */
-export interface VerifyClaimAgainstPagesOptions {
+interface VerifyClaimAgainstPagesOptions {
   /** Per-page fetched-content cap in chars; defaults to 6000 (web_fetch's own cap). */
   maxPageChars?: number;
   /** Optional truncation sink — mirrors capEvidenceText's visible-log contract. */
@@ -238,7 +238,7 @@ export function capEvidenceText(value: unknown, maxChars: number, log?: (message
 }
 
 /** Options for {@link claimVerifySource}. */
-export interface ClaimVerifySourceOptions {
+interface ClaimVerifySourceOptions {
   /**
    * Model tier for the per-claim verification agents. Defaults to "big"
    * (mirrors the cross-check agent's default — verification is the same class

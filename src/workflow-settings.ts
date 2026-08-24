@@ -41,6 +41,16 @@ export interface WorkflowSettings {
    */
   defaultTokenBudget?: number | null;
   /**
+   * T2-03: default tier routing for UNTAGGED agent() calls when no
+   * model-tiers.json is configured (surfaced in settings as DS-4 — previously
+   * only a run/global option on runWorkflow/WorkflowAgent). "economy"
+   * (default) routes through the prompt-aware classifyTask fallback;
+   * "inherit:main" restores the pre-T2-03 session-main-model behavior; any
+   * other string is treated as a literal tier name against the
+   * registry-derived default config.
+   */
+  defaultUntaggedTier?: string;
+  /**
    * T1-01: whether the run token budget counts cache-read traffic. Default
    * true = current behavior (the budget gate reads the full total,
    * input+output+cacheRead+cacheWrite). Set false to make the budget gate
@@ -155,6 +165,15 @@ export interface WorkflowSettings {
    * and subagentChromeTools.
    */
   subagentExtensionTools?: "off" | "on" | ExtensionToolSourceId[];
+  /**
+   * Skill loading for subagent sessions (T-01): "all" (default) keeps the
+   * SDK's installed-skill stubs in every read-capable subagent system prompt
+   * (~3.1 ktok/turn of frontmatter name+description stubs); "none" passes
+   * `noSkills: true` to the shared resource loader so read-capable coding
+   * agents skip the whole stub block (the skill bodies stay lazy-readable via
+   * the read tool on demand). Svelte-editing workflows keep "all".
+   */
+  subagentSkills?: "all" | "none";
   /**
    * Damage-control tools for subagents (design: tasks/damage-control-recovery/
    * DESIGN.md §6): the `workflow_damage_control` toolset (list/status/agents/
@@ -277,6 +296,14 @@ const SETTINGS_SCHEMA: Record<string, readonly SettingsValueType[]> = {
   // Same lenient drop-on-violation style as subagentHostTools: any string
   // passes the type schema; normalizeSettings accepts only "on"/"off".
   subagentChromeTools: ["string"],
+  // Same lenient drop-on-violation style as subagentChromeTools: any string
+  // passes the type schema; normalizeSettings accepts only "all"/"none"
+  // and drops anything else.
+  subagentSkills: ["string"],
+  // DS-4: any non-empty string passes the type schema; normalizeSettings
+  // accepts "economy"/"inherit:main"/a non-empty tier name and drops empty
+  // strings (lenient drop-on-violation, same style as subagentSkills).
+  defaultUntaggedTier: ["string"],
   // "on" (string) or a source-id allowlist (array); lenient drop-on-violation,
   // same style as subagentTools. normalizeSettings accepts only the exact
   // literal "on"/"off" and drops other strings.
@@ -536,6 +563,14 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   if (raw.subagentChromeTools === "on" || raw.subagentChromeTools === "off") {
     settings.subagentChromeTools = raw.subagentChromeTools;
+  }
+  if (raw.subagentSkills === "all" || raw.subagentSkills === "none") {
+    settings.subagentSkills = raw.subagentSkills;
+  }
+  // DS-4: any non-empty string is a valid tier routing — "economy",
+  // "inherit:main", or a literal tier name from the registry-derived config.
+  if (typeof raw.defaultUntaggedTier === "string" && raw.defaultUntaggedTier.trim().length > 0) {
+    settings.defaultUntaggedTier = raw.defaultUntaggedTier.trim();
   }
   if (
     raw.subagentDamageControlTools === "off" ||

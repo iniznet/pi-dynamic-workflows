@@ -9,7 +9,7 @@ import { WorkflowError, WorkflowErrorCode } from "../errors.js";
 import type { WorkflowStateManager } from "./state-machine.js";
 
 /** Cap on checklist item counts so a blueprint never becomes an unbounded dump. */
-export const BLUEPRINT_ITEM_CAPS = {
+const BLUEPRINT_ITEM_CAPS = {
   preconditions: 6,
   executionSteps: 8,
   // The fail-safe set is a closed enum of exactly six kinds (FAIL_SAFE_KINDS),
@@ -23,10 +23,10 @@ export const BLUEPRINT_ITEM_CAPS = {
  * the set closed prevents a blueprint from omitting a failure class the PRD
  * mandates (timeouts and API errors must always carry explicit fallback).
  */
-export const FAIL_SAFE_KINDS = ["test-runner", "typecheck", "scope-creep", "ci", "timeout", "api-error"] as const;
+const FAIL_SAFE_KINDS = ["test-runner", "typecheck", "scope-creep", "ci", "timeout", "api-error"] as const;
 
 /** One of the closed fail-safe trigger kinds. */
-export type FailSafeKind = (typeof FAIL_SAFE_KINDS)[number];
+type FailSafeKind = (typeof FAIL_SAFE_KINDS)[number];
 
 /** Explicit fallback logic bound to one failure trigger. */
 export interface FailSafeProcedure {
@@ -114,6 +114,15 @@ const FAIL_SAFE_KIND_LABELS: Record<FailSafeKind, string> = {
  * numbered directive ready for the plannotator review page. Rendering is total
  * — hand-edited or legacy blueprints still produce the four headers, with the
  * items they actually carry.
+ *
+ * DS-8 (identity-unsafe): toMarkdown RENDERS the blueprint's `id` (a
+ * randomUUID) and `createdAt` (a wall-clock timestamp) INTO its output. The
+ * artifact itself is fine, but if this render is ever embedded into an agent
+ * prompt (a report body, a review input, a prewalk briefing), those two fields
+ * make the prompt NON-deterministic — a different run would emit a different
+ * id/createdAt and every downstream resume hash would miss. Never feed this
+ * output to an agent without stripping id/createdAt (or deriving the step ids
+ * from content, claim-verify style).
  */
 export function toMarkdown(blueprint: ExecutionBlueprint): string {
   const lines: string[] = [];
@@ -184,7 +193,7 @@ interface CodebaseSignals {
  * Mine a codebase summary for tooling/stack signals the checklist can build on.
  * Pure best-effort keyword matching — an empty summary yields generic defaults.
  */
-export function detectCodebaseSignals(codebaseSummary: string): CodebaseSignals {
+function detectCodebaseSignals(codebaseSummary: string): CodebaseSignals {
   const text = codebaseSummary.toLowerCase();
   const find = (patterns: string[]): string | undefined => patterns.find((p) => text.includes(p));
   const signal: CodebaseSignals = {
@@ -373,7 +382,7 @@ export async function saveBlueprint(blueprint: ExecutionBlueprint, dir: string):
 }
 
 /** Options for the run-entry Phase 1 stage (see runPrewalkStage). */
-export interface PrewalkStageOptions {
+interface PrewalkStageOptions {
   /** Persisted phase state machine: prewalk is gated on wayfinderComplete. */
   stateManager: WorkflowStateManager;
   /** The task the blueprint plans (used as the blueprint title). */

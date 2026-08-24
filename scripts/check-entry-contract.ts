@@ -73,6 +73,7 @@ const ENTRY_CONTRACT: Record<string, string> = {
   DEFAULT_REPLAN_THRESHOLD: "V2-P11 re-plan forecast threshold default (config + runtime share it)",
   DEFAULT_SUBAGENT_EXTENSION_TOOLS:
     "P04 default knob for subagentExtensionTools (extension entry + settings UI share it)",
+  DEFAULT_SUBAGENT_SKILLS: "T-01 default knob for subagentSkills (agent resource-loader entry + settings UI share it)",
   workflowSettingsFromEnv: "config env override layer (entry-config:i2)",
   WORKFLOW_ENV_PREFIX: "config env override layer (entry-config:i2)",
   WORKFLOW_ENV_VARS: "config env override layer (entry-config:i2)",
@@ -335,7 +336,11 @@ const ENTRY_CONTRACT: Record<string, string> = {
   SupervisorSettleEvent: "W4 P02 settle-tap event type (supervisor.ts, type)",
   SupervisorVerdict: "W4 P02 supervisor verdict type (supervisor.ts, type)",
   DEFAULT_TOKEN_BUDGET: "config constant",
-  DEFAULT_MAX_TOTAL_OUTPUT_CHARS: "V2-QW3 config constant (run-level output ceiling default)",
+  // I1 DC-5 re-classification: retired/legacy consts — zero src reads, kept as
+  // public surface only because index.ts does `export * from ./config.js`.
+  // The live resolvers are resolveMaxTotalOutputChars (workflow.ts:1742) and
+  // resolveCommandWatchdogOptions (extensions/workflow.ts:349/369).
+  DEFAULT_MAX_TOTAL_OUTPUT_CHARS: "retired/legacy — zero src reads; live resolver: resolveMaxTotalOutputChars",
   resolveMaxTotalOutputChars: "V2-QW3 config helper (ceiling resolution: option > env > none)",
   WORKFLOW_RUNS_DIR: "config constant",
   WORKFLOW_SAVED_DIR: "config constant",
@@ -348,8 +353,10 @@ const ENTRY_CONTRACT: Record<string, string> = {
   DEFAULT_RETRY_BACKOFF_MS: "config constant (run retry backoff)",
   MAX_RETRY_BACKOFF_MS: "config constant (run retry backoff)",
   // ── I1 command watchdog knobs (idle-detector) ──
-  DEFAULT_COMMAND_IDLE_TIMEOUT_MS: "config constant (I1 command idle watchdog)",
-  DEFAULT_COMMAND_HARD_TIMEOUT_MS: "config constant (I1 command hard timeout)",
+  // I1 DC-5 re-classification: retired/legacy consts — zero src reads; the live
+  // resolver is resolveCommandWatchdogOptions (extensions/workflow.ts:349/369).
+  DEFAULT_COMMAND_IDLE_TIMEOUT_MS: "retired/legacy — zero src reads; live resolver: resolveCommandWatchdogOptions",
+  DEFAULT_COMMAND_HARD_TIMEOUT_MS: "retired/legacy — zero src reads; live resolver: resolveCommandWatchdogOptions",
   MAX_COMMAND_HARD_TIMEOUT_MS: "config constant (I1 SDK timeout ceiling)",
   DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS: "config constant (I1 kill escalation)",
   resolveCommandWatchdogOptions: "config helper (I1 knob resolution)",

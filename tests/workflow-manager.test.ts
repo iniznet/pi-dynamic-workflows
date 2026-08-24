@@ -1726,8 +1726,14 @@ test(
     // The original promise will reject (its controller was aborted). Suppress it.
     await origPromise.catch(() => {});
 
-    // Wait for the resumed run to complete
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait for the resumed run to complete — poll for the terminal state instead
+    // of a fixed sleep: the pre-pause promise already settled at pause, so the
+    // await above is not a wait for the resumed execution, and the resumed
+    // settle's wall time varies with suite load (a fixed 50ms window flaked the
+    // sibling pause/resume test under cap-2). 5s deadline bounds a real hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run should complete successfully");
@@ -1779,8 +1785,13 @@ return { a, b }`;
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
 
-      // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
-      await new Promise((r) => setTimeout(r, 50));
+      // Wait for resumed run to complete (agent 1 replayed from journal, agent
+      // 2 live — the shared deferred promise is already resolved, so agent 2
+      // settles as soon as it starts). Poll for the terminal state: the settle
+      // wall time varies with suite load and a fixed sleep flaked under cap-2.
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       const finalRun = manager.getRun(runId);
       assert.equal(finalRun?.status, "completed", "resumed multi-agent run should complete");
@@ -1838,7 +1849,13 @@ return { a, b }`;
     limitActive = false;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
-    await new Promise((r) => setTimeout(r, 50));
+    // Poll for the terminal state: the resumed execution's settle wall time
+    // varies with suite load and a fixed sleep flaked under cap-2. The
+    // runner auto-completes both calls once the limit clears, so no external
+    // resolve is needed. 5s deadline bounds a genuine hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run completes once the limit clears");
     assert.equal((finalRun?.result?.result as { a: unknown } | undefined)?.a, "first-result");
@@ -2037,8 +2054,12 @@ test(
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true, "resume should succeed for cold-start persisted run");
 
-    // Wait for the background execution (fake agent resolves instantly)
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait for the background execution (fake agent resolves instantly) — poll
+    // for the settle: the resumed run's completion wall time varies with load,
+    // and a fixed sleep flaked under cap-2. 5s deadline bounds a genuine hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const run = manager.getRun(runId);
     assert.ok(run, "run should be in memory after resume");
@@ -2135,7 +2156,11 @@ test(
     assert.equal(await contender.resume(runId), false, "second manager should be refused by the live lease");
 
     ownerAgent.resolve("done");
-    await new Promise((r) => setTimeout(r, 50));
+    // Poll for the settle — the resumed run's completion wall time varies with
+    // load; a fixed sleep flaked under cap-2 (see the pause/resume test).
+    for (let i = 0; i < 200 && owner.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(owner.getRun(runId)?.status, "completed", "leased owner should still finish");
   }),
 );
@@ -2195,12 +2220,19 @@ test(
     });
 
     assert.equal(await failing.resume(runId), true, "first resume starts");
-    await new Promise((r) => setTimeout(r, 100));
+    // Poll for the failure settle (the runner throws immediately, but the
+    // settle path's wall time varies with load — a fixed sleep flaked under
+    // cap-2). 5s deadline bounds a genuine hang.
+    for (let i = 0; i < 200 && failing.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(failing.getRun(runId)?.status, "failed", "first resume failed");
 
     const retry = new WorkflowManager({ cwd, agent: fakeAgent() });
     assert.equal(await retry.resume(runId), true, "failed run can be resumed after lease release");
-    await new Promise((r) => setTimeout(r, 100));
+    for (let i = 0; i < 200 && retry.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(retry.getRun(runId)?.status, "completed", "retry manager completed the run");
   }),
 );

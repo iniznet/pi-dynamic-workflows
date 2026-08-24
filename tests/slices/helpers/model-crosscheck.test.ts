@@ -8,7 +8,7 @@ import {
   parseCrosscheckVerdict,
   resolveModelForCrosscheck,
 } from "../../../src/model-crosscheck.js";
-import { runWorkflow } from "../../../src/workflow.js";
+import { type JournalEntry, runWorkflow } from "../../../src/workflow.js";
 
 /**
  * W2 P09 — distinctModel multi-model cross-check for verify() / consensus() /
@@ -432,6 +432,121 @@ await judgePanel(['a', 'b'], { judges: 1, distinctModel: 'prov/second' })`,
     },
   );
   assert.equal(agreement.schemaCalls(), 3 + 2 + 2, "only the primary votes/judges are agent() calls");
+});
+
+// ─── DS-1: journaled cross-check (resume determinism + off-ledger budget) ────
+
+const DS1_RUN = "ds1-crosscheck-run";
+
+function ds1Journal(): Map<string, JournalEntry> {
+  return new Map<string, JournalEntry>();
+}
+
+test("distinctModel: a resumed run replays the journaled cross-check (no live re-ask, no branch flip)", async () => {
+  let asks = 0;
+  const cross: ModelCrosschecker = {
+    async ask() {
+      asks++;
+      return "FALSE: not convinced";
+    },
+  };
+  let schemaCalls = 0;
+  const agent = {
+    async run(_prompt: string, o?: { schema?: unknown; model?: string }) {
+      if (!o?.schema) return "ok";
+      schemaCalls++;
+      if (o.model) return { verdict: false, reason: "judge" };
+      return { real: true, reason: "reviewer" };
+    },
+  };
+  const journal = ds1Journal();
+  const base = {
+    agent,
+    modelCrosschecker: cross,
+    persistLogs: false,
+    runId: DS1_RUN,
+    onAgentJournal: (entry: JournalEntry) => journal.set(`${entry.runId ?? DS1_RUN}:${entry.index}`, entry),
+  };
+  const script = `export const meta = { name: 'ds1_resume', description: 'journaled cross-check resume' }
+const r = await verify('claim', { reviewers: 2, distinctModel: 'prov/second' })
+return r`;
+
+  const first = await runWorkflow<{
+    real: boolean;
+    crossCheck?: { agreement: boolean; judged: boolean };
+  }>(script, base);
+  assert.equal(first.result.real, false, "the judge's ruling becomes the final verdict");
+  assert.equal(first.result.crossCheck?.agreement, false);
+  assert.equal(first.result.crossCheck?.judged, true);
+  assert.equal(asks, 1, "first run asks the second model live");
+  const schemaCallsAfterFirst = schemaCalls; // 2 reviewers + 1 judge = 3
+
+  const resumed = await runWorkflow<{
+    real: boolean;
+    crossCheck?: { agreement: boolean; judged: boolean };
+  }>(script, { ...base, resumeJournal: journal });
+  assert.equal(asks, 1, "resume replays the journaled cross-check reply — no live re-ask");
+  assert.equal(schemaCalls, schemaCallsAfterFirst, "the judge pass replays from the journal too");
+  assert.equal(resumed.result.real, first.result.real, "byte-identical outcome on resume");
+  assert.equal(resumed.result.crossCheck?.agreement, first.result.crossCheck?.agreement);
+  assert.equal(resumed.result.crossCheck?.judged, first.result.crossCheck?.judged);
+});
+
+test("distinctModel: a resumed run replays an unavailable cross-check (null reply journaled)", async () => {
+  let asks = 0;
+  const cross: ModelCrosschecker = {
+    async ask() {
+      asks++;
+      return null; // second model unavailable on the live run
+    },
+  };
+  const journal = ds1Journal();
+  const base = {
+    agent: verifyReviewers(true),
+    modelCrosschecker: cross,
+    persistLogs: false,
+    runId: `${DS1_RUN}-fallback`,
+    onAgentJournal: (entry: JournalEntry) =>
+      journal.set(`${entry.runId ?? `${DS1_RUN}-fallback`}:${entry.index}`, entry),
+  };
+  const script = `export const meta = { name: 'ds1_resume_null', description: 'null cross-check resume' }
+const r = await verify('claim', { reviewers: 2, distinctModel: 'prov/dead' })
+return r`;
+
+  const first = await runWorkflow<{ real: boolean; crossCheck?: unknown }>(script, base);
+  assert.equal(first.result.crossCheck, undefined, "unavailable second model falls back to the primary verdict");
+  assert.equal(asks, 1);
+
+  const resumed = await runWorkflow<{ real: boolean; crossCheck?: unknown }>(script, {
+    ...base,
+    resumeJournal: journal,
+  });
+  assert.equal(asks, 1, "the journaled null reply replays — no re-ask on resume");
+  assert.equal(resumed.result.real, first.result.real);
+  assert.equal(resumed.result.crossCheck, first.result.crossCheck);
+});
+
+test("distinctModel: the journaled cross-check participates in the resume journal but never bills the ledger", async () => {
+  const agentEnds: string[] = [];
+  const journal = ds1Journal();
+  const script = `export const meta = { name: 'ds1_budget', description: 'journaled, not billed' }
+await verify('claim', { reviewers: 2, distinctModel: 'prov/second' })
+return 'done'`;
+  const res = await runWorkflow(script, {
+    agent: verifyReviewers(true),
+    modelCrosschecker: crosscheckerOf({ "prov/second": "TRUE" }),
+    persistLogs: false,
+    onAgentEnd: (event) => agentEnds.push(event.label),
+    onAgentJournal: (entry: JournalEntry) => journal.set(`${entry.runId ?? DS1_RUN}:${entry.index}`, entry),
+  });
+  assert.equal(res.result, "done");
+  // 2 reviewers + 1 journaled cross-check ask = 3 journal entries. The ask
+  // must be journaled (deterministic replay) but must NEVER feed the ledger:
+  // onAgentEnd fires once per billing agent (the budget gate's only feed), and
+  // the cross-check ask is not an agent() call, so it adds no event and no
+  // spend — the run ledger sees only the primary votes.
+  assert.ok(journal.size >= 3, "reviewers + journaled cross-check ask are all journaled");
+  assert.equal(agentEnds.length, 2, "only the 2 primary reviewers bill — the cross-check adds no agent, no spend");
 });
 
 test("distinctModel: quality events emit crosscheck start/end around the second-model pass", async () => {

@@ -41,10 +41,10 @@ import { createJiti } from "jiti/static";
 export type ExtensionToolSourceId = "supi-web" | "pi-codegraph" | "pi-vision-handoff";
 
 /** How the `subagentExtensionTools` setting is shaped ("on" | allowlist). */
-export type ExtensionToolsMode = "on" | ExtensionToolSourceId[];
+type ExtensionToolsMode = "on" | ExtensionToolSourceId[];
 
 /** A source's capture outcome (used by the listing command for truthful rows). */
-export type CapturedSourceStatus = "captured" | "not-enabled" | "not-installed" | "unimportable" | "capture-failed";
+type CapturedSourceStatus = "captured" | "not-enabled" | "not-installed" | "unimportable" | "capture-failed";
 
 /** Per-source capture result: defs (when captured) + a status + one-line error. */
 export interface CapturedSourceResult {
@@ -65,7 +65,7 @@ export interface AgentRoots {
 }
 
 /** One capturable extension package. */
-export interface ExtensionToolSource {
+interface ExtensionToolSource {
   readonly id: ExtensionToolSourceId;
   readonly label: string;
   /** Exact tool names this source may contribute (defensive allowlist). */

@@ -86,7 +86,7 @@ export const COMPREHENSION_SCENARIOS: readonly ComprehensionScenario[] = [
 ];
 
 /** Skill discovery and read calls observed while the parent model authored a workflow. */
-export interface SkillLoadingEvidence {
+interface SkillLoadingEvidence {
   discovered: boolean;
   loaded: boolean;
   toolCalls: Array<{ tool: string; path?: string }>;
@@ -340,7 +340,7 @@ const SCENARIO_AGENT_FIXTURES: Readonly<Record<string, ScenarioAgentFixture>> = 
 };
 
 /** Exact requested and resolved model settings recorded for reproducible comparison. */
-export interface ComprehensionModelSelection {
+interface ComprehensionModelSelection {
   requested: string;
   resolved: string;
   thinkingLevel: ModelThinkingLevel | null;
@@ -349,7 +349,7 @@ export interface ComprehensionModelSelection {
 type ComprehensionFailureStage = "generation" | "parse" | "runtime" | "assertion";
 
 /** Versioned evidence from one generated workflow executed against its scenario contract. */
-export interface ComprehensionEvidence {
+interface ComprehensionEvidence {
   formatVersion: 2;
   provider: string;
   modelSelection: ComprehensionModelSelection;
@@ -388,7 +388,7 @@ interface RunComprehensionScenarioBaseOptions {
 }
 
 /** Dependencies and version facts needed to generate and execute one comprehension scenario. */
-export type RunComprehensionScenarioOptions = RunComprehensionScenarioBaseOptions &
+type RunComprehensionScenarioOptions = RunComprehensionScenarioBaseOptions &
   (
     | { modelSelection: ComprehensionModelSelection; model?: never }
     | {

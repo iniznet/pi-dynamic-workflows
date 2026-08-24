@@ -44,20 +44,10 @@ export const DEBUG_LOOP_NUMERIC_ARGS: readonly NumericArgSpec[] = [
  * (a bash relay needs no reasoning tier). Baked at generation time so the
  * script text (and resume hashes) is deterministic per generator version.
  */
-export interface DebugLoopTierOptions {
+interface DebugLoopTierOptions {
   tierHypothesize?: string;
   tierReproduce?: string;
   tierFix?: string;
-}
-
-/** Documentation-only config shape; the generated script reads these from `args` at runtime. */
-export interface DebugLoopConfig {
-  /** Description of the bug to isolate and fix. */
-  bug: string;
-  /** Optional pre-known reproduction command (the hypothesis agent may also name one). */
-  reproduce?: string;
-  /** K rounds of fix→verify rework. */
-  maxRounds?: number;
 }
 
 /**

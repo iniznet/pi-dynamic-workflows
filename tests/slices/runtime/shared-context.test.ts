@@ -146,6 +146,37 @@ test("T2-07: scripts without ctx() are byte-identical — no shared-context sect
   );
 });
 
+test("T-06: an oversized ctx() blob is capped in the instruction copy but fully readable via store_get", async () => {
+  const big = "B".repeat(6000);
+  const instructions: Array<string | undefined> = [];
+  await runWorkflow(
+    ctxScript(`
+const ref = ctx(${JSON.stringify(big)})
+const one = await agent('first ' + ref, { label: 'one' })
+return { one }
+`),
+    {
+      persistLogs: false,
+      agent: {
+        async run(_prompt: string, options?: { instructions?: string }) {
+          instructions.push(options?.instructions);
+          return "ok";
+        },
+      } as never,
+    },
+  );
+  const first = instructions[0];
+  assert.ok(first?.includes("[[ctx:0]]"), "the pointer is still named");
+  assert.ok(
+    first?.includes("characters omitted from this instruction copy") && first?.includes('store_get("wf:ctx:0")'),
+    "the instruction copy reports the deterministic 4K cap, the omitted tail, and the store-key escape hatch",
+  );
+  assert.ok(
+    !first?.includes("B".repeat(4001)),
+    "the instruction copy never carries more than the capped head of the blob",
+  );
+});
+
 // ─── T2-07: resume-hash stability ──────────────────────────────────────────────
 
 function hashScript(blobText: string): string {

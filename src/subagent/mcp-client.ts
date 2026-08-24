@@ -38,7 +38,7 @@ export interface McpCallResult {
 }
 
 /** Options for {@link McpHttpClient}. */
-export interface McpHttpClientOptions {
+interface McpHttpClientOptions {
   /**
    * Per-request deadline for listTools/callTool (ms) — the long bound for
    * actual tool work. Default {@link DEFAULT_TIMEOUT_MS} (30s).
@@ -83,7 +83,7 @@ export class McpTimeoutError extends Error {
 }
 
 /** Internal marker for a dead/expired session (HTTP 404 or session error). */
-export class McpSessionExpiredError extends Error {
+class McpSessionExpiredError extends Error {
   constructor(server: string, detail: string) {
     super(`MCP session for server "${server}" expired or rejected: ${detail}`);
     this.name = "McpSessionExpiredError";

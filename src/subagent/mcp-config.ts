@@ -50,13 +50,13 @@ export interface McpServerConfig {
 }
 
 /** Result of a config load: validated servers plus the path they came from. */
-export interface McpConfig {
+interface McpConfig {
   servers: McpServerConfig[];
   configPath: string;
 }
 
 /** Options for {@link loadMcpConfig}. */
-export interface LoadMcpConfigOptions {
+interface LoadMcpConfigOptions {
   /** Explicit config path; a relative path is resolved against `cwd`. */
   configPath?: string;
   /** Base for resolving a relative `configPath` (defaults to process.cwd()). */

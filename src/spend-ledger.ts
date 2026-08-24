@@ -26,13 +26,13 @@ import { deterministicRunClock, projectDurableStorePath, readDurableStoreFile } 
 import { workflowProjectKey } from "./workflow-paths.js";
 
 /** On-disk schema version of one ledger entry (bump only on a breaking shape change). */
-export const SPEND_LEDGER_SCHEMA_VERSION = 1 as const;
+const SPEND_LEDGER_SCHEMA_VERSION = 1 as const;
 
 /** Durable-store key prefix for per-run spend-ledger entries. */
-export const SPEND_LEDGER_PREFIX = "spendLedger";
+const SPEND_LEDGER_PREFIX = "spendLedger";
 
 /** The deterministic stamp for one run's ledger entry (fixed epoch + runId → stable, ordered by runId). */
-export function spendLedgerTimestamp(runId: string): string {
+function spendLedgerTimestamp(runId: string): string {
   return deterministicRunClock(runId)(0);
 }
 
@@ -42,7 +42,7 @@ export function spendLedgerKey(runId: string): string {
 }
 
 /** Per-phase spend row in a ledger entry. */
-export interface SpendLedgerPhase {
+interface SpendLedgerPhase {
   /** The phase title spend was attributed to (M25 assignment). */
   name: string;
   /** Tokens attributed to this phase across the whole run tree. */
@@ -52,7 +52,7 @@ export interface SpendLedgerPhase {
 }
 
 /** Per-provider spend row in a ledger entry. */
-export interface SpendLedgerProvider {
+interface SpendLedgerProvider {
   /** Provider (first path segment of the canonical model spec). */
   provider: string;
   /** Tokens attributed to this provider. */
@@ -101,7 +101,7 @@ export interface SpendLedgerEntry {
 }
 
 /** Inputs the runtime feeds the ledger writer at run end (all deterministic). */
-export interface BuildSpendLedgerEntryInput {
+interface BuildSpendLedgerEntryInput {
   runId: string;
   workflowName: string;
   status: SpendLedgerEntry["status"];
@@ -152,23 +152,8 @@ export function buildSpendLedgerEntry(input: BuildSpendLedgerEntryInput): SpendL
   };
 }
 
-/**
- * Write one run's spend-ledger entry. REPLAY-IDEMPOTENT (DurableStore.put is a
- * deep-equal no-op for a re-executed write) and RESUME-CORRECT: a resumed run
- * writes its cumulative total under the SAME runId, replacing the stale
- * pre-pause entry instead of appending a duplicate (the per-runId key keeps
- * the ledger a map, never a growing list). Best-effort by contract — the
- * caller must never fail a run on a ledger write.
- */
-export async function writeSpendLedgerEntry(
-  store: { put(key: string, value: unknown): Promise<void> },
-  entry: SpendLedgerEntry,
-): Promise<void> {
-  return store.put(spendLedgerKey(entry.runId), entry);
-}
-
 /** A spend-ledger entry read back from the durable store (lenient shape guard). */
-export function parseSpendLedgerEntry(value: unknown): SpendLedgerEntry | null {
+function parseSpendLedgerEntry(value: unknown): SpendLedgerEntry | null {
   if (typeof value !== "object" || value === null) return null;
   const entry = value as Partial<SpendLedgerEntry>;
   if (typeof entry.runId !== "string" || typeof entry.workflowName !== "string") return null;
@@ -230,14 +215,14 @@ export function readSpendLedgerEntries(entries: Readonly<Record<string, unknown>
 // ── aggregate analytics (pure, deterministic) ────────────────────────────────
 
 /** One per-dimension aggregate row. */
-export interface SpendAnalyticsRow {
+interface SpendAnalyticsRow {
   name: string;
   spend: number;
   runs: number;
 }
 
 /** Per-run trend row (newest-first by the deterministic stamp, runId tiebreak). */
-export interface SpendAnalyticsTrendRow {
+interface SpendAnalyticsTrendRow {
   runId: string;
   workflowName: string;
   status: SpendLedgerEntry["status"];
@@ -247,7 +232,7 @@ export interface SpendAnalyticsTrendRow {
 }
 
 /** Deterministic aggregate analytics over a set of ledger entries. */
-export interface SpendAnalytics {
+interface SpendAnalytics {
   /** Number of ledger entries aggregated. */
   runCount: number;
   totals: {
@@ -291,7 +276,7 @@ function sortEntriesNewestFirst(entries: SpendLedgerEntry[]): SpendLedgerEntry[]
  * sums + sorted keys, never wall clock / RNG. Deterministic for a fixed
  * ledger, so a replayed/resumed run computes identical analytics.
  */
-export function aggregateSpendAnalytics(entries: readonly SpendLedgerEntry[]): SpendAnalytics {
+function aggregateSpendAnalytics(entries: readonly SpendLedgerEntry[]): SpendAnalytics {
   const byPhase = new Map<string, { spend: number; runs: number }>();
   const byPattern = new Map<string, { spend: number; runs: number }>();
   const byProvider = new Map<string, { spend: number; runs: number }>();
@@ -352,7 +337,7 @@ export function aggregateSpendAnalytics(entries: readonly SpendLedgerEntry[]): S
 // ── script-facing query global ───────────────────────────────────────────────
 
 /** Query options for the `spendAnalytics` runtime global. */
-export interface SpendAnalyticsOptions {
+interface SpendAnalyticsOptions {
   /** Cap on the returned per-run `runs`/`trend` rows (default 50, min 1). */
   limit?: number;
 }

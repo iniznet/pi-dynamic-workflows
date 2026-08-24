@@ -28,7 +28,7 @@ export interface WorkflowReloadRuntime {
   dispose?: () => void;
 }
 
-export interface WorkflowRuntimeClaim {
+interface WorkflowRuntimeClaim {
   compatible?: WorkflowReloadRuntime;
   versionMismatch?: WorkflowReloadRuntime;
 }

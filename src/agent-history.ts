@@ -15,7 +15,7 @@ export interface AgentHistoryEntry {
   timestamp?: number;
 }
 
-export interface AgentHistoryOptions {
+interface AgentHistoryOptions {
   maxEntries?: number;
   maxTextChars?: number;
   maxTotalChars?: number;

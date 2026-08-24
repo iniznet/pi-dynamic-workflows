@@ -121,7 +121,11 @@ test(
     assert.equal(contender.getPersistence().load(runId)?.status, "running", "run is untouched by the contender");
 
     ownerAgent.resolve("done");
-    await new Promise((r) => setTimeout(r, 50));
+    // Poll for the settle — the resumed run's completion wall time varies
+    // with load; a fixed sleep flaked under cap-2 (see the pause/resume test).
+    for (let i = 0; i < 200 && owner.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(owner.getRun(runId)?.status, "completed", "leased owner should still finish");
   }),
 );
@@ -1199,7 +1203,16 @@ test(
     // Complete the resumed run
     da.resolve("resumed-done");
     await origPromise.catch(() => {});
-    await new Promise((r) => setTimeout(r, 30));
+    // The pre-pause promise settled at pause(), so awaiting it above is NOT a
+    // wait for the resumed execution — poll for the resumed settle instead of
+    // sleeping a fixed window: the settle path's wall time (agent settle +
+    // journal replay + one coalesced store commit + persist) varies with suite
+    // load, and a fixed 30ms sleep flaked under cap-2 (status still "running"
+    // while the resumed execution was mid-settle). Same poll pattern as the
+    // "Immediately resume" test above; 5s deadline bounds a genuine hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     assert.equal(manager.getRun(runId)?.status, "completed", "should complete after resume finishes");
   }),
@@ -1390,8 +1403,12 @@ test(
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true, "resume should schedule the run");
 
-      // Wait for the background executed run to process the agent error
-      await new Promise((r) => setTimeout(r, 100));
+      // Wait for the background executed run to process the agent error —
+      // poll for the failure settle (the runner throws immediately, but the
+      // settle wall time varies with load; a fixed sleep flaked under cap-2).
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       const finalRun = manager.getRun(runId);
       assert.equal(finalRun?.status, "failed", "resumed run should transition to failed when agent errors");
@@ -1461,7 +1478,11 @@ test(
       // Resume — the run will fail because the mocked agent throws
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true, "resume should schedule the run");
-      await new Promise((r) => setTimeout(r, 100));
+      // Poll for the failure settle (the runner throws immediately, but the
+      // settle wall time varies with load; a fixed sleep flaked under cap-2).
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       // Verify the run is now in failed state
       const failedRun = manager.getRun(runId);
@@ -1503,7 +1524,11 @@ test(
       // Resume — the run will fail
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true, "resume should schedule the run");
-      await new Promise((r) => setTimeout(r, 100));
+      // Poll for the failure settle (the runner throws immediately, but the
+      // settle wall time varies with load; a fixed sleep flaked under cap-2).
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       // Verify the run is now in failed state
       const failedRun = manager.getRun(runId);
@@ -1544,7 +1569,11 @@ test(
     try {
       // Resume — the run will fail
       await manager.resume(runId);
-      await new Promise((r) => setTimeout(r, 100));
+      // Poll for the failure settle (the runner throws immediately, but the
+      // settle wall time varies with load; a fixed sleep flaked under cap-2).
+      for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       // Verify the run is now in failed state
       const failedRun = manager.getRun(runId);
@@ -1562,8 +1591,12 @@ test(
     assert.equal(resumed, true, "resume should return true for a failed run");
     assert.equal(manager.getRun(runId)?.status, "running", "resumed failed run should transition to running");
 
-    // Wait for the resumed run to complete successfully
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait for the resumed run to complete successfully — poll for the terminal
+    // state: the resumed run's settle wall time varies with load, and a fixed
+    // sleep flaked under cap-2. 5s deadline bounds a genuine hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed failed run should complete successfully after restore");
@@ -1720,7 +1753,12 @@ return { a, b }`;
     const seenBeforeResume = seen.length;
     const resumed = await manager.resume(runId, { script: editResumeScriptV2 });
     assert.equal(resumed, true, "resume with edited script should succeed");
-    await new Promise((r) => setTimeout(r, 80));
+    // Poll for the terminal state: the resumed execution's settle wall time
+    // (replay + live call + coalesced store commit + persist) varies with
+    // suite load — a fixed sleep flaked under cap-2. 5s deadline bounds a hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run completes");
@@ -1765,7 +1803,12 @@ test(
     const seenBeforeResume = seen.length;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
-    await new Promise((r) => setTimeout(r, 80));
+    // Poll for the terminal state: the resumed execution's settle wall time
+    // (replay + live call + coalesced store commit + persist) varies with
+    // suite load — a fixed sleep flaked under cap-2. 5s deadline bounds a hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed");
@@ -1859,7 +1902,12 @@ return { inner, outer, third }`;
     const seenBeforeResume = seen.length;
     const resumed = await manager.resume(runId);
     assert.equal(resumed, true);
-    await new Promise((r) => setTimeout(r, 80));
+    // Poll for the terminal state: the resumed execution's settle wall time
+    // (replay + live call + coalesced store commit + persist) varies with
+    // suite load — a fixed sleep flaked under cap-2. 5s deadline bounds a hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed", "resumed run completes");
@@ -2027,9 +2075,12 @@ return { b }`;
     assert.equal(manager.getRun(runAId)?.status, "running");
 
     // Clean up the hung agent so nothing keeps the process alive, and prove
-    // the surviving entry settles normally afterward.
+    // the surviving entry settles normally afterward — poll for the settle
+    // (fixed sleeps flaked under cap-2; 5s deadline bounds a genuine hang).
     resolveHang?.("done");
-    await new Promise((r) => setTimeout(r, 30));
+    for (let i = 0; i < 200 && manager.getRun(runAId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(manager.getRun(runAId)?.status, "completed", "the protected entry still settles correctly");
   }),
 );
@@ -2117,7 +2168,11 @@ test(
     const manager2 = new WorkflowManager({ cwd, agent: succeedingAgent, maxTerminalRunsInMemory: 1 });
     const resumed = await manager2.resume(evictedRunId);
     assert.equal(resumed, true, "resume works purely from persisted state even though the in-memory copy is gone");
-    await new Promise((r) => setTimeout(r, 50));
+    // Poll for the settle — the resumed run's completion wall time varies with
+    // load; a fixed sleep flaked under cap-2. 5s deadline bounds a real hang.
+    for (let i = 0; i < 200 && manager2.getRun(evictedRunId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(manager2.listRuns().find((r) => r.runId === evictedRunId)?.status, "completed");
   }),
 );

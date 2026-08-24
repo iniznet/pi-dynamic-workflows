@@ -38,6 +38,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 /** Default number of consecutive idle kills within one attempt before the run-level watcher escalates. */
+// I1 DC-8: kept in tandem with the config.ts copy (the CONTRACT surface).
+// The config copy must stay the owner because config.ts cannot value-import
+// this module without violating the headless pi-tui-free guarantee; tests
+// import THIS copy directly (tests/command-watchdog.test.ts:22).
 export const DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS = 3;
 
 /**
@@ -84,7 +88,7 @@ export interface CommandWatchdogOptions {
 }
 
 /** One command's activity window, keyed by execution label. */
-export interface CommandActivityEntry {
+interface CommandActivityEntry {
   command: string;
   cwd: string;
   startedAtMs: number;

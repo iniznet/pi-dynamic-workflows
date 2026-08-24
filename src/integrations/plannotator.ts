@@ -53,7 +53,7 @@ export interface PlannotatorBridge {
  * on-demand Phase 2 gate hooks. Source-compatible with `Partial<PlannotatorConfig>`
  * (existing callers pass `{ port, autoOpenBrowser }` unchanged).
  */
-export interface PlannotatorBridgeOptions extends Partial<PlannotatorConfig> {
+interface PlannotatorBridgeOptions extends Partial<PlannotatorConfig> {
   /**
    * Optional persisted phase state machine. On a valid /approve the bridge runs
    * `approvePlan()` (flips `humanApproved` in active-state.json); a phase
@@ -103,7 +103,7 @@ function abortError(signal: AbortSignal): Error {
   return error;
 }
 
-export interface WaitOptions {
+interface WaitOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   /** Invoked with the plan whenever a non-pending status is observed. */

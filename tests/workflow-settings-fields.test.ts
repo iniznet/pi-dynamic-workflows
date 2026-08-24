@@ -65,7 +65,7 @@ function expectError(key: keyof WorkflowSettings, raw: string): string {
 describe("FIELD_REGISTRY completeness", () => {
   it("has exactly one entry per WorkflowSettings key, mirroring WORKFLOW_ENV_VARS", () => {
     const registryKeys = FIELD_REGISTRY.map((field) => field.key);
-    assert.equal(registryKeys.length, 26, "registry must hold one row per settings key");
+    assert.equal(registryKeys.length, 28, "registry must hold one row per settings key");
     assert.deepEqual(
       new Set(registryKeys),
       new Set(Object.keys(WORKFLOW_ENV_VARS)),
@@ -182,6 +182,14 @@ describe("parseFieldInput", () => {
     expectError("keywordTriggerWord", "   ");
     expectError("keywordTriggerWord", "/workflow");
     expectError("keywordTriggerWord", "pi workflow");
+  });
+
+  it("parses defaultUntaggedTier: economy / inherit:main / tier names (DS-4)", () => {
+    assert.equal(expectOk("defaultUntaggedTier", "economy"), "economy");
+    assert.equal(expectOk("defaultUntaggedTier", "  inherit:main  "), "inherit:main");
+    assert.equal(expectOk("defaultUntaggedTier", "fast-lane"), "fast-lane");
+    expectError("defaultUntaggedTier", "");
+    expectError("defaultUntaggedTier", "   ");
   });
 
   it("maps empty/null markers to null for nullable fields", () => {

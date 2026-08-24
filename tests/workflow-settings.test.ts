@@ -211,6 +211,43 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads subagentSkills: all|none (T-01 parity knob)", async () => {
+    await withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      saveWorkflowSettings({ subagentSkills: "none" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentSkills: "none" });
+      saveWorkflowSettings({ subagentSkills: "all" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { subagentSkills: "all" });
+
+      // A wrong-typed / out-of-enum value fails loudly (strict schema).
+      writeFileSync(settingsPath, JSON.stringify({ subagentSkills: 42 }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+    });
+  });
+
+  it("saves and loads defaultUntaggedTier: economy | inherit:main | tier name (DS-4)", async () => {
+    await withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+
+      saveWorkflowSettings({ defaultUntaggedTier: "economy" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultUntaggedTier: "economy" });
+      saveWorkflowSettings({ defaultUntaggedTier: "inherit:main" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultUntaggedTier: "inherit:main" });
+      // A literal tier name is a valid value too.
+      saveWorkflowSettings({ defaultUntaggedTier: "fast-lane" }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultUntaggedTier: "fast-lane" });
+
+      // A wrong-typed value violates the declared schema and fails loudly.
+      writeFileSync(settingsPath, JSON.stringify({ defaultUntaggedTier: 42 }), "utf-8");
+      assert.throws(() => loadWorkflowSettings(settingsPath), ConfigError);
+
+      // An empty string normalizes to "unset" (lenient drop, like other keys).
+      writeFileSync(settingsPath, JSON.stringify({ defaultUntaggedTier: "   " }), "utf-8");
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+    });
+  });
+
   it("normalizes default concurrency and agent retries", async () => {
     await withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

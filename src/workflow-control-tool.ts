@@ -75,7 +75,7 @@ export interface WorkflowControlToolOptions {
  * without the live-stats fields (legacy/cold rows) degrades to identity +
  * status; the caller uses this to answer "running or stuck" per agent.
  */
-export interface WorkflowControlAgentDetails {
+interface WorkflowControlAgentDetails {
   id: number;
   callId?: string;
   label: string;

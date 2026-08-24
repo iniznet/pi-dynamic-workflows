@@ -26,7 +26,7 @@ import type { AgentUsage, OperationTrace } from "./agent.js";
 import type { JournalEntry } from "./workflow.js";
 
 /** Schema version of the compacted journal encoding. Bump on any shape change. */
-export const COMPACT_JOURNAL_VERSION = 1 as const;
+const COMPACT_JOURNAL_VERSION = 1 as const;
 
 /**
  * One journal entry record in a compacted summary. Resolved entries are
@@ -34,7 +34,7 @@ export const COMPACT_JOURNAL_VERSION = 1 as const;
  * verbatim. The positional deltaKey surface (`index` + `runId`) is carried
  * through unchanged — never re-derived or relabeled.
  */
-export type CompactJournalRecord =
+type CompactJournalRecord =
   | {
       fold: "resolved";
       index: number;
@@ -211,7 +211,7 @@ export function reconstructJournal(summary: CompactJournalSummary): JournalEntry
   });
 }
 
-export interface JournalCompactionVerification {
+interface JournalCompactionVerification {
   ok: boolean;
   /** Why the gate rejected the summary (present when ok === false). */
   reason?: string;

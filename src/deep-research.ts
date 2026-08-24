@@ -20,7 +20,7 @@ export interface DeepResearchConfig {
  * deterministic — the resume hash of a fresh run is a pure function of the
  * generator version + these baked values.
  */
-export interface DeepResearchTierOptions {
+interface DeepResearchTierOptions {
   tierPlan?: string;
   tierGather?: string;
   tierCrossCheck?: string;
@@ -103,16 +103,32 @@ phase('Verify')
 // (measured up to 41K tokens). Deterministic — the same sources always yield
 // the same prompt, so resume hashes stay stable; the cross-checker can
 // web_fetch any URL to re-confirm truncated text.
+// DS-5: truncation cuts at a sentence/clause boundary (never mid-clause), so
+// the cross-checker never sees a fact split mid-sentence; the '…' marker and
+// the web_fetch re-confirm instruction stay.
+const truncateClaim = (text, cap) => {
+  if (typeof text !== 'string' || text.length <= cap) return text
+  const head = text.slice(0, cap - 1)
+  let cut = -1
+  for (let i = 0; i < head.length; i++) {
+    const ch = head.charCodeAt(i)
+    if ((ch === 46 || ch === 33 || ch === 63) && (i + 1 >= head.length || head.charCodeAt(i + 1) === 32)) cut = i + 1
+  }
+  if (cut > 0) return text.slice(0, cut) + '…'
+  const space = head.lastIndexOf(' ')
+  if (space > 0) return text.slice(0, space) + '…'
+  return head + '…'
+}
 const embeddedSources = []
 let embedBudget = 4000
 for (const s of allSources) {
   if (embeddedSources.length >= 40 || embedBudget <= 0) break
-  const claims = (Array.isArray(s.claims) ? s.claims : []).map((c) => (typeof c === 'string' && c.length > 400 ? c.slice(0, 397) + '…' : c))
+  const claims = (Array.isArray(s.claims) ? s.claims : []).map((c) => truncateClaim(c, 400))
   const entry = { url: s.url, claims }
   const size = JSON.stringify(entry).length
   if (size > embedBudget) {
     if (embeddedSources.length === 0) {
-      embeddedSources.push({ url: s.url, claims: claims.slice(0, 1).map((c) => (typeof c === 'string' && c.length > 200 ? c.slice(0, 197) + '…' : c)) })
+      embeddedSources.push({ url: s.url, claims: claims.slice(0, 1).map((c) => truncateClaim(c, 200)) })
     }
     break
   }
@@ -179,13 +195,22 @@ const conflicts = [
 ${claimVerifySource({ tier: tierCrossCheck })}
 
 phase('Report')
+// T-04: bound the report prompt's JSON embeds (SUPPORTED CLAIMS / CONFLICTS /
+// VERIFICATION) with deterministic 4,000-char slices each — before this cap the
+// report input was bounded only by the run-level 50k result cap (up to ~12.5K
+// tok). A slice may cut JSON mid-string; the report schema is separate, and the
+// '…' marker (mirroring capEmbedded) makes the truncation visible.
+const reportEmbed = (value) => {
+  const text = JSON.stringify(value)
+  return text.length > 4000 ? text.slice(0, 4000) + '…' : text
+}
 const report = await agent(
   'Write a concise, well-structured research report that answers the question using ONLY the supported claims below. ' +
   'Cite source URLs inline next to each claim. If the evidence is thin, say so explicitly. Include a short Conflicts ' +
   'section listing the entries below and why each was excluded — never present them as fact.\\n\\n' +
-  'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify(supported) +
-  '\\n\\nCONFLICTS JSON:\\n' + JSON.stringify(conflicts) +
-  '\\n\\nVERIFICATION JSON:\\n' + JSON.stringify(verification) +
+  'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + reportEmbed(supported) +
+  '\\n\\nCONFLICTS JSON:\\n' + reportEmbed(conflicts) +
+  '\\n\\nVERIFICATION JSON:\\n' + reportEmbed(verification) +
   '\\n\\nEach entry in VERIFICATION JSON carries verified: true/false — entries marked verified: false could not be confirmed against their cited pages; disclose them as unverified in the report, never as fact.',
   { label: 'write report', tier: ${tierReport} }
 )

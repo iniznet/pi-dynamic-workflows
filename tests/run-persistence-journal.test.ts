@@ -227,8 +227,16 @@ return { a, b }`;
     // call, so the live call's index is not fixed — resolve any outstanding
     // calls; no-ops for indexes that were never created.)
     await new Promise((r) => setTimeout(r, 20));
-    for (let i = 1; i < 6; i++) da.resolve(i, "done");
-    await new Promise((r) => setTimeout(r, 50));
+    // Resolve any outstanding calls as they appear while polling for the
+    // terminal state: the resumed execution's live agent-2 call index is not
+    // fixed (the paused original had already spawned its own), so a single
+    // fixed resolve loop can no-op if the call is created late under load, and
+    // the settle path's wall time varies — a fixed sleep flaked under cap-2.
+    // Repeated resolves are no-ops for settled/not-yet-created indexes.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      for (let j = 1; j < 8; j++) da.resolve(j, "done");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
 
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed");

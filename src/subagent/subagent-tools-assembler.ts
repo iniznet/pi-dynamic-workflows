@@ -32,13 +32,62 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "../command-watchdog.js";
 import { createAssemblerSubagentToolDiscovery, type SubagentToolDiscovery } from "../discovery.js";
 import { isExcludedHostTool } from "../gateway/subagent-host-tools.js";
+import { MCP_TOOL_DEFS_WARN_BYTES, toolDefinitionBytes } from "../workflows-subagent-tools-command.js";
 import type { McpToolsManager } from "./mcp-tools.js";
+import { withSubagentReadGuidance } from "./read-guidance.js";
 
 /** Effective subagentTools mode: "all" | exact mcp_* allowlist ([] = none). */
 export type SubagentToolsMode = "all" | string[];
 
+/**
+ * T-05: per-server dedupe for the oversized-MCP-def warning, mirroring
+ * McpToolsManager's warnOnce — the runtime guard logs each chatty server at
+ * most once per process lifetime so a fan-out run doesn't spam the console.
+ */
+const warnedOversizedMcpServers = new Set<string>();
+
+/**
+ * T-05: runtime size guard for the default "all" MCP merge. Skips a mode-
+ * eligible def whose provider-billed size (name + description + parameters,
+ * the same measure as the /workflows-subagent-tools listing) exceeds
+ * {@link MCP_TOOL_DEFS_WARN_BYTES} (4 KB) and logs the offending server once.
+ * The guard runs AFTER filterMcpTools allowlisting, so an explicitly-selected
+ * per-server tool (subagentTools string[] allowlist, or an mcp.json per-server
+ * `tools` filter) is NEVER dropped by the size guard — only the implicit
+ * "all" merge pays the bound. Defs that survive are returned unchanged.
+ * `serverNames` is a lazy supplier (resolved ONLY when a def is actually
+ * skipped, so a clean toolset pays zero extra I/O on the run-start path).
+ */
+function applyMcpSizeGuard(defs: ToolDefinition[], serverNames: () => string[]): ToolDefinition[] {
+  const bounded: ToolDefinition[] = [];
+  for (const def of defs) {
+    if (toolDefinitionBytes(def) <= MCP_TOOL_DEFS_WARN_BYTES) {
+      bounded.push(def);
+      continue;
+    }
+    // Best-effort server attribution for the one-time warning: match the
+    // longest sanitized server name that prefixes `mcp_<server>_<tool>`.
+    let server: string | undefined;
+    for (const candidate of serverNames()) {
+      if (def.name.startsWith(`mcp_${candidate}_`) && (server === undefined || candidate.length > server.length)) {
+        server = candidate;
+      }
+    }
+    const owner = server ?? "unknown";
+    if (!warnedOversizedMcpServers.has(owner)) {
+      warnedOversizedMcpServers.add(owner);
+      console.warn(
+        `[workflows-mcp] MCP server "${owner}" exposes a tool def over ${MCP_TOOL_DEFS_WARN_BYTES} B ` +
+          `(${def.name}); it is skipped from the default subagent toolset to bound per-turn token cost. ` +
+          "Restore it with an explicit subagentTools allowlist or an mcp.json per-server `tools` filter.",
+      );
+    }
+  }
+  return bounded;
+}
+
 /** Options for {@link SubagentToolsAssembler}. */
-export interface SubagentToolsAssemblerOptions {
+interface SubagentToolsAssemblerOptions {
   /** The effective subagentTools mode, resolved from settings ("all" default). */
   mode: SubagentToolsMode;
   /**
@@ -173,9 +222,16 @@ export class SubagentToolsAssembler {
     // defs ride along unwrapped. Absent/disabled → thin passthrough.
     const watchdog = this.commandWatchdog?.();
     const hostWrapped = watchdog && this.cwd ? applyCommandWatchdogToTools(host, this.cwd, watchdog) : host;
+    // T-05: the default "all" merge skips MCP defs over the 4 KB ceiling AFTER
+    // filterMcpTools allowlisting (an explicitly-selected tool is never dropped
+    // by the size guard — only the implicit catch-all merge pays the bound).
+    // The server-name list resolves lazily, only when a def is actually skipped.
+    const filteredMcp = filterMcpTools(mcp, this.mode, this.excludeTools);
+    const mcpBounded =
+      this.mode === "all" ? applyMcpSizeGuard(filteredMcp, () => this.mcpTools.serverNames()) : filteredMcp;
     const merged = [
       ...hostWrapped,
-      ...filterMcpTools(mcp, this.mode, this.excludeTools),
+      ...mcpBounded,
       ...filterExtensionTools(extension, this.excludeTools),
       ...filterDamageControlTools(damageControl, this.excludeTools),
     ];
@@ -189,7 +245,9 @@ export class SubagentToolsAssembler {
         unique.push(def);
       }
     }
-    return unique;
+    // T-02: append the search-first nudge to the winning `read` def description
+    // (idempotent — see read-guidance.ts). Covers every default merged toolset.
+    return withSubagentReadGuidance(unique);
   }
 
   /**

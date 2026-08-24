@@ -10,13 +10,20 @@ import { withTimeout } from "./timing.js";
  * surface (ModelRuntime.create + completeSimple; dist/core/model-runtime.d.ts
  * exposes exactly those, no agent-execution API exists at :116-122).
  *
- * The cross-check is a DIRECT ModelRuntime call: it consumes no agent slot,
- * journals nothing, and never touches the run's shared.spent/tokenUsage
- * accounting (the "economy-tier must not double-charge" invariant) — the
- * quality helpers' primary votes keep their economy tier and the cross-check
- * bills outside the run's ledger. Any failure (auth/config/network/timeout)
- * resolves `null` (unavailable) and the caller falls back to the same-model
- * verdict; a hung request is bounded by withTimeout.
+ * The cross-check is a DIRECT ModelRuntime call: it consumes no agent slot
+ * and never touches the run's shared.spent/tokenUsage accounting (the
+ * "economy-tier must not double-charge" invariant) — the quality helpers'
+ * primary votes keep their economy tier and the cross-check bills outside the
+ * run's ledger. DS-1: the run WRAPS each ask in the resume journal (a
+ * checkpoint-style helper call keyed by hash(question, modelSpec)), so a
+ * resumed run replays the ORIGINAL second-model reply instead of re-asking
+ * live — the verdict drives the agreement/disagreement branch and the judge
+ * pass, so a live re-ask could flip the branch and desync the journal prefix.
+ * Journaling changes nothing else about the economy contract: the ask still
+ * consumes no agent slot and never bills the ledger. Any failure
+ * (auth/config/network/timeout) resolves `null` (unavailable) and the caller
+ * falls back to the same-model verdict; a hung request is bounded by
+ * withTimeout.
  */
 
 /** Minimal cross-checker surface the workflow quality helpers depend on. */

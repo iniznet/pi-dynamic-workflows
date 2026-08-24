@@ -32,7 +32,7 @@ export interface Worktree {
 }
 
 /** Optional knobs for the central git exec helper. */
-export interface GitExecOptions {
+interface GitExecOptions {
   /** Hard per-command timeout in ms (default GIT_TIMEOUT_MS). */
   timeoutMs?: number;
   /** When aborted, the in-flight git child is SIGKILLed and the call rejects. */
@@ -263,7 +263,7 @@ export async function removeWorktree(wt: Worktree, opts: GitExecOptions = {}): P
 /** Result of {@link finalizeWorktree}; surfaces the failing git step + stderr so an
  * operator can distinguish trivially fixable failures (e.g. no user.identity) from
  * ones requiring different remediation (worktree gone / locked / git broken). */
-export interface FinalizeResult {
+interface FinalizeResult {
   ok: boolean;
   /** `git` step that failed (`add -A` or `commit`) plus the trimmed stderr, when !ok. */
   reason?: string;

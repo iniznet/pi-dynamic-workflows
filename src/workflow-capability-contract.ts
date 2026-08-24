@@ -359,6 +359,7 @@ const TEST_GATE_OPTIONS: OptionShape = {
         "assert predicates are machine-checked pure-JS over the captured output, never an LLM verdict; an absent assert defaults to { exitCode: 0 }",
         "fileContains checks the captured output (cat/grep), the vm-safe way to assert file content without host fs access",
         "assert.exitCode requires the bash tool (the grep tool reports matches, not an exit status)",
+        "DS-7: prefer `grep -n <pattern> <file>` over `cat <file>` for fileContains — grep prints only the matching lines, so the capture stays small and the assertion is robust against unrelated output bloat",
       ],
     ),
     option("postconditions", "string[]", true, null, [

@@ -31,6 +31,16 @@
  * `agent.run()` (deltaKey = stickyKey), so a re-acquire for the same logical
  * model returns the pinned choice; a re-acquire for a DIFFERENT logical model
  * falls through to fresh routing (the previous reservation is replaced).
+ *
+ * DS-6 (known, intentional resume divergence): pool state is wall-clock. TPM
+ * windows, cooldowns (recordSpend/recordLimitEvent), and earliestUnblockTime
+ * all use Date.now(), so a resumed run's routing decisions can differ from
+ * the original's — a provider cooling down at pause time may be free again on
+ * resume, and vice versa. This is live policy, NOT resume identity: the pool
+ * is never part of hashAgentCall's field set, and a resumed run re-routes
+ * against fresh pool state exactly as a fresh run would. Determinism is
+ * preserved at the agent() level (journaled calls replay); only the PROVIDER
+ * pinned to a replayed call's live siblings can differ.
  */
 
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";

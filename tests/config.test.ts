@@ -10,6 +10,7 @@ import test from "node:test";
 import {
   applyEnvSettingsOverride,
   DEFAULT_SUBAGENT_EXTENSION_TOOLS,
+  DEFAULT_SUBAGENT_SKILLS,
   MAX_AGENT_RETRIES,
   MAX_CONCURRENCY,
   normalizeKeywordTriggerWord,
@@ -54,6 +55,17 @@ test("workflowSettingsFromEnv parses every PI_WORKFLOW_* key", () => {
 
 test("an empty env yields no overrides at all", () => {
   assert.deepEqual(workflowSettingsFromEnv({}), {});
+});
+
+test("defaultUntaggedTier parses from its PI_WORKFLOW_* env var (DS-4)", () => {
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.defaultUntaggedTier]: "inherit:main" }), {
+    defaultUntaggedTier: "inherit:main",
+  });
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.defaultUntaggedTier]: "  fast-lane  " }), {
+    defaultUntaggedTier: "fast-lane",
+  });
+  // Empty/whitespace-only env values are dropped (unset → the run default).
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.defaultUntaggedTier]: "   " }), {});
 });
 
 test("missing env keys are skipped, not defaulted", () => {
@@ -120,6 +132,22 @@ test("subagentExtensionTools default is on (P04 default-flip knob)", () => {
   // (workflow-settings-fields.ts). Fresh installs get the captured research
   // tools (codegraph_*/web/vision) unless the user opts out with off.
   assert.equal(DEFAULT_SUBAGENT_EXTENSION_TOOLS, "on");
+});
+
+test("subagentSkills default is all (T-01 parity knob) and env accepts all|none", () => {
+  // T-01: "all" keeps the SDK skill-stub block (parity); "none" strips it via
+  // noSkills. The default must stay "all" so existing runs are unchanged.
+  assert.equal(DEFAULT_SUBAGENT_SKILLS, "all");
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentSkills]: "none" }), {
+    subagentSkills: "none",
+  });
+  assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentSkills]: "  all  " }), {
+    subagentSkills: "all",
+  });
+  // Anything else drops to the file value (lenient drop-on-violation).
+  for (const garbage of ["", "  ", "some", "true", "1"]) {
+    assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentSkills]: garbage }), {});
+  }
 });
 
 test("subagentExtensionTools env accepts on|off or a comma-separated known-source allowlist", () => {
@@ -243,6 +271,8 @@ test("WORKFLOW_ENV_VARS maps every WorkflowSettings key and uses the documented 
     "subagentHostTools",
     "subagentTools",
     "subagentChromeTools",
+    "subagentSkills",
+    "defaultUntaggedTier",
     "subagentExtensionTools",
     "subagentDamageControlTools",
     "hostActors",

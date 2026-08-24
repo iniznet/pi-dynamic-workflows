@@ -858,6 +858,31 @@ test("the subagent resource loader is built once per run and shared across subag
   second.catch(() => {});
 });
 
+test("subagentSkills 'none' passes noSkills:true to the shared resource loader (T-01)", async () => {
+  // The T-01 knob: "none" strips the skill-stub block (~3.1 ktok/turn) from
+  // read-capable subagent system prompts via the loader's noSkills flag;
+  // "all" (default) leaves noSkills unset — byte-identical parity. We read the
+  // constructed loader's runtime noSkills field (plain JS property in the
+  // published dist).
+  const dir = mkdtempSync(join(tmpdir(), "pi-dw-t01-skills-"));
+  try {
+    type Priv = { getSharedResourceLoader(agentDir: string): Promise<{ noSkills?: boolean }> };
+    const none = new WorkflowAgent({ cwd: dir, subagentSkills: "none" });
+    const noneLoader = await (none as unknown as Priv).getSharedResourceLoader(dir);
+    assert.equal(noneLoader.noSkills, true, "subagentSkills 'none' sets noSkills on the shared loader");
+
+    const all = new WorkflowAgent({ cwd: dir, subagentSkills: "all" });
+    const allLoader = await (all as unknown as Priv).getSharedResourceLoader(dir);
+    assert.equal(allLoader.noSkills, false, "subagentSkills 'all' keeps noSkills off (default parity)");
+
+    const omitted = new WorkflowAgent({ cwd: dir });
+    const omittedLoader = await (omitted as unknown as Priv).getSharedResourceLoader(dir);
+    assert.equal(omittedLoader.noSkills, false, "omitted subagentSkills keeps noSkills off (default parity)");
+  } finally {
+    await rmForce(dir);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // finalAssistantText — the unstructured result must come AFTER the last tool
 // result, so stale progress text can't be reported as a completed answer (#111)

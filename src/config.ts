@@ -46,6 +46,10 @@ export const DEFAULT_COMMAND_HARD_TIMEOUT_MS = 0;
  */
 export const MAX_COMMAND_HARD_TIMEOUT_MS = 2_147_483_000;
 /** Default consecutive idle kills before the run-level watcher escalates. */
+// I1 DC-8: this is the CONTRACT copy (check-entry-contract.ts:354; index.ts does
+// `export * from "./config.js"`). Kept alongside the command-watchdog copy —
+// consolidating would force config.ts to value-import command-watchdog.js,
+// violating the headless pi-tui-free guarantee (config.ts:11-16).
 export const DEFAULT_MAX_CONSECUTIVE_IDLE_KILLS = 3;
 
 // ─── I2 run-level idle automation defaults (design-final.json §agentIdleAutomation) ──
@@ -72,6 +76,19 @@ export const DEFAULT_AGENT_IDLE_RETRIES: number | null = null;
  * can never drift between the runtime and the settings surface.
  */
 export const DEFAULT_SUBAGENT_EXTENSION_TOOLS = "on" as const;
+
+/**
+ * Default for the `subagentSkills` setting (T-01): "all" loads the installed
+ * skill set (frontmatter name + description stubs only) into read-capable
+ * subagent sessions exactly as before. "none" passes `noSkills: true` to the
+ * shared DefaultResourceLoader, stripping the ~3.1 ktok skill-stub block from
+ * every subagent system prompt (the skill body stays lazy-loaded on demand by
+ * the agent via the read tool). One knob shared by the consumption site
+ * (agent.ts getSharedResourceLoader `?? DEFAULT_...`) and the UI default
+ * display (workflow-settings-fields.ts), so the flip is testable and can
+ * never drift between the runtime and the settings surface.
+ */
+export const DEFAULT_SUBAGENT_SKILLS = "all" as const;
 
 /**
  * V2-P12: per-actor activation budget — the maximum number of deliveries one
@@ -323,11 +340,12 @@ export const DEFAULT_APPROVAL_CLASSIFIER_MAX_TOKENS = 128;
  */
 export const APPROVAL_CLASSIFIER_MAX_EVIDENCE_CHARS = 6_000;
 
-// NOTE (cross-slice, B2-owned): surfacing `defaultUntaggedTier` in
-// settings.json (workflow-settings.ts schema + workflow-settings-fields.ts UI)
-// and wiring it through extensions/workflow.ts is deliberately NOT done here —
-// the run/global option on runWorkflow/WorkflowAgent is the primary channel
-// for this slice. See tasks/token-efficiency-audit/slice-c/handoff.md.
+// DS-4: `defaultUntaggedTier` IS surfaced in settings.json (workflow-settings.ts
+// schema + workflow-settings-fields.ts UI) and wired through extensions/
+// workflow.ts (PI_WORKFLOW_DEFAULT_UNTAGGED_TIER for headless/CI). The
+// run/global option on runWorkflow/WorkflowAgent stays the primary channel;
+// the settings surface is the user-facing knob. See
+// tasks/token-efficiency-audit/slice-c/handoff.md for the original deferral.
 
 // ─── Environment-var settings override layer (headless/CI/containerized) ─────
 // Env vars are the only settings channel that works without a writable home
@@ -381,6 +399,10 @@ export const WORKFLOW_ENV_VARS = {
   subagentTools: "PI_WORKFLOW_SUBAGENT_TOOLS",
   subagentChromeTools: "PI_WORKFLOW_SUBAGENT_CHROME_TOOLS",
   subagentExtensionTools: "PI_WORKFLOW_SUBAGENT_EXTENSION_TOOLS",
+  subagentSkills: "PI_WORKFLOW_SUBAGENT_SKILLS",
+  // DS-4: headless/CI channel for the untagged-agent tier default (economy /
+  // inherit:main / a literal tier name).
+  defaultUntaggedTier: "PI_WORKFLOW_DEFAULT_UNTAGGED_TIER",
   subagentDamageControlTools: "PI_WORKFLOW_SUBAGENT_DAMAGE_CONTROL_TOOLS",
   // V2-P12: session-scoped host-event actors (watchdog/advisor/spec) gate.
   hostActors: "PI_WORKFLOW_HOST_ACTORS",
@@ -515,6 +537,14 @@ export function workflowSettingsFromEnv(env: EnvSource = process.env): WorkflowS
   const subagentChromeTools = env[WORKFLOW_ENV_VARS.subagentChromeTools]?.trim();
   if (subagentChromeTools === "on" || subagentChromeTools === "off") {
     settings.subagentChromeTools = subagentChromeTools;
+  }
+  const subagentSkills = env[WORKFLOW_ENV_VARS.subagentSkills]?.trim();
+  if (subagentSkills === "all" || subagentSkills === "none") {
+    settings.subagentSkills = subagentSkills;
+  }
+  const defaultUntaggedTier = env[WORKFLOW_ENV_VARS.defaultUntaggedTier]?.trim();
+  if (defaultUntaggedTier && defaultUntaggedTier.length > 0) {
+    settings.defaultUntaggedTier = defaultUntaggedTier;
   }
   const subagentDamageControlTools = env[WORKFLOW_ENV_VARS.subagentDamageControlTools]?.trim();
   if (

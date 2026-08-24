@@ -168,7 +168,7 @@ function diffShardSource(): string {
  * medium. Baking the effective map into the script keeps the generated text
  * deterministic for a fixed generator version (resume-hash stability).
  */
-export interface CodeReviewTierOptions {
+interface CodeReviewTierOptions {
   /** Per-angle verify-batch tier overrides (defaults: D/E/F small, rest medium). */
   tierVerify?: Partial<Record<CodeReviewAngle, string>>;
 }

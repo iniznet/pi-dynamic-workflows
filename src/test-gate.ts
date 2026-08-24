@@ -1,4 +1,4 @@
-import { DEFAULT_TEST_GATE_ATTEMPTS, DEFAULT_TEST_GATE_TOOL } from "./config.js";
+import { DEFAULT_MAX_AGENT_RESULT_CHARS, DEFAULT_TEST_GATE_ATTEMPTS, DEFAULT_TEST_GATE_TOOL } from "./config.js";
 import { type ProvenanceEntry, provenanceContentId } from "./durable-store.js";
 
 /**
@@ -55,7 +55,7 @@ export interface TestGateStepResult {
 }
 
 /** Internal machine verdict: pass/fail + why. */
-export interface TestGateOutcome {
+interface TestGateOutcome {
   passed: boolean;
   detail: string;
 }
@@ -234,12 +234,18 @@ export function capTestGateOutput(output: string): string {
  * Prompt for one test subagent step. The agent runs the command inside its
  * real toolset and MUST report the raw capture — the machine predicate decides
  * acceptance, the model only relays tool evidence.
+ *
+ * DS-7: the relay prompt states the runtime's per-result cap so the capture is
+ * deterministic for big outputs — a verbatim "do not truncate" instruction
+ * with no cap mention makes outputContains/outputMatches on a large-but-correct
+ * output silently fail once the relay hits the cap (leading content wins; the
+ * tail is dropped, never summarized).
  */
 export function buildTestGatePrompt(test: TestGateTest, tool: TestGateTool): string {
   if (tool === "grep") {
     return `Search the current workspace with the grep tool using the following pattern and report EVERY matched line verbatim (do not summarize, do not omit matches).\n\nPattern:\n\`\`\`\n${test.command}\n\`\`\`\n\nReply with JSON matching the schema: output = a string containing every matched line.`;
   }
-  return `Run the following command with the bash tool and report its REAL exit status and FULL standard output verbatim (do not summarize, do not truncate, do not invent output).\n\nCommand:\n\`\`\`\n${test.command}\n\`\`\`\n\nReply with JSON matching the schema: exitCode = the command's actual exit status (number), output = the full standard output (string).`;
+  return `Run the following command with the bash tool and report its REAL exit status and FULL standard output verbatim (do not summarize, do not invent output). The runtime caps a captured output at ${DEFAULT_MAX_AGENT_RESULT_CHARS} characters — if the output is longer, report the FIRST ${DEFAULT_MAX_AGENT_RESULT_CHARS} characters exactly (leading content wins; the tail is dropped, never summarized).\n\nCommand:\n\`\`\`\n${test.command}\n\`\`\`\n\nReply with JSON matching the schema: exitCode = the command's actual exit status (number), output = the full standard output (string).`;
 }
 
 /** One failed test rendered into rework feedback. */

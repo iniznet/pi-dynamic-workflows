@@ -1701,6 +1701,13 @@ export function redactText(text: string): string {
  * Deep-copy `value` masking provider API keys/secrets in every string
  * (agent results, logs, tool I/O, checkpoints). Structure and non-secret
  * content are preserved exactly.
+ *
+ * INTENTIONAL RETENTION (I1 DC-4 audit): zero current callers — the
+ * persistence serializer (run-persistence.ts:909) and logger.ts:7 use
+ * `redactText` directly, and this wrapper is NOT re-exported via src/index.ts
+ * nor part of the 665-entry contract. Retained for the extension-hardening
+ * D-04 retention deferral (tasks/extension-hardening-round3/handoff.md);
+ * re-evaluate removal when that deferral is formally resolved.
  */
 export function redactSecrets(value: unknown): unknown {
   const seen = new WeakSet<object>();

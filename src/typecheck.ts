@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** The parsed workflow script segments the runtime already extracted. */
-export interface TypecheckInput {
+interface TypecheckInput {
   /** The evaluated `export const meta` value (literal-only, JSON-safe). */
   meta: unknown;
   /** The script minus the meta export — the same `body` the vm executes. */
@@ -34,7 +34,7 @@ export interface TypecheckInput {
 }
 
 /** Result of the advisory pre-run typecheck. Never throws; never blocks the run. */
-export interface TypecheckOutcome {
+interface TypecheckOutcome {
   /** True when tsc reported zero problems (or the check did not run because the toolchain is missing). */
   ok: boolean;
   /** Whether the check itself could not run (no toolchain, spawn failure, timeout). */
@@ -43,7 +43,7 @@ export interface TypecheckOutcome {
   detail: string;
 }
 
-export interface TypecheckOptions {
+interface TypecheckOptions {
   /** Base directory used to resolve a project-local TypeScript install. */
   cwd?: string;
   /** Hard cap on the tsc child process in ms. Defaults to TYPECHECK_TIMEOUT_MS. */
@@ -56,7 +56,7 @@ export interface TypecheckOptions {
 }
 
 /** Hard cap on the tsc child process; a hung tsc must never hang a run. */
-export const TYPECHECK_TIMEOUT_MS = 30_000;
+const TYPECHECK_TIMEOUT_MS = 30_000;
 
 /** Cap on how much tsc output is folded into the run's warning log. */
 const MAX_DETAIL_LENGTH = 600;

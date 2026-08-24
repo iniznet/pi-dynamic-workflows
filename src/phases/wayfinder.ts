@@ -452,7 +452,7 @@ export function isMapFogResolved(map: DecisionMap): boolean {
 }
 
 /** Options for the run-entry Phase 0 stage (see runWayfinderStage). */
-export interface WayfinderStageOptions {
+interface WayfinderStageOptions {
   /** Persisted phase state machine whose wayfinderComplete flag gates prewalk. */
   stateManager: WorkflowStateManager;
   /** The task prompt being assessed (input to the statable-question gate). */
@@ -466,7 +466,7 @@ export interface WayfinderStageOptions {
 }
 
 /** Outcome of the run-entry Phase 0 stage (see runWayfinderStage). */
-export interface WayfinderStageResult {
+interface WayfinderStageResult {
   /** The map in effect after this stage (loaded or freshly created). */
   map: DecisionMap;
   /** Whether a decision map was (re)written to disk by this stage. */
@@ -587,7 +587,7 @@ export async function loadDecisionMap(dir: string): Promise<DecisionMap | null> 
  * loaded graph can never self-lock. Returns null for a fundamentally
  * unrecognizable shape (non-object, missing tickets array).
  */
-export function normalizeDecisionMap(value: unknown): DecisionMap | null {
+function normalizeDecisionMap(value: unknown): DecisionMap | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   if (!Array.isArray(raw.tickets)) return null;

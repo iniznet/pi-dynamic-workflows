@@ -674,7 +674,7 @@ export interface WorkflowManagerOptions {
 /** Options that a fresh extension generation may safely refresh on a live
  * manager handed across `/reload`. Execution identity (`cwd`, persistence,
  * injected agent, and in-memory runs) is intentionally excluded. */
-export type WorkflowManagerReloadOptions = Pick<
+type WorkflowManagerReloadOptions = Pick<
   WorkflowManagerOptions,
   | "concurrency"
   | "loadSavedWorkflow"
@@ -1011,7 +1011,7 @@ const WORKFLOW_SCOPE_ENFORCE_ENV = "PI_WORKFLOW_WORKSPACE_SCOPE_ENFORCE";
  * per-run `ExecOptions.workspaceScopeEnforce`, and the env var above
  * (precedence: exec override > manager option > env > "flag").
  */
-export type WorkspaceScopeEnforceMode = "flag" | "reject" | "confirm" | "off";
+type WorkspaceScopeEnforceMode = "flag" | "reject" | "confirm" | "off";
 
 /**
  * Resolve an arbitrary value into a WorkspaceScopeEnforceMode with the same

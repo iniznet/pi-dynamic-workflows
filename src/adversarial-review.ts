@@ -20,7 +20,7 @@ export interface AdversarialReviewConfig {
  * investigate/refute phases stay untagged (economy default, T2-03). Baked at
  * generation time so the script text (and resume hashes) is deterministic.
  */
-export interface AdversarialReviewTierOptions {
+interface AdversarialReviewTierOptions {
   tierSynthesis?: string;
 }
 

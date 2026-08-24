@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,9 @@ import {
 } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 import { rmForce } from "./helpers/rm-force.js";
+
+const ROOT = join(import.meta.dirname, "..");
+const SKILL_ROOT = "skills/workflow-authoring";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
 function fakeRegistry(models: Array<{ provider: string; id: string }>) {
@@ -231,23 +234,29 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   );
   assert.match(description, /phases.*only when.*named phases.*declare only phases it will use/i);
   assert.match(description, /multiple phases.*phase\('Exact Title'\).*agent options/i);
-  assert.match(description, /await workflow\(savedName, childArgs\).*saved workflow inline/i);
-  assert.match(description, /nesting.*one level.*parent run's concurrency, agent, and token limits/i);
-  assert.match(
-    description,
-    /Optional helpers.*verify\(\), judgePanel\(\), loopUntilDry\(\), completenessCheck\(\).*retry\(\), gate\(\).*budget.*workflow-authoring skill/i,
-  );
+  // T-03: usage prose moved OUT of the always-on tool schema into the
+  // workflow-authoring skill reference (lazy-read on demand) — the schema
+  // keeps only a compact pointer to the helper/usage corpus.
+  assert.doesNotMatch(description, /await workflow\(savedName, childArgs\)/i);
+  assert.doesNotMatch(description, /nesting.*one level.*parent run's concurrency, agent, and token limits/i);
+  assert.doesNotMatch(description, /parallel\(\) requires functions, not promises/i);
+  assert.doesNotMatch(description, /pipeline\(items, \.\.\.stages\).*stages sequentially/i);
+  assert.doesNotMatch(description, /each stage receives.*previousValue.*originalItem.*index/i);
+  assert.doesNotMatch(description, /args, cwd, process\.cwd\(\), and budget/i);
+  assert.match(description, /usage prose.*workflow-authoring skill.*read it on demand/i);
   assert.match(description, /optional `agentType` option.*named user or project definition/i);
   assert.match(description, /bind tools, a model, and role instructions/i);
   assert.match(description, /name and purpose.*provided in context/i);
   assert.match(description, /bound model overrides `tier`.*explicit `model` overrides both/i);
   assert.match(description, /plain JavaScript only.*imports.*require\(\).*filesystem modules/i);
   assert.match(description, /Date\.now\(\).*Math\.random\(\).*new Date\(\).*unavailable/i);
-  assert.match(description, /args, cwd, process\.cwd\(\), and budget/i);
   assert.match(description, /must call agent\(\) at least once/i);
-  assert.match(description, /parallel\(\) requires functions, not promises.*results in input order/i);
-  assert.match(description, /pipeline\(items, \.\.\.stages\).*stages sequentially.*items proceed concurrently/i);
-  assert.match(description, /each stage receives.*previousValue.*originalItem.*index/i);
+
+  // The moved prose must still be reachable in the lazy-read skill reference.
+  const runtimeRef = readFileSync(join(ROOT, SKILL_ROOT, "references/runtime.md"), "utf8");
+  assert.match(runtimeRef, /parallel\(\).*takes thunks.*preserves input order/i);
+  assert.match(runtimeRef, /pipeline\(\).*runs stages sequentially per item.*proceed concurrently/i);
+  assert.match(runtimeRef, /\(previousValue, originalItem, index\)/i);
 
   const guidance = (tool.promptGuidelines ?? []).join(" ");
   assert.doesNotMatch(guidance, /Markdown fences|First statement: export const meta/i);
@@ -587,7 +596,12 @@ return { a, b }`;
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
     assert.match(text, new RegExp(`resumed from run ${runId}`), "text names the resumed run");
 
-    await new Promise((r) => setTimeout(r, 80));
+    // Poll for the terminal state: the resumed execution's settle wall time
+    // varies with suite load and a fixed sleep flaked under cap-2. 5s deadline
+    // bounds a genuine hang.
+    for (let i = 0; i < 200 && manager.getRun(runId)?.status === "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     const finalRun = manager.getRun(runId);
     assert.equal(finalRun?.status, "completed");
     assert.equal((finalRun?.result?.result as { b?: string } | undefined)?.b, "ran:SECOND-EDITED");

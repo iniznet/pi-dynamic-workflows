@@ -63,7 +63,7 @@ const FOOTER_HINT = "↑↓ navigate · enter cycle/edit · / search · esc canc
 const LOCK_NOTE = "🔒 set by env ";
 
 /** Exact file paths shown in the scope-row description (display only). */
-export interface SettingsScopePaths {
+interface SettingsScopePaths {
   globalPath: string;
   projectPath?: string;
 }
@@ -101,7 +101,7 @@ export interface WorkflowSettingsFormOptions {
 }
 
 /** Submenu factories injected so `buildSettingItems` stays I/O-free and testable. */
-export interface WorkflowSettingsSubmenuBuilders {
+interface WorkflowSettingsSubmenuBuilders {
   fieldSubmenu: (field: WorkflowSettingsField, model: SettingsFormModel, done: (value?: string) => void) => Component;
   /** Visual provider-pool editor (nested form rows) — used for the providerPool row. */
   providerPoolSubmenu: (

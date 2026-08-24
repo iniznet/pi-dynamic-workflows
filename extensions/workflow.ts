@@ -15,7 +15,11 @@ import {
 import { Type } from "typebox";
 import { builtinToolsetTools, CODE_DEV_TOOLSET } from "../src/builtin-workflows.js";
 import { applyCommandWatchdogToTools } from "../src/command-watchdog.js";
-import { DEFAULT_SUBAGENT_EXTENSION_TOOLS, resolveCommandWatchdogOptions } from "../src/config.js";
+import {
+  DEFAULT_SUBAGENT_EXTENSION_TOOLS,
+  DEFAULT_SUBAGENT_SKILLS,
+  resolveCommandWatchdogOptions,
+} from "../src/config.js";
 import { DEFAULT_IDLE_AGENT_MS, formatElapsed, tokenFigures, type WorkflowAgentSnapshot } from "../src/display.js";
 import {
   claimWorkflowRuntime,
@@ -402,6 +406,14 @@ export default function extension(pi: ExtensionAPI) {
     // watchdog-wrapped backend (the default toolset is already wrapped by the
     // assembler above).
     commandWatchdog,
+    // T-01: subagent skill stubs. "none" passes noSkills to the shared
+    // resource loader — read-capable coding agents skip the ~3.1 ktok/turn
+    // skill-stub block (skill bodies stay lazy-readable via the read tool).
+    subagentSkills: settings.subagentSkills ?? DEFAULT_SUBAGENT_SKILLS,
+    // DS-4: settings-surface knob for the untagged-agent tier default
+    // (economy | inherit:main | literal tier name). Run/global option stays
+    // the primary channel; unset here means the runWorkflow default applies.
+    defaultUntaggedTier: settings.defaultUntaggedTier,
   };
   // P2-1 WIRE: lazily-started host tool gateway. Constructing it opens nothing;
   // the bridge only comes up when a run needs host tools (design C: automatic

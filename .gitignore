@@ -18,3 +18,8 @@ tasks/
 
 # CodeGraph local index (regenerable; not part of the package)
 .codegraph/
+
+# Scratch files leaked by external task runners (never part of this package)
+tmp-*.mjs
+tmp/
+

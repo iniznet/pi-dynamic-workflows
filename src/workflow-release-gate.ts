@@ -31,7 +31,7 @@ import { createWorkflowTool } from "./workflow-tool.js";
 export { WorkflowReleaseDiagnosticCode } from "./enums.js";
 
 /** One actionable release alignment error or warning. */
-export interface WorkflowReleaseDiagnostic {
+interface WorkflowReleaseDiagnostic {
   code: WorkflowReleaseDiagnosticCode;
   severity: "error" | "warning";
   subject: string;
@@ -41,7 +41,7 @@ export interface WorkflowReleaseDiagnostic {
 type PublicationPath = (typeof CAPABILITY_PUBLICATION_PATHS)[number];
 
 /** Inputs and test overrides for the model-free workflow release gate. */
-export interface WorkflowReleaseCheckOptions {
+interface WorkflowReleaseCheckOptions {
   root: string;
   definition?: WorkflowCapabilityDefinition;
   extensionVersion?: string;
@@ -86,7 +86,7 @@ const PATTERNS = [
 const RECIPES = ["phased-budgets", "saved-nested-workflows", "bounded-semantic-retry", "structured-output"] as const;
 
 /** Skill files that must be present in the publishable npm package. */
-export const REQUIRED_WORKFLOW_PACKAGE_RESOURCES = [
+const REQUIRED_WORKFLOW_PACKAGE_RESOURCES = [
   `${SKILL_ROOT}/SKILL.md`,
   ...FOCUSED_REFERENCES.map((name) => `${SKILL_ROOT}/references/${name}.md`),
   ...PATTERNS.map((name) => `${SKILL_ROOT}/examples/${name}.js`),

@@ -13,7 +13,9 @@ import {
   DEFAULT_AGENT_TIMEOUT_MS,
   DEFAULT_KEYWORD_TRIGGER_WORD,
   DEFAULT_SUBAGENT_EXTENSION_TOOLS,
+  DEFAULT_SUBAGENT_SKILLS,
   DEFAULT_TOKEN_BUDGET,
+  DEFAULT_UNTAGGED_TIER,
   FAN_OUT_APPROVAL_THRESHOLD_DEFAULT,
   MAX_AGENT_RETRIES,
   MAX_CONCURRENCY,
@@ -330,6 +332,25 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     envVar: WORKFLOW_ENV_VARS.subagentChromeTools,
   },
   {
+    key: "subagentSkills",
+    type: "enum",
+    label: "Subagent skills",
+    help: "Installed-skill stubs in subagent system prompts (T-01): all (default, keeps the SDK's ~3.1 ktok/turn skill-name+description stub block in read-capable agents) or none (passes noSkills to the shared resource loader — read-capable coding agents skip the whole stub block; skill bodies stay lazy-readable via the read tool). Svelte-editing workflows keep all.",
+    options: ["all", "none"],
+    group: "Advanced",
+    defaultDisplay: DEFAULT_SUBAGENT_SKILLS,
+    envVar: WORKFLOW_ENV_VARS.subagentSkills,
+  },
+  {
+    key: "defaultUntaggedTier",
+    type: "string",
+    label: "Untagged-agent default tier",
+    help: "Tier routing for untagged agent() calls when no model-tiers.json is configured (DS-4): economy (default, prompt-aware classifyTask fallback — scan=small / edit=medium / synthesize+analyze=big), inherit:main (restore the pre-economy session-main-model behavior), or a literal tier name from the registry-derived default config. Only affects calls with no explicit model/tier/phase route.",
+    group: "Advanced",
+    defaultDisplay: DEFAULT_UNTAGGED_TIER,
+    envVar: WORKFLOW_ENV_VARS.defaultUntaggedTier,
+  },
+  {
     key: "subagentExtensionTools",
     type: "string[]",
     label: "Subagent extension tools",
@@ -400,7 +421,7 @@ export function getField(key: keyof WorkflowSettings): WorkflowSettingsField | u
 export type ProviderPoolScalarKey = "enabled" | "whenSaturated" | "saturationWaitTimeoutMs" | "defaultTpmWindowMs";
 
 /** Entry scalar keys editable inside the per-provider submenu. */
-export type ProviderPoolEntryScalarKey = "modelId" | "concurrency" | "weight" | "tpm" | "cooldownMs";
+type ProviderPoolEntryScalarKey = "modelId" | "concurrency" | "weight" | "tpm" | "cooldownMs";
 
 /**
  * One declarative row for one per-provider scalar (see PROVIDER_POOL_ENTRY_SCALARS).
@@ -678,6 +699,14 @@ export function parseFieldInput(
     case "number":
       return parseNumber(field, raw);
     case "string": {
+      // DS-4: the untagged-tier row accepts any non-empty trimmed value
+      // ("economy" / "inherit:main" / a literal tier name); the keyword row
+      // keeps its single-word rule.
+      const trimmed = raw.trim();
+      if (field.key === "defaultUntaggedTier") {
+        if (trimmed.length === 0) return { ok: false, error: "enter economy, inherit:main, or a tier name" };
+        return { ok: true, value: trimmed };
+      }
       const word = normalizeKeywordTriggerWord(raw);
       if (word === undefined) return { ok: false, error: "keyword must be a single word, no leading / or whitespace" };
       return { ok: true, value: word };

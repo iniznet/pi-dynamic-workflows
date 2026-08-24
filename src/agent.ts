@@ -20,7 +20,12 @@ import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
 import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "./command-watchdog.js";
-import { DEFAULT_UNTAGGED_TIER, UNTAGGED_TIER_ECONOMY, UNTAGGED_TIER_INHERIT_MAIN } from "./config.js";
+import {
+  DEFAULT_SUBAGENT_SKILLS,
+  DEFAULT_UNTAGGED_TIER,
+  UNTAGGED_TIER_ECONOMY,
+  UNTAGGED_TIER_INHERIT_MAIN,
+} from "./config.js";
 import { recordProvenance } from "./durable-store.js";
 import {
   classifyContextOverflow,
@@ -46,6 +51,7 @@ import {
   resolveTierModel,
 } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+import { withSubagentReadGuidance } from "./subagent/read-guidance.js";
 import { type SafeTimer, safeSetTimeout } from "./timing.js";
 
 /**
@@ -475,6 +481,14 @@ export interface WorkflowAgentOptions {
    * is ignored — the configured "medium" default keeps its existing precedence.
    */
   defaultUntaggedTier?: string;
+  /**
+   * T-01: subagent skill loading ("all" default keeps the SDK's installed-skill
+   * stubs in every read-capable subagent system prompt; "none" passes
+   * `noSkills: true` to the shared resource loader so read-capable coding
+   * agents skip the whole ~3.1 ktok/turn stub block — skill bodies stay
+   * lazy-readable via the read tool on demand).
+   */
+  subagentSkills?: "all" | "none";
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -1121,6 +1135,8 @@ export class WorkflowAgent {
   private readonly mainModel?: string;
   /** T2-03: untagged-agent default routing when no model-tiers.json exists. */
   private readonly defaultUntaggedTier?: string;
+  /** T-01: "all" loads skill stubs (parity); "none" skips them (noSkills). */
+  private readonly subagentSkills: "all" | "none";
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -1186,8 +1202,16 @@ export class WorkflowAgent {
     // already watchdog-wrapped at the toolset-assembly choke point and must NOT
     // be double-wrapped (nested idle timers). Absent knobs → thin passthrough.
     this.commandWatchdog = options.commandWatchdog;
+    // T-02: the search-first read nudge rides ONLY the runner-owned raw default
+    // coding tools (the 'off'-mode / direct-embed fallback, when no toolset is
+    // handed in). Caller-supplied tools are already nudged at the
+    // toolset-assembly choke points (assembler / builtinToolsetTools) and must
+    // pass through with array identity preserved (no double wrap, no re-spread).
     this.baseTools =
-      options.tools ?? applyCommandWatchdogToTools(createCodingTools(this.cwd), this.cwd, options.commandWatchdog?.());
+      options.tools ??
+      withSubagentReadGuidance(
+        applyCommandWatchdogToTools(createCodingTools(this.cwd), this.cwd, options.commandWatchdog?.()),
+      );
     this.excludeTools = options.excludeTools ?? [];
     this.sessionOptions = options.session ?? {};
     this.persistAgentSessions = options.persistAgentSessions ?? false;
@@ -1200,6 +1224,7 @@ export class WorkflowAgent {
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
     this.defaultUntaggedTier = options.defaultUntaggedTier;
+    this.subagentSkills = options.subagentSkills ?? DEFAULT_SUBAGENT_SKILLS;
     this.sharedRegistry = options.modelRegistry;
     this.sessionHandoff = options.sessionHandoff ?? false;
     this.handoffExecutionModel = options.handoffExecutionModel;
@@ -1259,6 +1284,11 @@ export class WorkflowAgent {
           agentDir,
           settingsManager: SettingsManager.create(this.cwd, agentDir),
           noExtensions: true,
+          // T-01: subagentSkills "none" strips the skill-stub block (~3.1 ktok)
+          // from every read-capable subagent system prompt; the skill bodies
+          // stay lazy-readable via the read tool on demand. Default parity
+          // holds: "all" leaves noSkills unset exactly as before.
+          noSkills: this.subagentSkills === "none" ? true : undefined,
         });
         await loader.reload();
         return loader;
@@ -1402,7 +1432,7 @@ export class WorkflowAgent {
     const baseTools =
       runCwd === this.cwd
         ? this.baseTools
-        : applyCommandWatchdogToTools(createCodingTools(runCwd), runCwd, watchdog?.());
+        : withSubagentReadGuidance(applyCommandWatchdogToTools(createCodingTools(runCwd), runCwd, watchdog?.()));
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
     const customTools: ToolDefinition[] = applyToolPolicy(
