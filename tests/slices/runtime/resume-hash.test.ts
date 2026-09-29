@@ -266,7 +266,7 @@ test("T2-03: the resume hash identity encodes ROUTING_POLICY_VERSION (routing-po
     routingPolicyVersion: ROUTING_POLICY_VERSION,
   });
   assert.equal(hash, createHash("sha256").update(expectedIdentity).digest("hex"));
-  assert.equal(ROUTING_POLICY_VERSION, 2, "bumped once for the slice-C routing-policy changes");
+  assert.equal(ROUTING_POLICY_VERSION, 3, "bumped once for the cost:model role-split default change");
 });
 
 test("T2-03: an untagged no-config call's hash is registry-dependent (economy fingerprint widening)", async () => {

@@ -11,10 +11,13 @@ import type { TSchema } from "typebox";
 import type { AgentUsage, OperationTrace } from "./agent.js";
 import {
   type AgentRunOptions,
+  isZeroWorkEvidence,
   listAvailableModels,
   usageComponentsTotal,
   WorkflowAgent,
   type WorkflowAgentOptions,
+  workEvidenceFromTraces,
+  type WorkEvidence,
 } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import {
@@ -41,6 +44,7 @@ import {
   DEFAULT_AGENT_TIMEOUT_MS,
   DEFAULT_HELPER_TIER,
   DEFAULT_MAX_AGENT_RESULT_CHARS,
+  DEFAULT_NO_PROGRESS_GUARD,
   DEFAULT_RECURSIVE_DEPTH,
   DEFAULT_RECURSIVE_MAX_ROOTS,
   DEFAULT_REPLAN_THRESHOLD,
@@ -54,6 +58,7 @@ import {
   MAX_NESTED_WORKFLOW_DEPTH,
   MAX_RECURSIVE_DEPTH,
   MAX_RETRY_BACKOFF_MS,
+  NO_PROGRESS_ZERO_EVIDENCE_CAP,
   ROUTING_POLICY_VERSION,
   resolveMaxTotalOutputChars,
   UNTAGGED_TIER_ECONOMY,
@@ -65,13 +70,15 @@ import type { ProviderPool } from "./gateway/provider-pool.js";
 import { agentLabelContext } from "./idle-context.js";
 import { createWorkflowLogger, pushBoundedLog } from "./logger.js";
 import { createModelCrosschecker, type ModelCrosschecker, parseCrosscheckVerdict } from "./model-crosscheck.js";
-import { parseModelRoutingFromMeta, resolveModelForPhase, tierNameForTask } from "./model-routing.js";
+import { classifyTask, parseModelRoutingFromMeta, resolveModelForPhase, tierNameForTask } from "./model-routing.js";
 import { providerFromCanonicalSpec } from "./model-spec.js";
 import {
   buildDefaultTierConfig,
   coerceSpecThinkingForTier,
   createMemoizedLoadModelTierConfig,
   type ModelTierConfig,
+  type RoleSplitTierDecision,
+  resolveRoleSplitTier,
   resolveTierModel,
 } from "./model-tier-config.js";
 import { runPrewalkStage } from "./phases/prewalk.js";
@@ -80,6 +87,12 @@ import { type FrontierMapper, runWayfinderStage } from "./phases/wayfinder.js";
 import { classifyRunPlan } from "./plan-size.js";
 import { journalEntryKey } from "./run-persistence.js";
 import { createAgentStoreTools, SharedStore } from "./shared-store.js";
+import {
+  evaluateSpendQuote,
+  formatQuoteUsd,
+  isSpendQuoteArmed,
+  type SpendQuoteOptions,
+} from "./spend-quote.js";
 import {
   bindSpendAnalytics,
   buildSpendLedgerEntry,
@@ -552,6 +565,21 @@ export interface AgentKillChannel {
 }
 
 /**
+ * Spend governance (slice C): one flagged zero-work-evidence success — the
+ * no-progress guard's audit trail (label, consecutive count, and the evidence
+ * figures that made it zero). Never part of any resume identity.
+ */
+export interface NoProgressFlag {
+  /** Agent label of the zero-evidence success. */
+  label: string;
+  /** Consecutive zero-evidence successes for this label at this flag. */
+  consecutive: number;
+  toolEvents: number;
+  editEvents: number;
+  resultChars: number;
+}
+
+/**
  * Global resources shared across a run and any workflow() nested inside it, so
  * the 16-concurrent / 1000-total caps and the token budget hold across nesting
  * instead of each level getting its own limiter and counters.
@@ -623,6 +651,20 @@ export interface SharedRuntime {
    * only; a resumed run re-observes its own live calls).
    */
   structuredOutputWarnings: Array<{ label: string; warning: string }>;
+  /**
+   * Spend governance (slice C): consecutive zero-work-evidence successes per
+   * agent label. The default-on no-progress guard tracks this per-call-site
+   * attempt budget; shared across nested workflow() frames like spent so a
+   * loop that spans frames is still capped. Never part of any resume hash
+   * (observation + guard state, rebuilt live on a resumed run).
+   */
+  noProgressByLabel: Map<string, number>;
+  /**
+   * Spend governance (slice C): every flagged zero-evidence success, in flag
+   * order (one entry per flagged settle, before the cap escalates). Surfaced
+   * on the run result when non-empty. Never part of any resume hash.
+   */
+  noProgressFlags: NoProgressFlag[];
   /**
    * Fires exactly once a run-fatal error is determined: an error that escaped
    * the TOP-level script's own execution completely uncaught (see runWorkflow's
@@ -1060,6 +1102,47 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    */
   rePlanThreshold?: number;
   /**
+   * Spend governance (slice C): base spend budget threshold (USD) the quote
+   * gate compares the run's worst-case USD quote against. An explicit
+   * `quotedValueUsd` wins over budget × tau; tau = 0/null (or no budget/value)
+   * disables the gate → current behavior (no quote, no refusal). Frozen at
+   * run start like tokenBudget; inherited by nested workflow() frames via the
+   * options spread but ENFORCED only at the top-level frame. Deliberately NOT
+   * part of any agent() resume hash (a launch-time gate, not per-call
+   * identity).
+   */
+  spendBudgetUsd?: number | null;
+  /**
+   * Spend governance (slice C): the run's quoted value (USD) — the ceiling
+   * the quote gate compares against directly (the run's worth). Overrides
+   * budget × tau when both are set. null/absent → falls back to budget × tau.
+   */
+  quotedValueUsd?: number | null;
+  /**
+   * Spend governance (slice C): tau multiplier for the quote gate — the
+   * worst-case quote must stay under `spendBudgetUsd × tau` (tau = value ÷
+   * budget, so the ceiling is at most the run's value). Default
+   * DEFAULT_SPEND_TAU (1); 0/null disables the gate → current behavior.
+   */
+  spendTau?: number | null;
+  /**
+   * Spend governance (slice C): quote-gate mode — "warn" (default) requires
+   * human confirmation before an over-budget launch (headless/background runs
+   * REFUSE — never silently launch over budget), "refuse" always refuses,
+   * "off" disables the gate. Only engaged when a spend ceiling is configured.
+   */
+  spendQuoteGate?: "warn" | "refuse" | "off";
+  /**
+   * Spend governance (slice C): default-on no-progress guard. An agent that
+   * reports SUCCESS with zero work evidence (no tool events / edit results) is
+   * flagged; consecutive zero-evidence successes per label are capped at
+   * NO_PROGRESS_ZERO_EVIDENCE_CAP (tightened to 1 once the re-plan signal has
+   * fired) and the run refuses to let the same call site loop silently. false
+   * restores the pre-guard behavior. Never part of any agent() resume hash
+   * (observation + guard state, not call identity).
+   */
+  noProgressGuard?: boolean;
+  /**
    * V2-QW3: run-level total-output ceiling (chars) — the sum of FINAL agent()
    * result chars (post-P05-cap) across the whole run tree. Once the run's
    * accumulator crosses the ceiling, the next agent() call throws
@@ -1256,7 +1339,19 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   onPhase?: (title: string) => void;
   /** Runtime behavior trace used by diagnostics and comprehension evidence. */
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
-  onAgentStart?: (event: { id: string; label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    id: string;
+    label: string;
+    phase?: string;
+    prompt: string;
+    /**
+     * cost:model: the tier this agent's model was resolved through (the
+     * role-split decision for untagged agents under a configured tier config,
+     * or the explicit agent() tier). Absent on paths without a tier decision.
+     */
+    tier?: string;
+    model?: string;
+  }) => void;
   onAgentEnd?: (event: {
     /**
      * Unique per agent() CALL (not per label — concurrent agents routinely
@@ -1273,10 +1368,24 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     tokens?: number;
     tokenUsage?: AgentUsage;
     worktree?: string;
+    /**
+     * cost:model: the tier this agent's model was resolved through (the
+     * role-split decision for untagged agents under a configured tier config,
+     * or the explicit agent() tier). Absent on paths without a tier decision.
+     */
+    tier?: string;
     model?: string;
     error?: string;
     errorCode?: WorkflowErrorCode;
     recoverable?: boolean;
+    /**
+     * Spend governance (slice C): set when the default-on no-progress guard
+     * flagged this SUCCESSFUL agent settle as zero work evidence (no tool
+     * events / edit results). Absent on evidence-bearing settles and on error
+     * events. Observation only — the flag is derived from the settle's own
+     * traces, never part of any resume identity.
+     */
+    noProgress?: NoProgressFlag;
     /**
      * The failing tool call (Fabric-style line-numbered failure repair): the
      * last operation whose outcome was not "ok" (else the final operation)
@@ -1331,6 +1440,15 @@ export interface WorkflowRunResult<T = unknown> {
    * persisted shape of a clean run is unchanged).
    */
   structuredOutputWarnings?: Array<{ label: string; warning: string }>;
+  /**
+   * Spend governance (slice C): every zero-work-evidence success the
+   * default-on no-progress guard flagged on this run's live path, in flag
+   * order (one entry per flagged settle, before the cap escalates). Undefined
+   * when the guard flagged nothing (JSON-dropped, so a clean run's result
+   * shape is unchanged). The guard's escalation itself throws
+   * WorkflowErrorCode.NO_PROGRESS instead of letting the loop continue.
+   */
+  noProgressFlags?: NoProgressFlag[];
   /**
    * V2-P01: approval decisions recorded on this run's live path (policy
    * allows/denies, human verdicts, classifier verdicts, serialized grants,
@@ -1909,6 +2027,8 @@ export async function runWorkflow<T = unknown>(
     depth: 0,
     nestedCallSeq: 0,
     structuredOutputWarnings: [],
+    noProgressByLabel: new Map(),
+    noProgressFlags: [],
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     pendingReplayDeltas: [],
@@ -1941,6 +2061,23 @@ export async function runWorkflow<T = unknown>(
   // sharedRuntime and sharedStore together (see workflowFn below), so this is
   // equivalent to `!options.sharedStore` — used at both choke points below.
   const isTopLevelRun = !options.sharedRuntime;
+
+  // ── Spend governance: quote-before-spend gate (slice C) ────────────────────
+  // Frozen at run start like tokenBudget; inherited by nested workflow() frames
+  // via the options spread, but ENFORCED only on the top-level frame (a nested
+  // frame is already inside the parent's quoted scope). Armed only when a spend
+  // ceiling resolves — an explicit quotedValueUsd, or a positive
+  // spendBudgetUsd with tau != 0. tau = 0/null or no budget → current behavior
+  // (no quote, no refusal). NEVER silent: an over-budget launch is refused
+  // headless or gated behind human confirmation before any agent runs.
+  const spendQuoteOptions: SpendQuoteOptions = {
+    spendBudgetUsd: options.spendBudgetUsd ?? null,
+    quotedValueUsd: options.quotedValueUsd ?? null,
+    spendTau: options.spendTau,
+    spendQuoteGate: options.spendQuoteGate,
+  };
+  const spendGateArmed = isSpendQuoteArmed(spendQuoteOptions);
+  const noProgressGuardEnabled = options.noProgressGuard ?? DEFAULT_NO_PROGRESS_GUARD;
 
   // PhaseGuard activation: when a persisted phase state machine is configured,
   // phase(title, { stage }) queues forward transitions on a chain that flushes
@@ -2105,6 +2242,45 @@ export async function runWorkflow<T = unknown>(
     pushBoundedLog(state.logs, text);
     logger.log(text);
   };
+
+  // ── Spend governance: quote-before-spend gate (slice C) — enforced here, at
+  // the top-level frame only, BEFORE any agent can run. Lazy import breaks the
+  // static cycle: estimate-forecast.ts imports from this module, so a static
+  // import here would form one. The gate runs once per armed launch — a
+  // one-time module-load + a pure AST scan (nothing executes, nothing is
+  // written), exactly like the --estimate pre-flight.
+  if (isTopLevelRun && spendGateArmed) {
+    const { estimateWorkflowForecast } = await import("./estimate-forecast.js");
+    const quote = evaluateSpendQuote(
+      estimateWorkflowForecast(script, {
+        tokenBudget: options.tokenBudget ?? null,
+        ...spendQuoteOptions,
+      }),
+      spendQuoteOptions,
+    );
+    if (quote.verdict === "refuse") {
+      throw new WorkflowError(quote.reason, WorkflowErrorCode.SPEND_QUOTE_EXCEEDED, { recoverable: false });
+    }
+    if (quote.verdict === "warn") {
+      const ask = `${quote.reason}\n\nLaunch anyway? Approve to proceed, deny to abort before anything is spent.`;
+      let approved = false;
+      if (options.confirm) {
+        const reply = await options.confirm(ask, { kind: "confirm", default: false, headless: "abort" });
+        approved = reply === true;
+      }
+      if (!approved) {
+        throw new WorkflowError(
+          `${quote.reason} Refused: no human confirmation available (headless run) — nothing was launched.`,
+          WorkflowErrorCode.SPEND_QUOTE_EXCEEDED,
+          { recoverable: false },
+        );
+      }
+      log(
+        `spend quote approved by human: ${formatQuoteUsd(quote.usdWorstCase)} over the ${formatQuoteUsd(quote.ceilingUsd as number)} ceiling`,
+      );
+    }
+    log(`spend quote: ${quote.reason}`);
+  }
 
   /** Minimal codebase summary when the pipeline caller supplies none. */
   const DEFAULT_PIPELINE_CODEBASE_SUMMARY = "No codebase summary provided to the phase pipeline.";
@@ -2942,6 +3118,11 @@ export async function runWorkflow<T = unknown>(
     // so parallel()/pipeline() fan-out is reproducible for a fixed script.
     const callIndex = state.callSeq++;
     const resolvedIsolation = agentOptions.isolation ?? agentDef?.isolation;
+    // cost:model: capture the role-split decision (truly-untagged call under a
+    // configured tier config WITH a prompt) — used for the registry-fingerprint
+    // condition below (a downgrade is registry-dependent) and to expose the
+    // chosen tier on the agent's start/end events.
+    let roleSplitDecision: RoleSplitTierDecision | undefined;
     const tierModel = resolveRoutingModelSignature(
       agentOptions,
       agentDef,
@@ -2956,7 +3137,17 @@ export async function runWorkflow<T = unknown>(
       options.modelRegistry,
       promptAwareDefaults,
       options.defaultUntaggedTier,
+      (decision) => {
+        roleSplitDecision = decision;
+      },
     );
+
+    // cost:model: the tier this agent's model was resolved through. The
+    // role-split decision names the cheapest/big tier for untagged agents
+    // under a configured tier config (the primary cost lever the user SEES);
+    // an explicit agentOptions.tier names itself; every other path omits the
+    // field entirely (JSON-dropped, so legacy event shapes are unchanged).
+    const eventTier = roleSplitDecision?.tier ?? agentOptions.tier;
 
     // For display in /workflows: the model this agent runs on — its explicit/
     // phase/tier spec, else the session's main model. tierModel encodes the
@@ -2989,16 +3180,27 @@ export async function runWorkflow<T = unknown>(
       // LIVE resolution consults the registry (resolvePromptAwareTier) — an
       // explicit tier with no model-tiers.json, OR an untagged call under the
       // economy default (untagged default != inherit:main, no explicit model).
-      // A configured tier (or configured untagged default) resolves purely
-      // from the config file, which tierModel already encodes, so a registry
-      // change must not invalidate those calls. `registryFingerprint` itself
-      // is undefined when no registry was synchronously available, in which
-      // case hashAgentCall omits the key and legacy journals replay unchanged.
-      loadTierConfig() == null &&
+      // cost:model: it ALSO matters on the configured-config path when the
+      // role-split DOWNGRADED an untagged call to the cheapest tier (that
+      // resolution consults the registry for the price/hint gate) — a registry
+      // change between a live run and its resume must invalidate the cached
+      // result or a stale economy-tier replay would survive a cheaper-model
+      // removal. A kept-default / escalated / no-prompt resolution is purely
+      // config-driven (tierModel already encodes it), so no fingerprint.
+      // `registryFingerprint` itself is undefined when no registry was
+      // synchronously available, in which case hashAgentCall omits the key
+      // and legacy journals replay unchanged.
+      (loadTierConfig() == null &&
         (agentOptions.tier != null ||
           (modelSpec == null &&
             !explicitModel &&
-            (options.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER) !== UNTAGGED_TIER_INHERIT_MAIN))
+            (options.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER) !== UNTAGGED_TIER_INHERIT_MAIN))) ||
+      (loadTierConfig() != null &&
+        modelSpec == null &&
+        !explicitModel &&
+        !agentOptions.tier &&
+        prompt.length > 0 &&
+        roleSplitDecision?.downgraded === true)
         ? registryFingerprint
         : undefined,
       // T2-07: the ctx() blobs registered before this call (omitted when none).
@@ -3051,6 +3253,8 @@ export async function runWorkflow<T = unknown>(
         label,
         phase: assignedPhase,
         prompt,
+        // cost:model: the tier this agent's model was resolved through.
+        tier: eventTier,
         model: replayModel,
       });
       supervisorTap({ kind: "start", id: deltaKey, label, phase: assignedPhase, prompt, model: replayModel });
@@ -3060,6 +3264,7 @@ export async function runWorkflow<T = unknown>(
         phase: assignedPhase,
         result: cached.result,
         tokens: 0,
+        tier: eventTier,
         model: replayModel,
       });
       supervisorTap({
@@ -3126,6 +3331,8 @@ export async function runWorkflow<T = unknown>(
         label,
         phase: assignedPhase,
         prompt,
+        // cost:model: the tier this agent's model was resolved through.
+        tier: eventTier,
         // displayModel is already seeded with the deterministic tier resolution
         // (explicit > configured tier > default medium tier > mainModel), so a
         // running agent shows the real tier model instead of the main-model
@@ -3278,6 +3485,10 @@ export async function runWorkflow<T = unknown>(
           // This attempt's tool-call traces; the successful attempt's traces are
           // journaled, a failed attempt's traces surface the failing operation.
           let operations: OperationTrace[] = [];
+          // Spend governance (slice C): this attempt's reported work evidence
+          // (onWorkEvidence). Reset per attempt like usage/operations so a
+          // retried call re-reports from scratch.
+          let agentWorkEvidence: WorkEvidence | undefined;
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
@@ -3415,6 +3626,13 @@ export async function runWorkflow<T = unknown>(
                 scriptLine,
                 onOperations: (traces) => {
                   operations = traces;
+                },
+                // Spend governance (slice C): the no-progress guard consumes
+                // the agent's own settle evidence (the real runner reports it
+                // on every successful settle). Injected test doubles that never
+                // report are simply not guarded (feature-detect, graceful).
+                onWorkEvidence: (evidence) => {
+                  agentWorkEvidence = evidence;
                 },
                 // Prewalk session handoff: chain the handoff session at phase
                 // boundaries (see chainHandoff) so phase N+1 inherits the phase N
@@ -3564,6 +3782,40 @@ export async function runWorkflow<T = unknown>(
                 });
               }
             }
+            // ── Spend governance: default-on no-progress guard (slice C) ──
+            // An agent that reports SUCCESS with zero work evidence is flagged,
+            // its consecutive attempt budget is capped, and the run refuses to
+            // let the same call site loop silently. Evidence comes from the
+            // agent's own settle report (onWorkEvidence — the real runner
+            // reports it on every successful settle); injected test doubles
+            // that never report are simply not guarded (feature-detect). Re-plan
+            // threshold honored: once the re-plan signal has fired the budget
+            // burn is already extreme, so the cap tightens to 1 — a no-evidence
+            // success on a burning run escalates immediately. The throw lands
+            // BEFORE commitDeltaOrdered, so the catch's discardDelta stays a
+            // clean no-op and the spent tokens stay in shared.spent (the guard
+            // never hides the burn it capped).
+            let noProgressFlag: NoProgressFlag | undefined;
+            if (noProgressGuardEnabled && agentWorkEvidence !== undefined) {
+              if (isZeroWorkEvidence(agentWorkEvidence)) {
+                const consecutive = (shared.noProgressByLabel.get(label) ?? 0) + 1;
+                shared.noProgressByLabel.set(label, consecutive);
+                noProgressFlag = { label, consecutive, ...agentWorkEvidence };
+                shared.noProgressFlags.push(noProgressFlag);
+                const cap = shared.rePlanEmitted ? 1 : NO_PROGRESS_ZERO_EVIDENCE_CAP;
+                if (consecutive >= cap) {
+                  throw new WorkflowError(
+                    `no-progress guard: agent "${label}" reported success ${consecutive}× with zero work evidence (no tool events, no edit results) — refusing to let it loop silently; re-plan the slice or give it real work` +
+                      (shared.rePlanEmitted
+                        ? " (the run is already past its re-plan threshold, so the very first no-evidence success escalates)"
+                        : ""),
+                    WorkflowErrorCode.NO_PROGRESS,
+                    { recoverable: false, agentLabel: label },
+                  );
+                }
+                log(`no-progress guard: agent "${label}" succeeded with zero work evidence (${consecutive}/${cap}) — flagged`);
+              }
+            }
             // E2: capture the delta together with its store commit ordinal — the
             // delta's position in the run's real completion order — so resume
             // replay can reconstruct the same store the live run ended with
@@ -3608,7 +3860,9 @@ export async function runWorkflow<T = unknown>(
               tokens,
               tokenUsage: usage,
               worktree: runCwd,
+              tier: eventTier,
               model: displayModel,
+              ...(noProgressFlag !== undefined ? { noProgress: noProgressFlag } : {}),
             });
             supervisorTap({
               kind: "end",
@@ -3808,6 +4062,7 @@ export async function runWorkflow<T = unknown>(
               tokens,
               tokenUsage: usage,
               worktree: runCwd,
+              tier: eventTier,
               model: displayModel,
               error: workflowError.message,
               errorCode: workflowError.code,
@@ -6170,6 +6425,11 @@ export async function runWorkflow<T = unknown>(
       // path (undefined when every schema agent called the tool cleanly).
       structuredOutputWarnings:
         shared.structuredOutputWarnings.length > 0 ? shared.structuredOutputWarnings : undefined,
+      // Spend governance (slice C): zero-work-evidence successes the default-on
+      // no-progress guard flagged on this run's live path (undefined when none
+      // were flagged — JSON-dropped, so a clean run's shape is unchanged). The
+      // guard's escalation itself throws NO_PROGRESS instead of looping.
+      noProgressFlags: shared.noProgressFlags.length > 0 ? shared.noProgressFlags : undefined,
       // V2-P01: approval decisions (policy/grant/classifier/human/trusted-script)
       // recorded on this run's live path — undefined when no risk-classed gate
       // fired (JSON-dropped, so a policy-less run's shape is unchanged).
@@ -6845,6 +7105,11 @@ function resolveRoutingModelSignature(
   registry?: ModelRegistry,
   promptAwareDefaults?: ModelTierConfig,
   untaggedDefault?: string,
+  // cost:model: reports the role-split decision for a truly-untagged call under
+  // a configured tier config (see resolveRoleSplitTier). The call site uses it
+  // for the registry-fingerprint condition (a downgrade is registry-dependent)
+  // and to expose the chosen tier on agent events.
+  onRoleSplit?: (decision: RoleSplitTierDecision) => void,
 ): string | undefined {
   const explicitModel = options.model ?? agentDef?.model;
   // T2-11: an explicit model is never thinking-capped (explicit > tier).
@@ -6859,15 +7124,28 @@ function resolveRoutingModelSignature(
     // mainModel (passed through), matching live resolution.
     return coerceSpecThinkingForTier(resolveTierModel(options.tier, config, mainModel), options.tier, config);
   }
-  // Untagged agent with a tier config present: the session routes it through
-  // the configured default ("medium") tier, so include that resolved model so
-  // editing model-tiers.json invalidates untagged agents too. A PHASE-routed
-  // call (modelSpec != null) never reaches the tier branch live — the phase
-  // model is passed as an explicit `model` — so its tierModel keeps the raw
-  // medium (byte-identical to the pre-T2-11 encoding); a truly untagged call
-  // (modelSpec == null) is capped like the live resolution, so a
-  // thinkingCaps change invalidates its cached replay.
+  // Untagged agent with a tier config present (cost:model role-split). A truly
+  // untagged call (modelSpec == null) WITH a prompt is routed exactly like the
+  // live resolution in resolveAgentModelSpec: mechanical slices to the
+  // cheapest configured tier when a genuinely cheaper model exists (safety-
+  // gated, registry consulted only for the price/hint check), hard slices to
+  // the configured "big" tier. A PHASE-routed call (modelSpec != null) never
+  // reaches the role-split live — the phase model is passed as an explicit
+  // `model` — so its tierModel keeps the raw medium (byte-identical to the
+  // pre-cost:model encoding); prompt-less untagged calls keep the configured
+  // "medium" default byte-for-byte.
   if (config) {
+    if (modelSpec == null && prompt) {
+      const decision = resolveRoleSplitTier(
+        classifyTask(phase ?? "runtime", prompt),
+        config,
+        mainModel,
+        registry ? listAvailableModels(registry) : [],
+      );
+      onRoleSplit?.(decision);
+      if (decision.modelSpec) return coerceSpecThinkingForTier(decision.modelSpec, decision.tier, config);
+      return undefined;
+    }
     const medium = resolveTierModel("medium", config, mainModel);
     if (medium) return modelSpec == null ? coerceSpecThinkingForTier(medium, "medium", config) : medium;
     return modelSpec;

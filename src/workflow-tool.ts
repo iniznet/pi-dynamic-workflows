@@ -186,6 +186,39 @@ const workflowToolSchema = Type?.Object({
         "Optional user-requested soft spend gate, not a planning target. Do not set `tokenBudget` unless the user explicitly supplies a cap or asks you to choose one; never infer or invent one from task size. If omitted, the configured `defaultTokenBudget` applies; without one, the run is unlimited. Reaching the gate blocks later `agent()` calls; concurrent in-flight work can overshoot.",
     }),
   ),
+  // ── Spend governance (slice C): quote-before-spend knobs ──
+  spendBudgetUsd: Type.Optional(
+    Type.Number({
+      minimum: 0.0001,
+      description:
+        "Spend-governance quote gate: the base budget threshold (USD) the run's worst-case USD quote is compared against before launch. Over-budget launches are refused (headless) or require confirmation (UI) — never silent. `quotedValueUsd` overrides budget × tau. Only set when the user provides a dollar figure; omit for current behavior.",
+    }),
+  ),
+  quotedValueUsd: Type.Optional(
+    Type.Number({
+      minimum: 0.0001,
+      description:
+        "Spend-governance quote gate: the run's quoted value (USD) — the ceiling the worst-case quote is compared against directly (the run's worth). Overrides `spendBudgetUsd` × `spendTau`. Only set when the user provides a dollar figure; omit for current behavior.",
+    }),
+  ),
+  spendTau: Type.Optional(
+    Type.Number({
+      description:
+        "Spend-governance quote gate: tau multiplier — the worst-case quote must stay under `spendBudgetUsd × tau` (tau = value ÷ budget, so the ceiling is at most the run's value). Default 1; 0 or null disables the gate (current behavior).",
+    }),
+  ),
+  spendQuoteGate: Type.Optional(
+    Type.Union([Type.Literal("warn"), Type.Literal("refuse"), Type.Literal("off")], {
+      description:
+        "Spend-governance quote gate mode: \"warn\" (default) requires human confirmation before an over-budget launch (headless/background runs refuse), \"refuse\" always refuses, \"off\" disables the gate. Only engaged when a spend budget/value is configured.",
+    }),
+  ),
+  noProgressGuard: Type.Optional(
+    Type.Boolean({
+      description:
+        "Spend-governance: default-on no-progress guard. An agent that reports success with zero work evidence (no tool events/edit results) is flagged; consecutive zero-evidence successes per label are capped and the run refuses to let it loop silently. false disables the guard.",
+    }),
+  ),
   resumeFromRunId: Type.Optional(
     Type.String({
       description: [
@@ -240,6 +273,12 @@ export type WorkflowToolInput = {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
+  /** Spend governance (slice C): quote-before-spend knobs (see schema). */
+  spendBudgetUsd?: number;
+  quotedValueUsd?: number;
+  spendTau?: number;
+  spendQuoteGate?: "warn" | "refuse" | "off";
+  noProgressGuard?: boolean;
   /**
    * Run-level default for the per-agent retry spend guard (T2-08): skip
    * auto-retry when a failed attempt already burned more than this many
@@ -489,7 +528,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               "workflow: `estimate` cannot be combined with `replayFromRunId`/`replayFixture` — estimate is a static scan; replay simulates the script body over canned results.",
             );
           }
-          const estimate = estimateWorkflowForecast(script, { tokenBudget: params.tokenBudget ?? null });
+          const estimate = estimateWorkflowForecast(script, {
+            tokenBudget: params.tokenBudget ?? null,
+            spendBudgetUsd: params.spendBudgetUsd ?? null,
+            quotedValueUsd: params.quotedValueUsd ?? null,
+            spendTau: params.spendTau,
+            spendQuoteGate: params.spendQuoteGate,
+          });
           return {
             content: [{ type: "text", text: renderWorkflowEstimate(estimate) }],
             details: {
@@ -502,6 +547,13 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
               replyTokens: estimate.replyTokens,
               totalTokens: estimate.totalTokens,
               worstCaseTotalTokens: estimate.worstCaseTotalTokens,
+              // Spend governance (slice C): the measured USD range + quote verdict.
+              usdMin: estimate.usdMin,
+              usdWorstCase: estimate.usdWorstCase,
+              spendCeilingUsd: estimate.spendCeilingUsd,
+              quoteVerdict: estimate.quoteVerdict,
+              quoteReason: estimate.quoteReason,
+              unpricedModels: estimate.unpricedModels,
               durationMs: estimate.durationMs,
               worstCaseDurationMs: estimate.worstCaseDurationMs,
               checkpoints: estimate.checkpoints,
@@ -576,6 +628,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentTimeoutMs: params.agentTimeoutMs,
           retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
+          spendBudgetUsd: params.spendBudgetUsd,
+          quotedValueUsd: params.quotedValueUsd,
+          spendTau: params.spendTau,
+          spendQuoteGate: params.spendQuoteGate,
+          noProgressGuard: params.noProgressGuard,
           checkpointGate: options.checkpointGate,
           fanOutApprovalThreshold: defaults.fanOutApprovalThreshold,
           pipeline: options.pipeline,
@@ -633,6 +690,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentTimeoutMs: params.agentTimeoutMs,
           retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
+          spendBudgetUsd: params.spendBudgetUsd,
+          quotedValueUsd: params.quotedValueUsd,
+          spendTau: params.spendTau,
+          spendQuoteGate: params.spendQuoteGate,
+          noProgressGuard: params.noProgressGuard,
           tools: invocationTools,
           toolset: invocationToolset,
           checkpointGate: options.checkpointGate,
@@ -667,6 +729,11 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           agentTimeoutMs: params.agentTimeoutMs,
           retryOnlyIfSpendUnder: params.retryOnlyIfSpendUnder,
           tokenBudget: params.tokenBudget,
+          spendBudgetUsd: params.spendBudgetUsd,
+          quotedValueUsd: params.quotedValueUsd,
+          spendTau: params.spendTau,
+          spendQuoteGate: params.spendQuoteGate,
+          noProgressGuard: params.noProgressGuard,
           tools: invocationTools,
           toolset: invocationToolset,
           confirm,

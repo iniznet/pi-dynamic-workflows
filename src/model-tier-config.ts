@@ -31,6 +31,9 @@ import { MODEL_TIERS_FILE } from "./config.js";
 // so importing from it cannot create a cycle.
 import type { ModelThinkingLevel } from "./model-spec.js";
 import { splitModelSpecThinking } from "./model-spec.js";
+// Pure leaf (no imports of its own): importing the classification enum here
+// cannot create a cycle, and keeps the role-split decision in one module.
+import { TaskClassification } from "./model-routing.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -527,4 +530,200 @@ function formatEffectiveThinking(level: ModelThinkingLevel | undefined, cap: Mod
   const base = effective ?? "unset";
   if (level === undefined || effective === level) return base;
   return `${base} (capped from ${level})`;
+}
+
+// ---------------------------------------------------------------------------
+// Cost:model role-split (cheapest-first default tiering)
+// ---------------------------------------------------------------------------
+// GAME-CHANGE (cost governance A): untagged agents are cheap-by-default. A
+// mechanical slice (scan/edit) routes to the CHEAPEST configured tier instead
+// of the old "medium" default; a genuinely hard slice (synthesize/analyze —
+// lead/synthesis/final verify) escalates to the "big" tier. This is a role
+// split (big-model-thinks / cheap-models-do), not a blanket downgrade.
+//
+// SAFETY GATE (non-negotiable): the mechanical downgrade happens ONLY when a
+// cheaper model is actually available. "Cheaper" needs a positive signal — a
+// known per-token output price from the registry, else a small-model name
+// hint (mini/flash/haiku/...) vs the reference. When no cheaper model exists
+// (unpriced, same model, or hint-equal) the resolution keeps the CURRENT
+// default behavior (configured "medium", else session default) and reports
+// keptDefault so the caller surfaces a visible notice. Never a silent quality
+// loss, never an assumed downgrade on missing price data.
+
+/**
+ * Task classifications that EARN the flagship tier under the role-split
+ * (cost:model): synthesis and analysis (lead/synthesis/final verify work).
+ * Everything else (scan/edit) is mechanical and routes to the cheapest tier.
+ */
+export const HARD_SLICE_CLASSIFICATIONS: ReadonlySet<TaskClassification> = new Set([
+  TaskClassification.SYNTHESIZE,
+  TaskClassification.ANALYZE,
+]);
+
+/**
+ * The decision the role-split makes for ONE untagged agent() call. Carries
+ * the chosen tier, the resolved model, AND the per-M-output-token prices of
+ * the chosen model and the reference (what the current default would have
+ * cost) so the run/estimate layers can show the user the savings.
+ */
+export interface RoleSplitTierDecision {
+  /** The tier this untagged agent runs on (e.g. "small" under a downgrade). */
+  tier: string;
+  /** Resolved model spec of that tier (undefined = fall to the session default). */
+  modelSpec: string | undefined;
+  /** True: routed to the CHEAPEST tier because a genuinely cheaper model exists. */
+  downgraded: boolean;
+  /** True: a hard slice escalated to the configured "big" tier. */
+  escalated: boolean;
+  /** True: no cheaper model existed — current default behavior kept (notice). */
+  keptDefault: boolean;
+  /** Human-readable reason, for the visible no-downgrade notice. */
+  reason: string;
+  /** Per-M-output-token price of the chosen model (registry-reported; else undefined). */
+  pricePerMTok: number | undefined;
+  /** Per-M-output-token price of the reference model the downgrade avoided (else undefined). */
+  referencePricePerMTok: number | undefined;
+}
+
+/**
+ * Per-M-output-token output price of a model spec in the registry projection
+ * (undefined when unknown). Purely a lookup — the price signals the
+ * downgrade gate and the savings exposure.
+ */
+export function pricePerMTokOf(spec: string | undefined, models: readonly RankableModel[]): number | undefined {
+  if (!spec) return undefined;
+  const info = models.find((m) => m.spec === spec);
+  return typeof info?.costOutput === "number" && info.costOutput > 0 ? info.costOutput : undefined;
+}
+
+/**
+ * The cheapest CONFIGURED tier whose model resolves: the tier name + resolved
+ * spec that ranks first in the least→most-capable order (price first, name
+ * hint fallback, context window, stable tier-name tie-break). Tiers that
+ * resolve to no model (empty spec) are skipped. Deterministic.
+ */
+export function cheapestTierModel(
+  config: ModelTierConfig,
+  mainModel: string | undefined,
+  models: readonly RankableModel[],
+): { tier: string; modelSpec: string } | undefined {
+  const entries: Array<{ tier: string; modelSpec: string }> = [];
+  for (const tier of sortedTierNames(config)) {
+    const spec = resolveTierModel(tier, config, mainModel);
+    if (spec && spec.trim().length > 0) entries.push({ tier, modelSpec: spec });
+  }
+  if (entries.length === 0) return undefined;
+  const resolved = entries.map((entry) => {
+    const known = models.find((m) => m.spec === entry.modelSpec);
+    return { spec: entry.modelSpec, costOutput: known?.costOutput, contextWindow: known?.contextWindow };
+  });
+  const cheapestSpec = rankByCapability(resolved)[0]?.spec;
+  if (!cheapestSpec) return undefined;
+  // Deterministic tie-break: the first tier (sortedTierNames order) whose
+  // resolved model IS the cheapest model.
+  return entries.find((entry) => entry.modelSpec === cheapestSpec);
+}
+
+/**
+ * SAFETY GATE: is `candidate` GENUINELY cheaper than `reference`? Both must
+ * resolve to different specs, and there must be a positive signal:
+ *   - both per-token output prices known → candidate price < reference price;
+ *   - otherwise (unknown/partial prices) → candidate carries a small-model
+ *     name hint and reference does not (never assume a downgrade on missing
+ *     price data).
+ * Identical specs, an unknown-price tie, or a bigger-name candidate all return
+ * false — the caller keeps the current default behavior (no silent quality
+ * loss).
+ */
+export function isGenuinelyCheaperModel(
+  candidate: string,
+  reference: string,
+  models: readonly RankableModel[],
+): boolean {
+  if (candidate === reference) return false;
+  const candidateCost = pricePerMTokOf(candidate, models);
+  const referenceCost = pricePerMTokOf(reference, models);
+  if (candidateCost !== undefined && referenceCost !== undefined) return candidateCost < referenceCost;
+  // Unknown/partial price: fall back to the capability hint. A small-hint name
+  // (mini/flash/haiku/nano/small) is a positive cheaper signal only when the
+  // reference does NOT also carry a small hint.
+  return hintScore(candidate) < hintScore(reference);
+}
+
+/**
+ * The role-split routing decision for an UNTAGGED agent() call under a
+ * CONFIGURED model-tiers.json (cost:model). Pure and deterministic over its
+ * inputs (config + registry projection + mainModel + classification).
+ *
+ *  - hard slices (SYNTHESIZE/ANALYZE — lead/synthesis/final verify) escalate
+ *    to the configured "big" tier; absent a configured big, they keep the
+ *    current "medium" behavior (never invent a flagship the user didn't
+ *    configure).
+ *  - mechanical slices (SCAN/EDIT) route to the cheapest configured tier via
+ *    the safety gate: only when `isGenuinelyCheaperModel` confirms a cheaper
+ *    model exists (keptDefault=false). Otherwise the current "medium" default
+ *    is kept and `keptDefault` is set so the caller can emit a visible notice.
+ *  - a missing "medium" tier keeps today's session-default fallback (modelSpec
+ *    undefined).
+ */
+export function resolveRoleSplitTier(
+  classification: TaskClassification,
+  config: ModelTierConfig,
+  mainModel: string | undefined,
+  models: readonly RankableModel[],
+): RoleSplitTierDecision {
+  const referenceSpec = resolveTierModel("medium", config, mainModel) ?? mainModel;
+  if (HARD_SLICE_CLASSIFICATIONS.has(classification)) {
+    const big = resolveTierModel("big", config, mainModel);
+    if (big) {
+      return {
+        tier: "big",
+        modelSpec: big,
+        downgraded: false,
+        escalated: true,
+        keptDefault: false,
+        reason: `hard slice (${classification}) escalates to the configured "big" tier`,
+        pricePerMTok: pricePerMTokOf(big, models),
+        referencePricePerMTok: pricePerMTokOf(referenceSpec, models),
+      };
+    }
+    const medium = resolveTierModel("medium", config, mainModel);
+    return {
+      tier: "medium",
+      modelSpec: medium,
+      downgraded: false,
+      escalated: false,
+      keptDefault: true,
+      reason: `hard slice (${classification}) but no "big" tier is configured — keeping the current "medium" default`,
+      pricePerMTok: pricePerMTokOf(medium, models),
+      referencePricePerMTok: pricePerMTokOf(referenceSpec, models),
+    };
+  }
+  // Mechanical slice: cheapest-first, gated by the no-downgrade safety check.
+  const cheapest = cheapestTierModel(config, mainModel, models);
+  if (cheapest && referenceSpec && isGenuinelyCheaperModel(cheapest.modelSpec, referenceSpec, models)) {
+    return {
+      tier: cheapest.tier,
+      modelSpec: cheapest.modelSpec,
+      downgraded: true,
+      escalated: false,
+      keptDefault: false,
+      reason: `mechanical slice routes to the cheapest tier "${cheapest.tier}" (${cheapest.modelSpec}) instead of the default (${referenceSpec})`,
+      pricePerMTok: pricePerMTokOf(cheapest.modelSpec, models),
+      referencePricePerMTok: pricePerMTokOf(referenceSpec, models),
+    };
+  }
+  const medium = resolveTierModel("medium", config, mainModel);
+  return {
+    tier: "medium",
+    modelSpec: medium,
+    downgraded: false,
+    escalated: false,
+    keptDefault: true,
+    reason: cheapest
+      ? `no cheaper model than "${referenceSpec ?? "(session default)"}" is available (cheapest tier "${cheapest.tier}" is not genuinely cheaper) — keeping the current default`
+      : `no configured tier resolves to a model — keeping the current default`,
+    pricePerMTok: pricePerMTokOf(medium, models),
+    referencePricePerMTok: pricePerMTokOf(referenceSpec, models),
+  };
 }

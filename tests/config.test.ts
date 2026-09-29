@@ -134,10 +134,12 @@ test("subagentExtensionTools default is on (P04 default-flip knob)", () => {
   assert.equal(DEFAULT_SUBAGENT_EXTENSION_TOOLS, "on");
 });
 
-test("subagentSkills default is all (T-01 parity knob) and env accepts all|none", () => {
-  // T-01: "all" keeps the SDK skill-stub block (parity); "none" strips it via
-  // noSkills. The default must stay "all" so existing runs are unchanged.
-  assert.equal(DEFAULT_SUBAGENT_SKILLS, "all");
+test("subagentSkills default is none (context-cost scoped loading) and env accepts all|none", () => {
+  // Context-cost default flip: "none" strips the ~3.1 ktok skill-stub block via
+  // noSkills (passive/mechanical slices must not pay it); "all" stays the
+  // opt-in that keeps the SDK skill-stub block for slices that need discovery
+  // in the system prompt (e.g. svelte editing).
+  assert.equal(DEFAULT_SUBAGENT_SKILLS, "none");
   assert.deepEqual(workflowSettingsFromEnv({ [WORKFLOW_ENV_VARS.subagentSkills]: "none" }), {
     subagentSkills: "none",
   });

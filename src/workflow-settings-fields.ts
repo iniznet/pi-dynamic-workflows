@@ -335,7 +335,7 @@ export const FIELD_REGISTRY: readonly WorkflowSettingsField[] = [
     key: "subagentSkills",
     type: "enum",
     label: "Subagent skills",
-    help: "Installed-skill stubs in subagent system prompts (T-01): all (default, keeps the SDK's ~3.1 ktok/turn skill-name+description stub block in read-capable agents) or none (passes noSkills to the shared resource loader — read-capable coding agents skip the whole stub block; skill bodies stay lazy-readable via the read tool). Svelte-editing workflows keep all.",
+    help: "Installed-skill stubs in subagent system prompts (T-01 + context-cost): none (default, passes noSkills to the shared resource loader — read-capable coding agents skip the whole ~3.1 ktok skill-stub block; skill bodies stay lazy-readable via the read tool) or all (keeps the SDK's skill-name+description stub block for slices that need discovery in the prompt, e.g. svelte editing).",
     options: ["all", "none"],
     group: "Advanced",
     defaultDisplay: DEFAULT_SUBAGENT_SKILLS,

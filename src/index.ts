@@ -34,6 +34,7 @@ export {
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
 export type { CodeReviewAngle } from "./code-review.js";
 export { CODE_REVIEW_ANGLES, diffShard, generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
+export * from "./codebase-oracle.js";
 export * from "./config.js";
 export type { DeepResearchConfig } from "./deep-research.js";
 export { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
@@ -461,6 +462,15 @@ export {
   SPEC_GENERATION_DEFAULT_FORMAT,
   SPEC_GENERATION_FORMATS,
 } from "./spec-generation.js";
+export {
+  evaluateSpendQuote,
+  formatQuoteUsd,
+  isSpendQuoteArmed,
+  resolveSpendCeilingUsd,
+  type SpendQuote,
+  type SpendQuoteOptions,
+  type SpendQuoteVerdict,
+} from "./spend-quote.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
 export type {

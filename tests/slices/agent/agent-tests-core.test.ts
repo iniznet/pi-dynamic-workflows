@@ -279,16 +279,38 @@ test("T2-03 routing matrix: a literal tier name resolves against the registry-de
   assert.equal(economyResolve("any prompt", { defaultUntaggedTier: "doesnotexist" }), "main/model");
 });
 
-test("T2-03 routing matrix: config present keeps existing precedence (untagged -> configured medium)", () => {
-  // Even with an economy-style prompt, a configured model-tiers.json wins:
-  // untagged defaults to the configured medium tier (plan matrix).
+test("T2-03 routing matrix + cost:model role-split: config present routes untagged calls by slice difficulty", () => {
+  // cost:model GAME-CHANGE: the configured-"medium"-for-everything precedence
+  // is replaced by the role split. With a configured model-tiers.json:
+  //   - a HARD slice (synthesize/analyze) escalates to the configured "big"
+  //     tier (spend only when the slice earns it);
+  //   - a MECHANICAL slice (scan/edit) downgrades to the CHEAPEST configured
+  //     tier when a genuinely cheaper model exists (vendor/small carries the
+  //     "small" name hint; the registry has no vendor/* price, so the hint is
+  //     the positive signal);
+  //   - the defaultUntaggedTier knob stays scoped to the no-config path and is
+  //     ignored here (existing precedence).
   assert.equal(
     resolveAgentModelSpec({}, "main/model", loadCfg, undefined, "synthesize the findings", economyList, (main) =>
       buildDefaultTierConfig(main, ECONOMY_MODELS),
     ),
-    "vendor/medium",
+    "vendor/big",
+    "a hard slice under a configured config escalates to the configured big tier",
   );
-  // The knob is ignored when a config exists (existing precedence).
+  assert.equal(
+    resolveAgentModelSpec(
+      {},
+      "main/model",
+      loadCfg,
+      undefined,
+      "scan the codebase for dead code",
+      economyList,
+      (main) => buildDefaultTierConfig(main, ECONOMY_MODELS),
+    ),
+    "vendor/small",
+    "a mechanical slice under a configured config routes to the cheapest tier when a cheaper model exists",
+  );
+  // The knob is still ignored when a config exists (existing precedence).
   assert.equal(
     resolveAgentModelSpec(
       { defaultUntaggedTier: "inherit:main" },
@@ -299,7 +321,8 @@ test("T2-03 routing matrix: config present keeps existing precedence (untagged -
       economyList,
       (main) => buildDefaultTierConfig(main, ECONOMY_MODELS),
     ),
-    "vendor/medium",
+    "vendor/big",
+    "the untagged-default knob does not bypass the configured role-split",
   );
 });
 
@@ -858,10 +881,11 @@ test("the subagent resource loader is built once per run and shared across subag
   second.catch(() => {});
 });
 
-test("subagentSkills 'none' passes noSkills:true to the shared resource loader (T-01)", async () => {
-  // The T-01 knob: "none" strips the skill-stub block (~3.1 ktok/turn) from
-  // read-capable subagent system prompts via the loader's noSkills flag;
-  // "all" (default) leaves noSkills unset — byte-identical parity. We read the
+test("subagentSkills 'none' (the context-cost default) passes noSkills:true to the shared resource loader", async () => {
+  // The context-cost knob: "none" (DEFAULT_SUBAGENT_SKILLS since the default
+  // flip) strips the skill-stub block (~3.1 ktok/turn) from read-capable
+  // subagent system prompts via the loader's noSkills flag; "all" leaves
+  // noSkills unset — byte-identical parity for the opt-in. We read the
   // constructed loader's runtime noSkills field (plain JS property in the
   // published dist).
   const dir = mkdtempSync(join(tmpdir(), "pi-dw-t01-skills-"));
@@ -873,11 +897,15 @@ test("subagentSkills 'none' passes noSkills:true to the shared resource loader (
 
     const all = new WorkflowAgent({ cwd: dir, subagentSkills: "all" });
     const allLoader = await (all as unknown as Priv).getSharedResourceLoader(dir);
-    assert.equal(allLoader.noSkills, false, "subagentSkills 'all' keeps noSkills off (default parity)");
+    assert.equal(allLoader.noSkills, false, "subagentSkills 'all' keeps noSkills off (opt-in parity)");
 
     const omitted = new WorkflowAgent({ cwd: dir });
     const omittedLoader = await (omitted as unknown as Priv).getSharedResourceLoader(dir);
-    assert.equal(omittedLoader.noSkills, false, "omitted subagentSkills keeps noSkills off (default parity)");
+    assert.equal(
+      omittedLoader.noSkills,
+      true,
+      "omitted subagentSkills uses the context-cost default (none) — scoped loading strips the skill block for passive slices",
+    );
   } finally {
     await rmForce(dir);
   }

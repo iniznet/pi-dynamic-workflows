@@ -388,6 +388,28 @@ export interface ExecOptions {
   /** Hard token budget for this run; once spent reaches it, agent() throws. */
   tokenBudget?: number | null;
   /**
+   * Spend governance (slice C): base spend budget threshold (USD) for the
+   * quote-before-spend gate (threaded to runWorkflow; see WorkflowRunOptions).
+   * Over-budget launches are refused (headless) or require confirmation (UI).
+   * Absent → no ceiling → current behavior.
+   */
+  spendBudgetUsd?: number;
+  /**
+   * Spend governance (slice C): the run's quoted value (USD) — the ceiling
+   * the quote gate compares against directly; overrides budget × tau.
+   */
+  quotedValueUsd?: number;
+  /** Spend governance (slice C): tau multiplier (0/null disables the gate). */
+  spendTau?: number | null;
+  /** Spend governance (slice C): quote-gate mode ("warn" | "refuse" | "off"). */
+  spendQuoteGate?: "warn" | "refuse" | "off";
+  /**
+   * Spend governance (slice C): default-on no-progress guard (false disables).
+   * Threaded to runWorkflow — an agent that reports success with zero work
+   * evidence is flagged and its consecutive attempt budget is capped.
+   */
+  noProgressGuard?: boolean;
+  /**
    * Tool set for this run's subagents, replacing the default coding tools —
    * e.g. built-in `/deep-research` appends web tools. Omit for the default.
    * Not persistable (functions): pair with `toolset` so a resumed run can
@@ -1836,6 +1858,17 @@ export class WorkflowManager extends EventEmitter {
         // P05: per-run agent-result cap default (see resolvedMaxAgentResultChars).
         defaultMaxAgentResultChars: resolvedMaxAgentResultChars,
         drainTimeoutMs: resolvedDrainTimeoutMs,
+        // Spend governance (slice C): quote-before-spend knobs + the
+        // no-progress guard, threaded through from ExecOptions (see
+        // WorkflowRunOptions). The gate is a launch-time guard — not frozen on
+        // the managed run like tokenBudget, and resume() only forwards them
+        // when the caller explicitly passes them (a resumed run's launch was
+        // already gated, or never configured one).
+        spendBudgetUsd: exec.spendBudgetUsd,
+        quotedValueUsd: exec.quotedValueUsd,
+        spendTau: exec.spendTau,
+        spendQuoteGate: exec.spendQuoteGate,
+        noProgressGuard: exec.noProgressGuard,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
         // P11: per-execution discovery (exec override wins) else the manager's;

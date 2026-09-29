@@ -58,7 +58,9 @@ const NO_WINDOW_REGISTRY = mockRegistry([{ provider: "prov", id: "tiny" }]);
 const EMPTY_SESSION = { messages: [] };
 
 function preflight(): { agent: WorkflowAgent; priv: PreflightPrivates } {
-  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  // codebaseOracle: false keeps the estimate hermetic — /tmp may hold unrelated
+  // files on some hosts, and the oracle render is a prompt-token input.
+  const agent = new WorkflowAgent({ cwd: "/tmp", codebaseOracle: false });
   return { agent, priv: agent as unknown as PreflightPrivates };
 }
 
@@ -182,15 +184,37 @@ test("T2-02: resolvedContextWindow reads the registry's window; absent → undef
   assert.equal(priv.resolvedContextWindow(TINY_REGISTRY, undefined, EMPTY_SESSION), undefined, "no model → soft guard");
 });
 
-test("T2-02: estimateIncomingInputTokens is chars/4 over system prefix + tools + history + prompt", () => {
+test("T2-02: estimateIncomingInputTokens is chars/4 over system prefix + tools + history + prompt (mode-aware)", () => {
   const { priv } = preflight();
-  const estimate = priv.estimateIncomingInputTokens(
+  const scoped = priv.estimateIncomingInputTokens(
     "a".repeat(400), // 100 tokens
     {},
     [{ name: "tool", description: "desc" }], // small
     { messages: [] },
     false,
   );
-  assert.ok(estimate !== undefined && estimate > 3_500, "system-prefix estimate (~3.5K tokens) is included");
-  assert.ok(estimate < 4_000, "a 400-char prompt adds ~100 tokens on top of the prefix");
+  assert.ok(
+    scoped !== undefined && scoped > 500,
+    "scoped system-prefix estimate (~500 tokens, no skill block) is included",
+  );
+  assert.ok(scoped < 1_500, "a 400-char prompt adds ~100 tokens on top of the scoped prefix");
+
+  // Context-cost: the full-skills opt-in keeps the ~3.5K-token prefix estimate
+  // (system prompt + AGENTS.md + the ~3.1 ktok skill-stub block).
+  const full = new WorkflowAgent({ cwd: "/tmp", subagentSkills: "all", codebaseOracle: false }) as unknown as PreflightPrivates;
+  const fullEstimate = full.estimateIncomingInputTokens(
+    "a".repeat(400),
+    {},
+    [{ name: "tool", description: "desc" }],
+    { messages: [] },
+    false,
+  );
+  assert.ok(
+    fullEstimate !== undefined && fullEstimate > 3_500,
+    "full system-prefix estimate (~3.5K tokens incl. skills) is included",
+  );
+  assert.ok(
+    (fullEstimate as number) - (scoped as number) >= 2_900,
+    "scoped loading drops the ~3.1 ktok skill block from the incoming-context estimate",
+  );
 });

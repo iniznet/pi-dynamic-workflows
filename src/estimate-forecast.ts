@@ -42,7 +42,12 @@ import {
   MAX_AGENTS_PER_RUN,
   MAX_CONCURRENCY,
   MAX_RECURSIVE_DEPTH,
+  MODEL_PRICE_BOOK,
+  type ModelPriceUsd,
+  modelPriceForEstimate,
+  resolveModelPrice,
 } from "./config.js";
+import { evaluateSpendQuote, type SpendQuoteOptions } from "./spend-quote.js";
 import { estimateTokens, parseWorkflowScript, type WorkflowMeta } from "./workflow.js";
 
 /** Every agent-spawning / gating runtime global the scan recognizes. */
@@ -149,6 +154,26 @@ export interface WorkflowEstimate {
   worstCaseTotalTokens: number;
   /** Tier-weighted cost proxy (relative, no USD): Σ agent tokens × tier weight. */
   costWeightedTokens: number;
+  /**
+   * MEASURED USD range quoted from the price book (spend governance): the
+   * minimum-case and worst-case dollar figures for the forecast's token
+   * counts at the per-model input/output prices. Computed alongside
+   * costWeightedTokens — the legacy relative proxy stays, the USD quote is
+   * the real-price surface. Best-effort: unpriced models quote at the
+   * default reference price and are listed in unpricedModels.
+   */
+  usdMin: number;
+  usdWorstCase: number;
+  /**
+   * Spend-quote surface (slice C): the resolved ceiling the worst case is
+   * compared against, the verdict, and its reason. null ceiling / "off"
+   * verdict = gate disabled (current behavior).
+   */
+  spendCeilingUsd: number | null;
+  quoteVerdict: "off" | "ok" | "warn" | "refuse";
+  quoteReason?: string;
+  /** Distinct model specs seen in the scan with no price-book entry (quoted at the default reference price). */
+  unpricedModels: string[];
   durationMs: number;
   worstCaseDurationMs: number;
   /** Human checkpoint() calls discovered (each also carries its prompt-token estimate). */
@@ -188,6 +213,32 @@ export interface EstimateOptions {
   maxAgents?: number;
   /** Relative tier cost weights (default ESTIMATE_TIER_COST_WEIGHTS). */
   tierCostWeights?: Readonly<Record<string, number>>;
+  /**
+   * Context-cost (T2-B1): fixed per-agent incoming-context tokens (system
+   * prefix + skill stubs + tool defs) that the prompt-token scan cannot see.
+   * Default 0 = the pre-existing estimate exactly (pure prompt + reply). The
+   * scoped-context wiring passes the measured per-agent prefix so the forecast
+   * reflects the default-on savings (a scoped run passes the small scoped
+   * prefix, a full-skills run the ~3.5 ktok prefix). Never part of any resume
+   * identity — read-only pre-flight display, like the whole forecast.
+   */
+  perAgentFixedContextTokens?: number;
+  /**
+   * Measured per-model price book (default MODEL_PRICE_BOOK). The USD range
+   * (usdMin/usdWorstCase) and the spend quote are computed from it — the
+   * assumed relative weights are only the legacy costWeightedTokens proxy.
+   */
+  priceBook?: Readonly<Record<string, ModelPriceUsd>>;
+  /**
+   * Spend-governance knobs (quote-before-spend): base budget threshold (USD),
+   * the run's quoted value (USD, wins over budget × tau), the tau multiplier
+   * (0/null = gate disabled), and the gate mode. They resolve into
+   * spendCeilingUsd + quoteVerdict/quoteReason on the estimate.
+   */
+  spendBudgetUsd?: number | null;
+  quotedValueUsd?: number | null;
+  spendTau?: number | null;
+  spendQuoteGate?: "warn" | "refuse" | "off";
 }
 
 // ── internal AST model ────────────────────────────────────────────────────────
@@ -266,6 +317,10 @@ interface FoldEnv {
   agentOverheadMs: number;
   maxAgents: number;
   tierCostWeights: Readonly<Record<string, number>>;
+  /** Measured per-model price book for the USD quote. */
+  priceBook: Readonly<Record<string, ModelPriceUsd>>;
+  /** Context-cost: fixed per-agent incoming-context tokens (default 0). */
+  perAgentFixedContextTokens: number;
 }
 
 interface PhaseAgg {
@@ -286,6 +341,9 @@ interface Agg {
   replyTokens: number;
   worstReplyTokens: number;
   costWeightedTokens: number;
+  /** Measured USD (min case / worst case) from the price book. */
+  usdMin: number;
+  usdWorstCase: number;
   durationMs: number;
   worstDurationMs: number;
   checkpoints: number;
@@ -1026,6 +1084,8 @@ function emptyAgg(): Agg {
     replyTokens: 0,
     worstReplyTokens: 0,
     costWeightedTokens: 0,
+    usdMin: 0,
+    usdWorstCase: 0,
     durationMs: 0,
     worstDurationMs: 0,
     checkpoints: 0,
@@ -1042,6 +1102,8 @@ function mergeAgg(target: Agg, add: Agg): void {
   target.replyTokens += add.replyTokens;
   target.worstReplyTokens += add.worstReplyTokens;
   target.costWeightedTokens += add.costWeightedTokens;
+  target.usdMin += add.usdMin;
+  target.usdWorstCase += add.usdWorstCase;
   target.durationMs += add.durationMs;
   target.worstDurationMs += add.worstDurationMs;
   target.checkpoints += add.checkpoints;
@@ -1064,7 +1126,13 @@ function fold(node: CallNode, env: FoldEnv): Agg {
   switch (node.kind) {
     case "agent": {
       const promptTokens = node.promptTokens ?? 0;
-      const perTokens = promptTokens + env.replyTokensPerAgent;
+      // Context-cost: the fixed per-agent incoming context (system prefix +
+      // skill stubs + tool defs) is billed once per agent execution, on top of
+      // the static prompt/reply the AST scan can measure. Default 0 keeps the
+      // legacy forecast byte-identical; the scoped-context wiring passes the
+      // measured per-agent prefix.
+      const fixed = env.perAgentFixedContextTokens;
+      const perTokens = promptTokens + env.replyTokensPerAgent + fixed;
       const perDurationMs = (perTokens / env.tokensPerSecond) * 1000 + env.agentOverheadMs;
       const weight = env.tierCostWeights[node.tier ?? ""] ?? 1;
       const min = node.multi;
@@ -1072,18 +1140,26 @@ function fold(node: CallNode, env: FoldEnv): Agg {
       const agg = emptyAgg();
       agg.agents = min;
       agg.worstAgents = worst;
-      agg.promptTokens = promptTokens * min;
-      agg.worstPromptTokens = promptTokens * worst;
+      agg.promptTokens = (promptTokens + fixed) * min;
+      agg.worstPromptTokens = (promptTokens + fixed) * worst;
       agg.replyTokens = env.replyTokensPerAgent * min;
       agg.worstReplyTokens = env.replyTokensPerAgent * worst;
       agg.costWeightedTokens = perTokens * min * weight;
+      // Measured USD from the price book: prompt tokens bill at the input
+      // price, the reply assumption at the output price. An explicit model
+      // spec's price wins, then the tier reference, then the default.
+      const price = modelPriceForEstimate(node.model, node.tier, env.priceBook);
+      const perUsd =
+        ((promptTokens + fixed) / 1000) * price.inputPer1kUsd + (env.replyTokensPerAgent / 1000) * price.outputPer1kUsd;
+      agg.usdMin = perUsd * min;
+      agg.usdWorstCase = perUsd * worst;
       agg.durationMs = perDurationMs * min;
       agg.worstDurationMs = perDurationMs * worst;
       if (node.phase) {
         const row = emptyPhaseAgg();
         row.agents = min;
         row.worstAgents = worst;
-        row.promptTokens = promptTokens * min;
+        row.promptTokens = (promptTokens + fixed) * min;
         row.replyTokens = env.replyTokensPerAgent * min;
         row.totalTokens = perTokens * min;
         row.worstTotalTokens = perTokens * worst;
@@ -1119,6 +1195,8 @@ function fold(node: CallNode, env: FoldEnv): Agg {
       agg.replyTokens = nested.replyTokens * node.multi;
       agg.worstReplyTokens = nested.replyTokens * node.worstMulti;
       agg.costWeightedTokens = nested.costWeightedTokens * node.multi;
+      agg.usdMin = nested.usdMin * node.multi;
+      agg.usdWorstCase = nested.usdWorstCase * node.worstMulti;
       agg.durationMs = nested.durationMs * node.multi;
       agg.worstDurationMs = nested.worstCaseDurationMs * node.worstMulti;
       for (const row of nested.phases) {
@@ -1204,6 +1282,8 @@ function fold(node: CallNode, env: FoldEnv): Agg {
       agg.replyTokens = item.replyTokens * batchMin;
       agg.worstReplyTokens = item.replyTokens * batchWorst;
       agg.costWeightedTokens = item.costWeightedTokens * batchMin;
+      agg.usdMin = item.usdMin * batchMin;
+      agg.usdWorstCase = item.usdWorstCase * batchWorst;
       // Propagate the children's per-phase aggregates (scaled the same way).
       for (const [phase, row] of item.phases) {
         const aggRow = emptyPhaseAgg();
@@ -1341,6 +1421,36 @@ function countDynamicPrompts(nodes: CallNode[]): number {
   return count;
 }
 
+/**
+ * Distinct explicit model specs seen in the scan with NO price-book entry.
+ * These quote at the default reference price (documented via a warning).
+ */
+function collectUnpricedModels(nodes: CallNode[], env: FoldEnv): string[] {
+  const found = new Set<string>();
+  const walk = (list: CallNode[]): void => {
+    for (const node of list) {
+      if (node.kind === "agent" && node.model && resolveModelPrice(node.model, env.priceBook) === undefined) {
+        found.add(node.model);
+      }
+      walk(node.children);
+    }
+  };
+  // Nested workflow() forecasts carry PUBLIC records (EstimateCallRecord[]), a
+  // different shape than the internal CallNode walk above — walk them with the
+  // public-shaped recursion instead of forcing them into the internal one.
+  const walkPublic = (list: EstimateCallRecord[]): void => {
+    for (const node of list) {
+      if (node.kind === "agent" && node.model && resolveModelPrice(node.model, env.priceBook) === undefined) {
+        found.add(node.model);
+      }
+      for (const nested of node.nested ?? []) walkPublic(nested.calls);
+    }
+  };
+  walk(nodes);
+  for (const nested of nodes.flatMap((node) => node.nested ?? [])) walkPublic(nested.calls);
+  return [...found];
+}
+
 function buildFoldEnv(opts: EstimateOptions): FoldEnv {
   return {
     replyTokensPerAgent: opts.replyTokensPerAgent ?? ESTIMATE_REPLY_TOKENS_PER_AGENT_DEFAULT,
@@ -1348,6 +1458,8 @@ function buildFoldEnv(opts: EstimateOptions): FoldEnv {
     agentOverheadMs: opts.agentOverheadMs ?? ESTIMATE_AGENT_OVERHEAD_MS_DEFAULT,
     maxAgents: opts.maxAgents ?? MAX_AGENTS_PER_RUN,
     tierCostWeights: opts.tierCostWeights ?? ESTIMATE_TIER_COST_WEIGHTS,
+    priceBook: opts.priceBook ?? MODEL_PRICE_BOOK,
+    perAgentFixedContextTokens: opts.perAgentFixedContextTokens ?? 0,
   };
 }
 
@@ -1401,6 +1513,22 @@ function buildEstimate(
     );
   }
 
+  // ── Spend governance: measured USD range + quote verdict (slice C) ──
+  // The USD range comes from the price book fold; the quote verdict comes from
+  // the shared spend-quote evaluator so the estimator and the runtime gate can
+  // never disagree on the ceiling. Unpriced models are documented (they quote
+  // at the default reference price — conservative unless the book is extended).
+  const unpricedModels = collectUnpricedModels(calls, env);
+  if (unpricedModels.length > 0) {
+    warnings.push(
+      `${unpricedModels.length} model spec(s) have no price-book entry (${unpricedModels.join(", ")}) — quoted at the default reference price; extend MODEL_PRICE_BOOK for an exact quote`,
+    );
+  }
+  const quote = evaluateSpendQuote({ usdMin: agg.usdMin, usdWorstCase: agg.usdWorstCase }, opts);
+  if (quote.verdict === "refuse" || quote.verdict === "warn") {
+    warnings.push(quote.reason);
+  }
+
   // Phase rows: meta-declared order first, then body-observed order.
   const seen = new Set<string>();
   const rows: EstimatePhaseRow[] = [];
@@ -1445,6 +1573,12 @@ function buildEstimate(
     totalTokens,
     worstCaseTotalTokens: agg.worstPromptTokens + agg.worstReplyTokens,
     costWeightedTokens: agg.costWeightedTokens,
+    usdMin: agg.usdMin,
+    usdWorstCase: agg.usdWorstCase,
+    spendCeilingUsd: quote.ceilingUsd,
+    quoteVerdict: quote.verdict,
+    ...(quote.reason !== undefined ? { quoteReason: quote.reason } : {}),
+    unpricedModels,
     durationMs: agg.durationMs,
     worstCaseDurationMs: agg.worstDurationMs,
     checkpoints: agg.checkpoints,
@@ -1523,6 +1657,15 @@ export function renderWorkflowEstimate(estimate: WorkflowEstimate): string {
       estimate.totalTokens,
     )}** total (worst ~${groupThousands(estimate.worstCaseTotalTokens)})`,
   );
+  // Spend governance: the measured USD range from the price book + the quote verdict.
+  lines.push(
+    `Cost: ~**${formatQuoteUsd(estimate.usdMin)} – ${formatQuoteUsd(estimate.usdWorstCase)}** (min – worst case, measured price book)`,
+  );
+  if (estimate.quoteVerdict !== "off") {
+    lines.push(`Quote: ${quoteVerdictLabel(estimate.quoteVerdict)} — ${estimate.quoteReason ?? ""}`);
+  } else if (estimate.spendCeilingUsd !== null) {
+    lines.push(`Quote: off (spend quote gate disabled)`);
+  }
   lines.push(
     `Duration: ~${formatEstimateDuration(estimate.durationMs)} (worst ~${formatEstimateDuration(
       estimate.worstCaseDurationMs,
@@ -1565,4 +1708,25 @@ export function renderWorkflowEstimate(estimate: WorkflowEstimate): string {
   for (const warning of estimate.warnings) lines.push(`⚠ ${warning}`);
   lines.push("Estimate only — best-effort static scan; no run was started, nothing was executed or written.");
   return lines.join("\n");
+}
+
+/** Human label for a quote verdict (spend governance). */
+function quoteVerdictLabel(verdict: "off" | "ok" | "warn" | "refuse"): string {
+  switch (verdict) {
+    case "ok":
+      return "within spend ceiling";
+    case "warn":
+      return "⚠ over spend ceiling — requires confirmation";
+    case "refuse":
+      return "✗ over spend ceiling — launch refused";
+    case "off":
+      return "disabled";
+  }
+}
+
+/** Format USD for a human cost line (same shape as the quote evaluator). */
+function formatQuoteUsd(usd: number): string {
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(4)}`;
 }

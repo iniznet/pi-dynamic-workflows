@@ -105,12 +105,16 @@ const EDIT_KEYWORDS = ["edit", "refactor", "fix", "implement", "write", "create"
 const SYNTHESIZE_KEYWORDS = ["synthesize", "summarize", "prewalk", "final", "consolidate", "aggregate", "overview"];
 
 /** Keywords that signal an analysis/review task. */
-const ANALYZE_KEYWORDS = ["analyze", "review", "critique", "audit", "inspect", "evaluate", "assess", "compare"];
+const ANALYZE_KEYWORDS = ["analyze", "review", "critique", "audit", "inspect", "evaluate", "assess", "compare", "verify", "validate"];
 
 /** Phase identifiers that qualify as early reconnaissance phases (0, 1). */
 const EARLY_PHASES = new Set(["0", "1", "phase-0", "phase-1", "phase0", "phase1"]);
 
-function matchesAnyKeyword(prompt: string, keywords: readonly string[]): boolean {
+function matchesAnyKeyword(prompt: unknown, keywords: readonly string[]): boolean {
+  // agent() prompts are arbitrary JSON values (numbers, objects, ...), so the
+  // keyword matcher must never assume a string — non-strings classify as
+  // keyword-free (a prompt with no discoverable intent is not a keyword hit).
+  if (typeof prompt !== "string") return false;
   const lower = prompt.toLowerCase();
   return keywords.some((kw) => lower.includes(kw));
 }
@@ -126,6 +130,10 @@ function matchesAnyKeyword(prompt: string, keywords: readonly string[]): boolean
  * - Prompt-level analyze keywords (any phase) → ANALYZE
  * - Prompt-level scan keywords (any phase) → SCAN
  * - Default → EDIT
+ *
+ * cost:model role-split: "verify"/"validate" were added to ANALYZE_KEYWORDS so
+ * verification slices (final verify) classify as hard and earn the flagship
+ * tier instead of being treated as mechanical edits on the cheapest tier.
  */
 export function classifyTask(phase: string, prompt: string): TaskClassification {
   const isEarlyPhase = EARLY_PHASES.has(phase);

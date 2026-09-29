@@ -166,12 +166,13 @@ export interface WorkflowSettings {
    */
   subagentExtensionTools?: "off" | "on" | ExtensionToolSourceId[];
   /**
-   * Skill loading for subagent sessions (T-01): "all" (default) keeps the
-   * SDK's installed-skill stubs in every read-capable subagent system prompt
-   * (~3.1 ktok/turn of frontmatter name+description stubs); "none" passes
-   * `noSkills: true` to the shared resource loader so read-capable coding
-   * agents skip the whole stub block (the skill bodies stay lazy-readable via
-   * the read tool on demand). Svelte-editing workflows keep "all".
+   * Skill loading for subagent sessions (T-01 + context-cost): "none"
+   * (default) passes `noSkills: true` to the shared resource loader so
+   * read-capable coding agents skip the whole ~3.1 ktok skill-stub block (the
+   * skill bodies stay lazy-readable via the read tool on demand); "all"
+   * keeps the SDK's installed-skill stubs in every read-capable subagent
+   * system prompt — the opt-in for slices that genuinely need skill discovery
+   * in the prompt (e.g. svelte editing).
    */
   subagentSkills?: "all" | "none";
   /**

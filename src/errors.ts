@@ -59,6 +59,25 @@ export enum WorkflowErrorCode {
   /** Token budget exhausted. */
   TOKEN_BUDGET_EXHAUSTED = "TOKEN_BUDGET_EXHAUSTED",
   /**
+   * Spend governance (slice C): the run's QUOTE-BEFORE-SPEND gate refused a
+   * launch whose worst-case USD quote exceeds the configured spend ceiling
+   * (spendBudgetUsd × tau, or quotedValueUsd). Non-recoverable by
+   * construction: re-launching the same script under the same ceiling quotes
+   * the same over-budget number — the caller must raise the budget/value,
+   * raise tau, or explicitly disable the gate. Never silent: an over-budget
+   * launch is always refused or gated behind human confirmation.
+   */
+  SPEND_QUOTE_EXCEEDED = "SPEND_QUOTE_EXCEEDED",
+  /**
+   * Spend governance (slice C): the default-on no-progress guard stopped an
+   * agent call that kept reporting SUCCESS with zero work evidence (no tool
+   * events / edit results) past its consecutive attempt budget — the silent
+   * loop the guard exists to break. Non-recoverable by construction: the
+   * same zero-work call would trip the identical cap on re-run; the slice
+   * must be re-planned or assigned real work.
+   */
+  NO_PROGRESS = "NO_PROGRESS",
+  /**
    * V2-QW3: the run's total agent-output ceiling (maxTotalOutputChars) was
    * crossed — the sum of FINAL agent() result chars (post-P05-cap) across the
    * whole run tree exceeded the ceiling, so the next agent() call is refused.

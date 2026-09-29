@@ -73,7 +73,19 @@ const ENTRY_CONTRACT: Record<string, string> = {
   DEFAULT_REPLAN_THRESHOLD: "V2-P11 re-plan forecast threshold default (config + runtime share it)",
   DEFAULT_SUBAGENT_EXTENSION_TOOLS:
     "P04 default knob for subagentExtensionTools (extension entry + settings UI share it)",
-  DEFAULT_SUBAGENT_SKILLS: "T-01 default knob for subagentSkills (agent resource-loader entry + settings UI share it)",
+  DEFAULT_SUBAGENT_SKILLS:
+    "context-cost default knob for subagentSkills (agent resource-loader entry + settings UI share it)",
+  // ── context-cost shared codebase oracle (T2-B1) — exported so embedders and
+  // the extension entry can scan/inject the same zero-LLM repo map ──
+  scanCodebaseOracle: "context-cost oracle raw scan (embedders + tests)",
+  loadCodebaseOracle: "context-cost oracle cached scan (run injection)",
+  recallSymbol: "context-cost oracle fail-closed recall",
+  normalizeOracleQuery: "context-cost oracle query normalization (recall surface)",
+  liveSearchFiles: "context-cost oracle filesystem live-search fallback",
+  resolveSymbol: "context-cost oracle combined recall + live-search",
+  renderOracle: "context-cost oracle bounded prompt render",
+  renderOracleFollowup: "context-cost oracle follow-up note surface",
+  isOracleEnabled: "context-cost oracle default-on gate",
   workflowSettingsFromEnv: "config env override layer (entry-config:i2)",
   WORKFLOW_ENV_PREFIX: "config env override layer (entry-config:i2)",
   WORKFLOW_ENV_VARS: "config env override layer (entry-config:i2)",

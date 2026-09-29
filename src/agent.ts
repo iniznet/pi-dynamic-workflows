@@ -19,6 +19,7 @@ import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
 import { applyToolPolicy } from "./agent-registry.js";
+import { type CodebaseOracle, isOracleEnabled, loadCodebaseOracle, renderOracle } from "./codebase-oracle.js";
 import { applyCommandWatchdogToTools, type CommandWatchdogOptions } from "./command-watchdog.js";
 import {
   DEFAULT_SUBAGENT_SKILLS,
@@ -34,7 +35,7 @@ import {
   WorkflowError,
   WorkflowErrorCode,
 } from "./errors.js";
-import { tierNameForTask } from "./model-routing.js";
+import { classifyTask, tierNameForTask } from "./model-routing.js";
 import {
   canonicalModelSpec,
   formatModelSpecWithThinking,
@@ -48,6 +49,7 @@ import {
   loadModelTierConfig,
   type ModelTierConfig,
   type RankableModel,
+  resolveRoleSplitTier,
   resolveTierModel,
 } from "./model-tier-config.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
@@ -352,6 +354,11 @@ export function resolveAgentModelSpec(
   // (non-pipeline runs, or callers that predate the fix) classification uses
   // the generic "runtime" default exactly as before.
   phase?: string,
+  // cost:model: called when an untagged agent under a CONFIGURED tier config
+  // wanted the cheapest tier but no genuinely cheaper model exists, so the
+  // current "medium" default was kept. The caller surfaces this as a visible
+  // notice (never a silent quality decision).
+  onNoCheaperTier?: (info: { tier: string; requestedSpec: string | undefined; reason: string }) => void,
 ): string | undefined {
   // T2-11: an EXPLICIT opts.model always wins and is never thinking-capped
   // (explicit > tier precedence) — returned before any tier resolution.
@@ -387,9 +394,22 @@ export function resolveAgentModelSpec(
     // agent's model for a call the user pinned to a configured tier.
     return coerceSpecThinkingForTier(resolveTierModel(options.tier, config, mainModel), options.tier, config);
   }
-  // Untagged agent: default to the configured medium tier when one exists
-  // (T2-03 plan matrix: "config -> existing precedence").
+  // Untagged agent with a tier config present (cost:model role-split): a
+  // prompt classifies the slice — mechanical (scan/edit) routes to the
+  // CHEAPEST configured tier when a genuinely cheaper model exists (safety-
+  // gated: keptDefault keeps the current "medium" behavior and reports a
+  // visible notice via onNoCheaperTier), hard (synthesize/analyze —
+  // lead/synthesis/final verify) escalates to the configured "big" tier.
+  // Prompt-less calls keep the pre-game-change "medium" default byte-for-byte.
   if (config) {
+    if (prompt) {
+      const decision = resolveRoleSplitTier(classifyTask(phase ?? "runtime", prompt), config, mainModel, listModels());
+      if (decision.keptDefault) {
+        onNoCheaperTier?.({ tier: decision.tier, requestedSpec: decision.modelSpec, reason: decision.reason });
+      }
+      if (decision.modelSpec) return coerceSpecThinkingForTier(decision.modelSpec, decision.tier, config);
+      return undefined;
+    }
     const medium = resolveTierModel("medium", config, mainModel);
     if (medium) return coerceSpecThinkingForTier(medium, "medium", config);
     return undefined;
@@ -489,6 +509,20 @@ export interface WorkflowAgentOptions {
    * lazy-readable via the read tool on demand).
    */
   subagentSkills?: "all" | "none";
+  /**
+   * Context-cost (T2-B1): the run's shared codebase oracle — a deterministic,
+   * ZERO-LLM symbol/type/declaration scan over `cwd` (functions/classes/
+   * consts/tokens with file:line, see src/codebase-oracle.ts). Computed ONCE
+   * per WorkflowAgent (~= once per run frame, plus a module-level cache) and
+   * rendered as a BOUNDED map into every subagent's prompt, so parallel
+   * agents reuse one repo map instead of each re-discovering structure.
+   *
+   * Default: enabled. `false` disables the scan + injection entirely. An
+   * object form lets an embedder supply its own `scan` (returns a
+   * CodebaseOracle; a null/throw degrades to no injection — never a broken
+   * agent).
+   */
+  codebaseOracle?: boolean | { enabled?: boolean; scan?: (cwd: string) => CodebaseOracle };
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -712,6 +746,27 @@ function warnTierUnconfiguredOnce(mainModel: string | undefined, registry: Model
 }
 
 /**
+ * cost:model: emitted at most once per process when an untagged agent under a
+ * CONFIGURED model-tiers.json wanted the cheapest tier but no genuinely
+ * cheaper model exists, so the current default was kept. The no-downgrade
+ * safety gate must never be silent — this names the kept tier, the resolved
+ * spec, and the reason. Diagnostics only — never lets a failure break a run.
+ */
+let warnedNoCheaperTier = false;
+function warnNoCheaperTierOnce(info: { tier: string; requestedSpec: string | undefined; reason: string }): void {
+  if (warnedNoCheaperTier) return;
+  warnedNoCheaperTier = true;
+  try {
+    console.warn(
+      `[workflow] untagged agent kept the "${info.tier}" default: ${info.reason}` +
+        (info.requestedSpec ? ` (resolving to "${info.requestedSpec}")` : " (session default)"),
+    );
+  } catch {
+    // best-effort diagnostic
+  }
+}
+
+/**
  * Emitted at most once per process when persistAgentSessions is enabled and a
  * session is actually persisted: full subagent transcripts (which may include
  * secrets or other sensitive context) are being written to disk. Surface the
@@ -789,6 +844,15 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * (all-zero stats), so consumers keep their scalar fallback.
    */
   onUsage?: (usage: AgentUsage) => void;
+  /**
+   * Spend governance (slice C): reported once on a SUCCESSFUL settle with the
+   * run's work evidence (tool events / edit results / result chars). A
+   * zero-evidence success (no tool events at all) is the no-progress pattern
+   * the default-on guard flags. Fires only on success — a failed/retried
+   * attempt produced no "done" claim. Pure observation: the agent never
+   * blocks on it.
+   */
+  onWorkEvidence?: (evidence: WorkEvidence) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`, parsed with the same grammar as Pi CLI's `--model`. When it
@@ -1017,6 +1081,47 @@ export interface OperationTrace {
   outcome: string;
 }
 
+// ── Spend governance: work-evidence hook (slice C) ───────────────────────────
+// A successful agent that did NO work (no tool events, no edit results, no
+// written deliverable) is the no-progress pattern the default-on guard flags.
+// The agent layer reports its evidence on every successful settle; the
+// workflow layer enforces the consecutive-zero-evidence budget cap. Keeping
+// the evidence shape here (not in workflow.ts) makes the hook testable and the
+// semantics shared by every consumer.
+
+/** Work-evidence stats for one settled agent run. */
+export interface WorkEvidence {
+  /** Number of tool executions observed (any outcome). */
+  toolEvents: number;
+  /** File-editing tool calls (edit/write/apply_patch) that completed ok. */
+  editEvents: number;
+  /** Final result length in chars (0 for structured/schema results). */
+  resultChars: number;
+}
+
+/**
+ * Derive work evidence from a run's typed operation traces + final result.
+ * Pure and deterministic. A write to README.md (or any file) is a tool event,
+ * so "no tool events" exactly means "no tool work AND no edits AND no
+ * deliverable file write".
+ */
+export function workEvidenceFromTraces(operations: readonly OperationTrace[], result: unknown): WorkEvidence {
+  const toolEvents = operations.length;
+  const editEvents = operations.filter(
+    (t) => (t.op === "edit" || t.op === "write" || t.op === "apply_patch") && t.outcome === "ok",
+  ).length;
+  return {
+    toolEvents,
+    editEvents,
+    resultChars: typeof result === "string" ? result.length : 0,
+  };
+}
+
+/** True when a settled run produced zero work evidence (the guard's trigger). */
+export function isZeroWorkEvidence(evidence: WorkEvidence): boolean {
+  return evidence.toolEvents === 0;
+}
+
 /** Payload delivered when the first-edit swap gate opens (see onSwap). */
 export interface HandoffSwapInfo {
   /** Canonical spec of the model the session was on before the swap. */
@@ -1088,6 +1193,16 @@ const PLANNING_GUIDANCE =
 const SYSTEM_PREFIX_ESTIMATE_CHARS = 14_000;
 
 /**
+ * Context-cost (T2-B1): the same prefix estimate under the default SCOPED
+ * loading (subagentSkills "none"): the ~3.1 ktok skill-stub block is stripped
+ * (see SUBAGENT_SKILL_STUB_BLOCK_TOKENS in config.ts), leaving the system
+ * prompt + AGENTS.md (~13.4 KiB ≈ 3,435 tok − ~12.4 KiB ≈ 3.1 ktok skills ≈
+ * 1.0 KiB ≈ 250–500 tok). Rounded conservatively so the preflight never
+ * undercounts the static prefix. Advisory only, like the full constant.
+ */
+const SCOPED_SYSTEM_PREFIX_ESTIMATE_CHARS = 2_000;
+
+/**
  * T2-02: the reserve kept below the resolved model's context window, matching
  * the SDK's reactive auto-compaction trigger (window − 16,384). The preflight
  * acts (proactive compact / ceiling throw) only when the estimate crosses into
@@ -1137,6 +1252,8 @@ export class WorkflowAgent {
   private readonly defaultUntaggedTier?: string;
   /** T-01: "all" loads skill stubs (parity); "none" skips them (noSkills). */
   private readonly subagentSkills: "all" | "none";
+  /** Context-cost oracle option (see WorkflowAgentOptions.codebaseOracle). */
+  private readonly codebaseOracleOption?: boolean | { enabled?: boolean; scan?: (cwd: string) => CodebaseOracle };
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -1148,10 +1265,18 @@ export class WorkflowAgent {
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
   /**
-   * Shared resource loader for every subagent of this run, built once. See
-   * getSharedResourceLoader — this is the #109 memory mitigation.
+   * Shared resource loaders for every subagent of this run, memoized PER MODE
+   * (#109 + context-cost): the scoped loader (noSkills — passive slices skip
+   * the ~3.1 ktok skill-stub block) and the full loader ("all" opt-in) are
+   * distinct, so one run can mix passive and skill-hungry slices while each
+   * mode is still built once and shared across subagents.
    */
-  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
+  private sharedResourceLoaders = new Map<"scoped" | "full", Promise<DefaultResourceLoader>>();
+  /**
+   * Context-cost: once-per-run memoized codebase oracle (boxed so a legitimate
+   * null — disabled/unavailable — is distinguishable from "not resolved yet").
+   */
+  private oracleBox?: { value: CodebaseOracle | null };
   /**
    * Emitted at most once per instance (~= once per run, see the class-level
    * lifetime note above): the untagged/default "medium" tier resolved to a
@@ -1225,6 +1350,7 @@ export class WorkflowAgent {
     this.mainModel = options.mainModel;
     this.defaultUntaggedTier = options.defaultUntaggedTier;
     this.subagentSkills = options.subagentSkills ?? DEFAULT_SUBAGENT_SKILLS;
+    this.codebaseOracleOption = options.codebaseOracle;
     this.sharedRegistry = options.modelRegistry;
     this.sessionHandoff = options.sessionHandoff ?? false;
     this.handoffExecutionModel = options.handoffExecutionModel;
@@ -1252,7 +1378,8 @@ export class WorkflowAgent {
   }
 
   /**
-   * A resource loader shared by every subagent of this run, built once (#109).
+   * Resource loaders shared by every subagent of this run, memoized per mode
+   * (#109 + context-cost).
    *
    * Without a resourceLoader, createAgentSession() builds a fresh
    * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
@@ -1273,48 +1400,130 @@ export class WorkflowAgent {
    * orchestration in subagents (no extension runtime at all), beyond the name-level
    * #107 denylist — and must be release-noted. `createAgentSession` with a shared
    * resourceLoader is a supported embedding pattern. runWorkflow builds one
-   * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
+   * WorkflowAgent per run, so each loader's lifetime is exactly one run: built
    * once, reused by all its subagents, then dropped with the agent.
+   *
+   * MODES (context-cost): "scoped" (default — subagentSkills "none") passes
+   * `noSkills: true`, stripping the ~3.1 ktok skill-stub block from every
+   * read-capable subagent system prompt (skill bodies stay lazy-readable via the
+   * read tool on demand); "full" (subagentSkills "all" opt-in) leaves noSkills
+   * unset exactly as before. Each mode is memoized independently so a single run
+   * can mix passive and skill-hungry slices without rebuilding the loader per
+   * subagent.
    */
-  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
-    if (!this.sharedResourceLoaderPromise) {
-      this.sharedResourceLoaderPromise = (async () => {
-        const loader = new DefaultResourceLoader({
-          cwd: this.cwd,
-          agentDir,
-          settingsManager: SettingsManager.create(this.cwd, agentDir),
-          noExtensions: true,
-          // T-01: subagentSkills "none" strips the skill-stub block (~3.1 ktok)
-          // from every read-capable subagent system prompt; the skill bodies
-          // stay lazy-readable via the read tool on demand. Default parity
-          // holds: "all" leaves noSkills unset exactly as before.
-          noSkills: this.subagentSkills === "none" ? true : undefined,
-        });
-        await loader.reload();
-        return loader;
-      })().catch((err) => {
+  private getSharedResourceLoader(
+    agentDir: string,
+    mode: "scoped" | "full" = this.subagentSkills === "none" ? "scoped" : "full",
+  ): Promise<DefaultResourceLoader> {
+    let promise = this.sharedResourceLoaders.get(mode);
+    if (!promise) {
+      promise = this.buildSharedResourceLoader(agentDir, mode).catch((err) => {
         // Don't let a transient build failure (e.g. EMFILE during reload's disk
         // I/O) poison every subagent AND every retry of this run — clear the memo
         // so the next caller rebuilds instead of replaying the same rejection.
-        this.sharedResourceLoaderPromise = undefined;
+        this.sharedResourceLoaders.delete(mode);
         throw err;
       });
+      this.sharedResourceLoaders.set(mode, promise);
     }
-    return this.sharedResourceLoaderPromise;
+    return promise;
   }
 
   /**
-   * T2-03: the tier name behind an UNTAGGED agent's implicit default, for the
-   * onModelFallback degrade label. Mirrors resolveAgentModelSpec's branches:
-   * configured "medium" when a model-tiers.json exists, else the prompt-aware
-   * classification tier (economy default). Purely diagnostic — the resolved
+   * Build one shared loader for a mode. Feature-detect the loader surface:
+   * `noSkills` is a typed pi >= 0.80.x option, but if the SDK build rejects it
+   * (constructor validation in an older/divergent release), the scoped mode
+   * degrades to the full loader — skills load exactly as before and the
+   * subagent still runs (graceful fallback, never a broken agent).
+   */
+  private async buildSharedResourceLoader(agentDir: string, mode: "scoped" | "full"): Promise<DefaultResourceLoader> {
+    const buildLoader = async (noSkills: boolean): Promise<DefaultResourceLoader> => {
+      const loader = new DefaultResourceLoader({
+        cwd: this.cwd,
+        agentDir,
+        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        noExtensions: true,
+        ...(noSkills ? { noSkills: true } : {}),
+      });
+      await loader.reload();
+      return loader;
+    };
+    if (mode !== "scoped") return buildLoader(false);
+    try {
+      return await buildLoader(true);
+    } catch {
+      // The SDK rejected the noSkills surface — degrade to parity (skills load,
+      // scoped savings skipped, the agent still runs).
+      return buildLoader(false);
+    }
+  }
+
+  /**
+   * Resolve the run's shared codebase oracle exactly once per WorkflowAgent
+   * (~= one run frame): the scan is memoized here AND cached module-wide, so N
+   * parallel subagents pay ONE deterministic zero-LLM scan. null = disabled or
+   * unavailable — the agent runs unchanged (never a break).
+   */
+  private resolveRunOracle(): CodebaseOracle | null {
+    if (this.oracleBox) return this.oracleBox.value;
+    let oracle: CodebaseOracle | null = null;
+    try {
+      const option = this.codebaseOracleOption;
+      if (isOracleEnabled(option)) {
+        const scan = typeof option === "object" && typeof option.scan === "function" ? option.scan : undefined;
+        oracle = scan ? scan(this.cwd) : loadCodebaseOracle({ cwd: this.cwd });
+      }
+    } catch (error) {
+      console.warn(
+        `[workflow] codebase oracle scan failed for ${this.cwd}: ${
+          error instanceof Error ? error.message : String(error)
+        }; continuing without a shared codebase map`,
+      );
+      oracle = null;
+    }
+    this.oracleBox = { value: oracle };
+    return oracle;
+  }
+
+  /**
+   * The bounded oracle render for a subagent prompt, or undefined when there is
+   * nothing useful to inject (disabled, unavailable, or an empty repo). Every
+   * agent of the run reuses the SAME once-computed map instead of re-discovering
+   * the repo with ls/grep/find round trips.
+   */
+  private oraclePromptBlock(): string | undefined {
+    const oracle = this.resolveRunOracle();
+    if (!oracle || oracle.symbolCount === 0) return undefined;
+    return renderOracle(oracle);
+  }
+
+  /**
+   * T2-03 + cost:model: the tier name behind an UNTAGGED agent's implicit
+   * default, for the onModelFallback degrade label. Mirrors
+   * resolveAgentModelSpec's branches: configured role-split tier when a
+   * model-tiers.json exists and a prompt classifies the slice (cheapest tier
+   * for mechanical work, "big" for hard slices — resolveRoleSplitTier),
+   * "medium" for prompt-less calls, else the prompt-aware classification tier
+   * under the no-config economy default. Purely diagnostic — the resolved
    * spec itself is what matters.
    */
   private implicitTierName(
     options: { defaultUntaggedTier?: string; pipelineStage?: "0" | "1" },
     prompt: string,
   ): string {
-    if (this.loadTierConfig() != null) return "medium";
+    const tierConfig = this.loadTierConfig();
+    if (tierConfig != null) {
+      if (prompt) {
+        const decision = resolveRoleSplitTier(
+          classifyTask(options.pipelineStage ?? "runtime", prompt),
+          tierConfig,
+          this.mainModel,
+          listAvailableModels(),
+        );
+        return decision.tier;
+      }
+      return "medium";
+    }
     const untaggedDefault = options.defaultUntaggedTier ?? this.defaultUntaggedTier ?? DEFAULT_UNTAGGED_TIER;
     if (untaggedDefault === UNTAGGED_TIER_ECONOMY) {
       return tierNameForTask(options.pipelineStage ?? "runtime", prompt);
@@ -1498,6 +1707,10 @@ export class WorkflowAgent {
       // classifies scan/edit prompts to the cheap tier. Absent on non-pipeline
       // runs — the prompt-aware fallback then classifies as "runtime" as before.
       options.pipelineStage,
+      // cost:model: a mechanical untagged slice under a configured tier config
+      // that could NOT downgrade to a cheaper model keeps the current default —
+      // surface that once, visibly, so the safety gate is never silent.
+      warnNoCheaperTierOnce,
     );
 
     // Provider pool: consult BEFORE model resolution so the session binds the
@@ -1815,7 +2028,8 @@ export class WorkflowAgent {
       // round-trip mid-stream. Advisory and soft-guarded — an unknowable
       // estimate/window falls through to today's behavior exactly, and the
       // CONTEXT_OVERFLOW class stays non-recoverable (the ceiling only fires it
-      // earlier).
+      // earlier). The oracle block rides inside buildPrompt, so the preflight
+      // estimate counts the SAME incoming context the real prompt carries.
       await this.maybePreflightContextHeadroom(
         session,
         prompt,
@@ -1855,9 +2069,13 @@ export class WorkflowAgent {
       throwIfTruncatedOutput(session.messages, options.label);
 
       if (options.schema) {
-        return (await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
+        const structured = await resolveStructuredOutput(session, capture, options.schema, options, (m) =>
           this.lastAssistantText(m),
-        )) as AgentRunResult<TSchemaDef>;
+        );
+        // Spend governance: report the settle's work evidence (no tools used =
+        // zero evidence — the guard's flag trigger). Never blocks the result.
+        options.onWorkEvidence?.(workEvidenceFromTraces(operations, structured));
+        return structured as AgentRunResult<TSchemaDef>;
       }
 
       // Unstructured result: require assistant text AFTER the last tool result.
@@ -1891,6 +2109,8 @@ export class WorkflowAgent {
           agentLabel: options.label,
         });
       }
+      // Spend governance: report the settle's work evidence (see onWorkEvidence).
+      options.onWorkEvidence?.(workEvidenceFromTraces(operations, text));
       return text as AgentRunResult<TSchemaDef>;
     } finally {
       removeAbortListener?.();
@@ -2022,7 +2242,7 @@ export class WorkflowAgent {
     structured: boolean,
   ): number | undefined {
     try {
-      let chars = SYSTEM_PREFIX_ESTIMATE_CHARS + this.buildPrompt(prompt, options, structured).length;
+      let chars = this.systemPrefixEstimateChars() + this.buildPrompt(prompt, options, structured).length;
       try {
         chars += JSON.stringify(tools).length;
       } catch {
@@ -2040,6 +2260,16 @@ export class WorkflowAgent {
     } catch {
       return undefined;
     }
+  }
+
+  /**
+   * Context-cost: the loader-produced system prefix estimate is mode-aware —
+   * the default scoped loading (subagentSkills "none") strips the ~3.1 ktok
+   * skill-stub block, so the preflight's static-prefix term drops accordingly
+   * instead of over-counting the incoming context (T2-02 stays advisory).
+   */
+  private systemPrefixEstimateChars(): number {
+    return this.subagentSkills === "none" ? SCOPED_SYSTEM_PREFIX_ESTIMATE_CHARS : SYSTEM_PREFIX_ESTIMATE_CHARS;
   }
 
   /**
@@ -2117,6 +2347,10 @@ export class WorkflowAgent {
       // opens (execution mode). Ordinary (non-handoff) agents are untouched.
       this.sessionHandoff && !this.handoffExecutionMode ? PLANNING_GUIDANCE : undefined,
       options.instructions,
+      // Context-cost (T2-B1): the run's shared bounded codebase map, injected
+      // into every subagent so parallel agents reuse one scan instead of each
+      // re-discovering the repo. Undefined when disabled/unavailable/empty.
+      this.oraclePromptBlock(),
       options.label ? `Task label: ${options.label}` : undefined,
       prompt,
     ].filter(Boolean);

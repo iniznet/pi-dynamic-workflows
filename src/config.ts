@@ -78,17 +78,30 @@ export const DEFAULT_AGENT_IDLE_RETRIES: number | null = null;
 export const DEFAULT_SUBAGENT_EXTENSION_TOOLS = "on" as const;
 
 /**
- * Default for the `subagentSkills` setting (T-01): "all" loads the installed
- * skill set (frontmatter name + description stubs only) into read-capable
- * subagent sessions exactly as before. "none" passes `noSkills: true` to the
- * shared DefaultResourceLoader, stripping the ~3.1 ktok skill-stub block from
- * every subagent system prompt (the skill body stays lazy-loaded on demand by
- * the agent via the read tool). One knob shared by the consumption site
- * (agent.ts getSharedResourceLoader `?? DEFAULT_...`) and the UI default
- * display (workflow-settings-fields.ts), so the flip is testable and can
- * never drift between the runtime and the settings surface.
+ * Default for the `subagentSkills` setting (T-01 + context-cost): "none"
+ * passes `noSkills: true` to the shared DefaultResourceLoader, stripping the
+ * ~3.1 ktok skill-stub block from every subagent system prompt (the skill
+ * body stays lazy-loaded on demand by the agent via the read tool). "all"
+ * loads the installed skill set (frontmatter name + description stubs only)
+ * into read-capable subagent sessions — kept as an opt-in for slices that
+ * genuinely need skill discovery in the system prompt (e.g. svelte editing).
+ *
+ * CONTEXT-COST DEFAULT FLIP: scoped loading is the default-on behavior — a
+ * passive/mechanical slice must not pay ~3.1 ktok/turn for skill stubs it
+ * never uses. One knob shared by the consumption site (agent.ts
+ * getSharedResourceLoader `?? DEFAULT_...`) and the UI default display
+ * (workflow-settings-fields.ts), so the flip is testable and can never drift
+ * between the runtime and the settings surface.
  */
-export const DEFAULT_SUBAGENT_SKILLS = "all" as const;
+export const DEFAULT_SUBAGENT_SKILLS = "none" as const;
+
+/**
+ * Context-cost (T2-B1): measured size of the installed-skill stub block the
+ * scoped default strips from every read-capable subagent system prompt (~3.1
+ * ktok/turn, token-efficiency audit). Drives the documented expected-savings
+ * and the mode-aware system-prefix estimate (agent.ts).
+ */
+export const SUBAGENT_SKILL_STUB_BLOCK_TOKENS = 3_100;
 
 /**
  * V2-P12: per-actor activation budget — the maximum number of deliveries one
@@ -252,6 +265,13 @@ export const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
  * prompt-aware classifyTask fallback (scan=small / edit=medium /
  * synthesize+analyze=big, see model-routing.ts) so untagged calls no longer
  * collapse onto the session's flagship main model.
+ *
+ * cost:model note: when a model-tiers.json IS configured, the configured
+ * "medium"-default precedence was replaced by the cheapest-first role-split
+ * (resolveRoleSplitTier in model-tier-config.ts): mechanical slices route to
+ * the cheapest configured tier when a genuinely cheaper model exists (safety-
+ * gated, never a silent quality loss), and hard slices escalate to "big". The
+ * knob below stays scoped to the no-config path (its documented surface).
  */
 export const UNTAGGED_TIER_ECONOMY = "economy";
 
@@ -268,14 +288,16 @@ export const UNTAGGED_TIER_INHERIT_MAIN = "inherit:main";
 export const DEFAULT_UNTAGGED_TIER = UNTAGGED_TIER_ECONOMY;
 
 /**
- * Resume-replay routing-policy version (T2-03/T2-05/T2-11). Included in
- * hashAgentCall's identity so a routing-policy change (economy default,
- * builtin per-phase tier defaults, per-tier thinking caps) invalidates cached
- * journaled results: journals persisted before the bump mismatch and re-run
- * live instead of silently replaying results computed under the OLD policy.
- * Bump whenever a routing-policy default changes.
+ * Resume-replay routing-policy version (T2-03/T2-05/T2-11, cost:model).
+ * Included in hashAgentCall's identity so a routing-policy change (economy
+ * default, builtin per-phase tier defaults, per-tier thinking caps, and the
+ * cost:model role-split default for untagged calls under a configured
+ * model-tiers.json) invalidates cached journaled results: journals persisted
+ * before the bump mismatch and re-run live instead of silently replaying
+ * results computed under the OLD policy. Bump whenever a routing-policy
+ * default changes.
  */
-export const ROUTING_POLICY_VERSION = 2;
+export const ROUTING_POLICY_VERSION = 3;
 
 /**
  * Default tier for the script-API quality helpers' votes (T2-04): verify() /
@@ -722,3 +744,235 @@ export function normalizeKeywordTriggerWord(value: unknown): string | undefined 
  * (frontmatter + body prompt).
  */
 export const AGENTS_DIR = ".pi/agents";
+
+// ─── Context-cost: shared codebase oracle (T2-B1) defaults ─────────────────
+// Deterministic, ZERO-LLM symbol/type/declaration scan injected once per run so
+// parallel subagents reuse a bounded repo map instead of each re-discovering
+// structure. Every knob is a hard bound: the scan must be cheap (file count,
+// per-file bytes, symbol count) and the render must be token-bounded. Pure
+// config — the runtime leaf (config.ts) stays pi-tui-free, and codebase-oracle.ts
+// only imports this module + node builtins.
+
+/** Whether the shared codebase oracle is injected by default (context-cost, default-on). */
+export const DEFAULT_ORACLE_ENABLED = true;
+
+/** Hard cap on the number of source files one oracle scan walks. */
+export const DEFAULT_ORACLE_MAX_FILES = 400;
+
+/** Hard cap on the number of symbols retained per oracle scan. */
+export const DEFAULT_ORACLE_MAX_SYMBOLS = 400;
+
+/** Per-file read cap (bytes) — a giant generated file never dominates the scan. */
+export const DEFAULT_ORACLE_MAX_BYTES_PER_FILE = 64_000;
+
+/**
+ * Token cap on the oracle's compact render injected into subagent prompts.
+ * A bounded map (≤ this many tokens) is far cheaper than every agent paying
+ * its own repo-discovery round trips, and far smaller than the ~3.1 ktok
+ * skill block the scoped default strips.
+ */
+export const DEFAULT_ORACLE_RENDER_MAX_TOKENS = 800;
+
+/**
+ * Context-cost expected-savings constant (documented, pure config): the net
+ * per-agent input-token saving of scoped loading on a passive slice — the
+ * ~3.1 ktok skill block minus the bounded oracle render it is replaced by.
+ * Not a runtime gate — a documented estimate for the forecast/reporting
+ * surfaces (estimate-forecast.ts + the slice handoff).
+ */
+export const SCOPED_CONTEXT_NET_SAVINGS_TOKENS_PER_AGENT =
+  SUBAGENT_SKILL_STUB_BLOCK_TOKENS - DEFAULT_ORACLE_RENDER_MAX_TOKENS;
+
+// ─── Spend governance: measured price book (slice C) ─────────────────────────
+// Real per-model USD prices replace the ASSUMED relative tier weights
+// (ESTIMATE_TIER_COST_WEIGHTS above) as the dollar denomination of the
+// pre-flight forecast. The relative weights stay exported as the legacy cost
+// proxy (costWeightedTokens) so existing consumers keep compiling; the quote
+// gate and the --estimate USD range are computed from THIS measured book.
+
+/** Measured USD price (per 1,000 tokens) for one model — the real-price quote basis. */
+export interface ModelPriceUsd {
+  /** USD per 1,000 INPUT tokens. */
+  inputPer1kUsd: number;
+  /** USD per 1,000 OUTPUT tokens. */
+  outputPer1kUsd: number;
+}
+
+/**
+ * MEASURED per-model price book (spend governance): public provider LIST
+ * prices (USD per 1k tokens) keyed by the canonical "provider/model" spec —
+ * the same spec form model-tiers.json and agent() opts.model carry. The quote
+ * is a conservative planning basis, never a billing contract: actual spend is
+ * metered from provider-reported usage at run end (the run's ledger records
+ * real cost). Missing entries resolve via resolveModelPrice's id/fragment
+ * fallback, then tier defaults, then DEFAULT_MODEL_PRICE_USD.
+ */
+export const MODEL_PRICE_BOOK: Readonly<Record<string, ModelPriceUsd>> = {
+  // OpenAI
+  "openai/gpt-4.1-mini": { inputPer1kUsd: 0.0004, outputPer1kUsd: 0.0016 },
+  "openai/gpt-4.1": { inputPer1kUsd: 0.002, outputPer1kUsd: 0.008 },
+  "openai/gpt-4o": { inputPer1kUsd: 0.0025, outputPer1kUsd: 0.01 },
+  "openai/gpt-4o-mini": { inputPer1kUsd: 0.00015, outputPer1kUsd: 0.0006 },
+  "openai/o3-mini": { inputPer1kUsd: 0.0011, outputPer1kUsd: 0.0044 },
+  // Anthropic
+  "anthropic/claude-3-5-haiku": { inputPer1kUsd: 0.0008, outputPer1kUsd: 0.004 },
+  "anthropic/claude-3-5-sonnet": { inputPer1kUsd: 0.003, outputPer1kUsd: 0.015 },
+  "anthropic/claude-haiku-4": { inputPer1kUsd: 0.001, outputPer1kUsd: 0.005 },
+  "anthropic/claude-sonnet-4": { inputPer1kUsd: 0.003, outputPer1kUsd: 0.015 },
+  "anthropic/claude-opus-4": { inputPer1kUsd: 0.015, outputPer1kUsd: 0.075 },
+  // Google
+  "google/gemini-2.0-flash": { inputPer1kUsd: 0.0001, outputPer1kUsd: 0.0004 },
+  "google/gemini-2.5-flash": { inputPer1kUsd: 0.0003, outputPer1kUsd: 0.0025 },
+  "google/gemini-2.5-pro": { inputPer1kUsd: 0.00125, outputPer1kUsd: 0.01 },
+  // DeepSeek
+  "deepseek/deepseek-chat": { inputPer1kUsd: 0.00027, outputPer1kUsd: 0.0011 },
+  "deepseek/deepseek-reasoner": { inputPer1kUsd: 0.00055, outputPer1kUsd: 0.00219 },
+};
+
+/**
+ * Per-tier reference prices for the forecast when the scan knows a tier but
+ * not its resolved model spec (small/medium/big map to the cheap/mid/flagship
+ * price classes). Kept in lockstep with the game-change's cheapest-first
+ * tiering: small is the cheapest class, so untagged/economy slices quote low.
+ */
+export const TIER_PRICE_DEFAULTS: Readonly<Record<string, ModelPriceUsd>> = {
+  small: { inputPer1kUsd: 0.0004, outputPer1kUsd: 0.0016 }, // gpt-4.1-mini class
+  medium: { inputPer1kUsd: 0.002, outputPer1kUsd: 0.008 }, // gpt-4.1 class
+  big: { inputPer1kUsd: 0.003, outputPer1kUsd: 0.015 }, // sonnet-4 class
+};
+
+/** Reference price for models/tiers with no price-book entry (a mid-range gpt-4.1-class model). */
+export const DEFAULT_MODEL_PRICE_USD: ModelPriceUsd = TIER_PRICE_DEFAULTS.medium;
+
+/**
+ * Most expensive price across the book + tier defaults — the conservative
+ * worst-case quote for a model the scan cannot resolve at all.
+ */
+export const MAX_MODEL_PRICE_USD: ModelPriceUsd = (() => {
+  let input = 0;
+  let output = 0;
+  for (const price of [...Object.values(MODEL_PRICE_BOOK), ...Object.values(TIER_PRICE_DEFAULTS)]) {
+    input = Math.max(input, price.inputPer1kUsd);
+    output = Math.max(output, price.outputPer1kUsd);
+  }
+  return { inputPer1kUsd: input, outputPer1kUsd: output };
+})();
+
+/**
+ * Resolve a model spec to its price-book entry. Robust to the spec forms the
+ * tree carries: strips any `:thinking` suffix, tries the exact canonical
+ * "provider/model" key, then the bare model id after the last "/", then a
+ * suffix match against book keys (so vendor-qualified ids resolve too).
+ * undefined = no entry in the book.
+ */
+export function resolveModelPrice(
+  spec: string | undefined,
+  book: Readonly<Record<string, ModelPriceUsd>> = MODEL_PRICE_BOOK,
+): ModelPriceUsd | undefined {
+  if (!spec) return undefined;
+  const normalized = spec.trim().split(":")[0] ?? "";
+  const exact = book[normalized];
+  if (exact) return exact;
+  // Bare model id (after the last "/", or the whole spec when unqualified) —
+  // tried as an exact book key, then via a suffix scan so vendor-qualified
+  // book entries ("openai/gpt-4.1-mini") resolve from "gpt-4.1-mini" too.
+  const slash = normalized.lastIndexOf("/");
+  const id = slash >= 0 ? normalized.slice(slash + 1) : normalized;
+  if (book[id]) return book[id];
+  for (const key of Object.keys(book)) {
+    if (key.endsWith(`/${id}`)) return book[key];
+  }
+  return undefined;
+}
+
+/**
+ * The price the estimator quotes for ONE agent call: an explicit model's
+ * price-book entry wins, then the tier's reference price, then the default
+ * reference price. Pure and deterministic — never reads the registry.
+ */
+export function modelPriceForEstimate(
+  model: string | undefined,
+  tier: string | undefined,
+  book: Readonly<Record<string, ModelPriceUsd>> = MODEL_PRICE_BOOK,
+): ModelPriceUsd {
+  const fromModel = resolveModelPrice(model, book);
+  if (fromModel) return fromModel;
+  if (tier && TIER_PRICE_DEFAULTS[tier]) return TIER_PRICE_DEFAULTS[tier];
+  return DEFAULT_MODEL_PRICE_USD;
+}
+
+// ─── Spend governance: quote-before-spend + tau gate (slice C) ────────────────
+// The gate quotes the run's worst-case USD (measured price book) BEFORE any
+// agent launches and compares it against a spend ceiling. Tau is the run's
+// value-to-budget ratio: ceiling = budget × tau (tau = value ÷ budget, so the
+// ceiling is at most the run's value). tau = 0/null disables the gate and
+// restores current behavior (no quote, no refusal).
+
+/**
+ * Default tau for the quote gate: the worst-case USD quote must stay under
+ * `spendBudgetUsd × tau`. Default 1 = spend at most the configured budget;
+ * 0 or null disables the gate entirely (current behavior).
+ */
+export const DEFAULT_SPEND_TAU = 1;
+
+/**
+ * Default quote-gate mode: "warn" = warn-and-require-confirm before an
+ * over-budget launch when a UI is available (headless/background runs REFUSE
+ * — never silently launch over budget); "refuse" = always refuse; "off" =
+ * gate disabled. Only engaged when a spend ceiling is configured.
+ */
+export const DEFAULT_SPEND_QUOTE_GATE = "warn" as const;
+
+/** Quote-gate mode literal. */
+export type SpendQuoteGateMode = "warn" | "refuse" | "off";
+
+/**
+ * Resolve the effective tau: explicit 0/null = disabled (null); a positive
+ * finite number wins; anything else falls back to DEFAULT_SPEND_TAU.
+ */
+export function resolveSpendTau(value: number | null | undefined): number | null {
+  if (value === null || value === 0) return null;
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  return DEFAULT_SPEND_TAU;
+}
+
+/**
+ * Resolve the run's spend ceiling (USD): an explicit quoted value wins (the
+ * run's worth — the ceiling is the value); else budget × tau. null = no
+ * ceiling = the gate is disabled (current behavior).
+ */
+export function resolveSpendCeilingUsd(
+  spendBudgetUsd: number | null | undefined,
+  quotedValueUsd: number | null | undefined,
+  spendTau: number | null | undefined,
+): number | null {
+  if (typeof quotedValueUsd === "number" && Number.isFinite(quotedValueUsd) && quotedValueUsd > 0) {
+    return quotedValueUsd;
+  }
+  if (typeof spendBudgetUsd === "number" && Number.isFinite(spendBudgetUsd) && spendBudgetUsd > 0) {
+    const tau = resolveSpendTau(spendTau);
+    if (tau !== null) return spendBudgetUsd * tau;
+  }
+  return null;
+}
+
+// ─── Spend governance: no-progress guard (slice C) ──────────────────────────
+// Default-on: an agent that reports SUCCESS with zero work evidence (no tool
+// events, no edit results) is flagged, its consecutive zero-evidence budget is
+// capped, and the run refuses to let the same agent call loop silently.
+
+/**
+ * Default-on no-progress guard. An agent that settles successfully with zero
+ * work evidence (no tool events / edit results — a pure "ok" with nothing
+ * done, or a README-less pass-through) is flagged. Escalates only when the
+ * SAME label keeps producing zero-evidence successes up to the cap.
+ */
+export const DEFAULT_NO_PROGRESS_GUARD = true;
+
+/**
+ * Consecutive zero-work-evidence successes per agent call site (label) before
+ * the guard refuses the next one (the "attempt budget"). Once the run's
+ * re-plan signal has fired (tokenBudget × rePlanThreshold crossed), the cap
+ * tightens to 1 — budget burn plus no evidence is never tolerated silently.
+ */
+export const NO_PROGRESS_ZERO_EVIDENCE_CAP = 3;
